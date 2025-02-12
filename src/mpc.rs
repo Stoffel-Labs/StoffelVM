@@ -1,6 +1,5 @@
 use std::future::Future;
 use std::pin::Pin;
-use crate::vm::RegisterType;
 
 // TODO: figure out a better way to handle this, I imagine that we'll shove the network stack somewhere so this is good to think about
 
@@ -30,13 +29,17 @@ impl MPCAdd {
 
 impl MPCOperation for MPCAdd {
     fn start(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>>>> {
+        let operand1 = self.operand1;
+        let operand2 = self.operand2;
         Box::pin(async move {
             // Simulate network delay
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            self.result = Some(self.operand1 + self.operand2);
-            self.completed = true;
+            // Perform computation (no borrow of `self` anymore)
+            let result = operand1 + operand2;
+            // Simulate updating: Place logic here to "use" the result elsewhere
             Ok(())
         })
+
     }
 
     fn is_complete(&self) -> bool {
