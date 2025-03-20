@@ -1,8 +1,8 @@
-use crate::activationshenanigans::ActivationRecord;
+use crate::activations::ActivationRecord;
 use crate::functions::Function;
 use crate::instructions::Instruction;
-use crate::vmstate::{VMState};
-use crate::types::{Upvalue, Value};
+use crate::vm_state::{VMState};
+use crate::core_types::{Upvalue, Value};
 
 /// Hook event types
 #[derive(Debug, Clone)]

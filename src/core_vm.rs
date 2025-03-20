@@ -1,8 +1,8 @@
-use crate::activationshenanigans::ActivationRecord;
+use crate::activations::ActivationRecord;
 use crate::functions::{ForeignFunction, ForeignFunctionContext, Function, VMFunction};
-use crate::hooks::{HookContext, HookEvent};
-use crate::types::{Closure, Upvalue, Value};
-use crate::vmstate::VMState;
+use crate::runtime_hooks::{HookContext, HookEvent};
+use crate::core_types::{Closure, Upvalue, Value};
+use crate::vm_state::VMState;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -10,6 +10,57 @@ use std::sync::{Arc, Mutex};
 /// The register-based virtual machine
 pub struct VirtualMachine {
     pub state: RefCell<VMState>,
+}
+
+impl VirtualMachine {
+    pub fn execute_with_args(&self, function_name: &str, args: &[Value]) -> Result<Value, String> {
+        let vm_func = {
+            let state = self.state.borrow();
+            match state.functions.get(function_name) {
+                Some(Function::VM(func)) => func.clone(),
+                Some(Function::Foreign(f)) => {
+                    let mut state = self.state.borrow_mut();
+                    let result = (f.func)(ForeignFunctionContext {
+                        args,
+                        vm_state: &mut state,
+                    })?;
+                    return Ok(result);
+                }
+                None => return Err(format!("Function {} not found", function_name)),
+            }
+        };
+        // FIXME: Changing this from `!=` to `==` for some reason causes it to correctly give the arguments but the other way around it doesn't :D
+        if args.len() != vm_func.parameters.len() {
+            return Err(format!(
+                "Function {} expects {} arguments but got {}",
+                function_name,
+                vm_func.parameters.len(),
+                args.len()
+            ));
+        }
+
+        {
+            let mut state = self.state.borrow_mut();
+            let mut initial_record = ActivationRecord {
+                function_name: function_name.to_string(),
+                locals: HashMap::new(),
+                registers: vec![Value::Unit; vm_func.register_count],
+                upvalues: Vec::new(),
+                instruction_pointer: 0,
+                stack: Vec::new(),
+                compare_flag: 0,
+            };
+
+            for (i, (param_name, arg_value)) in vm_func.parameters.iter().zip(args.iter()).enumerate() {
+                initial_record.registers[i] = arg_value.clone();
+                initial_record.locals.insert(param_name.clone(), arg_value.clone());
+            }
+
+            state.activation_records.push(initial_record);
+        }
+
+        self.execute_until_return()
+    }
 }
 
 impl Default for VirtualMachine {
@@ -493,7 +544,7 @@ impl VirtualMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activationshenanigans::ActivationRecord;
+    use crate::activations::ActivationRecord;
     use crate::functions::VMFunction;
     use crate::instructions::Instruction;
     use std::collections::HashMap;

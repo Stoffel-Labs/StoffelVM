@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use crate::types::{Upvalue, Value};
+use crate::core_types::{Upvalue, Value};
 
 #[derive(Clone)]
 pub struct ActivationRecord {

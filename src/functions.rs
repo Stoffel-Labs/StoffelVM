@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use crate::instructions::Instruction;
-use crate::types::Value;
-use crate::vmstate::VMState;
+use crate::core_types::Value;
+use crate::vm_state::VMState;
 
 /// VM function definition
 #[derive(Clone, PartialEq, Eq)]

@@ -1,12 +1,12 @@
 pub mod instructions;
-pub mod bitsandbobs;
-pub mod numbers;
-pub mod types;
-pub mod hooks;
+pub mod bitwise_ops;
+pub mod arithmetic_ops;
+pub mod core_types;
+pub mod runtime_hooks;
 pub mod functions;
-pub mod activationshenanigans;
-pub mod vmstate;
-pub mod bigbirtha;
+pub mod activations;
+pub mod vm_state;
+pub mod core_vm;
 
 
 

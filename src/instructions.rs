@@ -1,4 +1,4 @@
-use crate::types::Value;
+use crate::core_types::Value;
 
 #[repr(u8)]
 pub enum ReducedOpcode {

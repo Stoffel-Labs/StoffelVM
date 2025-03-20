@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::activationshenanigans::ActivationRecord;
+use crate::activations::ActivationRecord;
 use crate::functions::{ForeignFunctionContext, Function};
-use crate::hooks::{HookEvent, HookManager};
+use crate::runtime_hooks::{HookEvent, HookManager};
 use crate::instructions::Instruction;
-use crate::types::{Closure, ForeignObjectStorage, ObjectStore, Upvalue, Value};
+use crate::core_types::{Closure, ForeignObjectStorage, ObjectStore, Upvalue, Value};
 
 // VM internal state
 pub struct VMState {
