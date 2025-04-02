@@ -145,10 +145,10 @@ fn main() -> Result<(), String> {
         ],
         labels: {
             let mut labels = HashMap::new();
-            labels.insert("call_add".to_string(), 16);
-            labels.insert("call_subtract".to_string(), 20);
-            labels.insert("call_multiply".to_string(), 24);
-            labels.insert("call_divide".to_string(), 28);
+            labels.insert("call_add".to_string(), 14);
+            labels.insert("call_subtract".to_string(), 18);
+            labels.insert("call_multiply".to_string(), 22);
+            labels.insert("call_divide".to_string(), 26);
             labels
         },
     };

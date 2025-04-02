@@ -3,65 +3,14 @@ use crate::functions::{ForeignFunction, ForeignFunctionContext, Function, VMFunc
 use crate::runtime_hooks::{HookContext, HookEvent};
 use crate::core_types::{Closure, Upvalue, Value};
 use crate::vm_state::VMState;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// The register-based virtual machine
 pub struct VirtualMachine {
-    pub state: RefCell<VMState>,
+    pub state: Mutex<VMState>,
 }
 
-impl VirtualMachine {
-    pub fn execute_with_args(&self, function_name: &str, args: &[Value]) -> Result<Value, String> {
-        let vm_func = {
-            let state = self.state.borrow();
-            match state.functions.get(function_name) {
-                Some(Function::VM(func)) => func.clone(),
-                Some(Function::Foreign(f)) => {
-                    let mut state = self.state.borrow_mut();
-                    let result = (f.func)(ForeignFunctionContext {
-                        args,
-                        vm_state: &mut state,
-                    })?;
-                    return Ok(result);
-                }
-                None => return Err(format!("Function {} not found", function_name)),
-            }
-        };
-        // FIXME: Changing this from `!=` to `==` for some reason causes it to correctly give the arguments but the other way around it doesn't :D
-        if args.len() != vm_func.parameters.len() {
-            return Err(format!(
-                "Function {} expects {} arguments but got {}",
-                function_name,
-                vm_func.parameters.len(),
-                args.len()
-            ));
-        }
-
-        {
-            let mut state = self.state.borrow_mut();
-            let mut initial_record = ActivationRecord {
-                function_name: function_name.to_string(),
-                locals: HashMap::new(),
-                registers: vec![Value::Unit; vm_func.register_count],
-                upvalues: Vec::new(),
-                instruction_pointer: 0,
-                stack: Vec::new(),
-                compare_flag: 0,
-            };
-
-            for (i, (param_name, arg_value)) in vm_func.parameters.iter().zip(args.iter()).enumerate() {
-                initial_record.registers[i] = arg_value.clone();
-                initial_record.locals.insert(param_name.clone(), arg_value.clone());
-            }
-
-            state.activation_records.push(initial_record);
-        }
-
-        self.execute_until_return()
-    }
-}
 
 impl Default for VirtualMachine {
     fn default() -> Self {
@@ -72,7 +21,7 @@ impl Default for VirtualMachine {
 impl VirtualMachine {
     pub fn new() -> Self {
         let vm = VirtualMachine {
-            state: RefCell::new(VMState::new()),
+            state: Mutex::new(VMState::new()),
         };
 
         // Register standard library functions
@@ -434,7 +383,7 @@ impl VirtualMachine {
 
     // Register a VM function
     pub fn register_function(&self, function: VMFunction) {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().unwrap();
         state
             .functions
             .insert(function.name.clone(), Function::VM(function));
@@ -445,7 +394,7 @@ impl VirtualMachine {
     where
         F: Fn(ForeignFunctionContext) -> Result<Value, String> + 'static + Send + Sync,
     {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().unwrap();
         state.functions.insert(
             name.to_string(),
             Function::Foreign(ForeignFunction {
@@ -457,14 +406,14 @@ impl VirtualMachine {
 
     // Register a foreign object
     pub fn register_foreign_object<T: 'static + Send + Sync>(&self, object: T) -> Value {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().unwrap();
         let id = state.foreign_objects.register_object(object);
         Value::Foreign(id)
     }
 
     // Get a foreign object by ID
     pub fn get_foreign_object<T: 'static + Send + Sync>(&self, id: usize) -> Option<Arc<Mutex<T>>> {
-        let state = self.state.borrow();
+        let state = self.state.lock().unwrap();
         state.foreign_objects.get_object(id)
     }
 
@@ -476,7 +425,7 @@ impl VirtualMachine {
         P: Fn(&HookEvent) -> bool + 'static + Send + Sync,
         C: Fn(&HookEvent, &HookContext) -> Result<(), String> + 'static + Send + Sync,
     {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().unwrap();
         state
             .hook_manager
             .register_hook(Box::new(predicate), Box::new(callback), priority)
@@ -484,27 +433,76 @@ impl VirtualMachine {
 
     // Unregister a hook
     pub fn unregister_hook(&self, hook_id: usize) -> bool {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().unwrap();
         state.hook_manager.unregister_hook(hook_id)
     }
 
     // Enable a hook
     pub fn enable_hook(&self, hook_id: usize) -> bool {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().unwrap();
         state.hook_manager.enable_hook(hook_id)
     }
 
     // Disable a hook
     pub fn disable_hook(&self, hook_id: usize) -> bool {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().unwrap();
         state.hook_manager.disable_hook(hook_id)
+    }
+
+    pub fn execute_with_args(&self, function_name: &str, args: &[Value]) -> Result<Value, String> {
+        let vm_func = {
+            let state = self.state.lock().unwrap();
+            match state.functions.get(function_name) {
+                Some(Function::VM(func)) => func.clone(),
+                Some(Function::Foreign(f)) => {
+                    let mut state = self.state.lock().unwrap();
+                    let result = (f.func)(ForeignFunctionContext {
+                        args,
+                        vm_state: &mut state,
+                    })?;
+                    return Ok(result);
+                }
+                None => return Err(format!("Function {} not found", function_name)),
+            }
+        };
+
+        if args.len() != vm_func.parameters.len() {
+            return Err(format!(
+                "Function {} expects {} arguments but got {}",
+                function_name,
+                vm_func.parameters.len(),
+                args.len()
+            ));
+        }
+
+        {
+            let mut state = self.state.lock().unwrap();
+            let mut initial_record = ActivationRecord {
+                function_name: function_name.to_string(),
+                locals: HashMap::new(),
+                registers: vec![Value::Unit; vm_func.register_count],
+                upvalues: Vec::new(),
+                instruction_pointer: 0,
+                stack: Vec::new(),
+                compare_flag: 0,
+            };
+
+            for (i, (param_name, arg_value)) in vm_func.parameters.iter().zip(args.iter()).enumerate() {
+                initial_record.registers[i] = arg_value.clone();
+                initial_record.locals.insert(param_name.clone(), arg_value.clone());
+            }
+
+            state.activation_records.push(initial_record);
+        }
+
+        self.execute_until_return()
     }
 
     // Execute the VM with a given main function
     // TODO: should prob make it so that if no main function specified it will just run the provided bytecode
     pub fn execute(&self, main_function: &str) -> Result<Value, String> {
         let vm_func = {
-            let state = self.state.borrow();
+            let state = self.state.lock().unwrap();
             match state.functions.get(main_function) {
                 Some(Function::VM(func)) => func.clone(),
                 Some(Function::Foreign(_)) => {
@@ -518,7 +516,7 @@ impl VirtualMachine {
         };
 
         {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.lock().unwrap();
             let initial_record = ActivationRecord {
                 function_name: main_function.to_string(),
                 locals: HashMap::new(),
@@ -536,7 +534,7 @@ impl VirtualMachine {
     }
 
     pub fn execute_until_return(&self) -> Result<Value, String> {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().unwrap();
         state.execute_until_return()
     }
 }
@@ -2408,7 +2406,7 @@ mod tests {
         let iterations = 10000; // Reduced for faster test runs
         let start = Instant::now();
 
-        let mut state = vm.state.borrow_mut();
+        let mut state = vm.state.lock().unwrap();
         let initial_record = ActivationRecord {
             function_name: "loop_test".to_string(),
             locals: HashMap::new(),

@@ -16,6 +16,12 @@ pub struct VMState {
     pub hook_manager: HookManager,
 }
 
+impl Default for VMState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VMState {
     pub fn new() -> Self {
         VMState {

@@ -93,6 +93,12 @@ pub struct HookManager {
     pub next_hook_id: usize,
 }
 
+impl Default for HookManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HookManager {
     pub fn new() -> Self {
         HookManager {
