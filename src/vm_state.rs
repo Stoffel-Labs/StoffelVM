@@ -514,39 +514,11 @@ impl VMState {
                         return Ok(return_value);
                     }
 
-                    // Get the upvalues from the activation record we're returning from
-                    let current_upvalues = self.activation_records.last().unwrap().upvalues.clone();
-
                     // Pop the current activation record
                     self.activation_records.pop();
 
-                    // Now, update any closures in the parent's registers with upvalues from this function
+                    // Get the parent record (which is now the last one)
                     let parent_record = self.activation_records.last_mut().unwrap();
-
-                    // Look for any closures in the registers that reference the returning function
-                    for reg_value in &mut parent_record.registers {
-                        if let Value::Closure(closure_arc) = reg_value {
-                            // If this closure matches the function we're returning from
-                            if closure_arc.function_id == returning_from {
-                                // We need to update this closure with the current upvalues
-                                // Clone the existing Arc to make it mutable
-                                let mut closure = (**closure_arc).clone();
-
-                                // Update the closure's upvalues with current values
-                                for upvalue in &mut closure.upvalues {
-                                    for current_upvalue in &current_upvalues {
-                                        if upvalue.name == current_upvalue.name {
-                                            // Update this upvalue with the latest value
-                                            upvalue.value = current_upvalue.value.clone();
-                                        }
-                                    }
-                                }
-
-                                // Replace the original closure with the updated one
-                                *reg_value = Value::Closure(Arc::new(closure));
-                            }
-                        }
-                    }
 
                     // Set the return value in register 0 of the parent activation record
                     let old_value = parent_record.registers[0].clone();

@@ -6,7 +6,7 @@ use crate::core_types::Value;
 use crate::vm_state::VMState;
 
 /// VM function definition
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct VMFunction {
     pub name: String,
     pub parameters: Vec<String>,
@@ -70,7 +70,7 @@ impl Clone for ForeignFunction {
 }
 
 /// Function definition - can be either VM or foreign
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Hash)]
 pub enum Function {
     VM(VMFunction),
     Foreign(ForeignFunction),

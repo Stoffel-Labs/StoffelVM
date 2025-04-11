@@ -7,6 +7,5 @@ pub mod functions;
 pub mod activations;
 pub mod vm_state;
 pub mod core_vm;
-
-
-
+pub mod net;
+pub mod storage;

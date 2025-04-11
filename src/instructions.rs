@@ -49,7 +49,7 @@ pub enum ReducedOpcode {
 }
 
 /// Memory address or register operand
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum Operand {
     Register(usize),                   // A register (r0, r1, etc.)
     StackAddr(i32),                    // Stack pointer offset [sp+n]
@@ -58,7 +58,8 @@ pub enum Operand {
 }
 
 /// Instruction set matching ReducedOpcode
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
+#[derive(Hash)]
 pub enum Instruction {
     // Load value from stack to register
     LD(usize, i32),                      // LD r1, [sp+0]
