@@ -68,6 +68,9 @@ impl PeerConnection for QuicNoiseConnection {
 
 pub struct PeerManager {
     // Fields for managing active connections, listener state, etc.
+    // - Map<SocketAddr, PeerState> (from light_udp)
+    // - UDP Socket
+    // - Task handle for the main event loop (recv/send/timeout checks)
 }
 
 impl NetworkManager for PeerManager {
@@ -75,6 +78,9 @@ impl NetworkManager for PeerManager {
         Box::pin(async move {
             // Implementation to establish outgoing connection
             // Use `address` within the async block
+            // - Send initial handshake packet (e.g., SYN)
+            // - Add PeerState to internal map
+            // - Wait for handshake response (e.g., SYN-ACK)
             let _ = address;
             unimplemented!("Peer connect not implemented")
         })
@@ -84,6 +90,8 @@ impl NetworkManager for PeerManager {
         Box::pin(async move {
             // Implementation to start listening for incoming connections
             // Use `bind_address` within the async block
+            // - Bind UDP socket
+            // - Start the main event loop task (handling receives, sends, timeouts, probes)
             let _ = bind_address;
             unimplemented!("Peer listen not implemented")
         })
