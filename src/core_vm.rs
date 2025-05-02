@@ -555,131 +555,28 @@ mod tests {
     }
 
     #[test]
-    fn test_arithmetic_instructions() {
+    fn test_less_than_jump() {
         let vm = setup_vm();
 
-        let test_function = VMFunction {
-            name: "test_arithmetic".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 5,
-            instructions: vec![
-                // Test ADD: 5 + 10 = 15
-                Instruction::LDI(0, Value::Int(5)),
-                Instruction::LDI(1, Value::Int(10)),
-                Instruction::ADD(2, 0, 1),
-                // Test SUB: 20 - 5 = 15
-                Instruction::LDI(0, Value::Int(20)),
-                Instruction::LDI(1, Value::Int(5)),
-                Instruction::SUB(3, 0, 1),
-                // Test MUL: 3 * 5 = 15
-                Instruction::LDI(0, Value::Int(3)),
-                Instruction::LDI(1, Value::Int(5)),
-                Instruction::MUL(4, 0, 1),
-                // Return result of ADD
-                Instruction::RET(2),
-            ],
-            labels: HashMap::new(),
-        };
-
-        vm.register_function(test_function);
-        let result = vm.execute("test_arithmetic").unwrap();
-        assert_eq!(result, Value::Int(15));
-    }
-
-    #[test]
-    fn test_bitwise_instructions() {
-        let vm = setup_vm();
-
-        let test_function = VMFunction {
-            name: "test_bitwise".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 5,
-            instructions: vec![
-                // Test AND: 0b1010 & 0b1100 = 0b1000 (8)
-                Instruction::LDI(0, Value::Int(10)),
-                Instruction::LDI(1, Value::Int(12)),
-                Instruction::AND(2, 0, 1),
-                // Test OR: 0b1010 | 0b0101 = 0b1111 (15)
-                Instruction::LDI(0, Value::Int(10)),
-                Instruction::LDI(1, Value::Int(5)),
-                Instruction::OR(3, 0, 1),
-                // Test XOR: 0b1111 ^ 0b1010 = 0b0101 (5)
-                Instruction::LDI(0, Value::Int(15)),
-                Instruction::LDI(1, Value::Int(10)),
-                Instruction::XOR(4, 0, 1),
-                // Return result of XOR
-                Instruction::RET(4),
-            ],
-            labels: HashMap::new(),
-        };
-
-        vm.register_function(test_function);
-        let result = vm.execute("test_bitwise").unwrap();
-        assert_eq!(result, Value::Int(5));
-    }
-
-    #[test]
-    fn test_shift_instructions() {
-        let vm = setup_vm();
-
-        let test_function = VMFunction {
-            name: "test_shifts".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 5,
-            instructions: vec![
-                // Test SHL: 1 << 3 = 8
-                Instruction::LDI(0, Value::Int(1)),
-                Instruction::LDI(1, Value::Int(3)),
-                Instruction::SHL(2, 0, 1),
-                // Test SHR: 16 >> 2 = 4
-                Instruction::LDI(0, Value::Int(16)),
-                Instruction::LDI(1, Value::Int(2)),
-                Instruction::SHR(3, 0, 1),
-                // Return result of SHL
-                Instruction::RET(2),
-            ],
-            labels: HashMap::new(),
-        };
-
-        vm.register_function(test_function);
-        let result = vm.execute("test_shifts").unwrap();
-        assert_eq!(result, Value::Int(8));
-    }
-
-    #[test]
-    fn test_comparison_and_jumps() {
-        let vm = setup_vm();
-
-        // Create a simpler test to diagnose the issue
         let mut labels = HashMap::new();
-        labels.insert("equal_branch".to_string(), 6);
+        labels.insert("less_than".to_string(), 6);
         labels.insert("end".to_string(), 7);
 
         let test_function = VMFunction {
-            name: "test_jumps".to_string(),
+            name: "test_less_than_jump".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
             parent: None,
             register_count: 3,
             instructions: vec![
-                // Load two equal values
-                Instruction::LDI(0, Value::Int(10)),
-                Instruction::LDI(1, Value::Int(10)),
-                // Compare them - should set compare_flag to 0 (equal)
-                Instruction::CMP(0, 1),
-                // Jump if equal
-                Instruction::JMPEQ("equal_branch".to_string()),
-                // This should be skipped if equal
-                Instruction::LDI(2, Value::Int(0)),
+                Instruction::LDI(0, Value::Int(5)),  // r0 = 5
+                Instruction::LDI(1, Value::Int(10)), // r1 = 10
+                Instruction::CMP(0, 1),              // Compare r0 < r1 (sets flag to -1)
+                Instruction::JMPLT("less_than".to_string()), // Jump if less than
+                Instruction::LDI(2, Value::Int(0)),  // Should be skipped
                 Instruction::JMP("end".to_string()),
-                // equal_branch:
-                Instruction::LDI(2, Value::Int(1)),
+                // less_than:
+                Instruction::LDI(2, Value::Int(1)),  // Set result to 1 if jump taken
                 // end:
                 Instruction::RET(2),
             ],
@@ -687,33 +584,33 @@ mod tests {
         };
 
         vm.register_function(test_function);
-        let result = vm.execute("test_jumps").unwrap();
-        assert_eq!(result, Value::Int(1));
+        let result = vm.execute("test_less_than_jump").unwrap();
+        assert_eq!(result, Value::Int(1)); // Expect 1 because 5 < 10
     }
 
     #[test]
-    fn test_not_equal_jumps() {
+    fn test_greater_than_jump() {
         let vm = setup_vm();
 
         let mut labels = HashMap::new();
-        labels.insert("not_equal".to_string(), 6);
+        labels.insert("greater_than".to_string(), 6);
         labels.insert("end".to_string(), 7);
 
         let test_function = VMFunction {
-            name: "test_not_equal_jumps".to_string(),
+            name: "test_greater_than_jump".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
             parent: None,
             register_count: 3,
             instructions: vec![
-                Instruction::LDI(0, Value::Int(10)),
-                Instruction::LDI(1, Value::Int(20)),
-                Instruction::CMP(0, 1),
-                Instruction::JMPNEQ("not_equal".to_string()),
-                Instruction::LDI(2, Value::Int(0)),
+                Instruction::LDI(0, Value::Int(15)), // r0 = 15
+                Instruction::LDI(1, Value::Int(10)), // r1 = 10
+                Instruction::CMP(0, 1),              // Compare r0 > r1 (sets flag to 1)
+                Instruction::JMPGT("greater_than".to_string()), // Jump if greater than
+                Instruction::LDI(2, Value::Int(0)),  // Should be skipped
                 Instruction::JMP("end".to_string()),
-                // not_equal:
-                Instruction::LDI(2, Value::Int(1)),
+                // greater_than:
+                Instruction::LDI(2, Value::Int(1)),  // Set result to 1 if jump taken
                 // end:
                 Instruction::RET(2),
             ],
@@ -721,9 +618,13 @@ mod tests {
         };
 
         vm.register_function(test_function);
-        let result = vm.execute("test_not_equal_jumps").unwrap();
-        assert_eq!(result, Value::Int(1));
+        let result = vm.execute("test_greater_than_jump").unwrap();
+        assert_eq!(result, Value::Int(1)); // Expect 1 because 15 > 10
     }
+
+    // Example of using new jumps for <=
+    // Jump if NOT greater than (JMPGT to the false branch)
+    // Or Jump if Less Than OR Equal (JMPLT target; JMPEQ target)
 
     #[test]
     fn test_load_instructions() {

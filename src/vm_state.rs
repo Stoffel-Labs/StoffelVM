@@ -393,6 +393,28 @@ impl VMState {
                         self.activation_records.last_mut().unwrap().instruction_pointer = target;
                     }
                 },
+                Instruction::JMPLT(label) => {
+                    // Jump if Less Than (compare_flag == -1)
+                    let should_jump = self.activation_records.last().unwrap().compare_flag == -1;
+
+                    if should_jump {
+                        let target = vm_function.labels.get(&label)
+                            .ok_or_else(|| format!("Label '{}' not found", label))?
+                            .clone();
+
+                        self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                    }
+                },
+                Instruction::JMPGT(label) => {
+                    // Jump if Greater Than (compare_flag == 1)
+                    let should_jump = self.activation_records.last().unwrap().compare_flag == 1;
+                    if should_jump {
+                        let target = vm_function.labels.get(&label)
+                            .ok_or_else(|| format!("Label '{}' not found", label))?
+                            .clone();
+                        self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                    }
+                },
                 Instruction::CALL(function_name) => {
                     let args = self.activation_records.last().unwrap().stack.clone();
                     let function = self.functions.get(&function_name)
