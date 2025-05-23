@@ -90,22 +90,22 @@ impl PacketHeader {
     const BASE_HEADER_SIZE: usize = 8 + 8 + 1 + 1 + 8 + 2; // StreamID, SeqNum, Flags, NumAcks, AckNum, PayloadLen
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        buf.put_u64(self.stream_id);
-        buf.put_u64(self.sequence_number);
+        buf.put_u64_le(self.stream_id);
+        buf.put_u64_le(self.sequence_number);
         buf.put_u8(self.flags);
         buf.put_u8(self.num_acks_or_sacks);
         if self.flags & PacketFlags::Ack.bits() != 0 {
-            buf.put_u64(self.ack_number);
+            buf.put_u64_le(self.ack_number);
         } else {
-            buf.put_u64(0); // Put placeholder if no ACK flag
+            buf.put_u64_le(0); // Put placeholder if no ACK flag
         }
         if self.flags & PacketFlags::Sack.bits() != 0 {
             for &(start, end) in &self.sack_ranges {
-                buf.put_u64(start);
-                buf.put_u64(end);
+                buf.put_u64_le(start); // Use little-endian for consistency
+                buf.put_u64_le(end);   // Use little-endian for consistency
             }
         }
-        buf.put_u16(self.payload_length);
+        buf.put_u16_le(self.payload_length);
     }
 
     pub fn decode(buf: &mut BytesMut) -> Result<Self, String> {
@@ -113,12 +113,12 @@ impl PacketHeader {
             return Err("Buffer too small for base header".to_string());
         }
 
-        let stream_id = buf.get_u64();
-        let sequence_number = buf.get_u64();
+        let stream_id = buf.get_u64_le();
+        let sequence_number = buf.get_u64_le();
         let flags = buf.get_u8();
         let num_acks_or_sacks = buf.get_u8();
-        let ack_number = buf.get_u64(); // Always read, even if flag not set
-        let payload_length = buf.get_u16();
+        let ack_number = buf.get_u64_le(); // Always read, even if flag not set
+        let payload_length = buf.get_u16_le();
 
         let mut sack_ranges = Vec::new();
         if flags & PacketFlags::Sack.bits() != 0 {
@@ -132,8 +132,8 @@ impl PacketHeader {
                 ));
             }
             for _ in 0..num_sacks {
-                let start = buf.get_u64();
-                let end = buf.get_u64();
+                let start = buf.get_u64_le(); // Use little-endian for consistency
+                let end = buf.get_u64_le();   // Use little-endian for consistency
                 sack_ranges.push((start, end));
             }
         }
@@ -277,7 +277,7 @@ impl StreamState {
             self.next_expected_seq += 1;
             filled_gap = true;
             // Check buffered packets to see if more are now contiguous
-            while let Some(data) = self.received_buffer.remove(&self.next_expected_seq) {
+            while let Some(_data) = self.received_buffer.remove(&self.next_expected_seq) {
                  // Process data (or just advance counter for now)
                  self.next_expected_seq += 1;
             }
@@ -347,7 +347,7 @@ impl PeerState {
 pub fn parse_packet(datagram: &[u8]) -> Result<(PacketHeader, Bytes), String> {
     let mut buffer = BytesMut::from(datagram);
     let header = PacketHeader::decode(&mut buffer)?;
-    let header_size = header.header_size();
+    let _header_size = header.header_size();
 
     // Check if buffer has enough bytes for the declared payload
     if buffer.len() < header.payload_length as usize {

@@ -6,16 +6,16 @@ use std::collections::HashMap;
 
 fn main() -> Result<(), String> {
     // Initialize the VM
-    let vm = VirtualMachine::new();
-    
+    let mut vm = VirtualMachine::new();
+
     // Create a simple hello world function
-    let hello_world = VMFunction {
-        name: "hello_world".to_string(),
-        parameters: vec![],
-        upvalues: vec![],
-        parent: None,
-        register_count: 1,
-        instructions: vec![
+    let hello_world = VMFunction::new(
+        "hello_world".to_string(),
+        vec![],
+        vec![],
+        None,
+        1,
+        vec![
             // Load "Hello, World!" string into register 0
             Instruction::LDI(0, Value::String("Hello, World!".to_string())),
             // Push register 0 as argument for print function
@@ -25,16 +25,16 @@ fn main() -> Result<(), String> {
             // Return Unit (void)
             Instruction::RET(0),
         ],
-        labels: HashMap::new(),
-    };
-    
+        HashMap::new(),
+    );
+
     // Register the function with the VM
     vm.register_function(hello_world);
-    
+
     // Execute the function
     let result = vm.execute("hello_world")?;
-    
+
     println!("Program returned: {:?}", result);
-    
+
     Ok(())
 }

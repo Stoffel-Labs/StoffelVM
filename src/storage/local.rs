@@ -1,8 +1,8 @@
 //! Interface for persistent storage local to a single server/peer using redb.
 
-use redb::{Database, Error as RedbError, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, Error as RedbError, TableDefinition};
 use std::path::Path;
-use std::sync::{Arc, Mutex}; // Using Mutex for simplicity, consider RwLock for performance
+use std::sync::Arc;
 
 /// Trait defining operations for local data persistence.
 pub trait LocalStorage: Send + Sync {
@@ -48,7 +48,7 @@ impl RedbLocalStorage {
     where
         F: FnOnce(&mut redb::Table<&[u8], &[u8]>) -> Result<R, RedbError>,
     {
-        let mut write_txn = self.db.begin_write().map_err(|e| format!("Failed to begin write transaction: {}", e))?;
+        let write_txn = self.db.begin_write().map_err(|e| format!("Failed to begin write transaction: {}", e))?;
         let result = {
              let mut table = write_txn.open_table(DATA_TABLE).map_err(|e| format!("Failed to open table for write: {}", e))?;
              operation(&mut table).map_err(|e| format!("Operation failed: {}", e))
