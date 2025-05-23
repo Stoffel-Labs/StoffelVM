@@ -1,16 +1,18 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use crate::activations::ActivationRecord;
-use crate::functions::{ForeignFunctionContext, Function};
-use crate::runtime_hooks::{HookEvent, HookManager};
-use crate::instructions::Instruction;
+use rustc_hash::FxHashMap;
+use smallvec::{smallvec, SmallVec};
+use crate::activations::{ActivationRecord, ActivationRecordPool};
 use crate::core_types::{Closure, ForeignObjectStorage, ObjectStore, Upvalue, Value};
+use crate::functions::{ForeignFunctionContext, Function};
+use crate::instructions::{Instruction, ResolvedInstruction};
+use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
 
-// VM internal state
 pub struct VMState {
-    pub functions: HashMap<String, Function>,
-    pub activation_records: Vec<ActivationRecord>,
+    pub functions: FxHashMap<String, Function>,
+    pub activation_records: SmallVec<[ActivationRecord; 8]>,
     pub current_instruction: usize,
+    pub instruction_cache: SmallVec<[Instruction; 32]>,
+    pub activation_pool: ActivationRecordPool,
     pub object_store: ObjectStore,
     pub foreign_objects: ForeignObjectStorage,
     pub hook_manager: HookManager,
@@ -25,23 +27,29 @@ impl Default for VMState {
 impl VMState {
     pub fn new() -> Self {
         VMState {
-            functions: HashMap::new(),
-            activation_records: Vec::new(),
+            functions: FxHashMap::default(),
+            activation_records: smallvec![],
             current_instruction: 0,
+            instruction_cache: SmallVec::with_capacity(32),
+            activation_pool: ActivationRecordPool::new(1024),
             object_store: ObjectStore::new(),
             foreign_objects: ForeignObjectStorage::new(),
             hook_manager: HookManager::new(),
         }
     }
 
-    // Returns the current activation record
+    // Helper to safely get activation records length
+    pub fn activation_records_len(&self) -> usize {
+        self.activation_records.len()
+    }
+
     pub fn current_activation_record(&mut self) -> &mut ActivationRecord {
         self.activation_records.last_mut().unwrap()
     }
 
-    // Find upvalue in the current scope chain
     pub fn find_upvalue(&self, name: &str) -> Option<Value> {
-        for record in self.activation_records.iter().rev() {
+        for i in (0..self.activation_records_len()).rev() {
+            let record = &self.activation_records[i];
             if let Some(value) = record.locals.get(name) {
                 return Some(value.clone());
             }
@@ -55,7 +63,6 @@ impl VMState {
         None
     }
 
-    // Register value read/write events
     pub fn trigger_register_read(&self, reg: usize, value: &Value) -> Result<(), String> {
         let event = HookEvent::RegisterRead(reg, value.clone());
         self.hook_manager.trigger(&event, self)
@@ -66,7 +73,16 @@ impl VMState {
         self.hook_manager.trigger(&event, self)
     }
 
-    // Create a closure from a function and upvalues
+    // Helper method to trigger hooks without requiring a mutable borrow of self.activation_records
+    pub fn trigger_hook_with_snapshot(&self, event: &HookEvent) -> Result<(), String> {
+        let context = HookContext::new(
+            &self.activation_records,
+            self.current_instruction,
+            &self.functions
+        );
+        self.hook_manager.trigger_with_context(event, &context)
+    }
+
     pub fn create_closure(&mut self, function_name: &str, upvalue_names: &[String]) -> Result<Value, String> {
         let mut upvalues = Vec::new();
         for name in upvalue_names {
@@ -79,32 +95,62 @@ impl VMState {
             });
         }
 
-        // Create the closure
         let closure = Closure {
             function_id: function_name.to_string(),
             upvalues: upvalues.clone(),
         };
 
-        // Trigger closure created hook
         let event = HookEvent::ClosureCreated(function_name.to_string(), upvalues);
         self.hook_manager.trigger(&event, self)?;
 
         Ok(Value::Closure(Arc::new(closure)))
     }
 
-    // Execute until return instruction
     pub fn execute_until_return(&mut self) -> Result<Value, String> {
+        // let mut temp_buffer = SmallVec::<[Value; 8]>::new();
+
+        // Store the activation records length before we enter the loop
+        let activation_records_len = self.activation_records_len();
+
+        // Create a loop that doesn't hold a mutable borrow across iterations
         loop {
+            // Check if we have any activation records
+            if self.activation_records.is_empty() {
+                return Err("Unexpected end of execution".to_string());
+            }
+
+            // Get the current record's function name and instruction pointer
             let function_name;
             let ip;
-            let activation_records_len;
-
-
+            let use_resolved;
             {
                 let current_record = self.activation_records.last().unwrap();
                 function_name = current_record.function_name.clone();
                 ip = current_record.instruction_pointer;
-                activation_records_len = self.activation_records.len();
+                use_resolved = current_record.resolved_instructions.is_some();
+            }
+
+            // Prepare the instruction cache
+            self.instruction_cache.clear();
+            let cached_instructions = {
+                let current_record = self.activation_records.last().unwrap();
+                current_record.cached_instructions.clone()
+            };
+
+            if let Some(cached) = cached_instructions {
+                self.instruction_cache = cached;
+            } else {
+                let instructions = {
+                    let current_record = self.activation_records.last().unwrap();
+                    current_record.instructions.clone()
+                };
+                self.instruction_cache.extend(instructions);
+
+                // Update the cached instructions
+                {
+                    let current_record = self.activation_records.last_mut().unwrap();
+                    current_record.cached_instructions = Some(self.instruction_cache.clone());
+                }
             }
 
             let vm_function = match self.functions.get(&function_name) {
@@ -115,7 +161,18 @@ impl VMState {
                 None => return Err(format!("Function {} not found", function_name)),
             };
 
-            if ip >= vm_function.instructions.len() {
+            // Check if we're at the end of the function
+            let is_end_of_function = if use_resolved {
+                let resolved_len = {
+                    let current_record = self.activation_records.last().unwrap();
+                    current_record.resolved_instructions.as_ref().unwrap().len()
+                };
+                ip >= resolved_len
+            } else {
+                ip >= vm_function.instructions.len()
+            };
+
+            if is_end_of_function {
                 if activation_records_len == 1 {
                     return Ok(self.activation_records[0].registers[0].clone());
                 } else {
@@ -128,49 +185,190 @@ impl VMState {
                 }
             }
 
-            let instruction = vm_function.instructions[ip].clone();
+            // Get the instruction to execute
+            let instruction = if use_resolved {
+                // We'll still need the original instruction for hooks and debugging
+                let resolved_idx = {
+                    let current_record = self.activation_records.last().unwrap();
+                    current_record.resolved_instructions.as_ref().unwrap()[ip]
+                };
+
+                // Convert resolved instruction back to regular instruction for hooks
+                // This is necessary for compatibility with the hook system
+                match resolved_idx {
+                    ResolvedInstruction::LD(reg, offset) => Instruction::LD(reg, offset),
+                    ResolvedInstruction::LDI(reg, const_idx) => {
+                        // Get the constant value from the constant pool using the stored constant index
+                        let constant_value = {
+                            let current_record = self.activation_records.last().unwrap();
+                            if let Some(constants) = &current_record.constant_values {
+                                if const_idx < constants.len() {
+                                    constants[const_idx].clone()
+                                } else {
+                                    // Error: constant not found
+                                    return Err(format!("Constant index {} out of bounds", const_idx));
+                                }
+                            } else {
+                                // Error: constants not available
+                                return Err(format!("Constant values not available for function"));
+                            }
+                        };
+                        Instruction::LDI(reg, constant_value)
+                    },
+                    ResolvedInstruction::MOV(dest, src) => Instruction::MOV(dest, src),
+                    ResolvedInstruction::ADD(dest, src1, src2) => Instruction::ADD(dest, src1, src2),
+                    ResolvedInstruction::SUB(dest, src1, src2) => Instruction::SUB(dest, src1, src2),
+                    ResolvedInstruction::MUL(dest, src1, src2) => Instruction::MUL(dest, src1, src2),
+                    ResolvedInstruction::DIV(dest, src1, src2) => Instruction::DIV(dest, src1, src2),
+                    ResolvedInstruction::MOD(dest, src1, src2) => Instruction::MOD(dest, src1, src2),
+                    ResolvedInstruction::AND(dest, src1, src2) => Instruction::AND(dest, src1, src2),
+                    ResolvedInstruction::OR(dest, src1, src2) => Instruction::OR(dest, src1, src2),
+                    ResolvedInstruction::XOR(dest, src1, src2) => Instruction::XOR(dest, src1, src2),
+                    ResolvedInstruction::NOT(dest, src) => Instruction::NOT(dest, src),
+                    ResolvedInstruction::SHL(dest, src, amount) => Instruction::SHL(dest, src, amount),
+                    ResolvedInstruction::SHR(dest, src, amount) => Instruction::SHR(dest, src, amount),
+                    ResolvedInstruction::JMP(target) => {
+                        // Convert numeric target back to label for compatibility
+                        // This is inefficient but necessary for hooks
+                        let label = format!("label_{}", target);
+                        Instruction::JMP(label)
+                    },
+                    ResolvedInstruction::JMPEQ(target) => {
+                        let label = format!("label_{}", target);
+                        Instruction::JMPEQ(label)
+                    },
+                    ResolvedInstruction::JMPNEQ(target) => {
+                        let label = format!("label_{}", target);
+                        Instruction::JMPNEQ(label)
+                    },
+                    ResolvedInstruction::JMPLT(target) => {
+                        let label = format!("label_{}", target);
+                        Instruction::JMPLT(label)
+                    },
+                    ResolvedInstruction::JMPGT(target) => {
+                        let label = format!("label_{}", target);
+                        Instruction::JMPGT(label)
+                    },
+                    ResolvedInstruction::CALL(func_idx) => {
+                        // Get the function name from the constant pool
+                        let function_name = {
+                            let current_record = self.activation_records.last().unwrap();
+                            if let Some(constants) = &current_record.constant_values {
+                                if func_idx < constants.len() {
+                                    match &constants[func_idx] {
+                                        Value::String(name) => name.clone(),
+                                        _ => return Err(format!("Expected string constant for function name at index {}", func_idx))
+                                    }
+                                } else {
+                                    return Err(format!("Function name constant index {} out of bounds", func_idx));
+                                }
+                            } else {
+                                return Err(format!("Constant values not available for function"));
+                            }
+                        };
+                        Instruction::CALL(function_name)
+                    },
+                    ResolvedInstruction::RET(reg) => Instruction::RET(reg),
+                    ResolvedInstruction::PUSHARG(reg) => Instruction::PUSHARG(reg),
+                    ResolvedInstruction::CMP(reg1, reg2) => Instruction::CMP(reg1, reg2),
+                }
+            } else {
+                if self.instruction_cache.is_empty() {
+                    // If instruction cache is empty, get instructions from the function
+                    let instructions = vm_function.instructions.clone();
+                    self.instruction_cache.extend(instructions);
+
+                    // Update the cached instructions in the current record
+                    let current_record = self.activation_records.last_mut().unwrap();
+                    current_record.cached_instructions = Some(self.instruction_cache.clone());
+                }
+                self.instruction_cache[ip].clone()
+            };
 
             self.current_instruction = ip;
-            self.activation_records.last_mut().unwrap().instruction_pointer += 1;
 
-            let event = HookEvent::BeforeInstructionExecute(instruction.clone());
-            self.hook_manager.trigger(&event, self)?;
+            // Update the instruction pointer
+            {
+                let current_record = self.activation_records.last_mut().unwrap();
+                current_record.instruction_pointer += 1;
+            }
 
-            match instruction.clone() {
+            // Only create hook events if hooks are registered
+            if !self.hook_manager.hooks.is_empty() {
+                let event = HookEvent::BeforeInstructionExecute(instruction.clone());
+                self.trigger_hook_with_snapshot(&event)?;
+            }
+
+            // Clone the instruction before matching to avoid reference issues
+            let instruction_clone = instruction.clone();
+            match instruction_clone {
                 Instruction::LD(dest_reg, offset) => {
-                    let record = self.activation_records.last().unwrap();
-                    let idx = (record.stack.len() as i32) + offset - 1;
-                    if idx < 0 || idx >= record.stack.len() as i32 {
+                    // Get stack length and check bounds
+                    let stack_len;
+                    {
+                        let current_record = self.activation_records.last().unwrap();
+                        stack_len = current_record.stack.len();
+                    }
+
+                    let idx = (stack_len as i32) + offset - 1;
+                    if idx < 0 || idx >= stack_len as i32 {
                         return Err(format!("Stack address [sp+{}] out of bounds", offset));
                     }
-                    let value = record.stack[idx as usize].clone();
 
-                    let record = self.activation_records.last_mut().unwrap();
-                    let old_value = record.registers[dest_reg].clone();
-                    record.registers[dest_reg] = value.clone();
+                    // Get value from stack
+                    let value;
+                    {
+                        let current_record = self.activation_records.last().unwrap();
+                        value = current_record.stack[idx as usize].clone();
+                    }
 
-                    let event = HookEvent::RegisterWrite(dest_reg, old_value, value);
-                    self.hook_manager.trigger(&event, self)?;
+                    // Update register
+                    let old_value;
+                    {
+                        let current_record = self.activation_records.last_mut().unwrap();
+                        old_value = current_record.registers[dest_reg].clone();
+                        current_record.registers[dest_reg] = value.clone();
+                    }
+
+                    // Only create hook events if hooks are registered
+                    if !self.hook_manager.hooks.is_empty() {
+                        let event = HookEvent::RegisterWrite(dest_reg, old_value, value);
+                        self.trigger_hook_with_snapshot(&event)?;
+                    }
                 },
                 Instruction::LDI(dest_reg, value) => {
-                    let record = self.activation_records.last_mut().unwrap();
-                    let old_value = record.registers[dest_reg].clone();
-                    record.registers[dest_reg] = value.clone();
+                    // Update register
+                    let old_value;
+                    {
+                        let current_record = self.activation_records.last_mut().unwrap();
+                        old_value = current_record.registers[dest_reg].clone();
+                        current_record.registers[dest_reg] = value.clone();
+                    }
 
                     let event = HookEvent::RegisterWrite(dest_reg, old_value, value);
-                    self.hook_manager.trigger(&event, self)?;
+                    self.trigger_hook_with_snapshot(&event)?;
                 },
                 Instruction::MOV(dest_reg, src_reg) => {
-                    let record = self.activation_records.last_mut().unwrap();
-                    let value = record.registers[src_reg].clone();
-                    let old_value = record.registers[dest_reg].clone();
-                    record.registers[dest_reg] = value.clone();
+                    // Get value from source register
+                    let value;
+                    let old_value;
+                    {
+                        let current_record = self.activation_records.last().unwrap();
+                        value = current_record.registers[src_reg].clone();
+                    }
+
+                    // Update destination register
+                    {
+                        let current_record = self.activation_records.last_mut().unwrap();
+                        old_value = current_record.registers[dest_reg].clone();
+                        current_record.registers[dest_reg] = value.clone();
+                    }
 
                     let read_event = HookEvent::RegisterRead(src_reg, value.clone());
-                    self.hook_manager.trigger(&read_event, self)?;
+                    self.trigger_hook_with_snapshot(&read_event)?;
 
                     let write_event = HookEvent::RegisterWrite(dest_reg, old_value, value);
-                    self.hook_manager.trigger(&write_event, self)?;
+                    self.trigger_hook_with_snapshot(&write_event)?;
                 },
                 Instruction::ADD(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
@@ -364,67 +562,154 @@ impl VMState {
                         _ => return Err("Type error in SHR operation".to_string()),
                     }
                 },
-                Instruction::JMP(label) => {
-                    let target = vm_function.labels.get(&label)
-                        .ok_or_else(|| format!("Label '{}' not found", label))?
-                        .clone();
+                Instruction::JMP(ref label) => {
+                    // If we're using resolved instructions, get the target from the resolved instruction
+                    if use_resolved {
+                        let resolved_idx = {
+                            let current_record = self.activation_records.last().unwrap();
+                            current_record.resolved_instructions.as_ref().unwrap()[ip]
+                        };
 
-                    self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                        if let ResolvedInstruction::JMP(target) = resolved_idx {
+                            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                        } else {
+                            return Err(format!("Expected JMP instruction, got {:?}", resolved_idx));
+                        }
+                    } else {
+                        // Otherwise, look up the label in the function's labels HashMap
+                        let target = vm_function.labels.get(label)
+                            .ok_or_else(|| format!("Label '{}' not found", label))?
+                            .clone();
+
+                        self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                    }
                 },
-                Instruction::JMPEQ(label) => {
+                Instruction::JMPEQ(ref label) => {
                     let should_jump = self.activation_records.last().unwrap().compare_flag == 0;
 
                     if should_jump {
-                        let target = vm_function.labels.get(&label)
-                            .ok_or_else(|| format!("Label '{}' not found", label))?
-                            .clone();
+                        if use_resolved {
+                            let resolved_idx = {
+                                let current_record = self.activation_records.last().unwrap();
+                                current_record.resolved_instructions.as_ref().unwrap()[ip]
+                            };
 
-                        self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            if let ResolvedInstruction::JMPEQ(target) = resolved_idx {
+                                self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            } else {
+                                return Err(format!("Expected JMPEQ instruction, got {:?}", resolved_idx));
+                            }
+                        } else {
+                            let target = vm_function.labels.get(label)
+                                .ok_or_else(|| format!("Label '{}' not found", label))?
+                                .clone();
+
+                            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                        }
                     }
                 },
-                Instruction::JMPNEQ(label) => {
+                Instruction::JMPNEQ(ref label) => {
                     let should_jump = self.activation_records.last().unwrap().compare_flag != 0;
 
                     if should_jump {
-                        let target = vm_function.labels.get(&label)
-                            .ok_or_else(|| format!("Label '{}' not found", label))?
-                            .clone();
+                        if use_resolved {
+                            let resolved_idx = {
+                                let current_record = self.activation_records.last().unwrap();
+                                current_record.resolved_instructions.as_ref().unwrap()[ip]
+                            };
 
-                        self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            if let ResolvedInstruction::JMPNEQ(target) = resolved_idx {
+                                self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            } else {
+                                return Err(format!("Expected JMPNEQ instruction, got {:?}", resolved_idx));
+                            }
+                        } else {
+                            let target = vm_function.labels.get(label)
+                                .ok_or_else(|| format!("Label '{}' not found", label))?
+                                .clone();
+
+                            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                        }
                     }
                 },
-                Instruction::JMPLT(label) => {
+                Instruction::JMPLT(ref label) => {
                     // Jump if Less Than (compare_flag == -1)
                     let should_jump = self.activation_records.last().unwrap().compare_flag == -1;
 
                     if should_jump {
-                        let target = vm_function.labels.get(&label)
-                            .ok_or_else(|| format!("Label '{}' not found", label))?
-                            .clone();
+                        if use_resolved {
+                            let resolved_idx = {
+                                let current_record = self.activation_records.last().unwrap();
+                                current_record.resolved_instructions.as_ref().unwrap()[ip]
+                            };
 
-                        self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            if let ResolvedInstruction::JMPLT(target) = resolved_idx {
+                                self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            } else {
+                                return Err(format!("Expected JMPLT instruction, got {:?}", resolved_idx));
+                            }
+                        } else {
+                            let target = vm_function.labels.get(label)
+                                .ok_or_else(|| format!("Label '{}' not found", label))?
+                                .clone();
+
+                            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                        }
                     }
                 },
-                Instruction::JMPGT(label) => {
+                Instruction::JMPGT(ref label) => {
                     // Jump if Greater Than (compare_flag == 1)
                     let should_jump = self.activation_records.last().unwrap().compare_flag == 1;
                     if should_jump {
-                        let target = vm_function.labels.get(&label)
-                            .ok_or_else(|| format!("Label '{}' not found", label))?
-                            .clone();
-                        self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                        if use_resolved {
+                            let resolved_idx = {
+                                let current_record = self.activation_records.last().unwrap();
+                                current_record.resolved_instructions.as_ref().unwrap()[ip]
+                            };
+
+                            if let ResolvedInstruction::JMPGT(target) = resolved_idx {
+                                self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            } else {
+                                return Err(format!("Expected JMPGT instruction, got {:?}", resolved_idx));
+                            }
+                        } else {
+                            let target = vm_function.labels.get(label)
+                                .ok_or_else(|| format!("Label '{}' not found", label))?
+                                .clone();
+
+                            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                        }
                     }
                 },
-                Instruction::CALL(function_name) => {
-                    let args = self.activation_records.last().unwrap().stack.clone();
-                    let function = self.functions.get(&function_name)
+                Instruction::CALL(ref function_name) => {
+                    // Get arguments from stack
+                    let args;
+                    {
+                        let current_record = self.activation_records.last().unwrap();
+                        args = current_record.stack.clone();
+                    }
+
+                    let function = self.functions.get(function_name)
                         .ok_or_else(|| format!("Function \'{}\' not found", function_name))?
                         .clone();
 
-                    // Record activation stack size BEFORE the function call
                     let activation_count_before = self.activation_records.len();
 
-                    self.activation_records.last_mut().unwrap().stack.clear();
+                    // Clear the stack and trigger StackPop events
+                    let mut popped_values = Vec::new();
+                    {
+                        let current_record = self.activation_records.last_mut().unwrap();
+                        while let Some(value) = current_record.stack.pop() {
+                            popped_values.push(value);
+                        }
+                        // Stack is now empty
+                    }
+
+                    // Trigger stack pop events after releasing the mutable borrow
+                    for value in popped_values {
+                        let event = HookEvent::StackPop(value);
+                        self.hook_manager.trigger(&event, self)?;
+                    }
 
                     match function {
                         Function::VM(vm_func) => {
@@ -433,28 +718,47 @@ impl VMState {
                                                    function_name, vm_func.parameters.len(), args.len()));
                             }
 
+                            // Initialize upvalues for the function
+                            let mut upvalues = Vec::new();
+                            for name in &vm_func.upvalues {
+                                let value = self.find_upvalue(name)
+                                    .ok_or_else(|| format!("Could not find upvalue {} when calling function", name))?;
+
+                                upvalues.push(Upvalue {
+                                    name: name.clone(),
+                                    value,
+                                });
+                            }
+
                             let closure = Closure {
                                 function_id: function_name.clone(),
-                                upvalues: Vec::new(),
+                                upvalues: upvalues.clone(),
                             };
                             let closure_value = Value::Closure(Arc::new(closure));
 
-                            let event = HookEvent::BeforeFunctionCall(closure_value, args.clone());
+                            let event = HookEvent::BeforeFunctionCall(closure_value, args.clone().to_vec());
                             self.hook_manager.trigger(&event, self)?;
 
                             let new_record = ActivationRecord {
                                 function_name: function_name.clone(),
-                                locals: HashMap::new(),
-                                registers: vec![Value::Unit; vm_func.register_count],
-                                upvalues: Vec::new(),
+                                locals: FxHashMap::default(),
+                                registers: SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]),
+                                upvalues,
                                 instruction_pointer: 0,
-                                stack: Vec::new(),
+                                stack: SmallVec::new(),
                                 compare_flag: 0,
+                                instructions: SmallVec::from(vm_func.instructions.clone()),
+                                cached_instructions: vm_func.cached_instructions.as_ref().map(|v| SmallVec::from_vec(v.clone())),
+                                resolved_instructions: vm_func.resolved_instructions.clone(),
+                                constant_values: vm_func.constant_values.clone(),
+                                closure: None,
                             };
 
                             let args_len = args.len();
 
-                            self.activation_records.push(new_record);
+                            let mut record = self.activation_pool.get();
+                            *record = new_record;
+                            self.activation_records.push((*record).clone());
 
                             {
                                 let record = self.activation_records.last_mut().unwrap();
@@ -466,19 +770,29 @@ impl VMState {
 
                             if self.activation_records.len() >= 2 {
                                 let prev_record_idx = self.activation_records.len() - 2;
-                                let prev_record = &mut self.activation_records[prev_record_idx].clone();
-                                for _ in 0..args_len {
-                                    if let Some(value) = prev_record.stack.pop() {
-                                        let event = HookEvent::StackPop(value);
-                                        self.hook_manager.trigger(&event, self)?;
+                                // Pop values from the actual previous activation record, not a clone
+                                let mut popped_values = Vec::new();
+                                {
+                                    let prev_record = &mut self.activation_records[prev_record_idx];
+                                    for _ in 0..args_len {
+                                        if let Some(value) = prev_record.stack.pop() {
+                                            popped_values.push(value);
+                                        }
                                     }
+                                    prev_record.stack.clear();
+                                }
+
+                                // Trigger stack pop events after releasing the mutable borrow
+                                for value in popped_values {
+                                    let event = HookEvent::StackPop(value);
+                                    self.hook_manager.trigger(&event, self)?;
                                 }
                             }
                         },
                         Function::Foreign(foreign_func) => {
                             let func_value = Value::String(format!("<foreign function {}>", function_name));
 
-                            let event = HookEvent::BeforeFunctionCall(func_value.clone(), args.clone());
+                            let event = HookEvent::BeforeFunctionCall(func_value.clone(), args.clone().to_vec());
                             self.hook_manager.trigger(&event, self)?;
 
                             let context = ForeignFunctionContext {
@@ -492,19 +806,25 @@ impl VMState {
                                 continue;
                             }
 
+                            // Check if there are any activation records left
+                            if self.activation_records.is_empty() {
+                                return Ok(result);
+                            }
+
                             let old_value;
-                            let mut popped_items = Vec::new();
+                            let mut popped_items = SmallVec::<[Value; 8]>::new();
                             {
-                                // Normal case - process the function result
                                 let record = self.activation_records.last_mut().unwrap();
                                 old_value = record.registers[0].clone();
                                 record.registers[0] = result.clone();
 
+                                // First collect the items from the stack
                                 for _ in 0..args.len() {
                                     if let Some(value) = record.stack.pop() {
                                         popped_items.push(value);
                                     }
                                 }
+                                // Clear the stack after collecting all items
                                 record.stack.clear();
                             }
 
@@ -514,7 +834,6 @@ impl VMState {
                             let fn_event = HookEvent::AfterFunctionCall(func_value, result);
                             self.hook_manager.trigger(&fn_event, self)?;
 
-                            // Clean up the stack
                             for value in popped_items {
                                 let event = HookEvent::StackPop(value);
                                 self.hook_manager.trigger(&event, self)?;
@@ -522,12 +841,44 @@ impl VMState {
                         }
                     }
 
-                    // Always clear the stack after a function call
-                    self.activation_records.last_mut().unwrap().stack.clear();
+                    // Check if there are any activation records left
+                    if !self.activation_records.is_empty() {
+                        // Pop each value from the stack and trigger a StackPop event for each one
+                        let mut popped_values = Vec::new();
+                        {
+                            let record = self.activation_records.last_mut().unwrap();
+                            while let Some(value) = record.stack.pop() {
+                                popped_values.push(value);
+                            }
+                            // Stack is now empty
+                        }
+
+                        // Trigger stack pop events after releasing the mutable borrow
+                        for value in popped_values {
+                            let event = HookEvent::StackPop(value);
+                            self.hook_manager.trigger(&event, self)?;
+                        }
+                    }
                 },
                 Instruction::RET(reg) => {
-                    let return_value = self.activation_records.last().unwrap().registers[reg].clone();
-                    let returning_from = self.activation_records.last().unwrap().function_name.clone();
+                    let current_record = self.activation_records.last().unwrap();
+                    let return_value = current_record.registers[reg].clone();
+                    let returning_from = current_record.function_name.clone();
+
+                    // If this is a closure, update the upvalues in the original closure
+                    if let Some(Value::Closure(closure_arc)) = &current_record.closure {
+                        // Clone the closure_arc to get ownership
+                        let closure_arc = Arc::clone(closure_arc);
+                        // Get a mutable reference to the closure by creating a new one
+                        let mut new_closure = (*closure_arc).clone();
+
+                        // Update the upvalues in the new closure with the values from the activation record
+                        new_closure.upvalues = current_record.upvalues.clone();
+
+                        // Replace the original closure with the new one in the activation record
+                        let current_record = self.activation_records.last_mut().unwrap();
+                        current_record.closure = Some(Value::Closure(Arc::new(new_closure)));
+                    }
 
                     // If we only have one activation record (main function), just return
                     if self.activation_records.len() <= 1 {
@@ -590,10 +941,11 @@ impl VMState {
 
             let event = HookEvent::AfterInstructionExecute(instruction.clone());
             self.hook_manager.trigger(&event, self)?;
+            // The loop will never exit normally, it will always return from within
+            // or continue to the next iteration
         }
     }
 
-    // Call a foreign function
     pub fn call_foreign_function(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
         let function = self.functions.get(name).ok_or_else(||
             format!("Foreign function {} not found", name))?

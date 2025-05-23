@@ -26,18 +26,29 @@ pub enum HookEvent {
     StackPop(Value),
 }
 
+// A simplified context that doesn't require borrowing the entire VMState
 pub struct HookContext<'a> {
-    pub vm_state: &'a VMState,
+    pub activation_records: &'a [ActivationRecord],
+    pub current_instruction: usize,
+    pub functions: &'a rustc_hash::FxHashMap<String, Function>,
 }
 
 impl<'a> HookContext<'a> {
-    pub fn new(vm_state: &'a VMState) -> Self {
-        HookContext { vm_state }
+    pub fn new(
+        activation_records: &'a [ActivationRecord],
+        current_instruction: usize,
+        functions: &'a rustc_hash::FxHashMap<String, Function>,
+    ) -> Self {
+        HookContext { 
+            activation_records,
+            current_instruction,
+            functions,
+        }
     }
 
     // Safe accessor methods for VM state
     pub fn current_activation_record(&self) -> Option<&ActivationRecord> {
-        self.vm_state.activation_records.last()
+        self.activation_records.last()
     }
 
     pub fn get_compare_flag(&self) -> Option<i32> {
@@ -51,7 +62,7 @@ impl<'a> HookContext<'a> {
     }
 
     pub fn get_current_instruction(&self) -> usize {
-        self.vm_state.current_instruction
+        self.current_instruction
     }
 
     pub fn get_function_name(&self) -> Option<String> {
@@ -59,11 +70,11 @@ impl<'a> HookContext<'a> {
     }
 
     pub fn get_call_depth(&self) -> usize {
-        self.vm_state.activation_records.len()
+        self.activation_records.len()
     }
 
     pub fn get_instruction_at(&self, function_name: &str, index: usize) -> Option<Instruction> {
-        self.vm_state.functions.get(function_name).and_then(|func| {
+        self.functions.get(function_name).and_then(|func| {
             match func {
                 Function::VM(vm_func) => vm_func.instructions.get(index).cloned(),
                 _ => None
@@ -152,14 +163,34 @@ impl HookManager {
     }
 
     pub fn trigger(&self, event: &HookEvent, vm_state: &VMState) -> Result<(), String> {
-        let context = HookContext::new(vm_state);
+        let context = HookContext::new(
+            &vm_state.activation_records,
+            vm_state.current_instruction,
+            &vm_state.functions
+        );
 
+        self.trigger_with_context(event, &context)
+    }
+
+    pub fn trigger_with_context(&self, event: &HookEvent, context: &HookContext) -> Result<(), String> {
+        // Fast path: if no hooks are registered, return immediately
+        if self.hooks.is_empty() {
+            return Ok(());
+        }
+
+        // Find matching hooks
         let matching_hooks: Vec<_> = self.hooks.iter()
             .filter(|hook| hook.enabled && (hook.predicate)(event))
             .collect();
 
+        // Fast path: if no hooks match, return immediately
+        if matching_hooks.is_empty() {
+            return Ok(());
+        }
+
+        // Execute matching hooks
         for hook in matching_hooks {
-            (hook.callback)(event, &context)?;
+            (hook.callback)(event, context)?;
         }
 
         Ok(())

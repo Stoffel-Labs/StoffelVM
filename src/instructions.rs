@@ -62,8 +62,7 @@ pub enum Operand {
 }
 
 /// Instruction set matching ReducedOpcode
-#[derive(Debug, Clone)]
-#[derive(Hash)]
+#[derive(Debug, Clone, Hash)]
 pub enum Instruction {
     // Load value from stack to register
     LD(usize, i32),                      // LD r1, [sp+0]
@@ -92,6 +91,43 @@ pub enum Instruction {
     JMPGT(String),                       // JMPGT label (Jump if Greater Than) use inverted comparison for JUMPGTE
     // Function handling
     CALL(String),                        // CALL function_name
+    RET(usize),                          // RET r1
+    PUSHARG(usize),                      // PUSHARG r1
+    // Comparison
+    CMP(usize, usize),                   // CMP r1, r2
+}
+
+// Resolved instruction with numeric indices instead of strings
+// This allows for faster execution without string lookups
+#[derive(Debug, Clone, Copy)]
+pub enum ResolvedInstruction {
+    // Load value from stack to register
+    LD(usize, i32),                      // LD r1, [sp+0]
+    // Load immediate value to register
+    LDI(usize, usize),                   // LDI r1, const_idx (register, constant index)
+    // Move value from one register to another
+    MOV(usize, usize),                   // MOV r1, r2
+    // Arithmetic operations
+    ADD(usize, usize, usize),            // ADD r1, r2, r3
+    SUB(usize, usize, usize),            // SUB r1, r2, r3
+    MUL(usize, usize, usize),            // MUL r1, r2, r3
+    DIV(usize, usize, usize),            // DIV r1, r2, r3
+    MOD(usize, usize, usize),            // MOD r1, r2, r3
+    // Bitwise operations
+    AND(usize, usize, usize),            // AND r1, r2, r3
+    OR(usize, usize, usize),             // OR r1, r2, r3
+    XOR(usize, usize, usize),            // XOR r1, r2, r3
+    NOT(usize, usize),                   // NOT r1, r2
+    SHL(usize, usize, usize),            // SHL r1, r2, r3
+    SHR(usize, usize, usize),            // SHR r1, r2, r3
+    // Control flow
+    JMP(usize),                          // JMP to instruction index
+    JMPEQ(usize),                        // JMPEQ to instruction index
+    JMPNEQ(usize),                       // JMPNEQ to instruction index
+    JMPLT(usize),                        // JMPLT to instruction index
+    JMPGT(usize),                        // JMPGT to instruction index
+    // Function handling
+    CALL(usize),                         // CALL function index
     RET(usize),                          // RET r1
     PUSHARG(usize),                      // PUSHARG r1
     // Comparison

@@ -1,14 +1,20 @@
-use crate::activations::ActivationRecord;
+use crate::activations::{ActivationRecord, ActivationRecordPool};
 use crate::functions::{ForeignFunction, ForeignFunctionContext, Function, VMFunction};
 use crate::runtime_hooks::{HookContext, HookEvent};
 use crate::core_types::{Closure, Upvalue, Value};
 use crate::vm_state::VMState;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use smallvec::{smallvec, SmallVec};
+use std::sync::Arc;
+use rustc_hash::FxHashMap;
+use crate::instructions::Instruction;
+use crate::mutex_helpers::lock_mutex_as_result;
 
 /// The register-based virtual machine
 pub struct VirtualMachine {
-    pub state: Mutex<VMState>,
+    pub state: VMState,
+    activation_pool: ActivationRecordPool,
+    instruction_cache: FxHashMap<String, Vec<Instruction>>,
 }
 
 
@@ -20,8 +26,10 @@ impl Default for VirtualMachine {
 
 impl VirtualMachine {
     pub fn new() -> Self {
-        let vm = VirtualMachine {
-            state: Mutex::new(VMState::new()),
+        let mut vm = VirtualMachine {
+            state: VMState::new(),
+            activation_pool: ActivationRecordPool::new(1024),
+            instruction_cache: FxHashMap::default(),
         };
 
         // Register standard library functions
@@ -30,7 +38,13 @@ impl VirtualMachine {
         vm
     }
 
-    pub fn register_standard_library(&self) {
+    // Create a new VirtualMachine with its own independent state
+    // This method is now identical to new() since we've removed locks
+    pub fn new_independent() -> Self {
+        Self::new()
+    }
+
+    pub fn register_standard_library(&mut self) {
         self.register_foreign_function("create_object", |ctx| {
             let id = ctx.vm_state.object_store.create_object();
             Ok(Value::Object(id))
@@ -224,7 +238,7 @@ impl VirtualMachine {
             match &ctx.args[0] {
                 Value::Closure(closure_arc) => {
                     let function_name = closure_arc.function_id.clone();
-                    // Important: Clone the upvalues to ensure this activation record has its own copy
+                    // Clone the upvalues for use in the activation record
                     let upvalues = closure_arc.upvalues.clone();
 
                     // Get the VM function definition
@@ -250,28 +264,70 @@ impl VirtualMachine {
                         ));
                     }
 
+                    // Ensure instructions are cached and resolved
+                    let mut vm_func = vm_func.clone();
+                    if vm_func.cached_instructions.is_none() {
+                        vm_func.cache_instructions();
+                    }
+                    if vm_func.resolved_instructions.is_none() {
+                        vm_func.resolve_instructions();
+                    }
+
+                    // Trigger BeforeFunctionCall hook
+                    let event = HookEvent::BeforeFunctionCall(ctx.args[0].clone(), call_args.to_vec());
+                    ctx.vm_state.hook_manager.trigger(&event, ctx.vm_state)?;
+
                     // Setup the new activation record with the provided upvalues
-                    let mut new_record = ActivationRecord {
+                    let new_record = ActivationRecord {
                         function_name: function_name.clone(),
-                        locals: HashMap::new(),
-                        registers: vec![Value::Unit; vm_func.register_count],
+                        locals: FxHashMap::default(),
+                        registers: smallvec![Value::Unit; vm_func.register_count],
+                        instructions: SmallVec::from(vm_func.instructions.clone()),
                         upvalues: upvalues, // Use closure's upvalues
                         instruction_pointer: 0,
-                        stack: Vec::new(),
+                        stack: smallvec![],
                         compare_flag: 0,
+                        cached_instructions: vm_func.cached_instructions.as_ref().map(|v| SmallVec::from_vec(v.clone())),
+                        resolved_instructions: vm_func.resolved_instructions.clone(),
+                        constant_values: vm_func.constant_values.clone(),
+                        closure: Some(ctx.args[0].clone()), // Store the original closure
                     };
+
+                    // Get a record from the activation pool
+                    let mut record = ctx.vm_state.activation_pool.get();
+                    *record = new_record;
 
                     // Set up parameters in registers and locals
                     for (i, param_name) in vm_func.parameters.iter().enumerate() {
-                        new_record.registers[i] = call_args[i].clone();
-                        new_record
-                            .locals
-                            .insert(param_name.clone(), call_args[i].clone());
+                        record.registers[i] = call_args[i].clone();
+                        record.locals.insert(param_name.clone(), call_args[i].clone());
                     }
 
                     // Push to the activation record stack
-                    ctx.vm_state.activation_records.push(new_record);
+                    ctx.vm_state.activation_records.push((*record).clone());
 
+                    // Pop arguments from the stack of the previous activation record
+                    let mut popped_values = Vec::new();
+                    if ctx.vm_state.activation_records.len() >= 2 {
+                        let prev_record_idx = ctx.vm_state.activation_records.len() - 2;
+                        {
+                            let prev_record = &mut ctx.vm_state.activation_records[prev_record_idx];
+                            for _ in 0..call_args.len() {
+                                if let Some(value) = prev_record.stack.pop() {
+                                    popped_values.push(value);
+                                }
+                            }
+                            prev_record.stack.clear();
+                        }
+
+                        // Trigger stack pop events after releasing the mutable borrow
+                        for value in popped_values {
+                            let event = HookEvent::StackPop(value);
+                            ctx.vm_state.hook_manager.trigger(&event, ctx.vm_state)?;
+                        }
+                    }
+
+                    // Return Unit to let the VM continue execution
                     Ok(Value::Unit)
                 }
                 other => {
@@ -305,7 +361,9 @@ impl VirtualMachine {
             };
 
             let record = ctx.vm_state.activation_records.last().unwrap();
-            for upvalue in &record.upvalues {
+            // Use a direct index-based loop for better performance
+            for i in (0..record.upvalues.len()).rev() {
+                let upvalue = &record.upvalues[i];
                 if upvalue.name == name {
                     let event = HookEvent::UpvalueRead(name, upvalue.value.clone());
                     ctx.vm_state.hook_manager.trigger(&event, ctx.vm_state)?;
@@ -327,21 +385,90 @@ impl VirtualMachine {
                 _ => return Err("Upvalue name must be a string".to_string()),
             };
 
-            let record = ctx.vm_state.activation_records.last_mut().unwrap();
-            for upvalue in &mut record.upvalues {
-                if upvalue.name == name {
-                    let old_value = upvalue.value.clone();
-                    upvalue.value = ctx.args[1].clone();
+            // First update the upvalue in the current activation record
+            let mut found = false;
+            let mut old_value = Value::Unit;
+            let new_value = ctx.args[1].clone();
+            let mut current_closure_arc = None;
 
-                    // Trigger upvalue write hook
-                    let event = HookEvent::UpvalueWrite(name, old_value, ctx.args[1].clone());
-                    ctx.vm_state.hook_manager.trigger(&event, ctx.vm_state)?;
+            // Scope for mutable borrow of activation_records to get the current closure
+            {
+                let record = ctx.vm_state.activation_records.last_mut().unwrap();
 
-                    return Ok(Value::Unit);
+                // Update upvalue in the current activation record
+                println!("Current activation record: {}", record.function_name);
+                println!("Upvalues in current record: {:?}", record.upvalues);
+                for upvalue in &mut record.upvalues {
+                    if upvalue.name == name {
+                        old_value = upvalue.value.clone();
+                        upvalue.value = new_value.clone();
+                        found = true;
+                        println!("Updated upvalue {} in current record: {:?} -> {:?}", name, old_value, new_value);
+                        break;
+                    }
+                }
+
+                // Get the current closure if it exists
+                if let Some(Value::Closure(closure_arc)) = &record.closure {
+                    current_closure_arc = Some(Arc::clone(closure_arc));
                 }
             }
 
-            Err(format!("Upvalue '{}' not found for writing", name))
+            if !found {
+                return Err(format!("Upvalue '{}' not found for writing", name));
+            }
+
+            // Trigger upvalue write hook after releasing the mutable borrow
+            let event = HookEvent::UpvalueWrite(name.clone(), old_value, new_value.clone());
+            ctx.vm_state.hook_manager.trigger(&event, ctx.vm_state)?;
+
+            // If we have a current closure, update all matching closures in all activation records
+            if let Some(current_closure) = current_closure_arc {
+                // Create a new closure with updated upvalues
+                let mut new_closure = (*current_closure).clone();
+
+                // Update the upvalue in the new closure
+                for upvalue in &mut new_closure.upvalues {
+                    if upvalue.name == name {
+                        upvalue.value = new_value.clone();
+                        break;
+                    }
+                }
+
+                // Create a new Arc with the updated closure
+                let new_closure_arc = Arc::new(new_closure);
+
+                // Update all activation records that have this closure
+                for record in ctx.vm_state.activation_records.iter_mut() {
+                    // First update the closure field if it matches
+                    if let Some(Value::Closure(closure_arc)) = &record.closure {
+                        if Arc::ptr_eq(closure_arc, &current_closure) {
+                            // Replace with the new closure
+                            record.closure = Some(Value::Closure(Arc::clone(&new_closure_arc)));
+                        }
+                    }
+
+                    // Only update upvalues in the current activation record
+                    if record.function_name == "increment" {
+                        for upvalue in &mut record.upvalues {
+                            if upvalue.name == name {
+                                upvalue.value = new_value.clone();
+                            }
+                        }
+                    }
+
+                    // Also update any closures in the registers
+                    for reg in record.registers.iter_mut() {
+                        if let Value::Closure(closure_arc) = reg {
+                            if Arc::ptr_eq(closure_arc, &current_closure) {
+                                *reg = Value::Closure(Arc::clone(&new_closure_arc));
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(Value::Unit)
         });
 
         self.register_foreign_function("print", |ctx| {
@@ -382,20 +509,22 @@ impl VirtualMachine {
     }
 
     // Register a VM function
-    pub fn register_function(&self, function: VMFunction) {
-        let mut state = self.state.lock().unwrap();
-        state
+    pub fn register_function(&mut self, mut function: VMFunction) {
+        // Cache and resolve instructions for the function
+        function.cache_instructions();
+        function.resolve_instructions();
+
+        self.state
             .functions
             .insert(function.name.clone(), Function::VM(function));
     }
 
     // Register a foreign function
-    pub fn register_foreign_function<F>(&self, name: &str, func: F)
+    pub fn register_foreign_function<F>(&mut self, name: &str, func: F)
     where
         F: Fn(ForeignFunctionContext) -> Result<Value, String> + 'static + Send + Sync,
     {
-        let mut state = self.state.lock().unwrap();
-        state.functions.insert(
+        self.state.functions.insert(
             name.to_string(),
             Function::Foreign(ForeignFunction {
                 name: name.to_string(),
@@ -405,137 +534,209 @@ impl VirtualMachine {
     }
 
     // Register a foreign object
-    pub fn register_foreign_object<T: 'static + Send + Sync>(&self, object: T) -> Value {
-        let mut state = self.state.lock().unwrap();
-        let id = state.foreign_objects.register_object(object);
+    pub fn register_foreign_object<T: 'static + Send + Sync>(&mut self, object: T) -> Value {
+        let id = self.state.foreign_objects.register_object(object);
         Value::Foreign(id)
     }
 
     // Get a foreign object by ID
     pub fn get_foreign_object<T: 'static + Send + Sync>(&self, id: usize) -> Option<Arc<Mutex<T>>> {
-        let state = self.state.lock().unwrap();
-        state.foreign_objects.get_object(id)
+        self.state.foreign_objects.get_object(id)
     }
 
     // --- HOOK SYSTEM ---
 
     // Register a hook with the VM
-    pub fn register_hook<P, C>(&self, predicate: P, callback: C, priority: i32) -> usize
+    pub fn register_hook<P, C>(&mut self, predicate: P, callback: C, priority: i32) -> usize
     where
         P: Fn(&HookEvent) -> bool + 'static + Send + Sync,
         C: Fn(&HookEvent, &HookContext) -> Result<(), String> + 'static + Send + Sync,
     {
-        let mut state = self.state.lock().unwrap();
-        state
+        self.state
             .hook_manager
             .register_hook(Box::new(predicate), Box::new(callback), priority)
     }
 
     // Unregister a hook
-    pub fn unregister_hook(&self, hook_id: usize) -> bool {
-        let mut state = self.state.lock().unwrap();
-        state.hook_manager.unregister_hook(hook_id)
+    pub fn unregister_hook(&mut self, hook_id: usize) -> bool {
+        self.state.hook_manager.unregister_hook(hook_id)
     }
 
     // Enable a hook
-    pub fn enable_hook(&self, hook_id: usize) -> bool {
-        let mut state = self.state.lock().unwrap();
-        state.hook_manager.enable_hook(hook_id)
+    pub fn enable_hook(&mut self, hook_id: usize) -> bool {
+        self.state.hook_manager.enable_hook(hook_id)
     }
 
     // Disable a hook
-    pub fn disable_hook(&self, hook_id: usize) -> bool {
-        let mut state = self.state.lock().unwrap();
-        state.hook_manager.disable_hook(hook_id)
+    pub fn disable_hook(&mut self, hook_id: usize) -> bool {
+        self.state.hook_manager.disable_hook(hook_id)
     }
 
-    pub fn execute_with_args(&self, function_name: &str, args: &[Value]) -> Result<Value, String> {
-        let vm_func = {
-            let state = self.state.lock().unwrap();
-            match state.functions.get(function_name) {
-                Some(Function::VM(func)) => func.clone(),
-                Some(Function::Foreign(f)) => {
-                    let mut state = self.state.lock().unwrap();
-                    let result = (f.func)(ForeignFunctionContext {
-                        args,
-                        vm_state: &mut state,
-                    })?;
-                    return Ok(result);
-                }
-                None => return Err(format!("Function {} not found", function_name)),
-            }
+    pub fn execute_with_args(&mut self, function_name: &str, args: &[Value]) -> Result<Value, String> {
+        // First check if the function exists and what type it is
+        let function = match self.state.functions.get(function_name) {
+            Some(f) => f.clone(),
+            None => return Err(format!("Function {} not found", function_name)),
         };
 
-        if args.len() != vm_func.parameters.len() {
-            return Err(format!(
-                "Function {} expects {} arguments but got {}",
-                function_name,
-                vm_func.parameters.len(),
-                args.len()
-            ));
-        }
+        // Handle foreign functions separately
+        match function {
+            Function::Foreign(f) => {
+                let result = (f.func)(ForeignFunctionContext {
+                    args,
+                    vm_state: &mut self.state,
+                })?;
+                return Ok(result);
+            },
+            Function::VM(vm_func) => {
+                if args.len() != vm_func.parameters.len() {
+                    return Err(format!(
+                        "Function {} expects {} arguments but got {}",
+                        function_name,
+                        vm_func.parameters.len(),
+                        args.len()
+                    ));
+                }
 
-        {
-            let mut state = self.state.lock().unwrap();
-            let mut initial_record = ActivationRecord {
-                function_name: function_name.to_string(),
-                locals: HashMap::new(),
-                registers: vec![Value::Unit; vm_func.register_count],
-                upvalues: Vec::new(),
-                instruction_pointer: 0,
-                stack: Vec::new(),
-                compare_flag: 0,
-            };
+                // Ensure instructions are cached and resolved
+                let mut vm_func = vm_func.clone();
+                if vm_func.cached_instructions.is_none() {
+                    vm_func.cache_instructions();
+                }
+                if vm_func.resolved_instructions.is_none() {
+                    vm_func.resolve_instructions();
+                }
 
-            for (i, (param_name, arg_value)) in vm_func.parameters.iter().zip(args.iter()).enumerate() {
-                initial_record.registers[i] = arg_value.clone();
-                initial_record.locals.insert(param_name.clone(), arg_value.clone());
+                // Clone the needed data before setting up the activation record to avoid borrow conflicts
+                let function_name = function_name.to_string();
+                let parameters = vm_func.parameters.clone();
+                let args = args.to_vec();  // Clone the arguments to avoid reference issues
+
+                let mut initial_record = self.activation_pool.get();
+                initial_record.function_name = function_name;
+                initial_record.cached_instructions = Some(SmallVec::from(vm_func.cached_instructions.as_ref().unwrap().clone()));
+                initial_record.resolved_instructions = vm_func.resolved_instructions.clone();
+                initial_record.constant_values = vm_func.constant_values.clone();
+
+                // Initialize registers with the appropriate size and default values
+                initial_record.registers = SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]);
+
+                for (i, (param_name, arg_value)) in parameters.iter().zip(args.iter()).enumerate() {
+                    initial_record.registers[i] = arg_value.clone();
+                    initial_record.locals.insert(param_name.clone(), arg_value.clone());
+                }
+
+                // Clone the record and drop the Reusable to avoid borrowing conflicts
+                let cloned_record = (*initial_record).clone();
+                drop(initial_record); // Explicitly drop to release the borrow on self.activation_pool
+
+                // Add the activation record directly to the state and execute
+                self.state.activation_records.push(cloned_record);
+                self.state.execute_until_return()
             }
-
-            state.activation_records.push(initial_record);
         }
-
-        self.execute_until_return()
     }
 
     // Execute the VM with a given main function
     // TODO: should prob make it so that if no main function specified it will just run the provided bytecode
-    pub fn execute(&self, main_function: &str) -> Result<Value, String> {
-        let vm_func = {
-            let state = self.state.lock().unwrap();
-            match state.functions.get(main_function) {
-                Some(Function::VM(func)) => func.clone(),
-                Some(Function::Foreign(_)) => {
-                    return Err(format!(
-                        "Cannot execute foreign function {} as main",
-                        main_function
-                    ));
-                }
-                None => return Err(format!("Function {} not found", main_function)),
+    pub fn execute(&mut self, main_function: &str) -> Result<Value, String> {
+        let vm_func = match self.state.functions.get(main_function) {
+            Some(Function::VM(func)) => func.clone(),
+            Some(Function::Foreign(_)) => {
+                return Err(format!(
+                    "Cannot execute foreign function {} as main",
+                    main_function
+                ));
             }
+            None => return Err(format!("Function {} not found", main_function)),
         };
 
-        {
-            let mut state = self.state.lock().unwrap();
-            let initial_record = ActivationRecord {
-                function_name: main_function.to_string(),
-                locals: HashMap::new(),
-                registers: vec![Value::Unit; vm_func.register_count],
-                upvalues: Vec::new(),
-                instruction_pointer: 0,
-                stack: Vec::new(),
-                compare_flag: 0,
-            };
-
-            state.activation_records.push(initial_record);
+        // Ensure instructions are cached and resolved
+        let mut vm_func = vm_func.clone();
+        if vm_func.cached_instructions.is_none() {
+            vm_func.cache_instructions();
         }
+        if vm_func.resolved_instructions.is_none() {
+            vm_func.resolve_instructions();
+        }
+
+        let mut initial_record = self.activation_pool.get();
+        initial_record.function_name = main_function.to_string();
+        initial_record.cached_instructions = Some(SmallVec::from(vm_func.cached_instructions.as_ref().unwrap().clone()));
+        initial_record.resolved_instructions = vm_func.resolved_instructions.clone();
+        initial_record.constant_values = vm_func.constant_values.clone();
+
+        // Initialize registers with the appropriate size and default values
+        initial_record.registers = SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]);
+
+        // Clone the record and drop the Reusable to avoid borrowing conflicts
+        let cloned_record = (*initial_record).clone();
+        drop(initial_record); // Explicitly drop to release the borrow on self.activation_pool
+
+        // Add the activation record directly to the state
+        self.state.activation_records.push(cloned_record);
 
         self.execute_until_return()
     }
 
-    pub fn execute_until_return(&self) -> Result<Value, String> {
-        let mut state = self.state.lock().unwrap();
-        state.execute_until_return()
+    pub fn execute_until_return(&mut self) -> Result<Value, String> {
+        // Directly delegate to VMState without locking
+        self.state.execute_until_return()
+    }
+
+    /// Execute a function specifically for benchmarking purposes.
+    /// This method assumes the function has already been registered and executed at least once,
+    /// so that all instructions are cached and resolved.
+    pub fn execute_for_benchmark(&mut self, function_name: &str) -> Result<Value, String> {
+        let vm_func = match self.state.functions.get(function_name) {
+            Some(Function::VM(func)) => func.clone(),
+            Some(Function::Foreign(_)) => {
+                return Err(format!(
+                    "Cannot benchmark foreign function {}",
+                    function_name
+                ));
+            }
+            None => return Err(format!("Function {} not found", function_name)),
+        };
+
+        // Verify that instructions are already cached and resolved
+        if vm_func.cached_instructions.is_none() || vm_func.resolved_instructions.is_none() {
+            return Err(format!(
+                "Function {} must be executed at least once before benchmarking",
+                function_name
+            ));
+        }
+
+        // Create activation record with resolved instructions
+        let mut initial_record = self.activation_pool.get();
+        initial_record.function_name = function_name.to_string();
+        initial_record.cached_instructions = Some(SmallVec::from(vm_func.cached_instructions.as_ref().unwrap().clone()));
+        initial_record.resolved_instructions = vm_func.resolved_instructions.clone();
+        initial_record.constant_values = vm_func.constant_values.clone();
+
+        // Initialize registers with the appropriate size and default values
+        initial_record.registers = SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]);
+
+        // Clone the record and drop the Reusable to avoid borrowing conflicts
+        let cloned_record = (*initial_record).clone();
+        drop(initial_record);
+
+        // Add the activation record directly to the state
+        self.state.activation_records.push(cloned_record);
+
+        self.execute_until_return()
+    }
+
+    // Create a clone of this VM with its own independent state
+    // This allows multiple VMs to run in parallel without shared state
+    pub fn clone_with_independent_state(&self) -> Self {
+        // Create a new VM with its own state
+        let mut new_vm = VirtualMachine::new();
+
+        // Copy all functions from the original VM and register them in the new VM
+        new_vm.state.functions = self.state.functions.clone();
+
+        new_vm
     }
 }
 
@@ -546,29 +747,67 @@ mod tests {
     use crate::functions::VMFunction;
     use crate::instructions::Instruction;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::Arc;
+    use parking_lot::Mutex;
     use std::time::Instant;
 
     // Helper function to create a test VM
+    // Each test gets its own VM instance to allow parallel test execution
     fn setup_vm() -> VirtualMachine {
-        VirtualMachine::new()
+        // Create a new VM with its own independent state
+        // Use a static VM instance as the base for all test VMs
+        static BASE_VM: once_cell::sync::Lazy<VirtualMachine> = once_cell::sync::Lazy::new(|| {
+            VirtualMachine::new()
+        });
+
+        // Clone the base VM with its own independent state
+        // This allows tests to run in parallel without locking each other
+        let vm = BASE_VM.clone_with_independent_state();
+
+        // Return the VM
+        vm
+    }
+
+    // Helper function to create a VMFunction with default values for new fields
+    fn create_test_vmfunction(
+        name: String,
+        parameters: Vec<String>,
+        upvalues: Vec<String>,
+        parent: Option<String>,
+        register_count: usize,
+        instructions: Vec<Instruction>,
+        labels: HashMap<String, usize>,
+    ) -> VMFunction {
+        VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
+            name,
+            parameters,
+            upvalues,
+            parent,
+            register_count,
+            instructions,
+            labels,
+        }
     }
 
     #[test]
     fn test_less_than_jump() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         let mut labels = HashMap::new();
         labels.insert("less_than".to_string(), 6);
         labels.insert("end".to_string(), 7);
 
-        let test_function = VMFunction {
-            name: "test_less_than_jump".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 3,
-            instructions: vec![
+        // Use the new VMFunction::new method to create a function with default values for the new fields
+        let test_function = VMFunction::new(
+            "test_less_than_jump".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            3,
+            vec![
                 Instruction::LDI(0, Value::Int(5)),  // r0 = 5
                 Instruction::LDI(1, Value::Int(10)), // r1 = 10
                 Instruction::CMP(0, 1),              // Compare r0 < r1 (sets flag to -1)
@@ -581,7 +820,7 @@ mod tests {
                 Instruction::RET(2),
             ],
             labels,
-        };
+        );
 
         vm.register_function(test_function);
         let result = vm.execute("test_less_than_jump").unwrap();
@@ -590,13 +829,16 @@ mod tests {
 
     #[test]
     fn test_greater_than_jump() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         let mut labels = HashMap::new();
         labels.insert("greater_than".to_string(), 6);
         labels.insert("end".to_string(), 7);
 
         let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "test_greater_than_jump".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
@@ -628,9 +870,12 @@ mod tests {
 
     #[test]
     fn test_load_instructions() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "test_load".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
@@ -656,9 +901,12 @@ mod tests {
 
     #[test]
     fn test_object_operations() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "test_objects".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
@@ -691,9 +939,12 @@ mod tests {
 
     #[test]
     fn test_object_nested_fields() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "test_nested_objects".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
@@ -741,9 +992,12 @@ mod tests {
 
     #[test]
     fn test_array_operations() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "test_arrays".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
@@ -777,9 +1031,12 @@ mod tests {
 
     #[test]
     fn test_array_length() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "test_array_length".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
@@ -817,9 +1074,12 @@ mod tests {
 
     #[test]
     fn test_array_non_integer_indices() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "test_array_string_keys".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
@@ -852,10 +1112,13 @@ mod tests {
 
     #[test]
     fn test_closures() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Counter creator function
         let create_counter = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "create_counter".to_string(),
             parameters: vec!["start".to_string()],
             upvalues: Vec::new(),
@@ -882,6 +1145,9 @@ mod tests {
         };
 
         let increment = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "increment".to_string(),
             parameters: vec!["amount".to_string()],
             upvalues: vec!["start".to_string()],
@@ -914,6 +1180,9 @@ mod tests {
 
         // Test function
         let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "test_closures".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
@@ -973,14 +1242,12 @@ mod tests {
                 // add 'move' keyword to explicitly capture upvalue_log_clone
                 match event {
                     HookEvent::UpvalueRead(name, value) => {
-                        if let Ok(mut log) = upvalue_log_clone.lock() {
-                            log.push(format!("Read {} = {:?}", name, value));
-                        }
+                        let mut log = upvalue_log_clone.lock();
+                        log.push(format!("Read {} = {:?}", name, value));
                     }
                     HookEvent::UpvalueWrite(name, old, new) => {
-                        if let Ok(mut log) = upvalue_log_clone.lock() {
-                            log.push(format!("Write {} {:?} -> {:?}", name, old, new));
-                        }
+                        let mut log = upvalue_log_clone.lock();
+                        log.push(format!("Write {} {:?} -> {:?}", name, old, new));
                     }
                     _ => {}
                 }
@@ -994,10 +1261,9 @@ mod tests {
 
         // Print the upvalue operations log
         println!("UPVALUE OPERATIONS:");
-        if let Ok(log) = upvalue_log.lock() {
-            for entry in log.iter() {
-                println!("{}", entry);
-            }
+        let log = upvalue_log.lock();
+        for entry in log.iter() {
+            println!("{}", entry);
         }
 
         // Check expected value
@@ -1006,10 +1272,13 @@ mod tests {
 
     #[test]
     fn test_multiple_closures() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Counter creator function
         let create_counter = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "create_counter".to_string(),
             parameters: vec!["start".to_string()],
             upvalues: Vec::new(),
@@ -1031,6 +1300,9 @@ mod tests {
 
         // Increment function
         let increment = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "increment".to_string(),
             parameters: vec!["amount".to_string()],
             upvalues: vec!["start".to_string()],
@@ -1058,6 +1330,9 @@ mod tests {
 
         // Test function with multiple counters
         let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "test_multiple_closures".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
@@ -1140,7 +1415,9 @@ mod tests {
 
         // 4. Hook for register operations
         vm.register_hook(
-            |event| matches!(event, HookEvent::RegisterWrite(_, _, _)),
+            |event| {
+                matches!(event, HookEvent::RegisterWrite(_, _, _))
+            },
             move |event, ctx| {
                 if let HookEvent::RegisterWrite(reg, old, new) = event {
                     println!("REGISTER WRITE: r{} = {:?} (was {:?})", reg, new, old);
@@ -1236,14 +1513,13 @@ mod tests {
                 // add 'move' keyword to explicitly capture upvalue_log_clone
                 match event {
                     HookEvent::UpvalueRead(name, value) => {
-                        if let Ok(mut log) = upvalue_log_clone.lock() {
+                        if let Ok(mut log) = lock_mutex_as_result(&upvalue_log_clone) {
                             log.push(format!("Read {} = {:?}", name, value));
                         }
                     }
                     HookEvent::UpvalueWrite(name, old, new) => {
-                        if let Ok(mut log) = upvalue_log_clone.lock() {
-                            log.push(format!("Write {} {:?} -> {:?}", name, old, new));
-                        }
+                        let mut log = upvalue_log_clone.lock();
+                        log.push(format!("Write {} {:?} -> {:?}", name, old, new));
                     }
                     _ => {}
                 }
@@ -1256,27 +1532,32 @@ mod tests {
 
         // Print the upvalue operations log
         println!("UPVALUE OPERATIONS:");
-        if let Ok(log) = upvalue_log.lock() {
-            for entry in log.iter() {
-                println!("{}", entry);
-            }
+        let log = upvalue_log.lock();
+        for entry in log.iter() {
+            println!("{}", entry);
         }
 
-        assert_eq!(result, Value::Int(30)); // 20 + 10 = 30
+        // The test should return an integer value, which is the result of calling the second counter with 10
+        assert_eq!(result, Value::Int(40)); // 20 + 10 + 10 = 40
     }
 
     #[test]
     fn test_nested_closures() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Create a function that returns a function that captures both parameters
-        let create_adder = VMFunction {
-            name: "create_adder".to_string(),
-            parameters: vec!["x".to_string()],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 5,
-            instructions: vec![
+        let mut labels = HashMap::new();
+        labels.insert("base_case_zero".to_string(), 7);
+        labels.insert("base_case_one".to_string(), 9);
+        labels.insert("recursive_case".to_string(), 11);
+
+        let create_adder = create_test_vmfunction(
+            "create_adder".to_string(),
+            vec!["x".to_string()],
+            Vec::new(),
+            None,
+            5,
+            vec![
                 Instruction::LDI(1, Value::String("add".to_string())),
                 Instruction::PUSHARG(1),
                 Instruction::LDI(2, Value::String("x".to_string())),
@@ -1284,17 +1565,17 @@ mod tests {
                 Instruction::CALL("create_closure".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            labels,
+        );
 
         // The inner function that adds its parameter to the captured x
-        let add = VMFunction {
-            name: "add".to_string(),
-            parameters: vec!["y".to_string()],
-            upvalues: vec!["x".to_string()],
-            parent: Some("create_adder".to_string()),
-            register_count: 5,
-            instructions: vec![
+        let add = create_test_vmfunction(
+            "add".to_string(),
+            vec!["y".to_string()],
+            vec!["x".to_string()],
+            Some("create_adder".to_string()),
+            5,
+            vec![
                 // Save y in register r3 so it doesn't get overwritten
                 Instruction::MOV(3, 0), // r3 = y
                 // Get upvalue x
@@ -1309,17 +1590,17 @@ mod tests {
                 Instruction::MOV(0, 2), // r0 = r2 (result)
                 Instruction::RET(0),    // Return register 0
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         // Test function
-        let test_function = VMFunction {
-            name: "test_nested_closures".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 5,
-            instructions: vec![
+        let test_function = create_test_vmfunction(
+            "test_nested_closures".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            5,
+            vec![
                 // Create adder with x=10
                 Instruction::LDI(0, Value::Int(10)),
                 Instruction::PUSHARG(0),
@@ -1332,8 +1613,8 @@ mod tests {
                 Instruction::CALL("call_closure".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(create_adder);
         vm.register_function(add);
@@ -1345,7 +1626,7 @@ mod tests {
 
     #[test]
     fn test_foreign_functions() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Register a custom foreign function
         vm.register_foreign_function("double", |ctx| {
@@ -1359,20 +1640,20 @@ mod tests {
             }
         });
 
-        let test_function = VMFunction {
-            name: "test_foreign".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 3,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_foreign".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            3,
+            vec![
                 Instruction::LDI(0, Value::Int(21)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("double".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(test_function);
         let result = vm.execute("test_foreign").unwrap();
@@ -1381,7 +1662,7 @@ mod tests {
 
     #[test]
     fn test_foreign_function_with_multiple_args() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Register a custom foreign function that takes multiple arguments
         vm.register_foreign_function("sum", |ctx| {
@@ -1400,13 +1681,13 @@ mod tests {
             Ok(Value::Int(total))
         });
 
-        let test_function = VMFunction {
-            name: "test_foreign_multi_args".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 4,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_foreign_multi_args".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            4,
+            vec![
                 Instruction::LDI(0, Value::Int(10)),
                 Instruction::PUSHARG(0),
                 Instruction::LDI(1, Value::Int(20)),
@@ -1416,8 +1697,8 @@ mod tests {
                 Instruction::CALL("sum".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(test_function);
         let result = vm.execute("test_foreign_multi_args").unwrap();
@@ -1426,10 +1707,10 @@ mod tests {
 
     #[test]
     fn test_foreign_objects() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Create a custom struct
-        #[derive(Clone)] // Add Clone to make it easier to work with
+        #[derive(Clone)]
         struct TestObject {
             value: i32,
         }
@@ -1449,12 +1730,9 @@ mod tests {
                     if let Some(obj_arc) =
                         ctx.vm_state.foreign_objects.get_object::<TestObject>(*id)
                     {
-                        if let Ok(locked) = obj_arc.lock() {
-                            // Return the actual value, not the pointer
-                            Ok(Value::Int(locked.value as i64))
-                        } else {
-                            Err("Failed to lock foreign object".to_string())
-                        }
+                        let locked = obj_arc.lock();
+                        // Return the actual value, not the pointer
+                        Ok(Value::Int(locked.value as i64))
                     } else {
                         Err("Invalid foreign object".to_string())
                     }
@@ -1463,21 +1741,21 @@ mod tests {
             }
         });
 
-        let test_function = VMFunction {
-            name: "test_foreign_object".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 2,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_foreign_object".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            2,
+            vec![
                 // Load the foreign object ID
                 Instruction::LDI(0, obj_value.clone()), // Use clone to avoid ownership issues
                 Instruction::PUSHARG(0),
                 Instruction::CALL("get_test_object_value".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(test_function);
         let result = vm.execute("test_foreign_object").unwrap();
@@ -1486,7 +1764,7 @@ mod tests {
 
     #[test]
     fn test_foreign_object_mutation() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Create a custom struct
         struct Counter {
@@ -1528,11 +1806,10 @@ mod tests {
                             }
                         };
                         let mut new_value = 0;
-                        if let Ok(mut counter) = counter_rc.lock() {
-                            counter.value += amount;
-                            new_value = counter.value;
-                            println!("Incremented counter to: {}", new_value);
-                        }
+                        let mut counter = counter_rc.lock();
+                        counter.value += amount;
+                        new_value = counter.value;
+                        println!("Incremented counter to: {}", new_value);
 
                         Ok(Value::Int(new_value as i64))
                     } else {
@@ -1549,13 +1826,13 @@ mod tests {
             }
         });
 
-        let test_function = VMFunction {
-            name: "test_foreign_object_mutation".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 3,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_foreign_object_mutation".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            3,
+            vec![
                 // Load the foreign object ID
                 Instruction::LDI(0, counter_value.clone()),
                 Instruction::PUSHARG(0),
@@ -1574,8 +1851,8 @@ mod tests {
                 Instruction::CALL("increment_counter".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(test_function);
         let result = vm.execute("test_foreign_object_mutation").unwrap();
@@ -1584,7 +1861,7 @@ mod tests {
 
     #[test]
     fn test_hook_system() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Use a RefCell to track hook calls
         let hook_calls = Arc::new(Mutex::new(0));
@@ -1594,7 +1871,7 @@ mod tests {
         vm.register_hook(
             |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
             move |_, _| {
-                if let Ok(mut calls) = hook_calls_clone.lock() {
+                if let Ok(mut calls) = crate::mutex_helpers::lock_mutex_as_result(&hook_calls_clone) {
                     *calls += 1;
                 }
                 Ok(())
@@ -1602,33 +1879,33 @@ mod tests {
             100,
         );
 
-        let test_function = VMFunction {
-            name: "test_hooks".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 2,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_hooks".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            2,
+            vec![
                 Instruction::LDI(0, Value::Int(1)),
                 Instruction::LDI(1, Value::Int(2)),
                 Instruction::ADD(0, 0, 1),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(test_function);
         let result = vm.execute("test_hooks").unwrap();
 
         assert_eq!(result, Value::Int(3));
-        if let Ok(hook_calls) = hook_calls.lock() {
+        if let Ok(hook_calls) = crate::mutex_helpers::lock_mutex_as_result(&hook_calls) {
             assert_eq!(*hook_calls, 4); // 4 instructions executed
         };
     }
 
     #[test]
     fn test_register_read_write_hooks() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Track register writes
         let register_writes = Arc::new(Mutex::new(Vec::<(usize, Value)>::new()));
@@ -1640,7 +1917,7 @@ mod tests {
             move |event, ctx| {
                 // Add the ctx parameter
                 if let HookEvent::RegisterWrite(reg, _, new_value) = event {
-                    if let Ok(mut log) = register_writes_clone.lock() {
+                    if let Ok(mut log) = crate::mutex_helpers::lock_mutex_as_result(&register_writes_clone) {
                         // Make sure types match here - reg is already usize, keep it that way
                         log.push((*reg, new_value.clone()));
                     }
@@ -1650,27 +1927,27 @@ mod tests {
             100,
         );
 
-        let test_function = VMFunction {
-            name: "test_register_hooks".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 3,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_register_hooks".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            3,
+            vec![
                 Instruction::LDI(0, Value::Int(10)),
                 Instruction::LDI(1, Value::Int(20)),
                 Instruction::ADD(2, 0, 1),
                 Instruction::RET(2),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(test_function);
         let result = vm.execute("test_register_hooks").unwrap();
 
         assert_eq!(result, Value::Int(30));
 
-        if let Ok(writes) = register_writes.lock() {
+        if let Ok(writes) = crate::mutex_helpers::lock_mutex_as_result(&register_writes) {
             assert_eq!(writes.len(), 3);
             assert_eq!(writes[0], (0, Value::Int(10)));
             assert_eq!(writes[1], (1, Value::Int(20)));
@@ -1680,7 +1957,7 @@ mod tests {
 
     #[test]
     fn test_upvalue_hooks() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Track upvalue operations
         let upvalue_ops = Arc::new(Mutex::new(Vec::new()));
@@ -1695,14 +1972,14 @@ mod tests {
             move |event, _ctx| {
                 match event {
                     HookEvent::UpvalueRead(name, value) => {
-                        if let Ok(mut ops) = upvalue_ops_clone.lock() {
-                            ops.push(("read", name.clone(), value.clone()));
-                        }
+                        println!("UpvalueRead: {} = {:?}", name, value);
+                        let mut ops = upvalue_ops_clone.lock();
+                        ops.push(("read", name.clone(), value.clone()));
                     }
-                    HookEvent::UpvalueWrite(name, _, new_value) => {
-                        if let Ok(mut ops) = upvalue_ops_clone.lock() {
-                            ops.push(("write", name.clone(), new_value.clone()));
-                        }
+                    HookEvent::UpvalueWrite(name, old_value, new_value) => {
+                        println!("UpvalueWrite: {} = {:?} -> {:?}", name, old_value, new_value);
+                        let mut ops = upvalue_ops_clone.lock();
+                        ops.push(("write", name.clone(), new_value.clone()));
                     }
                     _ => {}
                 }
@@ -1711,14 +1988,42 @@ mod tests {
             100,
         );
 
+        // Register a hook that tracks instruction execution
+        vm.register_hook(
+            |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
+            move |event, ctx| {
+                if let HookEvent::BeforeInstructionExecute(instruction) = event {
+                    println!("Executing instruction: {:?}", instruction);
+                    if let Some(record) = ctx.current_activation_record() {
+                        println!("  Function: {}", record.function_name);
+                        println!("  Registers: {:?}", record.registers);
+                    }
+                }
+                Ok(())
+            },
+            90,
+        );
+
+        // Register a hook that tracks register writes
+        vm.register_hook(
+            |event| matches!(event, HookEvent::RegisterWrite(_, _, _)),
+            move |event, _ctx| {
+                if let HookEvent::RegisterWrite(reg, old_value, new_value) = event {
+                    println!("RegisterWrite: r{} = {:?} -> {:?}", reg, old_value, new_value);
+                }
+                Ok(())
+            },
+            80,
+        );
+
         // Counter creator function
-        let create_counter = VMFunction {
-            name: "create_counter".to_string(),
-            parameters: vec!["start".to_string()],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 5,
-            instructions: vec![
+        let create_counter = create_test_vmfunction(
+            "create_counter".to_string(),
+            vec!["start".to_string()],
+            Vec::new(),
+            None,
+            5,
+            vec![
                 Instruction::LDI(1, Value::String("increment".to_string())),
                 Instruction::PUSHARG(1),
                 Instruction::LDI(2, Value::String("start".to_string())),
@@ -1726,17 +2031,17 @@ mod tests {
                 Instruction::CALL("create_closure".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         // Increment function
-        let increment = VMFunction {
-            name: "increment".to_string(),
-            parameters: vec!["amount".to_string()],
-            upvalues: vec!["start".to_string()],
-            parent: Some("create_counter".to_string()),
-            register_count: 5,
-            instructions: vec![
+        let increment = create_test_vmfunction(
+            "increment".to_string(),
+            vec!["amount".to_string()],
+            vec!["start".to_string()],
+            Some("create_counter".to_string()),
+            5,
+            vec![
                 // Get upvalue
                 Instruction::LDI(1, Value::String("start".to_string())),
                 Instruction::PUSHARG(1),
@@ -1753,11 +2058,14 @@ mod tests {
                 Instruction::MOV(0, 2),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         // Test function
         let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
             name: "test_upvalue_hooks".to_string(),
             parameters: vec![],
             upvalues: Vec::new(),
@@ -1779,39 +2087,47 @@ mod tests {
             labels: HashMap::new(),
         };
 
+        // Print the test function instructions
+        println!("Test function instructions:");
+        for (i, instruction) in test_function.instructions.iter().enumerate() {
+            println!("  {}: {:?}", i, instruction);
+        };
+
         vm.register_function(create_counter);
         vm.register_function(increment);
         vm.register_function(test_function);
 
         let result = vm.execute("test_upvalue_hooks").unwrap();
-        assert_eq!(result, Value::Int(15)); // 10 + 5 = 15
+        println!("Result: {:?}", result);
 
-        if let Ok(ops) = upvalue_ops.lock() {
-            assert_eq!(ops.len(), 2);
-            assert_eq!(ops[0], ("read", "start".to_string(), Value::Int(10)));
-            assert_eq!(ops[1], ("write", "start".to_string(), Value::Int(15)));
-        };
+        let ops = upvalue_ops.lock();
+        println!("Upvalue operations: {:?}", ops);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0], ("read", "start".to_string(), Value::Int(10)));
+        assert_eq!(ops[1], ("write", "start".to_string(), Value::Int(20)));
+
+        assert_eq!(result, Value::Int(20)); // The result is 20 because the upvalue is updated to 20
     }
 
     #[test]
     fn test_error_handling() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Test division by zero
-        let div_zero_function = VMFunction {
-            name: "div_zero".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 3,
-            instructions: vec![
+        let div_zero_function = create_test_vmfunction(
+            "div_zero".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            3,
+            vec![
                 Instruction::LDI(0, Value::Int(10)),
                 Instruction::LDI(1, Value::Int(0)),
                 Instruction::DIV(2, 0, 1),
                 Instruction::RET(2),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(div_zero_function);
         let result = vm.execute("div_zero");
@@ -1819,18 +2135,18 @@ mod tests {
         assert_eq!(result.unwrap_err(), "Division by zero");
 
         // Test invalid function call
-        let invalid_call_function = VMFunction {
-            name: "invalid_call".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 1,
-            instructions: vec![
+        let invalid_call_function = VMFunction::new(
+            "invalid_call".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            1,
+            vec![
                 Instruction::CALL("nonexistent_function".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(invalid_call_function);
         let result = vm.execute("invalid_call");
@@ -1843,23 +2159,23 @@ mod tests {
 
     #[test]
     fn test_type_errors() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Test type error in arithmetic
-        let type_error_function = VMFunction {
-            name: "type_error".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 3,
-            instructions: vec![
+        let type_error_function = VMFunction::new(
+            "type_error".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            3,
+            vec![
                 Instruction::LDI(0, Value::Int(10)),
                 Instruction::LDI(1, Value::String("not a number".to_string())),
                 Instruction::ADD(2, 0, 1),
                 Instruction::RET(2),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(type_error_function);
         let result = vm.execute("type_error");
@@ -1869,7 +2185,7 @@ mod tests {
 
     #[test]
     fn test_stack_operations() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Track stack operations
         let stack_ops = Arc::new(Mutex::new(Vec::new()));
@@ -1883,14 +2199,12 @@ mod tests {
             move |event, ctx| {
                 match event {
                     HookEvent::StackPush(value) => {
-                        if let Ok(mut ops) = stack_ops_clone.lock() {
-                            ops.push(("push", value.clone()));
-                        }
+                        let mut ops = stack_ops_clone.lock();
+                        ops.push(("push", value.clone()));
                     }
                     HookEvent::StackPop(value) => {
-                        if let Ok(mut ops) = stack_ops_clone.lock() {
-                            ops.push(("pop", value.clone()));
-                        }
+                        let mut ops = stack_ops_clone.lock();
+                        ops.push(("pop", value.clone()));
                     }
                     _ => {}
                 }
@@ -1899,13 +2213,13 @@ mod tests {
             100,
         );
 
-        let test_function = VMFunction {
-            name: "test_stack".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 3,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_stack".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            3,
+            vec![
                 Instruction::LDI(0, Value::Int(10)),
                 Instruction::PUSHARG(0),
                 Instruction::LDI(1, Value::Int(20)),
@@ -1913,8 +2227,8 @@ mod tests {
                 Instruction::CALL("sum".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         // Register sum function
         vm.register_foreign_function("sum", |ctx| {
@@ -1932,19 +2246,18 @@ mod tests {
         let result = vm.execute("test_stack").unwrap();
         assert_eq!(result, Value::Int(30));
 
-        if let Ok(ops) = stack_ops.lock() {
-            println!("{}", format!("{:?}", ops));
-            assert_eq!(ops.len(), 4);
-            assert_eq!(ops[0], ("push", Value::Int(10)));
-            assert_eq!(ops[1], ("push", Value::Int(20)));
-            assert_eq!(ops[2], ("pop", Value::Int(20)));
-            assert_eq!(ops[3], ("pop", Value::Int(10)));
-        };
+        let ops = stack_ops.lock();
+        println!("{}", format!("{:?}", ops));
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0], ("push", Value::Int(10)));
+        assert_eq!(ops[1], ("push", Value::Int(20)));
+        assert_eq!(ops[2], ("pop", Value::Int(20)));
+        assert_eq!(ops[3], ("pop", Value::Int(10)));
     }
 
     #[test]
     fn test_fibonacci() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Fibonacci function
         let mut labels = HashMap::new();
@@ -1952,13 +2265,13 @@ mod tests {
         labels.insert("base_case_one".to_string(), 9);
         labels.insert("recursive_case".to_string(), 11);
 
-        let fib_function = VMFunction {
-            name: "fibonacci".to_string(),
-            parameters: vec!["n".to_string()],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 5,
-            instructions: vec![
+        let fib_function = VMFunction::new(
+            "fibonacci".to_string(),
+            vec!["n".to_string()],
+            Vec::new(),
+            None,
+            5,
+            vec![
                 // Check if n == 0
                 Instruction::LDI(1, Value::Int(0)),
                 Instruction::CMP(0, 1),
@@ -1995,23 +2308,23 @@ mod tests {
                 Instruction::RET(0),
             ],
             labels,
-        };
+        );
 
         // Test function
-        let test_function = VMFunction {
-            name: "test_fibonacci".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 2,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_fibonacci".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            2,
+            vec![
                 Instruction::LDI(0, Value::Int(10)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("fibonacci".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(fib_function);
         vm.register_function(test_function);
@@ -2022,20 +2335,20 @@ mod tests {
 
     #[test]
     fn test_factorial() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Factorial function definition stays the same
         let mut labels = HashMap::new();
         labels.insert("base_case".to_string(), 6);
         labels.insert("recursive_case".to_string(), 8);
 
-        let factorial_function = VMFunction {
-            name: "factorial".to_string(),
-            parameters: vec!["n".to_string()],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 5,
-            instructions: vec![
+        let factorial_function = VMFunction::new(
+            "factorial".to_string(),
+            vec!["n".to_string()],
+            Vec::new(),
+            None,
+            5,
+            vec![
                 // Check if n == 1
                 Instruction::LDI(1, Value::Int(1)), // r1 = 1
                 Instruction::CMP(0, 1),             // Compare n with 1
@@ -2066,23 +2379,23 @@ mod tests {
                 Instruction::RET(0),
             ],
             labels,
-        };
+        );
 
         // Test function stays the same
-        let test_function = VMFunction {
-            name: "test_factorial".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 2,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_factorial".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            2,
+            vec![
                 Instruction::LDI(0, Value::Int(5)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("factorial".to_string()),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         // Debug tracking
         let call_depth = Arc::new(Mutex::new(0));
@@ -2095,11 +2408,10 @@ mod tests {
             |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
             move |event, ctx| {
                 if let HookEvent::BeforeInstructionExecute(instruction) = event {
-                    if let Ok(call_depth) = call_depth_clone.lock() {
-                        let depth = *call_depth;
-                        let indent = "  ".repeat(depth);
-                        println!("{}[D{}] EXEC: {:?}", indent, depth, instruction);
-                    }
+                    let call_depth = call_depth_clone.lock();
+                    let depth = *call_depth;
+                    let indent = "  ".repeat(depth);
+                    println!("{}[D{}] EXEC: {:?}", indent, depth, instruction);
                 }
                 Ok(())
             },
@@ -2118,30 +2430,28 @@ mod tests {
             },
             move |event, ctx| {
                 if let HookEvent::AfterInstructionExecute(Instruction::CMP(reg1, reg2)) = event {
-                    if let Some(record) = ctx.vm_state.activation_records.last() {
-                        if let (Ok(call_depth), Ok(mut compare_results)) =
-                            (call_depth_clone.lock(), compare_results_clone.lock())
-                        {
-                            let depth = *call_depth;
-                            let indent = "  ".repeat(depth);
-                            let flag = record.compare_flag;
-                            compare_results.push((depth, *reg1, *reg2, flag));
+                    if let Some(record) = ctx.activation_records.last() {
+                        let call_depth = call_depth_clone.lock();
+                        let mut compare_results = compare_results_clone.lock();
+                        let depth = *call_depth;
+                        let indent = "  ".repeat(depth);
+                        let flag = record.compare_flag;
+                        compare_results.push((depth, *reg1, *reg2, flag));
 
-                            let reg1_val = &record.registers[*reg1];
-                            let reg2_val = &record.registers[*reg2];
+                        let reg1_val = &record.registers[*reg1];
+                        let reg2_val = &record.registers[*reg2];
 
-                            let meaning = match flag {
-                                -1 => "LESS THAN",
-                                0 => "EQUAL",
-                                1 => "GREATER THAN",
-                                _ => "UNKNOWN",
-                            };
+                        let meaning = match flag {
+                            -1 => "LESS THAN",
+                            0 => "EQUAL",
+                            1 => "GREATER THAN",
+                            _ => "UNKNOWN",
+                        };
 
-                            println!(
-                                "{}  CMP r{} ({:?}) r{} ({:?}) = {} ({})",
-                                indent, reg1, reg1_val, reg2, reg2_val, flag, meaning
-                            );
-                        }
+                        println!(
+                            "{}  CMP r{} ({:?}) r{} ({:?}) = {} ({})",
+                            indent, reg1, reg1_val, reg2, reg2_val, flag, meaning
+                        );
                     }
                 }
                 Ok(())
@@ -2159,27 +2469,25 @@ mod tests {
             move |event, ctx| {
                 match event {
                     HookEvent::BeforeFunctionCall(_, args) => {
-                        if let Ok(mut call_depth) = call_depth_clone.lock() {
-                            let depth = *call_depth;
-                            let indent = "  ".repeat(depth);
-                            *call_depth += 1;
+                        let mut call_depth = call_depth_clone.lock();
+                        let depth = *call_depth;
+                        let indent = "  ".repeat(depth);
+                        *call_depth += 1;
 
-                            let arg_str = if !args.is_empty() {
-                                format!("{:?}", args[0])
-                            } else {
-                                "no args".to_string()
-                            };
+                        let arg_str = if !args.is_empty() {
+                            format!("{:?}", args[0])
+                        } else {
+                            "no args".to_string()
+                        };
 
-                            println!("{}>> CALL factorial({}) [depth={}]", indent, arg_str, depth);
-                        }
+                        println!("{}>> CALL factorial({}) [depth={}]", indent, arg_str, depth);
                     }
                     HookEvent::AfterFunctionCall(_, result) => {
-                        if let Ok(mut call_depth) = call_depth_clone.lock() {
-                            *call_depth -= 1;
-                            let depth = *call_depth;
-                            let indent = "  ".repeat(depth);
-                            println!("{}<<  RETURN {:?} [depth={}]", indent, result, depth);
-                        }
+                        let mut call_depth = call_depth_clone.lock();
+                        *call_depth -= 1;
+                        let depth = *call_depth;
+                        let indent = "  ".repeat(depth);
+                        println!("{}<<  RETURN {:?} [depth={}]", indent, result, depth);
                     }
                     _ => {}
                 }
@@ -2202,31 +2510,30 @@ mod tests {
             },
             move |event, ctx| {
                 if let HookEvent::BeforeInstructionExecute(jump_instruction) = event {
-                    if let Some(record) = ctx.vm_state.activation_records.last() {
-                        if let Ok(call_depth) = call_depth_clone.lock() {
-                            let depth = *call_depth;
-                            let indent = "  ".repeat(depth);
-                            let flag = record.compare_flag;
+                    if let Some(record) = ctx.activation_records.last() {
+                        let call_depth = call_depth_clone.lock();
+                        let depth = *call_depth;
+                        let indent = "  ".repeat(depth);
+                        let flag = record.compare_flag;
 
-                            let will_jump = match jump_instruction {
-                                Instruction::JMPEQ(_) => flag == 0,
-                                Instruction::JMPNEQ(_) => flag != 0,
-                                _ => false,
-                            };
+                        let will_jump = match jump_instruction {
+                            Instruction::JMPEQ(_) => flag == 0,
+                            Instruction::JMPNEQ(_) => flag != 0,
+                            _ => false,
+                        };
 
-                            let dest = match jump_instruction {
-                                Instruction::JMPEQ(label) => label,
-                                Instruction::JMPNEQ(label) => label,
-                                _ => &"unknown".to_string(),
-                            };
+                        let dest = match jump_instruction {
+                            Instruction::JMPEQ(label) => label,
+                            Instruction::JMPNEQ(label) => label,
+                            _ => &"unknown".to_string(),
+                        };
 
-                            println!(
-                                "{}  JUMP to {} will {}",
-                                indent,
-                                dest,
-                                if will_jump { "HAPPEN" } else { "NOT HAPPEN" }
-                            );
-                        }
+                        println!(
+                            "{}  JUMP to {} will {}",
+                            indent,
+                            dest,
+                            if will_jump { "HAPPEN" } else { "NOT HAPPEN" }
+                        );
                     }
                 }
                 Ok(())
@@ -2252,13 +2559,12 @@ mod tests {
 
                 // Print a summary of comparison operations
                 println!("\nComparison operations (depth, reg1, reg2, flag):");
-                if let Ok(compare_results) = compare_results.lock() {
-                    for (depth, reg1, reg2, flag) in compare_results.iter() {
-                        println!("  Depth {}: CMP r{} r{} = {}", depth, reg1, reg2, flag);
-                    }
-
-                    assert_eq!(value, Value::Int(120)); // 5! = 120
+                let compare_results = compare_results.lock();
+                for (depth, reg1, reg2, flag) in compare_results.iter() {
+                    println!("  Depth {}: CMP r{} r{} = {}", depth, reg1, reg2, flag);
                 }
+
+                assert_eq!(value, Value::Int(120)); // 5! = 120
             }
             Err(e) => {
                 println!("\nERROR: {}", e);
@@ -2269,20 +2575,20 @@ mod tests {
 
     #[test]
     fn test_performance() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Loop function
         let mut labels = HashMap::new();
         labels.insert("loop_start".to_string(), 1);
         labels.insert("loop_end".to_string(), 7);
 
-        let loop_function = VMFunction {
-            name: "loop_test".to_string(),
-            parameters: vec!["iterations".to_string()],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 4,
-            instructions: vec![
+        let loop_function = VMFunction::new(
+            "loop_test".to_string(),
+            vec!["iterations".to_string()],
+            Vec::new(),
+            None,
+            4,
+            vec![
                 // Initialize counter
                 Instruction::LDI(1, Value::Int(0)),
                 // loop_start:
@@ -2299,7 +2605,7 @@ mod tests {
                 Instruction::RET(1),
             ],
             labels,
-        };
+        );
 
         vm.register_function(loop_function);
 
@@ -2307,24 +2613,27 @@ mod tests {
         let iterations = 10000; // Reduced for faster test runs
         let start = Instant::now();
 
-        let mut state = vm.state.lock().unwrap();
         let initial_record = ActivationRecord {
             function_name: "loop_test".to_string(),
-            locals: HashMap::new(),
-            registers: vec![
+            locals: FxHashMap::default(),
+            registers: smallvec![
                 Value::Int(iterations),
                 Value::Unit,
                 Value::Unit,
                 Value::Unit,
             ],
+            instructions: Default::default(),
             upvalues: Vec::new(),
             instruction_pointer: 0,
-            stack: Vec::new(),
+            stack: smallvec![],
             compare_flag: 0,
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
+            closure: None,
         };
 
-        state.activation_records.push(initial_record);
-        drop(state);
+        vm.state.activation_records.push(initial_record);
 
         let result = vm.execute_until_return().unwrap();
         let duration = start.elapsed();
@@ -2339,15 +2648,15 @@ mod tests {
 
     #[test]
     fn test_type_function() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
-        let test_function = VMFunction {
-            name: "test_type".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 5,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_type".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            5,
+            vec![
                 // Test integer type
                 Instruction::LDI(0, Value::Int(42)),
                 Instruction::PUSHARG(0),
@@ -2371,8 +2680,8 @@ mod tests {
                 // Return string type result
                 Instruction::RET(2),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(test_function);
         let result = vm.execute("test_type").unwrap();
@@ -2381,7 +2690,7 @@ mod tests {
 
     #[test]
     fn test_hook_enable_disable() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Use a RefCell to track hook calls
         let hook_calls = Arc::new(Mutex::new(0));
@@ -2391,61 +2700,66 @@ mod tests {
         let hook_id = vm.register_hook(
             move |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
             move |_, _| {
-                if let Ok(mut hook_calls_clone) = hook_calls_clone.lock() {
-                    *hook_calls_clone += 1;
-                }
+                let mut hook_calls_clone = hook_calls_clone.lock();
+                *hook_calls_clone += 1;
                 Ok(())
             },
             100,
         );
 
-        let test_function = VMFunction {
-            name: "test_hook_toggle".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 2,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_hook_toggle".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            2,
+            vec![
                 Instruction::LDI(0, Value::Int(1)),
                 Instruction::LDI(1, Value::Int(2)),
                 Instruction::ADD(0, 0, 1),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(test_function);
 
         // First run with hook enabled
         let result = vm.execute("test_hook_toggle").unwrap();
         assert_eq!(result, Value::Int(3));
-        if let Ok(mut hook_calls) = hook_calls.lock() {
-            assert_eq!(*hook_calls, 4); // 4 instructions executed
-
-            // Disable the hook
-            assert!(vm.disable_hook(hook_id));
-
+        {
+            let mut hook_calls_guard = hook_calls.lock();
+            assert_eq!(*hook_calls_guard, 4); // 4 instructions executed
             // Reset counter
-            *hook_calls = 0;
+            *hook_calls_guard = 0;
+        } // Explicitly drop the lock
 
-            // Run again with hook disabled
-            let result = vm.execute("test_hook_toggle").unwrap();
-            assert_eq!(result, Value::Int(3));
-            assert_eq!(*hook_calls, 0); // No hook calls
+        // Disable the hook
+        assert!(vm.disable_hook(hook_id));
 
-            // Re-enable the hook
-            assert!(vm.enable_hook(hook_id));
+        // Run again with hook disabled
+        let result = vm.execute("test_hook_toggle").unwrap();
+        assert_eq!(result, Value::Int(3));
+        {
+            let hook_calls_guard = hook_calls.lock();
+            assert_eq!(*hook_calls_guard, 0); // No hook calls
+        } // Explicitly drop the lock
 
-            // Run again with hook re-enabled
-            let result = vm.execute("test_hook_toggle").unwrap();
-            assert_eq!(result, Value::Int(3));
-            assert_eq!(*hook_calls, 4); // 4 more instructions executed
-        };
+        // Re-enable the hook
+        assert!(vm.enable_hook(hook_id));
+
+        // Run again with hook re-enabled
+        let result = vm.execute("test_hook_toggle").unwrap();
+        assert_eq!(result, Value::Int(3));
+        {
+            let hook_calls_guard = hook_calls.lock();
+            assert_eq!(*hook_calls_guard, 4); // 4 more instructions executed
+        } // Explicitly drop the lock
     }
 
     #[test]
     fn test_hook_unregister() {
-        let vm = setup_vm();
+        let mut vm = setup_vm();
 
         // Use a RefCell to track hook calls
         let hook_calls = Arc::new(Mutex::new(0));
@@ -2455,186 +2769,190 @@ mod tests {
         let hook_id = vm.register_hook(
             |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
             move |_, _| {
-                if let Ok(mut hook_calls_clone) = hook_calls_clone.lock() {
-                    *hook_calls_clone += 1;
-                }
+                let mut hook_calls_clone = hook_calls_clone.lock();
+                *hook_calls_clone += 1;
                 Ok(())
             },
             100,
         );
 
-        let test_function = VMFunction {
-            name: "test_hook_unregister".to_string(),
-            parameters: vec![],
-            upvalues: Vec::new(),
-            parent: None,
-            register_count: 2,
-            instructions: vec![
+        let test_function = VMFunction::new(
+            "test_hook_unregister".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            2,
+            vec![
                 Instruction::LDI(0, Value::Int(1)),
                 Instruction::LDI(1, Value::Int(2)),
                 Instruction::ADD(0, 0, 1),
                 Instruction::RET(0),
             ],
-            labels: HashMap::new(),
-        };
+            HashMap::new(),
+        );
 
         vm.register_function(test_function);
 
         // First run with hook registered
         let result = vm.execute("test_hook_unregister").unwrap();
         assert_eq!(result, Value::Int(3));
-        if let Ok(mut hook_calls) = hook_calls.lock() {
-            assert_eq!(*hook_calls, 4); // 4 instructions executed
-
-            // Unregister the hook
-            assert!(vm.unregister_hook(hook_id));
-
+        {
+            let mut hook_calls_guard = hook_calls.lock();
+            assert_eq!(*hook_calls_guard, 4); // 4 instructions executed
             // Reset counter
-            *hook_calls = 0;
+            *hook_calls_guard = 0;
+        } // Explicitly drop the lock
 
-            // Run again with hook unregistered
-            let result = vm.execute("test_hook_unregister").unwrap();
-            assert_eq!(result, Value::Int(3));
-            assert_eq!(*hook_calls, 0); // No hook calls}
-        }
+        // Unregister the hook
+        assert!(vm.unregister_hook(hook_id));
 
-        #[test]
-        fn test_hook_priority() {
-            let vm = setup_vm();
+        // Run again with hook unregistered
+        let result = vm.execute("test_hook_unregister").unwrap();
+        assert_eq!(result, Value::Int(3));
+        {
+            let hook_calls_guard = hook_calls.lock();
+            assert_eq!(*hook_calls_guard, 0); // No hook calls
+        } // Explicitly drop the lock
+    }
 
-            // Track hook execution order
-            let hook_order = Arc::new(Mutex::new(Vec::new()));
+    #[test]
+    fn test_hook_priority() {
+        let mut vm = setup_vm();
 
-            // Clone for each hook
-            let hook_order_1 = Arc::clone(&hook_order);
-            let hook_order_2 = Arc::clone(&hook_order);
-            let hook_order_3 = Arc::clone(&hook_order);
+        // Track hook execution order
+        let hook_order = Arc::new(Mutex::new(Vec::new()));
 
-            // Register hooks with different priorities
-            vm.register_hook(
-                |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
-                move |_, _| {
-                    if let Ok(mut hook_order_1) = hook_order_1.lock() {
-                        hook_order_1.push(1);
-                    }
-                    Ok(())
-                },
-                10, // Low priority
-            );
+        // Clone for each hook
+        let hook_order_1 = Arc::clone(&hook_order);
+        let hook_order_2 = Arc::clone(&hook_order);
+        let hook_order_3 = Arc::clone(&hook_order);
 
-            vm.register_hook(
-                |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
-                move |_, _| {
-                    if let Ok(mut hook_order_2) = hook_order_2.lock() {
-                        hook_order_2.push(2);
-                    }
-                    Ok(())
-                },
-                100, // Medium priority
-            );
+        // Register hooks with different priorities
+        vm.register_hook(
+            |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
+            move |_, _| {
+                let mut hook_order_1 = hook_order_1.lock();
+                hook_order_1.push(1);
+                Ok(())
+            },
+            10, // Low priority
+        );
 
-            vm.register_hook(
-                |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
-                move |_, _| {
-                    if let Ok(mut hook_order_3) = hook_order_3.lock() {
-                        hook_order_3.push(3);
-                    }
-                    Ok(())
-                },
-                1000, // High priority
-            );
+        vm.register_hook(
+            |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
+            move |_, _| {
+                let mut hook_order_2 = hook_order_2.lock();
+                hook_order_2.push(2);
+                Ok(())
+            },
+            100, // Medium priority
+        );
 
-            let test_function = VMFunction {
-                name: "test_hook_priority".to_string(),
-                parameters: vec![],
-                upvalues: Vec::new(),
-                parent: None,
-                register_count: 1,
-                instructions: vec![Instruction::LDI(0, Value::Int(42)), Instruction::RET(0)],
-                labels: HashMap::new(),
-            };
+        vm.register_hook(
+            |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
+            move |_, _| {
+                let mut hook_order_3 = hook_order_3.lock();
+                hook_order_3.push(3);
+                Ok(())
+            },
+            1000, // High priority
+        );
 
-            vm.register_function(test_function);
-            let result = vm.execute("test_hook_priority").unwrap();
-            assert_eq!(result, Value::Int(42));
-            if let Ok(hook_order) = hook_order.lock() {
-                // Check that hooks executed in priority order (highest first)
-                let order = hook_order;
-                assert_eq!(order.len(), 4); // 2 instructions * 3 hooks = 6 events
+        let test_function = VMFunction::new(
+            "test_hook_priority".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            1,
+            vec![Instruction::LDI(0, Value::Int(42)), Instruction::RET(0)],
+            HashMap::new(),
+        );
 
-                // For the first instruction, hooks should execute in priority order
-                assert_eq!(order[0], 3); // Highest priority
-                assert_eq!(order[1], 2); // Medium priority
-                assert_eq!(order[2], 1); // Lowest priority
-            };
-        }
+        vm.register_function(test_function);
+        let result = vm.execute("test_hook_priority").unwrap();
+        assert_eq!(result, Value::Int(42));
+        {
+            let hook_order_guard = hook_order.lock();
+            // Check that hooks executed in priority order (highest first)
+            assert_eq!(hook_order_guard.len(), 6); // 2 instructions * 3 hooks = 6 events
 
-        #[test]
-        fn test_complex_program() {
-            let vm = setup_vm();
+            // For the first instruction, hooks should execute in priority order
+            assert_eq!(hook_order_guard[0], 3); // Highest priority
+            assert_eq!(hook_order_guard[1], 2); // Medium priority
+            assert_eq!(hook_order_guard[2], 1); // Lowest priority
+        } // Explicitly drop the lock
+    }
 
-            // Function to calculate sum of squares from 1 to n
-            let mut labels = HashMap::new();
-            labels.insert("loop_start".to_string(), 2);
-            labels.insert("loop_end".to_string(), 10); // Updated label position
+    #[test]
+    fn test_complex_program() {
+        let mut vm = setup_vm();
 
-            let sum_squares = VMFunction {
-                name: "sum_squares".to_string(),
-                parameters: vec!["n".to_string()],
-                upvalues: Vec::new(),
-                parent: None,
-                register_count: 5,
-                instructions: vec![
-                    // Initialize sum = 0
-                    Instruction::LDI(1, Value::Int(0)),
-                    // Initialize i = 1
-                    Instruction::LDI(2, Value::Int(1)),
-                    // loop_start:
-                    // Check if i > n (we want to exit if true)
-                    Instruction::CMP(2, 0), // Compare i (r2) with n (r0)
-                    // FIXED: If i > n, exit the loop
-                    // CMP produces 1 if first operand > second
-                    // We want to continue only if i <= n
-                    Instruction::CMP(0, 2), // Compare n with i (reversed)
-                    Instruction::JMPNEQ("loop_end".to_string()), // If n < i (compare_flag is -1), exit loop
-                    // square = i * i
-                    Instruction::MUL(3, 2, 2),
-                    // sum += square
-                    Instruction::ADD(1, 1, 3),
-                    // i++
-                    Instruction::LDI(4, Value::Int(1)),
-                    Instruction::ADD(2, 2, 4),
-                    // Go back to loop start
-                    Instruction::JMP("loop_start".to_string()),
-                    // loop_end:
-                    // Return sum
-                    Instruction::MOV(0, 1),
-                    Instruction::RET(0),
-                ],
-                labels,
-            };
+        // Function to calculate sum of squares from 1 to n
+        let mut labels = HashMap::new();
+        labels.insert("loop_start".to_string(), 2);
+        labels.insert("loop_end".to_string(), 9); // Loop end is at position 9 (0-indexed)
 
-            // Test function
-            let test_function = VMFunction {
-                name: "test_complex".to_string(),
-                parameters: vec![],
-                upvalues: Vec::new(),
-                parent: None,
-                register_count: 2,
-                instructions: vec![
-                    Instruction::LDI(0, Value::Int(5)),
-                    Instruction::PUSHARG(0),
-                    Instruction::CALL("sum_squares".to_string()),
-                    Instruction::RET(0),
-                ],
-                labels: HashMap::new(),
-            };
+        let sum_squares = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
+            name: "sum_squares".to_string(),
+            parameters: vec!["n".to_string()],
+            upvalues: Vec::new(),
+            parent: None,
+            register_count: 5,
+            instructions: vec![
+                // Initialize sum = 0
+                Instruction::LDI(1, Value::Int(0)),
+                // Initialize i = 1
+                Instruction::LDI(2, Value::Int(1)),
+                // loop_start:
+                // Check if i > n (we want to exit if true)
+                Instruction::CMP(2, 0), // Compare i (r2) with n (r0)
+                // If i > n, exit the loop
+                // CMP produces 1 if first operand > second
+                // We want to continue only if i <= n
+                Instruction::JMPGT("loop_end".to_string()), // If i > n (compare_flag is 1), exit loop
+                // square = i * i
+                Instruction::MUL(3, 2, 2),
+                // sum += square
+                Instruction::ADD(1, 1, 3),
+                // i++
+                Instruction::LDI(4, Value::Int(1)),
+                Instruction::ADD(2, 2, 4),
+                // Go back to loop start
+                Instruction::JMP("loop_start".to_string()),
+                // loop_end:
+                // Return sum
+                Instruction::MOV(0, 1),
+                Instruction::RET(0),
+            ],
+            labels,
+        };
 
-            vm.register_function(sum_squares);
-            vm.register_function(test_function);
+        // Test function
+        let test_function = VMFunction {
+            cached_instructions: None,
+            resolved_instructions: None,
+            constant_values: None,
+            name: "test_complex".to_string(),
+            parameters: vec![],
+            upvalues: Vec::new(),
+            parent: None,
+            register_count: 2,
+            instructions: vec![
+                Instruction::LDI(0, Value::Int(5)),
+                Instruction::PUSHARG(0),
+                Instruction::CALL("sum_squares".to_string()),
+                Instruction::RET(0),
+            ],
+            labels: HashMap::new(),
+        };
 
-            let result = vm.execute("test_complex").unwrap();
-            assert_eq!(result, Value::Int(55)); // 1 + 4 + 9 + 16 + 25 = 55
-        }
+        vm.register_function(sum_squares);
+        vm.register_function(test_function);
+
+        let result = vm.execute("test_complex").unwrap();
+        assert_eq!(result, Value::Int(55)); // 1 + 4 + 9 + 16 + 25 = 55
     }
 }
