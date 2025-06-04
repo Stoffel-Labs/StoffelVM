@@ -8,7 +8,11 @@ edition = "2021"
 async-trait = "0.1"
 redb = "2.1.0"
 tokio = { version = "1.44.2", features = ["full"] }
-bytes = "1.10.1"
+quinn = { version = "0.11.8", features = ["default", "rustls", "ring"] }
+rustls = "0.23"
+rustls-pemfile = "2.0"
+rcgen = "0.12"
+bytes = "1.5"
 rand = "0.9.0"
 object-pool = "0.6.0"
 rustc-hash = "2.1.1"
