@@ -8,16 +8,20 @@ use std::sync::{Arc, Mutex};
 
 fn main() -> Result<(), String> {
     // Initialize the VM
-    let vm = VirtualMachine::new();
-    
+    let mut vm = VirtualMachine::new();
+
     // Create a simple function to debug
-    let factorial = VMFunction {
-        name: "factorial".to_string(),
-        parameters: vec!["n".to_string()],
-        upvalues: vec![],
-        parent: None,
-        register_count: 5,
-        instructions: vec![
+    let mut factorial_labels = HashMap::new();
+    factorial_labels.insert("base_case".to_string(), 6);
+    factorial_labels.insert("recursive_case".to_string(), 8);
+
+    let factorial = VMFunction::new(
+        "factorial".to_string(),
+        vec!["n".to_string()],
+        vec![],
+        None,
+        5,
+        vec![
             // Check if n == 1
             Instruction::LDI(1, Value::Int(1)),
             Instruction::CMP(0, 1),
@@ -38,23 +42,18 @@ fn main() -> Result<(), String> {
             Instruction::MUL(0, 3, 0),
             Instruction::RET(0),
         ],
-        labels: {
-            let mut labels = HashMap::new();
-            labels.insert("base_case".to_string(), 6);
-            labels.insert("recursive_case".to_string(), 8);
-            labels
-        },
-    };
-    
+        factorial_labels,
+    );
+
     // Register the function with the VM
     vm.register_function(factorial);
-    
+
     // Set up debugging hooks
-    
+
     // 1. Track instruction execution
     let instruction_log = Arc::new(Mutex::new(Vec::new()));
     let instruction_log_clone = Arc::clone(&instruction_log);
-    
+
     vm.register_hook(
         |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
         move |event, ctx| {
@@ -69,11 +68,11 @@ fn main() -> Result<(), String> {
         },
         100,
     );
-    
+
     // 2. Track register writes
     let register_log = Arc::new(Mutex::new(Vec::new()));
     let register_log_clone = Arc::clone(&register_log);
-    
+
     vm.register_hook(
         |event| matches!(event, HookEvent::RegisterWrite(_, _, _)),
         move |event, ctx| {
@@ -86,11 +85,11 @@ fn main() -> Result<(), String> {
         },
         90,
     );
-    
+
     // 3. Track function calls
     let call_log = Arc::new(Mutex::new(Vec::new()));
     let call_log_clone = Arc::clone(&call_log);
-    
+
     vm.register_hook(
         |event| {
             matches!(event, HookEvent::BeforeFunctionCall(_, _)) || 
@@ -121,13 +120,13 @@ fn main() -> Result<(), String> {
         },
         80,
     );
-    
+
     // Execute the factorial function with argument 5
     let args = vec![Value::Int(5)];
     let result = vm.execute_with_args("factorial", &args)?;
-    
+
     println!("factorial(5) = {:?}", result);
-    
+
     // Print debug logs
     println!("\nInstruction Execution Log:");
     println!("-------------------------");
@@ -136,7 +135,7 @@ fn main() -> Result<(), String> {
             println!("{}", entry);
         }
     }
-    
+
     println!("\nRegister Write Log:");
     println!("-----------------");
     if let Ok(log) = register_log.lock() {
@@ -144,7 +143,7 @@ fn main() -> Result<(), String> {
             println!("{}", entry);
         }
     }
-    
+
     println!("\nFunction Call Log:");
     println!("----------------");
     if let Ok(log) = call_log.lock() {
@@ -152,6 +151,6 @@ fn main() -> Result<(), String> {
             println!("{}", entry);
         }
     }
-    
+
     Ok(())
 }

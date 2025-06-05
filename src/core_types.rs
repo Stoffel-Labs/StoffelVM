@@ -1,39 +1,38 @@
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 /// Represents an array in the VM
 #[derive(Debug, Clone)]
 pub struct Array {
-    elements: Vec<Value>,
-    extra_fields: HashMap<Value, Value>, // For non-integer or sparse indices
-}
-
-impl Default for Array {
-    fn default() -> Self {
-        Self::new()
-    }
+    elements: SmallVec<[Value; 16]>, // Optimize for small arrays
+    extra_fields: FxHashMap<Value, Value>, // Already using FxHashMap
+    length_hint: usize, // Cache length for O(1) access
 }
 
 impl Array {
     pub fn new() -> Self {
         Array {
-            elements: Vec::new(),
-            extra_fields: HashMap::new(),
+            elements: SmallVec::new(),
+            extra_fields: FxHashMap::default(),
+            length_hint: 0,
         }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         Array {
-            elements: Vec::with_capacity(capacity),
-            extra_fields: HashMap::new(),
+            elements: SmallVec::with_capacity(capacity),
+            extra_fields: FxHashMap::default(),
+            length_hint: 0,
         }
     }
 
     pub fn get(&self, key: &Value) -> Option<&Value> {
         match key {
-            Value::Int(idx) if *idx >= 1 && (*idx as usize) <= self.elements.len() => {
+            Value::Int(idx) if *idx >= 1 && (*idx as usize) <= self.length_hint => {
                 Some(&self.elements[*idx as usize - 1])
             },
             _ => self.extra_fields.get(key),
@@ -43,25 +42,16 @@ impl Array {
     pub fn set(&mut self, key: Value, value: Value) {
         match key {
             Value::Int(idx) if idx >= 1 => {
+                self.length_hint = self.length_hint.max(idx as usize);
                 let idx_usize = idx as usize - 1;
-
-                if idx_usize == self.elements.len() {
-                    self.elements.push(value);
-                    return;
-                }
-
-                if idx_usize < self.elements.len() {
+                if idx_usize < 32 { // Small array optimization
+                    if idx_usize >= self.elements.len() {
+                        self.elements.resize(idx_usize + 1, Value::Unit);
+                    }
                     self.elements[idx_usize] = value;
-                    return;
+                } else {
+                    self.extra_fields.insert(Value::Int(idx), value);
                 }
-
-                if idx_usize < self.elements.len() + 16 {
-                    self.elements.resize(idx_usize + 1, Value::Unit);
-                    self.elements[idx_usize] = value;
-                    return;
-                }
-
-                self.extra_fields.insert(Value::Int(idx), value);
             },
             _ => {
                 self.extra_fields.insert(key, value);
@@ -70,7 +60,7 @@ impl Array {
     }
 
     pub fn length(&self) -> usize {
-        self.elements.len()
+        self.length_hint
     }
 }
 
@@ -82,10 +72,26 @@ pub struct Upvalue {
 }
 
 /// Represents a closure - a function with its captured environment
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone)]
 pub struct Closure {
     pub function_id: String,    // Reference to the base function
     pub upvalues: Vec<Upvalue>, // Captured values from outer scopes
+}
+
+impl PartialEq for Closure {
+    fn eq(&self, other: &Self) -> bool {
+        self.function_id == other.function_id && 
+        self.upvalues == other.upvalues
+    }
+}
+
+impl Eq for Closure {}
+
+impl std::hash::Hash for Closure {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.function_id.hash(state);
+        self.upvalues.hash(state);
+    }
 }
 
 /// Value types supported by the VM
@@ -124,22 +130,22 @@ impl fmt::Debug for Value {
 /// Object structure
 #[derive(Debug, Clone)]
 pub struct Object {
-    pub fields: HashMap<Value, Value>,
+    pub fields: FxHashMap<Value, Value>,
 }
 
 /// Combined object/array storage
 #[derive(Default)]
 pub struct ObjectStore {
-    pub objects: HashMap<usize, Object>,
-    pub arrays: HashMap<usize, Array>,
+    pub objects: FxHashMap<usize, Object>,
+    pub arrays: FxHashMap<usize, Array>,
     pub next_id: usize,
 }
 
 impl ObjectStore {
     pub fn new() -> Self {
         ObjectStore {
-            objects: HashMap::new(),
-            arrays: HashMap::new(),
+            objects: FxHashMap::default(),
+            arrays: FxHashMap::default(),
             next_id: 1,
         }
     }
@@ -148,7 +154,7 @@ impl ObjectStore {
         let id = self.next_id;
         self.next_id += 1;
         self.objects.insert(id, Object {
-            fields: HashMap::new(),
+            fields: FxHashMap::default(),
         });
         id
     }
@@ -236,7 +242,7 @@ impl<T: 'static + Send + Sync> AnyObject for TypedObject<T> {
 
 /// Foreign object storage
 pub struct ForeignObjectStorage {
-    pub objects: HashMap<usize, Box<dyn AnyObject + Send + Sync>>,
+    pub objects: FxHashMap<usize, Box<dyn AnyObject + Send + Sync>>,
     pub next_id: usize,
 }
 
@@ -249,7 +255,7 @@ impl Default for ForeignObjectStorage {
 impl ForeignObjectStorage {
     pub fn new() -> Self {
         ForeignObjectStorage {
-            objects: HashMap::new(),
+            objects: FxHashMap::default(),
             next_id: 1,
         }
     }
