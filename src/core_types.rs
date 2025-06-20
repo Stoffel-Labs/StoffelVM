@@ -1,3 +1,17 @@
+//! # Core Types for StoffelVM
+//!
+//! This module defines the fundamental types used throughout the StoffelVM.
+//! It includes the value system, object model, and storage mechanisms that
+//! form the foundation of the VM's runtime environment.
+//!
+//! The VM supports various value types:
+//! - Primitive types: Int, Float, Bool, String, Unit
+//! - Complex types: Object, Array, Closure
+//! - Foreign types: References to Rust objects exposed to the VM
+//!
+//! The module also provides storage systems for objects, arrays, and foreign objects,
+//! as well as the upvalue system for closures.
+
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
@@ -6,10 +20,20 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 /// Represents an array in the VM
+///
+/// Arrays in StoffelVM are 1-indexed (like Lua) and support both numeric indices
+/// and arbitrary keys (similar to JavaScript arrays or Lua tables).
+/// The implementation uses a hybrid approach:
+/// - Small arrays (indices < 32) use a contiguous SmallVec for efficient access
+/// - Larger indices and non-numeric keys use a hash map
+/// - A length hint is maintained for O(1) length queries
 #[derive(Debug, Clone)]
 pub struct Array {
+    /// Contiguous storage for small arrays (optimized for indices < 32)
     elements: SmallVec<[Value; 16]>, // Optimize for small arrays
+    /// Storage for large indices and non-numeric keys
     extra_fields: FxHashMap<Value, Value>, // Already using FxHashMap
+    /// Cached length for O(1) access
     length_hint: usize, // Cache length for O(1) access
 }
 
@@ -64,18 +88,37 @@ impl Array {
     }
 }
 
-/// Represents an upvalue - a variable from an outer scope
+/// Represents an upvalue - a variable captured from an outer scope
+///
+/// Upvalues are the mechanism that enables closures to capture and maintain
+/// references to variables from their enclosing scopes, even after those
+/// scopes have exited. This is essential for implementing true lexical scoping.
+///
+/// When a function references a variable from an outer scope, that variable
+/// is tracked as an upvalue, ensuring it remains accessible throughout the
+/// lifetime of any closures that reference it.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Upvalue {
+    /// Name of the captured variable
     pub name: String,
+    /// Value of the captured variable
     pub value: Value,
 }
 
 /// Represents a closure - a function with its captured environment
+///
+/// Closures combine a function with the variables it captures from its
+/// surrounding lexical environment. This allows functions to maintain access
+/// to variables from their defining scope, even after that scope has exited.
+///
+/// The VM implements true lexical scoping through this upvalue system, where
+/// multiple closures can share references to the same captured variables.
 #[derive(Clone)]
 pub struct Closure {
-    pub function_id: String,    // Reference to the base function
-    pub upvalues: Vec<Upvalue>, // Captured values from outer scopes
+    /// Reference to the base function (by name)
+    pub function_id: String,
+    /// Variables captured from outer scopes
+    pub upvalues: Vec<Upvalue>,
 }
 
 impl PartialEq for Closure {
@@ -95,16 +138,33 @@ impl std::hash::Hash for Closure {
 }
 
 /// Value types supported by the VM
+///
+/// This enum represents all possible values that can be manipulated by the VM.
+/// It includes both primitive types (Int, Float, Bool, String) and complex types
+/// (Object, Array, Closure), as well as references to foreign objects.
+///
+/// The VM uses a dual-type system:
+/// - Clear values: Publicly visible values used for control flow and general computation
+/// - Secret values: Privately shared values used in secure multiparty computation (future)
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Value {
+    /// 64-bit signed integer
     Int(i64),
-    Float(i64),  // Represented as fixed-point for Eq/Hash
+    /// Fixed-point floating point number (represented as i64 internally for Eq/Hash)
+    Float(i64),
+    /// Boolean value
     Bool(bool),
+    /// String value
     String(String),
-    Object(usize),    // Regular object reference
-    Array(usize),     // Array reference
-    Foreign(usize),   // External object reference
-    Closure(Arc<Closure>), // Function closure
+    /// Reference to an object (key-value map)
+    Object(usize),
+    /// Reference to an array
+    Array(usize),
+    /// Reference to a foreign object (Rust object exposed to VM)
+    Foreign(usize),
+    /// Function closure (function with captured environment)
+    Closure(Arc<Closure>),
+    /// Unit/void/nil value
     Unit,
 }
 
@@ -127,17 +187,33 @@ impl fmt::Debug for Value {
     }
 }
 
-/// Object structure
+/// Object structure for key-value storage
+///
+/// Objects in StoffelVM are similar to JavaScript objects or Lua tables -
+/// they store key-value pairs where both keys and values can be any valid VM value.
+/// This provides a flexible foundation for implementing various data structures
+/// and programming patterns.
 #[derive(Debug, Clone)]
 pub struct Object {
+    /// Map of field names to values
     pub fields: FxHashMap<Value, Value>,
 }
 
-/// Combined object/array storage
+/// Combined storage system for objects and arrays
+///
+/// This centralized store manages all objects and arrays in the VM.
+/// It provides a reference-based system where objects and arrays are
+/// identified by numeric IDs, similar to a simple garbage collection system.
+///
+/// The store handles creation, access, and modification of objects and arrays,
+/// as well as field access operations that work across both types.
 #[derive(Default)]
 pub struct ObjectStore {
+    /// Storage for objects, indexed by ID
     pub objects: FxHashMap<usize, Object>,
+    /// Storage for arrays, indexed by ID
     pub arrays: FxHashMap<usize, Array>,
+    /// Next available ID for object/array allocation
     pub next_id: usize,
 }
 
@@ -224,14 +300,25 @@ impl ObjectStore {
     }
 }
 
-/// Trait for type-erased objects
+/// Trait for type-erased foreign objects
+///
+/// This trait enables the VM to store and retrieve arbitrary Rust types
+/// in a type-safe manner. It provides the foundation for the Foreign Function
+/// Interface (FFI) system, allowing Rust objects to be exposed to the VM.
 pub trait AnyObject: Send + Sync {
+    /// Get a reference to the object as a type-erased Any
     fn as_any(&self) -> &dyn Any;
+    /// Get a mutable reference to the object as a type-erased Any
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-/// Type-specific container implementing AnyObject
+/// Type-specific container for foreign objects
+///
+/// This generic wrapper preserves the exact type of a foreign object
+/// while implementing the AnyObject trait. It uses Arc<Mutex<T>> to
+/// provide thread-safe shared access to the wrapped object.
 pub struct TypedObject<T: 'static + Send + Sync> {
+    /// Thread-safe reference to the wrapped object
     pub value: Arc<Mutex<T>>
 }
 
@@ -240,9 +327,18 @@ impl<T: 'static + Send + Sync> AnyObject for TypedObject<T> {
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 }
 
-/// Foreign object storage
+/// Storage system for foreign (Rust) objects
+///
+/// This system manages all foreign objects exposed to the VM.
+/// It provides a way to register Rust objects with the VM and
+/// retrieve them later in a type-safe manner.
+///
+/// Foreign objects are identified by numeric IDs, similar to
+/// the ObjectStore system for VM-native objects and arrays.
 pub struct ForeignObjectStorage {
+    /// Storage for foreign objects, indexed by ID
     pub objects: FxHashMap<usize, Box<dyn AnyObject + Send + Sync>>,
+    /// Next available ID for foreign object allocation
     pub next_id: usize,
 }
 

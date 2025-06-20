@@ -1,3 +1,21 @@
+//! # Function System for StoffelVM
+//!
+//! This module defines the function types and related functionality for the StoffelVM.
+//! The VM supports two primary function types:
+//!
+//! 1. `VMFunction` - Functions defined in the VM's instruction set
+//! 2. `ForeignFunction` - Functions implemented in Rust and exposed to the VM
+//!
+//! The module also provides the infrastructure for function resolution, closure creation,
+//! and the Foreign Function Interface (FFI) system that bridges Rust and the VM.
+//!
+//! Functions in StoffelVM support:
+//! - Parameter passing
+//! - Return values
+//! - Lexical scoping with upvalues
+//! - Nested function definitions
+//! - First-class functions and closures
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -9,22 +27,52 @@ use crate::instructions::ResolvedInstruction;
 use smallvec::SmallVec;
 
 /// VM function definition
+///
+/// Represents a function defined in the VM's instruction set. These functions
+/// are the primary unit of execution in the VM and can be called directly or
+/// wrapped in closures.
+///
+/// VM functions support:
+/// - Named parameters
+/// - Upvalue capture for lexical scoping
+/// - Nested function definitions
+/// - Register-based execution
+/// - Label-based control flow
 #[derive(Clone)]
 pub struct VMFunction {
+    /// Cached copy of instructions for faster execution
     pub cached_instructions: Option<Vec<Instruction>>,
+    /// Optimized instructions with resolved indices
     pub resolved_instructions: Option<SmallVec<[ResolvedInstruction; 32]>>,
+    /// Constant values extracted from instructions
     pub constant_values: Option<SmallVec<[Value; 16]>>,
+    /// Function name (used for lookup and debugging)
     pub name: String,
+    /// Parameter names (used for binding arguments)
     pub parameters: Vec<String>,
+    /// Names of variables captured from outer scopes
     pub upvalues: Vec<String>,
+    /// Parent function name (for nested functions)
     pub parent: Option<String>,
+    /// Number of registers used by this function
     pub register_count: usize,
+    /// List of instructions that make up the function body
     pub instructions: Vec<Instruction>,
+    /// Mapping from label names to instruction indices
     pub labels: HashMap<String, usize>,
 }
 
 impl VMFunction {
-    // Create a new VMFunction with default values for the new fields
+    /// Create a new VM function with the specified parameters
+    ///
+    /// # Arguments
+    /// * `name` - Function name used for lookup and debugging
+    /// * `parameters` - List of parameter names
+    /// * `upvalues` - List of variable names captured from outer scopes
+    /// * `parent` - Optional parent function name (for nested functions)
+    /// * `register_count` - Number of registers used by this function
+    /// * `instructions` - List of instructions that make up the function body
+    /// * `labels` - Mapping from label names to instruction indices
     pub fn new(name: String, parameters: Vec<String>, upvalues: Vec<String>, parent: Option<String>, 
                register_count: usize, instructions: Vec<Instruction>, labels: HashMap<String, usize>) -> Self {
         VMFunction {
@@ -41,6 +89,10 @@ impl VMFunction {
         }
     }
 
+    /// Cache the function's instructions for faster execution
+    ///
+    /// This creates a copy of the instructions that can be used during execution
+    /// without modifying the original instructions.
     pub fn cache_instructions(&mut self) {
         if self.cached_instructions.is_none() {
             let cached = self.instructions.clone();
@@ -48,6 +100,16 @@ impl VMFunction {
         }
     }
 
+    /// Resolve symbolic instructions to optimized numeric form
+    ///
+    /// This process:
+    /// 1. Collects all constant values into a separate array
+    /// 2. Resolves label references to instruction indices
+    /// 3. Converts string-based function calls to index-based calls
+    /// 4. Creates an optimized instruction set for faster execution
+    ///
+    /// The resolved instructions use numeric indices instead of strings,
+    /// allowing for faster execution without string lookups.
     pub fn resolve_instructions(&mut self) {
         if self.resolved_instructions.is_some() {
             return; // Already resolved
@@ -176,17 +238,39 @@ impl Hash for VMFunction {
 }
 
 /// Foreign (native) function type
+///
+/// This type represents a Rust function that can be called from the VM.
+/// It takes a context containing arguments and VM state, and returns
+/// either a value or an error string.
 pub type ForeignFunctionPtr = Arc<dyn Fn(ForeignFunctionContext) -> Result<Value, String> + Send + Sync>;
 
 /// Context passed to foreign functions
+///
+/// This structure provides foreign functions with:
+/// 1. Access to their arguments
+/// 2. Access to the VM state for interacting with the VM
+///
+/// Foreign functions can use this context to read arguments, manipulate
+/// VM state, and interact with objects and arrays in the VM.
 pub struct ForeignFunctionContext<'a> {
+    /// Arguments passed to the function
     pub args: &'a [Value],
+    /// Reference to the VM state for interaction
     pub vm_state: &'a mut VMState,
 }
 
 /// Foreign function wrapper
+///
+/// This structure wraps a Rust function to make it callable from the VM.
+/// It associates a name with the function for lookup in the VM's function registry.
+///
+/// Foreign functions are a key part of the VM's FFI system, allowing the VM
+/// to call into Rust code for functionality that would be difficult or inefficient
+/// to implement in the VM's instruction set.
 pub struct ForeignFunction {
+    /// Name of the function (used for lookup)
     pub name: String,
+    /// The actual Rust function implementation
     pub func: ForeignFunctionPtr,
 }
 
@@ -214,8 +298,17 @@ impl Clone for ForeignFunction {
 }
 
 /// Function definition - can be either VM or foreign
+///
+/// This enum represents the two types of functions supported by the VM:
+/// 1. VM functions defined in the VM's instruction set
+/// 2. Foreign functions implemented in Rust
+///
+/// The VM treats both types uniformly when calling them, but their
+/// implementations and execution models differ significantly.
 #[derive(Clone, Hash)]
 pub enum Function {
+    /// A function defined in the VM's instruction set
     VM(VMFunction),
+    /// A function implemented in Rust and exposed to the VM
     Foreign(ForeignFunction),
 }

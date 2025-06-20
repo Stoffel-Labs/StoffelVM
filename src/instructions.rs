@@ -1,5 +1,20 @@
+//! # Instruction Set for StoffelVM
+//!
+//! This module defines the instruction set for the StoffelVM, a register-based virtual machine.
+//! The VM uses a dual representation of instructions:
+//!
+//! 1. `Instruction` - Human-readable symbolic representation used during function definition
+//! 2. `ResolvedInstruction` - Optimized representation with numeric indices for faster execution
+//!
+//! The instruction set is designed to be simple yet powerful, supporting memory operations,
+//! arithmetic, bitwise operations, control flow, and function calls.
+
 use crate::core_types::Value;
 
+/// Raw opcodes for VM instructions
+///
+/// These are the low-level numeric representations of instructions used by the VM.
+/// Each opcode corresponds to a specific operation in the VM's instruction set.
 #[repr(u8)]
 pub enum ReducedOpcode {
     // LD r1 [sp+0]
@@ -53,15 +68,28 @@ pub enum ReducedOpcode {
 }
 
 /// Memory address or register operand
+///
+/// Represents the different types of operands that can be used in VM instructions.
+/// This provides flexibility in addressing modes for the VM.
 #[derive(Debug, Clone)]
 pub enum Operand {
-    Register(usize),                   // A register (r0, r1, etc.)
-    StackAddr(i32),                    // Stack pointer offset [sp+n]
-    Immediate(Value),                  // An immediate value (constant)
-    Label(String),                     // A jump label
+    /// A register (r0, r1, etc.) - used for storing and manipulating values
+    Register(usize),
+    /// Stack pointer offset [sp+n] - used for accessing function arguments
+    StackAddr(i32),
+    /// An immediate value (constant) - used for embedding values directly in instructions
+    Immediate(Value),
+    /// A jump label - used for control flow instructions
+    Label(String),
 }
 
-/// Instruction set matching ReducedOpcode
+/// Symbolic instruction set for the VM
+///
+/// This is the human-readable representation of instructions used during function definition.
+/// Each variant corresponds to a specific operation in the VM and includes the necessary
+/// operands for that operation.
+///
+/// Instructions are later resolved to `ResolvedInstruction` for more efficient execution.
 #[derive(Debug, Clone, Hash)]
 pub enum Instruction {
     // Load value from stack to register
@@ -97,8 +125,14 @@ pub enum Instruction {
     CMP(usize, usize),                   // CMP r1, r2
 }
 
-// Resolved instruction with numeric indices instead of strings
-// This allows for faster execution without string lookups
+/// Resolved instruction with numeric indices instead of strings
+///
+/// This is an optimized representation of instructions used during execution.
+/// String identifiers (like function names and labels) are replaced with numeric indices,
+/// allowing for faster execution without string lookups.
+///
+/// This representation is generated from the symbolic `Instruction` enum during function
+/// registration and is used by the VM's execution engine.
 #[derive(Debug, Clone, Copy)]
 pub enum ResolvedInstruction {
     // Load value from stack to register

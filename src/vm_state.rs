@@ -1,3 +1,18 @@
+//! # VM State Management for StoffelVM
+//!
+//! This module defines the runtime state of the StoffelVM and provides the core
+//! execution engine. It manages:
+//!
+//! - Function registry and lookup
+//! - Activation record stack for function calls
+//! - Object and array storage
+//! - Foreign object management
+//! - Instruction execution
+//! - Hook system for debugging and instrumentation
+//!
+//! The VM state is the central component that orchestrates all aspects of
+//! program execution, from function calls to object manipulation.
+
 use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
@@ -7,14 +22,30 @@ use crate::functions::{ForeignFunctionContext, Function};
 use crate::instructions::{Instruction, ResolvedInstruction};
 use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
 
+/// Runtime state of the virtual machine
+///
+/// This structure maintains the complete state of the VM during execution,
+/// including the function registry, activation record stack, object storage,
+/// and hook system for debugging.
+///
+/// The VM state is the central component that orchestrates all aspects of
+/// program execution, from function calls to object manipulation.
 pub struct VMState {
+    /// Registry of all functions (both VM and foreign)
     pub functions: FxHashMap<String, Function>,
+    /// Stack of activation records for function calls
     pub activation_records: SmallVec<[ActivationRecord; 8]>,
+    /// Current instruction being executed
     pub current_instruction: usize,
+    /// Cache for instructions during execution
     pub instruction_cache: SmallVec<[Instruction; 32]>,
+    /// Pool for efficient activation record reuse
     pub activation_pool: ActivationRecordPool,
+    /// Storage for objects and arrays
     pub object_store: ObjectStore,
+    /// Storage for foreign (Rust) objects
     pub foreign_objects: ForeignObjectStorage,
+    /// Hook manager for debugging and instrumentation
     pub hook_manager: HookManager,
 }
 
@@ -25,6 +56,15 @@ impl Default for VMState {
 }
 
 impl VMState {
+    /// Create a new VM state with default values
+    ///
+    /// This initializes all components of the VM state:
+    /// - Empty function registry
+    /// - Empty activation record stack
+    /// - Activation record pool with capacity for 1024 records
+    /// - Empty object and array storage
+    /// - Empty foreign object storage
+    /// - Default hook manager
     pub fn new() -> Self {
         VMState {
             functions: FxHashMap::default(),
@@ -38,22 +78,51 @@ impl VMState {
         }
     }
 
-    // Helper to safely get activation records length
+    /// Get the number of activation records on the stack
+    ///
+    /// This is a helper method to safely get the length of the activation record stack.
+    /// It's used to determine the current call depth and for stack traversal.
     pub fn activation_records_len(&self) -> usize {
         self.activation_records.len()
     }
 
+    /// Get a mutable reference to the current (top) activation record
+    ///
+    /// This method returns a reference to the activation record at the top of the stack,
+    /// which represents the currently executing function.
+    ///
+    /// # Panics
+    /// Panics if the activation record stack is empty.
     pub fn current_activation_record(&mut self) -> &mut ActivationRecord {
         self.activation_records.last_mut().unwrap()
     }
 
+    /// Find an upvalue (captured variable) by name in the activation record stack
+    ///
+    /// This method searches for a variable with the given name in the current
+    /// lexical scope, which includes:
+    /// 1. Local variables in the current activation record
+    /// 2. Upvalues (captured variables) in the current activation record
+    /// 3. Local variables and upvalues in parent activation records
+    ///
+    /// The search proceeds from the top of the stack (most recent call) to the
+    /// bottom (oldest call), implementing lexical scoping rules.
+    ///
+    /// # Arguments
+    /// * `name` - The name of the variable to find
+    ///
+    /// # Returns
+    /// * `Some(Value)` - The value of the variable if found
+    /// * `None` - If no variable with the given name is found
     pub fn find_upvalue(&self, name: &str) -> Option<Value> {
         for i in (0..self.activation_records_len()).rev() {
             let record = &self.activation_records[i];
+            // First check local variables in this activation record
             if let Some(value) = record.locals.get(name) {
                 return Some(value.clone());
             }
 
+            // Then check upvalues (captured variables) in this activation record
             for upvalue in &record.upvalues {
                 if upvalue.name == name {
                     return Some(upvalue.value.clone());
@@ -63,17 +132,53 @@ impl VMState {
         None
     }
 
+    /// Trigger a register read hook event
+    ///
+    /// This method is called when a register is read during instruction execution.
+    /// It creates a RegisterRead event and passes it to the hook manager for processing.
+    ///
+    /// # Arguments
+    /// * `reg` - The register index being read
+    /// * `value` - The value being read from the register
+    ///
+    /// # Returns
+    /// * `Ok(())` - If all hooks executed successfully
+    /// * `Err(String)` - If any hook returned an error
     pub fn trigger_register_read(&self, reg: usize, value: &Value) -> Result<(), String> {
         let event = HookEvent::RegisterRead(reg, value.clone());
         self.hook_manager.trigger(&event, self)
     }
 
+    /// Trigger a register write hook event
+    ///
+    /// This method is called when a register is written during instruction execution.
+    /// It creates a RegisterWrite event and passes it to the hook manager for processing.
+    ///
+    /// # Arguments
+    /// * `reg` - The register index being written
+    /// * `old_value` - The previous value in the register
+    /// * `new_value` - The new value being written to the register
+    ///
+    /// # Returns
+    /// * `Ok(())` - If all hooks executed successfully
+    /// * `Err(String)` - If any hook returned an error
     pub fn trigger_register_write(&self, reg: usize, old_value: &Value, new_value: &Value) -> Result<(), String> {
         let event = HookEvent::RegisterWrite(reg, old_value.clone(), new_value.clone());
         self.hook_manager.trigger(&event, self)
     }
 
-    // Helper method to trigger hooks without requiring a mutable borrow of self.activation_records
+    /// Trigger a hook event with a snapshot of the current VM state
+    ///
+    /// This helper method creates a snapshot of the current VM state and passes it
+    /// to the hook manager along with the event. This allows hooks to inspect the
+    /// VM state without requiring a mutable borrow of the activation records.
+    ///
+    /// # Arguments
+    /// * `event` - The hook event to trigger
+    ///
+    /// # Returns
+    /// * `Ok(())` - If all hooks executed successfully
+    /// * `Err(String)` - If any hook returned an error
     pub fn trigger_hook_with_snapshot(&self, event: &HookEvent) -> Result<(), String> {
         let context = HookContext::new(
             &self.activation_records,
@@ -83,7 +188,24 @@ impl VMState {
         self.hook_manager.trigger_with_context(event, &context)
     }
 
+    /// Create a closure from a function and captured variables
+    ///
+    /// A closure combines a function with variables captured from its lexical environment.
+    /// This method:
+    /// 1. Finds the values of the specified upvalue names in the current scope
+    /// 2. Creates a new closure with those upvalues
+    /// 3. Triggers a ClosureCreated hook event
+    /// 4. Returns the closure as a Value
+    ///
+    /// # Arguments
+    /// * `function_name` - The name of the function to wrap in a closure
+    /// * `upvalue_names` - The names of variables to capture from the current scope
+    ///
+    /// # Returns
+    /// * `Ok(Value::Closure)` - The created closure
+    /// * `Err(String)` - If an upvalue couldn't be found or a hook returned an error
     pub fn create_closure(&mut self, function_name: &str, upvalue_names: &[String]) -> Result<Value, String> {
+        // Find and collect all upvalues from the current scope
         let mut upvalues = Vec::new();
         for name in upvalue_names {
             let value = self.find_upvalue(name)
@@ -95,14 +217,17 @@ impl VMState {
             });
         }
 
+        // Create the closure with the function and captured upvalues
         let closure = Closure {
             function_id: function_name.to_string(),
             upvalues: upvalues.clone(),
         };
 
+        // Trigger a hook event for debugging/instrumentation
         let event = HookEvent::ClosureCreated(function_name.to_string(), upvalues);
         self.hook_manager.trigger(&event, self)?;
 
+        // Return the closure wrapped in a Value
         Ok(Value::Closure(Arc::new(closure)))
     }
 
