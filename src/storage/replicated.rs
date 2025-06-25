@@ -1,7 +1,7 @@
 //! Interface for storage that is replicated across multiple peers.
 
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
 /// Trait defining operations for replicated data storage.
 /// Implementation requires a consensus mechanism (e.g., Raft, Paxos) or
@@ -9,17 +9,30 @@ use std::future::Future;
 pub trait ReplicatedStorage: Send + Sync {
     /// Proposes storing data associated with a key across replicas.
     /// This operation needs to achieve consensus before confirming success.
-    fn store<'a>(&'a mut self, key: &'a [u8], value: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn store<'a>(
+        &'a mut self,
+        key: &'a [u8],
+        value: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
     /// Retrieves data associated with a key from the replicated state.
     /// May require reading from a quorum or the leader depending on consistency model.
-    fn retrieve<'a>(&'a self, key: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>>;
+    fn retrieve<'a>(
+        &'a self,
+        key: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>>;
 
     /// Proposes deleting data associated with a key across replicas.
-    fn delete<'a>(&'a mut self, key: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>>;
+    fn delete<'a>(
+        &'a mut self,
+        key: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>>;
 
     /// Checks if a key exists in the replicated state.
-    fn exists<'a>(&'a self, key: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>>;
+    fn exists<'a>(
+        &'a self,
+        key: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>>;
 }
 
 // Placeholder implementation - actual implementation is complex.
@@ -35,7 +48,11 @@ pub struct BasicReplicatedStorage {
 
 // Manually implement the trait to match the required signature with lifetimes.
 impl ReplicatedStorage for BasicReplicatedStorage {
-    fn store<'a>(&'a mut self, key: &'a [u8], value: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    fn store<'a>(
+        &'a mut self,
+        key: &'a [u8],
+        value: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         // Clone data needed for the async block before the Box::pin
         let data_clone = Arc::clone(&self.data);
         let key_vec = key.to_vec();
@@ -50,7 +67,10 @@ impl ReplicatedStorage for BasicReplicatedStorage {
         })
     }
 
-    fn retrieve<'a>(&'a self, key: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>> {
+    fn retrieve<'a>(
+        &'a self,
+        key: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>> {
         let data_clone = Arc::clone(&self.data);
         let key_vec = key.to_vec();
 
@@ -62,7 +82,10 @@ impl ReplicatedStorage for BasicReplicatedStorage {
         })
     }
 
-    fn delete<'a>(&'a mut self, key: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>> {
+    fn delete<'a>(
+        &'a mut self,
+        key: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>> {
         let data_clone = Arc::clone(&self.data);
         let key_vec = key.to_vec();
         Box::pin(async move {
@@ -73,7 +96,10 @@ impl ReplicatedStorage for BasicReplicatedStorage {
         })
     }
 
-     fn exists<'a>(&'a self, key: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>> {
+    fn exists<'a>(
+        &'a self,
+        key: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>> {
         let data_clone = Arc::clone(&self.data);
         let key_vec = key.to_vec();
         Box::pin(async move {

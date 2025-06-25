@@ -1,10 +1,10 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use stoffel_vm::core_types::Value;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::functions::VMFunction;
 use stoffel_vm::instructions::Instruction;
-use stoffel_vm::core_types::Value;
 use stoffel_vm::runtime_hooks::HookEvent;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 fn main() -> Result<(), String> {
     // Initialize the VM
@@ -92,8 +92,8 @@ fn main() -> Result<(), String> {
 
     vm.register_hook(
         |event| {
-            matches!(event, HookEvent::BeforeFunctionCall(_, _)) || 
-            matches!(event, HookEvent::AfterFunctionCall(_, _))
+            matches!(event, HookEvent::BeforeFunctionCall(_, _))
+                || matches!(event, HookEvent::AfterFunctionCall(_, _))
         },
         move |event, ctx| {
             if let Ok(mut log) = call_log_clone.lock() {
@@ -107,12 +107,12 @@ fn main() -> Result<(), String> {
                             "no args".to_string()
                         };
                         log.push(format!("{}-> CALL factorial({})", indent, arg_str));
-                    },
+                    }
                     HookEvent::AfterFunctionCall(_, result) => {
                         let depth = ctx.get_call_depth();
                         let indent = "  ".repeat(depth);
                         log.push(format!("{}<- RETURN {:?}", indent, result));
-                    },
+                    }
                     _ => {}
                 }
             }

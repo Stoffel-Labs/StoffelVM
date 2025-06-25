@@ -16,15 +16,18 @@
 //!
 //! The current implementation uses the Quinn library for QUIC support.
 
-use bytes::Bytes;
-use quinn::{Connection, Endpoint, ServerConfig, ClientConfig, Incoming};
+use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::future::Future;
 use std::sync::Arc;
-use std::collections::HashMap;
+use stoffelmpc_network::{Message, Network, NetworkError, Node, PartyId};
 use tokio::sync::Mutex;
+use ark_ff::Field;
+use uuid::Uuid;
 
 /// Represents a connection to a peer
 ///
@@ -46,7 +49,10 @@ pub trait PeerConnection: Send + Sync {
     /// # Returns
     /// * `Ok(())` - If the data was sent successfully
     /// * `Err(String)` - If there was an error sending the data
-    fn send<'a>(&'a mut self, data: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn send<'a>(
+        &'a mut self,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
     /// Receives data from the peer on the default stream
     ///
@@ -56,7 +62,9 @@ pub trait PeerConnection: Send + Sync {
     /// # Returns
     /// * `Ok(Vec<u8>)` - The received data
     /// * `Err(String)` - If there was an error receiving data
-    fn receive<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+    fn receive<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
 
     /// Sends data on a specific stream
     ///
@@ -70,7 +78,11 @@ pub trait PeerConnection: Send + Sync {
     /// # Returns
     /// * `Ok(())` - If the data was sent successfully
     /// * `Err(String)` - If there was an error sending the data
-    fn send_on_stream<'a>(&'a mut self, stream_id: u64, data: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn send_on_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
     /// Receives data from a specific stream
     ///
@@ -83,7 +95,10 @@ pub trait PeerConnection: Send + Sync {
     /// # Returns
     /// * `Ok(Vec<u8>)` - The received data
     /// * `Err(String)` - If there was an error receiving data
-    fn receive_from_stream<'a>(&'a mut self, stream_id: u64) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+    fn receive_from_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
 
     /// Returns the address of the remote peer
     ///
@@ -129,7 +144,10 @@ pub trait NetworkManager: Send + Sync {
     /// # Returns
     /// * `Ok(Box<dyn PeerConnection>)` - A connection to the peer
     /// * `Err(String)` - If the connection could not be established
-    fn connect<'a>(&'a mut self, address: SocketAddr) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
+    fn connect<'a>(
+        &'a mut self,
+        address: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
 
     /// Accepts an incoming connection
     ///
@@ -142,7 +160,9 @@ pub trait NetworkManager: Send + Sync {
     /// # Returns
     /// * `Ok(Box<dyn PeerConnection>)` - A connection to the peer
     /// * `Err(String)` - If no connection could be accepted
-    fn accept<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
+    fn accept<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
 
     /// Listens for incoming connections
     ///
@@ -156,7 +176,10 @@ pub trait NetworkManager: Send + Sync {
     /// # Returns
     /// * `Ok(())` - If the listening endpoint was set up successfully
     /// * `Err(String)` - If the listening endpoint could not be set up
-    fn listen<'a>(&'a mut self, bind_address: SocketAddr) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn listen<'a>(
+        &'a mut self,
+        bind_address: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 /// QUIC-based implementation of PeerConnection
@@ -215,43 +238,61 @@ impl QuicPeerConnection {
     /// # Returns
     /// * `Ok((SendStream, RecvStream))` - The send and receive halves of the stream
     /// * `Err(String)` - If the stream could not be created
-    async fn get_or_create_stream(&mut self, stream_id: u64) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+    async fn get_or_create_stream(
+        &mut self,
+        stream_id: u64,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
         let mut streams = self.streams.lock().await;
         if let Some((send, recv)) = streams.remove(&stream_id) {
             // Reuse existing stream
             Ok((send, recv))
-        } else if self.is_server {
-            // Server should accept incoming streams
-            let (send, recv) = self.connection.accept_bi().await
-                .map_err(|e| format!("Failed to accept bidirectional stream: {}", e))?;
-            Ok((send, recv))
         } else {
-            // Client should create new streams
-            let (send, recv) = self.connection.open_bi().await
-                .map_err(|e| format!("Failed to open bidirectional stream: {}", e))?;
-            Ok((send, recv))
+            drop(streams); // Release the lock before async operations
+            if self.is_server {
+                // Server should accept incoming streams
+                let (send, recv) = self
+                    .connection
+                    .accept_bi()
+                    .await
+                    .map_err(|e| format!("Failed to accept bidirectional stream: {}", e))?;
+                Ok((send, recv))
+            } else {
+                // Client should create new streams
+                let (send, recv) = self
+                    .connection
+                    .open_bi()
+                    .await
+                    .map_err(|e| format!("Failed to open bidirectional stream: {}", e))?;
+                Ok((send, recv))
+            }
         }
     }
 }
 
 impl PeerConnection for QuicPeerConnection {
-    fn send<'a>(&'a mut self, data: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            self.send_on_stream(0, data).await
-        })
+    fn send<'a>(
+        &'a mut self,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { self.send_on_stream(0, data).await })
     }
 
-    fn receive<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
-        Box::pin(async move {
-            self.receive_from_stream(0).await
-        })
+    fn receive<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+        Box::pin(async move { self.receive_from_stream(0).await })
     }
 
-    fn send_on_stream<'a>(&'a mut self, stream_id: u64, data: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    fn send_on_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             let (mut send, recv) = self.get_or_create_stream(stream_id).await?;
 
-            send.write_all(data).await
+            send.write_all(data)
+                .await
                 .map_err(|e| format!("Failed to send data: {}", e))?;
 
             // Store the stream back for reuse
@@ -262,47 +303,28 @@ impl PeerConnection for QuicPeerConnection {
         })
     }
 
-    fn receive_from_stream<'a>(&'a mut self, stream_id: u64) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+    fn receive_from_stream<'a>(
+        &'a mut self,
+        stream_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
         Box::pin(async move {
-            // Try multiple times to get or create the stream
-            let mut attempts = 0;
-            let max_attempts = 3;
-            let mut last_error = String::new();
+            let (send, mut recv) = self.get_or_create_stream(stream_id).await?;
 
-            while attempts < max_attempts {
-                match self.get_or_create_stream(stream_id).await {
-                    Ok((send, mut recv)) => {
-                        // Read a chunk of data (up to 65536 bytes)
-                        let mut buf = vec![0u8; 65536];
-                        match recv.read(&mut buf).await {
-                            Ok(Some(n)) => {
-                                buf.truncate(n);
+            // Read a chunk of data (up to 65536 bytes)
+            let mut buf = vec![0u8; 65536];
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => {
+                    buf.truncate(n);
 
-                                // Store the stream back for reuse
-                                let mut streams = self.streams.lock().await;
-                                streams.insert(stream_id, (send, recv));
+                    // Store the stream back for reuse
+                    let mut streams = self.streams.lock().await;
+                    streams.insert(stream_id, (send, recv));
 
-                                return Ok(buf);
-                            }
-                            Ok(None) => {
-                                last_error = "Connection closed by peer".to_string();
-                            }
-                            Err(e) => {
-                                last_error = format!("Failed to receive data: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        last_error = e;
-                    }
+                    Ok(buf)
                 }
-
-                // Wait a bit before retrying
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                attempts += 1;
+                Ok(None) => Err("Connection closed by peer".to_string()),
+                Err(e) => Err(format!("Failed to receive data: {}", e)),
             }
-
-            Err(last_error)
         })
     }
 
@@ -315,6 +337,137 @@ impl PeerConnection for QuicPeerConnection {
             self.connection.close(0u32.into(), b"Connection closed");
             Ok(())
         })
+    }
+}
+
+/// A node in the QUIC network
+///
+/// This struct represents a participant in the secure multiparty computation
+/// network. It implements the Node trait from stoffelmpc-network.
+#[derive(Debug, Clone)]
+pub struct QuicNode {
+    /// The UUID of this node
+    uuid: Uuid,
+    /// The network address of this node
+    address: SocketAddr,
+}
+
+impl QuicNode {
+    /// Creates a new node with a random UUID
+    ///
+    /// # Arguments
+    /// * `address` - The network address of the node
+    pub fn new_with_random_id(address: SocketAddr) -> Self {
+        Self {
+            uuid: Uuid::new_v4(),
+            address,
+        }
+    }
+
+    /// Creates a new node with a specific UUID
+    ///
+    /// # Arguments
+    /// * `uuid` - The UUID of the node
+    /// * `address` - The network address of the node
+    pub fn new(uuid: Uuid, address: SocketAddr) -> Self {
+        Self { uuid, address }
+    }
+
+    /// Creates a new node with a specific ID
+    ///
+    /// # Arguments
+    /// * `id` - The ID of the node (will be converted to UUID)
+    /// * `address` - The network address of the node
+    pub fn from_party_id(id: PartyId, address: SocketAddr) -> Self {
+        // Convert PartyId to u128 and then to UUID
+        let uuid = Uuid::from_u128(id as u128);
+        Self { uuid, address }
+    }
+
+    /// Returns the network address of this node
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Returns the UUID of this node
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
+    }
+}
+
+impl Node for QuicNode {
+    fn id(&self) -> PartyId {
+        // Convert UUID to u128 and then to PartyId
+        // This might lose precision if PartyId is smaller than u128
+        self.uuid.as_u128() as PartyId
+    }
+
+    fn scalar_id<F: Field>(&self) -> F {
+        // Convert UUID to u128 for use with Field
+        F::from(self.uuid.as_u128())
+    }
+}
+
+/// Configuration for the QUIC network
+///
+/// This struct contains configuration parameters for the QUIC network,
+/// such as timeout values, retry settings, and other network-specific options.
+#[derive(Debug, Clone)]
+pub struct QuicNetworkConfig {
+    /// Timeout for network operations in milliseconds
+    pub timeout_ms: u64,
+    /// Maximum number of retry attempts for network operations
+    pub max_retries: u32,
+    /// Whether to use secure connections (TLS)
+    pub use_tls: bool,
+}
+
+impl Default for QuicNetworkConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: 30000, // 30 seconds
+            max_retries: 3,
+            use_tls: true,
+        }
+    }
+}
+
+/// A message type for QUIC-based communication
+///
+/// This struct implements the Message trait from stoffelmpc-network,
+/// providing a standard way to serialize and deserialize messages
+/// for secure multiparty computation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuicMessage {
+    /// The ID of the sender of this message
+    sender_id: PartyId,
+    /// The actual message content
+    content: Vec<u8>,
+}
+
+impl QuicMessage {
+    /// Creates a new message
+    ///
+    /// # Arguments
+    /// * `sender_id` - The ID of the sender
+    /// * `content` - The content of the message
+    pub fn new(sender_id: PartyId, content: Vec<u8>) -> Self {
+        Self { sender_id, content }
+    }
+
+    /// Returns the content of the message
+    pub fn content(&self) -> &[u8] {
+        &self.content
+    }
+}
+
+impl Message for QuicMessage {
+    fn sender_id(&self) -> PartyId {
+        self.sender_id
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.content
     }
 }
 
@@ -335,6 +488,22 @@ pub struct QuicNetworkManager {
     server_config: Option<ServerConfig>,
     /// Configuration for the client role
     client_config: Option<ClientConfig>,
+    /// The nodes in the network
+    nodes: Vec<QuicNode>,
+    /// The ID of this node in the network
+    node_id: PartyId,
+    /// Network configuration
+    network_config: QuicNetworkConfig,
+    /// Active connections to other nodes
+    /// Using Arc<Mutex<>> for interior mutability to allow modifying connections
+    /// while keeping self immutable in Network trait methods
+    connections: Arc<Mutex<HashMap<PartyId, Box<dyn PeerConnection>>>>,
+}
+
+impl Default for QuicNetworkManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl QuicNetworkManager {
@@ -344,11 +513,80 @@ impl QuicNetworkManager {
     /// Before using the manager, you must call either `connect()` or `listen()`
     /// to set up the appropriate endpoint.
     pub fn new() -> Self {
+        // Generate a random UUID for this node
+        let node_id = Uuid::new_v4().as_u128() as PartyId;
+
         Self {
             endpoint: None,
             server_config: None,
             client_config: None,
+            nodes: Vec::new(),
+            node_id,
+            network_config: QuicNetworkConfig::default(),
+            connections: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Creates a new QUIC network manager with the specified node ID
+    ///
+    /// # Arguments
+    /// * `node_id` - The ID of this node in the network
+    pub fn with_node_id(node_id: PartyId) -> Self {
+        let mut manager = Self::new();
+        manager.node_id = node_id;
+        manager
+    }
+
+    /// Creates a new QUIC network manager with a random UUID-based node ID
+    pub fn with_random_id() -> Self {
+        Self::new() // new() already generates a random UUID-based ID
+    }
+
+    /// Creates a new QUIC network manager with the specified configuration
+    ///
+    /// # Arguments
+    /// * `config` - The network configuration
+    pub fn with_config(config: QuicNetworkConfig) -> Self {
+        let mut manager = Self::new();
+        manager.network_config = config;
+        manager
+    }
+
+    /// Adds a node to the network
+    ///
+    /// # Arguments
+    /// * `node` - The node to add
+    pub fn add_node(&mut self, node: QuicNode) {
+        self.nodes.push(node);
+    }
+
+    /// Adds a node with a random UUID to the network
+    ///
+    /// # Arguments
+    /// * `address` - The network address of the node
+    pub fn add_node_with_random_id(&mut self, address: SocketAddr) {
+        let node = QuicNode::new_with_random_id(address);
+        self.nodes.push(node);
+    }
+
+    /// Adds a node with a specific UUID to the network
+    ///
+    /// # Arguments
+    /// * `uuid` - The UUID of the node
+    /// * `address` - The network address of the node
+    pub fn add_node_with_uuid(&mut self, uuid: Uuid, address: SocketAddr) {
+        let node = QuicNode::new(uuid, address);
+        self.nodes.push(node);
+    }
+
+    /// Adds a node with a specific party ID to the network
+    ///
+    /// # Arguments
+    /// * `id` - The ID of the node
+    /// * `address` - The network address of the node
+    pub fn add_node_with_party_id(&mut self, id: PartyId, address: SocketAddr) {
+        let node = QuicNode::from_party_id(id, address);
+        self.nodes.push(node);
     }
 
     /// Creates an insecure client configuration for QUIC
@@ -378,7 +616,7 @@ impl QuicNetworkManager {
         // Create a QUIC client configuration with the crypto configuration
         let mut config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-                .map_err(|e| format!("Failed to create QUIC client config: {}", e))?
+                .map_err(|e| format!("Failed to create QUIC client config: {}", e))?,
         ));
 
         // Set transport config
@@ -413,7 +651,8 @@ impl QuicNetworkManager {
 
         // Convert the certificate and key to DER format
         let cert_der = CertificateDer::from(cert.serialize_der().unwrap());
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der()));
+        let key_der =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der()));
 
         // Create a server crypto configuration with the certificate
         let mut server_crypto = rustls::ServerConfig::builder()
@@ -427,7 +666,7 @@ impl QuicNetworkManager {
         // Create a QUIC server configuration with the crypto configuration
         let mut server_config = ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
-                .map_err(|e| format!("Failed to create QUIC server config: {}", e))?
+                .map_err(|e| format!("Failed to create QUIC server config: {}", e))?,
         ));
 
         // Configure transport parameters
@@ -439,7 +678,10 @@ impl QuicNetworkManager {
 }
 
 impl NetworkManager for QuicNetworkManager {
-    fn connect<'a>(&'a mut self, address: SocketAddr) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
+    fn connect<'a>(
+        &'a mut self,
+        address: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
         Box::pin(async move {
             if self.endpoint.is_none() {
                 // Create client endpoint
@@ -457,26 +699,91 @@ impl NetworkManager for QuicNetworkManager {
                 .await
                 .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-            Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
+            // Create the peer connection
+            let peer_connection = Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>;
+
+            // Find the node ID for this address or generate a new one
+            let node_id = self.nodes.iter()
+                .find(|node| node.address() == address)
+                .map(|node| node.id())
+                .unwrap_or_else(|| {
+                    // If we don't have a node for this address, create one
+                    let node = QuicNode::new_with_random_id(address);
+                    let id = node.id();
+                    self.nodes.push(node);
+                    id
+                });
+
+            // Store the connection in the connections hashmap
+            // We need to create a new connection since we can't clone the trait object
+            let mut connections = self.connections.lock().await;
+
+            // For now, we'll just store the connection and return it
+            // In a real implementation, we would need to create a new connection
+            // with the same underlying QUIC connection
+            connections.insert(node_id, peer_connection);
+
+            // Create a new connection to return
+            // In a real implementation, this would share the same underlying QUIC connection
+            let new_connection = endpoint
+                .connect(address, "localhost")
+                .map_err(|e| format!("Failed to initiate connection: {}", e))?
+                .await
+                .map_err(|e| format!("Failed to establish connection: {}", e))?;
+
+            Ok(Box::new(QuicPeerConnection::new(new_connection, false)) as Box<dyn PeerConnection>)
         })
     }
 
-    fn accept<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
+    fn accept<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
         Box::pin(async move {
-            let endpoint = self.endpoint.as_ref()
+            let endpoint = self
+                .endpoint
+                .as_ref()
                 .ok_or_else(|| "Endpoint not initialized. Call listen() first.".to_string())?;
 
-            let incoming = endpoint.accept().await
+            let incoming = endpoint
+                .accept()
+                .await
                 .ok_or_else(|| "No incoming connections".to_string())?;
 
-            let connection = incoming.await
+            let connection = incoming
+                .await
                 .map_err(|e| format!("Failed to accept connection: {}", e))?;
 
+            // Create the peer connection
+            let peer_connection = Box::new(QuicPeerConnection::new(connection.clone(), true)) as Box<dyn PeerConnection>;
+
+            // Get the remote address of the connection
+            let remote_addr = connection.remote_address();
+
+            // Find the node ID for this address or generate a new one
+            let node_id = self.nodes.iter()
+                .find(|node| node.address() == remote_addr)
+                .map(|node| node.id())
+                .unwrap_or_else(|| {
+                    // If we don't have a node for this address, create one
+                    let node = QuicNode::new_with_random_id(remote_addr);
+                    let id = node.id();
+                    self.nodes.push(node);
+                    id
+                });
+
+            // Store the connection in the connections hashmap
+            let mut connections = self.connections.lock().await;
+            connections.insert(node_id, peer_connection);
+
+            // Create a new connection to return
             Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
         })
     }
 
-    fn listen<'a>(&'a mut self, bind_address: SocketAddr) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    fn listen<'a>(
+        &'a mut self,
+        bind_address: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             let server_config = Self::create_self_signed_server_config()?;
             let endpoint = Endpoint::server(server_config, bind_address)
@@ -485,6 +792,99 @@ impl NetworkManager for QuicNetworkManager {
             self.endpoint = Some(endpoint);
             Ok(())
         })
+    }
+}
+
+/// Implementation of the Network trait for QuicNetworkManager
+///
+/// This implementation uses the QUIC protocol for communication between nodes.
+impl Network for QuicNetworkManager {
+    type NodeType = QuicNode;
+    type NetworkConfig = QuicNetworkConfig;
+
+    async fn send(&self, recipient: PartyId, message: &[u8]) -> Result<usize, NetworkError> {
+        // Acquire the lock on the connections hashmap
+        let mut connections = self.connections.lock().await;
+
+        // Check if the connection exists
+        if !connections.contains_key(&recipient) {
+            return Err(NetworkError::PartyNotFound(recipient));
+        }
+
+        // Get a mutable reference to the connection
+        let connection = connections.get_mut(&recipient).unwrap();
+
+        // Send the message
+        match connection.send(message).await {
+            Ok(_) => {
+                println!("Successfully sent message to recipient {}", recipient);
+                Ok(message.len())
+            },
+            Err(e) => {
+                println!("Failed to send message to recipient {}: {}", recipient, e);
+                Err(NetworkError::SendError)
+            }
+        }
+    }
+
+    async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
+        let mut total_bytes = 0;
+
+        // Acquire the lock on the connections hashmap
+        let mut connections = self.connections.lock().await;
+
+        // Send the message to all nodes except self
+        for node in &self.nodes {
+            if node.id() != self.node_id {
+                // Check if we have a connection to this node
+                if connections.contains_key(&node.id()) {
+                    // Get a mutable reference to the connection
+                    let connection = connections.get_mut(&node.id()).unwrap();
+
+                    // Send the message
+                    match connection.send(message).await {
+                        Ok(_) => {
+                            println!("Successfully broadcasted message to node {}", node.id());
+                            total_bytes += message.len();
+                        },
+                        Err(e) => {
+                            println!("Failed to broadcast message to node {}: {}", node.id(), e);
+                            // Continue with other nodes even if one fails
+                        }
+                    }
+                } else {
+                    // Log a warning that we couldn't send the message to this node
+                    println!("Warning: No connection to node {}, skipping broadcast", node.id());
+                }
+            }
+        }
+
+        if total_bytes > 0 {
+            Ok(total_bytes)
+        } else {
+            // If we didn't send any messages, return an error
+            Err(NetworkError::SendError)
+        }
+    }
+
+    fn parties(&self) -> Vec<&Self::NodeType> {
+        self.nodes.iter().collect()
+    }
+
+    fn parties_mut(&mut self) -> Vec<&mut Self::NodeType> {
+        self.nodes.iter_mut().collect()
+    }
+
+    fn config(&self) -> &Self::NetworkConfig {
+        &self.network_config
+    }
+
+    fn node(&self, id: PartyId) -> Option<&Self::NodeType> {
+        self.nodes.iter().find(|node| node.id() == id)
+    }
+
+    fn node_mut(&mut self, id: PartyId) -> Option<&mut Self::NodeType> {
+        self.nodes.iter_mut().find(|node| node.id() == id)
     }
 }
 

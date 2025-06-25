@@ -12,12 +12,12 @@
 //! The module also provides storage systems for objects, arrays, and foreign objects,
 //! as well as the upvalue system for closures.
 
-use std::any::Any;
-use std::fmt;
-use std::sync::Arc;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
 
 /// Represents an array in the VM
 ///
@@ -58,7 +58,7 @@ impl Array {
         match key {
             Value::Int(idx) if *idx >= 1 && (*idx as usize) <= self.length_hint => {
                 Some(&self.elements[*idx as usize - 1])
-            },
+            }
             _ => self.extra_fields.get(key),
         }
     }
@@ -68,7 +68,8 @@ impl Array {
             Value::Int(idx) if idx >= 1 => {
                 self.length_hint = self.length_hint.max(idx as usize);
                 let idx_usize = idx as usize - 1;
-                if idx_usize < 32 { // Small array optimization
+                if idx_usize < 32 {
+                    // Small array optimization
                     if idx_usize >= self.elements.len() {
                         self.elements.resize(idx_usize + 1, Value::Unit);
                     }
@@ -76,7 +77,7 @@ impl Array {
                 } else {
                     self.extra_fields.insert(Value::Int(idx), value);
                 }
-            },
+            }
             _ => {
                 self.extra_fields.insert(key, value);
             }
@@ -123,8 +124,7 @@ pub struct Closure {
 
 impl PartialEq for Closure {
     fn eq(&self, other: &Self) -> bool {
-        self.function_id == other.function_id && 
-        self.upvalues == other.upvalues
+        self.function_id == other.function_id && self.upvalues == other.upvalues
     }
 }
 
@@ -175,7 +175,7 @@ impl fmt::Debug for Value {
             Value::Float(fp) => {
                 let float_val = *fp as f64 / 1000.0;
                 write!(f, "{}", float_val)
-            },
+            }
             Value::Bool(b) => write!(f, "{}", b),
             Value::String(s) => write!(f, "\"{}\"", s),
             Value::Object(id) => write!(f, "Object({})", id),
@@ -229,9 +229,12 @@ impl ObjectStore {
     pub fn create_object(&mut self) -> usize {
         let id = self.next_id;
         self.next_id += 1;
-        self.objects.insert(id, Object {
-            fields: FxHashMap::default(),
-        });
+        self.objects.insert(
+            id,
+            Object {
+                fields: FxHashMap::default(),
+            },
+        );
         id
     }
 
@@ -267,17 +270,20 @@ impl ObjectStore {
 
     pub fn get_field(&self, value: &Value, key: &Value) -> Option<Value> {
         match value {
-            Value::Object(id) => {
-                self.get_object(*id).and_then(|obj| obj.fields.get(key).cloned())
-            },
-            Value::Array(id) => {
-                self.get_array(*id).and_then(|arr| arr.get(key).cloned())
-            },
-            _ => None
+            Value::Object(id) => self
+                .get_object(*id)
+                .and_then(|obj| obj.fields.get(key).cloned()),
+            Value::Array(id) => self.get_array(*id).and_then(|arr| arr.get(key).cloned()),
+            _ => None,
         }
     }
 
-    pub fn set_field(&mut self, value: &Value, key: Value, field_value: Value) -> Result<(), String> {
+    pub fn set_field(
+        &mut self,
+        value: &Value,
+        key: Value,
+        field_value: Value,
+    ) -> Result<(), String> {
         match value {
             Value::Object(id) => {
                 if let Some(obj) = self.get_object_mut(*id) {
@@ -286,7 +292,7 @@ impl ObjectStore {
                 } else {
                     Err(format!("Object with ID {} not found", id))
                 }
-            },
+            }
             Value::Array(id) => {
                 if let Some(arr) = self.get_array_mut(*id) {
                     arr.set(key, field_value);
@@ -294,8 +300,8 @@ impl ObjectStore {
                 } else {
                     Err(format!("Array with ID {} not found", id))
                 }
-            },
-            _ => Err("Expected object or array".to_string())
+            }
+            _ => Err("Expected object or array".to_string()),
         }
     }
 }
@@ -319,12 +325,16 @@ pub trait AnyObject: Send + Sync {
 /// provide thread-safe shared access to the wrapped object.
 pub struct TypedObject<T: 'static + Send + Sync> {
     /// Thread-safe reference to the wrapped object
-    pub value: Arc<Mutex<T>>
+    pub value: Arc<Mutex<T>>,
 }
 
 impl<T: 'static + Send + Sync> AnyObject for TypedObject<T> {
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 /// Storage system for foreign (Rust) objects
@@ -362,7 +372,7 @@ impl ForeignObjectStorage {
 
         // Store a TypedObject wrapper that preserves the exact type
         let typed_obj = TypedObject {
-            value: Arc::new(Mutex::new(object))
+            value: Arc::new(Mutex::new(object)),
         };
         self.objects.insert(id, Box::new(typed_obj));
 

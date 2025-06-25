@@ -38,14 +38,14 @@
 //    - Compares regular execution with optimized execution
 //    - Provides a more accurate measurement of the core execution loop
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::collections::HashMap;
+use std::time::Duration;
+use stoffel_vm::core_types::Value;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::functions::VMFunction;
 use stoffel_vm::instructions::Instruction;
-use stoffel_vm::core_types::Value;
-use stoffel_vm::runtime_hooks::{HookEvent, HookContext};
-use std::collections::HashMap;
-use std::time::Duration;
+use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 
 fn bench_basic_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("Basic Operations");
@@ -71,9 +71,7 @@ fn bench_basic_operations(c: &mut Criterion) {
         vm.register_function(arithmetic);
 
         group.bench_function("arithmetic", |b| {
-            b.iter(|| {
-                black_box(vm.execute("arithmetic_test").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("arithmetic_test").unwrap()));
         });
     }
 
@@ -97,9 +95,7 @@ fn bench_basic_operations(c: &mut Criterion) {
         vm.register_function(registers);
 
         group.bench_function("registers", |b| {
-            b.iter(|| {
-                black_box(vm.execute("register_test").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("register_test").unwrap()));
         });
     }
 
@@ -119,7 +115,7 @@ fn bench_function_calls(c: &mut Criterion) {
             None,
             2,
             vec![
-                Instruction::ADD(1, 0, 0),  // Double the input
+                Instruction::ADD(1, 0, 0), // Double the input
                 Instruction::RET(1),
             ],
             HashMap::new(),
@@ -143,9 +139,7 @@ fn bench_function_calls(c: &mut Criterion) {
         vm.register_function(caller);
 
         group.bench_function("regular_call", |b| {
-            b.iter(|| {
-                black_box(vm.execute("caller").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("caller").unwrap()));
         });
     }
 
@@ -233,9 +227,7 @@ fn bench_object_operations(c: &mut Criterion) {
         vm.register_function(object_ops);
 
         group.bench_function("object_access", |b| {
-            b.iter(|| {
-                black_box(vm.execute("object_ops").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("object_ops").unwrap()));
         });
     }
 
@@ -275,9 +267,7 @@ fn bench_array_operations(c: &mut Criterion) {
         vm.register_function(array_ops);
 
         group.bench_function("array_access", |b| {
-            b.iter(|| {
-                black_box(vm.execute("array_ops").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("array_ops").unwrap()));
         });
     }
 
@@ -308,23 +298,15 @@ fn bench_hook_system(c: &mut Criterion) {
 
         // Benchmark without hooks
         group.bench_function("no_hooks", |b| {
-            b.iter(|| {
-                black_box(vm.execute("simple_prog").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("simple_prog").unwrap()));
         });
 
         // Add a simple instruction hook
-        vm.register_hook(
-            |_| true,
-            |_, _| Ok(()),
-            100,
-        );
+        vm.register_hook(|_| true, |_, _| Ok(()), 100);
 
         // Benchmark with hooks
         group.bench_function("with_hooks", |b| {
-            b.iter(|| {
-                black_box(vm.execute("simple_prog").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("simple_prog").unwrap()));
         });
     }
 
@@ -366,17 +348,15 @@ fn bench_optimized_hook_system(c: &mut Criterion) {
 
     // Benchmark without hooks
     group.bench_function("baseline_no_hooks", |b| {
-        b.iter(|| {
-            black_box(vm.execute("test_prog").unwrap())
-        });
+        b.iter(|| black_box(vm.execute("test_prog").unwrap()));
     });
 
     // Register different types of hooks to measure their overhead
 
     // 1. Simple instruction hook that does nothing
     let hook_id1 = vm.register_hook(
-        |_| true,  // Match all instructions
-        |_, _| Ok(()),  // Do nothing
+        |_| true,      // Match all instructions
+        |_, _| Ok(()), // Do nothing
         100,
     );
 
@@ -385,9 +365,7 @@ fn bench_optimized_hook_system(c: &mut Criterion) {
 
     // Benchmark with simple hook
     group.bench_function("simple_hook", |b| {
-        b.iter(|| {
-            black_box(vm.execute("test_prog").unwrap())
-        });
+        b.iter(|| black_box(vm.execute("test_prog").unwrap()));
     });
 
     // Unregister the simple hook instead of just disabling it
@@ -411,41 +389,25 @@ fn bench_optimized_hook_system(c: &mut Criterion) {
 
     // Benchmark with selective hook
     group.bench_function("selective_hook", |b| {
-        b.iter(|| {
-            black_box(vm.execute("test_prog").unwrap())
-        });
+        b.iter(|| black_box(vm.execute("test_prog").unwrap()));
     });
 
     // Unregister the selective hook instead of just disabling it
     vm.unregister_hook(hook_id2);
 
     // 3. Register multiple hooks with different priorities
-    let hook_id3 = vm.register_hook(
-        |_| true,
-        |_, _| Ok(()),
-        100,
-    );
+    let hook_id3 = vm.register_hook(|_| true, |_, _| Ok(()), 100);
 
-    let hook_id4 = vm.register_hook(
-        |_| true,
-        |_, _| Ok(()),
-        200,
-    );
+    let hook_id4 = vm.register_hook(|_| true, |_, _| Ok(()), 200);
 
-    let hook_id5 = vm.register_hook(
-        |_| true,
-        |_, _| Ok(()),
-        300,
-    );
+    let hook_id5 = vm.register_hook(|_| true, |_, _| Ok(()), 300);
 
     // Warmup with multiple hooks
     vm.execute("test_prog").unwrap();
 
     // Benchmark with multiple hooks
     group.bench_function("multiple_hooks", |b| {
-        b.iter(|| {
-            black_box(vm.execute("test_prog").unwrap())
-        });
+        b.iter(|| black_box(vm.execute("test_prog").unwrap()));
     });
 
     // Unregister all hooks instead of just disabling them
@@ -489,9 +451,7 @@ fn bench_optimized_operations(c: &mut Criterion) {
 
     // Only measure the execution
     group.bench_function("arithmetic_optimized", |b| {
-        b.iter(|| {
-            black_box(vm.execute("arithmetic_test").unwrap())
-        });
+        b.iter(|| black_box(vm.execute("arithmetic_test").unwrap()));
     });
 
     // Register register operations function
@@ -516,9 +476,7 @@ fn bench_optimized_operations(c: &mut Criterion) {
 
     // Benchmark
     group.bench_function("registers_optimized", |b| {
-        b.iter(|| {
-            black_box(vm.execute("register_test").unwrap())
-        });
+        b.iter(|| black_box(vm.execute("register_test").unwrap()));
     });
 
     group.finish();
@@ -604,42 +562,30 @@ fn bench_core_execution(c: &mut Criterion) {
 
     // Benchmark using regular execute method
     group.bench_function("arithmetic_regular", |b| {
-        b.iter(|| {
-            black_box(vm.execute("arithmetic_bench").unwrap())
-        });
+        b.iter(|| black_box(vm.execute("arithmetic_bench").unwrap()));
     });
 
     // Benchmark using execute_for_benchmark method
     group.bench_function("arithmetic_benchmark", |b| {
-        b.iter(|| {
-            black_box(vm.execute_for_benchmark("arithmetic_bench").unwrap())
-        });
+        b.iter(|| black_box(vm.execute_for_benchmark("arithmetic_bench").unwrap()));
     });
 
     // Benchmark register operations
     group.bench_function("registers_regular", |b| {
-        b.iter(|| {
-            black_box(vm.execute("registers_bench").unwrap())
-        });
+        b.iter(|| black_box(vm.execute("registers_bench").unwrap()));
     });
 
     group.bench_function("registers_benchmark", |b| {
-        b.iter(|| {
-            black_box(vm.execute_for_benchmark("registers_bench").unwrap())
-        });
+        b.iter(|| black_box(vm.execute_for_benchmark("registers_bench").unwrap()));
     });
 
     // Benchmark control flow
     group.bench_function("control_flow_regular", |b| {
-        b.iter(|| {
-            black_box(vm.execute("control_flow_bench").unwrap())
-        });
+        b.iter(|| black_box(vm.execute("control_flow_bench").unwrap()));
     });
 
     group.bench_function("control_flow_benchmark", |b| {
-        b.iter(|| {
-            black_box(vm.execute_for_benchmark("control_flow_bench").unwrap())
-        });
+        b.iter(|| black_box(vm.execute_for_benchmark("control_flow_bench").unwrap()));
     });
 
     group.finish();
@@ -670,9 +616,7 @@ fn bench_individual_instructions(c: &mut Criterion) {
         vm.execute("add_test").unwrap(); // Warmup
 
         group.bench_function("add_instruction", |b| {
-            b.iter(|| {
-                black_box(vm.execute("add_test").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("add_test").unwrap()));
         });
     }
 
@@ -698,9 +642,7 @@ fn bench_individual_instructions(c: &mut Criterion) {
         vm.execute("mul_test").unwrap(); // Warmup
 
         group.bench_function("mul_instruction", |b| {
-            b.iter(|| {
-                black_box(vm.execute("mul_test").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("mul_test").unwrap()));
         });
     }
 
@@ -725,9 +667,7 @@ fn bench_individual_instructions(c: &mut Criterion) {
         vm.execute("mov_test").unwrap(); // Warmup
 
         group.bench_function("mov_instruction", |b| {
-            b.iter(|| {
-                black_box(vm.execute("mov_test").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("mov_test").unwrap()));
         });
     }
 
@@ -761,9 +701,7 @@ fn bench_vm_components(c: &mut Criterion) {
         vm.execute("noop_test").unwrap(); // Warmup
 
         group.bench_function("instruction_dispatch", |b| {
-            b.iter(|| {
-                black_box(vm.execute("noop_test").unwrap())
-            });
+            b.iter(|| black_box(vm.execute("noop_test").unwrap()));
         });
     }
 
@@ -796,11 +734,13 @@ fn bench_parameterized(c: &mut Criterion) {
         vm.register_function(test_func);
         vm.execute(&format!("test_func_{}", size)).unwrap(); // Warmup
 
-        group.bench_with_input(BenchmarkId::new("instruction_count", size), size, |b, &size| {
-            b.iter(|| {
-                black_box(vm.execute(&format!("test_func_{}", size)).unwrap())
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("instruction_count", size),
+            size,
+            |b, &size| {
+                b.iter(|| black_box(vm.execute(&format!("test_func_{}", size)).unwrap()));
+            },
+        );
     }
 
     group.finish();
@@ -843,9 +783,7 @@ fn bench_memory_overhead(c: &mut Criterion) {
         vm.execute(&format!("array_test_{}", size)).unwrap(); // Warmup
 
         group.bench_with_input(BenchmarkId::new("array_size", size), size, |b, &size| {
-            b.iter(|| {
-                black_box(vm.execute(&format!("array_test_{}", size)).unwrap())
-            });
+            b.iter(|| black_box(vm.execute(&format!("array_test_{}", size)).unwrap()));
         });
     }
 

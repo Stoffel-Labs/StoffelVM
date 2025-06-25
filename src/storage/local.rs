@@ -30,15 +30,22 @@ pub struct RedbLocalStorage {
 impl RedbLocalStorage {
     /// Creates or opens a redb database at the specified path.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        let db = Database::create(path).map_err(|e| format!("Failed to create/open redb database: {}", e))?;
+        let db = Database::create(path)
+            .map_err(|e| format!("Failed to create/open redb database: {}", e))?;
 
         // Ensure the table exists (optional, but good practice)
-        let write_txn = db.begin_write().map_err(|e| format!("Failed to begin write transaction: {}", e))?;
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| format!("Failed to begin write transaction: {}", e))?;
         {
             // Scope for the open_table call
-           let _ = write_txn.open_table(DATA_TABLE).map_err(|e| format!("Failed to open table: {}", e))?;
+            let _ = write_txn
+                .open_table(DATA_TABLE)
+                .map_err(|e| format!("Failed to open table: {}", e))?;
         } // table handle is dropped here
-        write_txn.commit().map_err(|e| format!("Failed to commit initial transaction: {}", e))?;
+        write_txn
+            .commit()
+            .map_err(|e| format!("Failed to commit initial transaction: {}", e))?;
 
         Ok(RedbLocalStorage { db: Arc::new(db) })
     }
@@ -48,17 +55,24 @@ impl RedbLocalStorage {
     where
         F: FnOnce(&mut redb::Table<&[u8], &[u8]>) -> Result<R, RedbError>,
     {
-        let write_txn = self.db.begin_write().map_err(|e| format!("Failed to begin write transaction: {}", e))?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| format!("Failed to begin write transaction: {}", e))?;
         let result = {
-             let mut table = write_txn.open_table(DATA_TABLE).map_err(|e| format!("Failed to open table for write: {}", e))?;
-             operation(&mut table).map_err(|e| format!("Operation failed: {}", e))
+            let mut table = write_txn
+                .open_table(DATA_TABLE)
+                .map_err(|e| format!("Failed to open table for write: {}", e))?;
+            operation(&mut table).map_err(|e| format!("Operation failed: {}", e))
         }; // table handle dropped here
 
         if result.is_ok() {
-            write_txn.commit().map_err(|e| format!("Failed to commit transaction: {}", e))?;
+            write_txn
+                .commit()
+                .map_err(|e| format!("Failed to commit transaction: {}", e))?;
         } else {
-             // No need to explicitly abort, dropping does it, but good for clarity
-             // write_txn.abort().map_err(|e| format!("Failed to abort transaction: {}", e))?;
+            // No need to explicitly abort, dropping does it, but good for clarity
+            // write_txn.abort().map_err(|e| format!("Failed to abort transaction: {}", e))?;
         }
         result
     }
@@ -73,10 +87,18 @@ impl LocalStorage for RedbLocalStorage {
     }
 
     fn retrieve(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| format!("Failed to begin read transaction: {}", e))?;
-        let table = read_txn.open_table(DATA_TABLE).map_err(|e| format!("Failed to open table for read: {}", e))?;
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| format!("Failed to begin read transaction: {}", e))?;
+        let table = read_txn
+            .open_table(DATA_TABLE)
+            .map_err(|e| format!("Failed to open table for read: {}", e))?;
 
-        match table.get(key).map_err(|e| format!("Failed to retrieve key: {}", e))? {
+        match table
+            .get(key)
+            .map_err(|e| format!("Failed to retrieve key: {}", e))?
+        {
             Some(value) => Ok(Some(value.value().to_vec())),
             None => Ok(None),
         }

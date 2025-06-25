@@ -2,10 +2,9 @@
 //! Integration tests for QUIC-based peer-to-peer networking.
 
 use std::net::SocketAddr;
-use tokio::time::{sleep, Duration, timeout};
-use stoffel_vm::net::{NetworkManager, QuicNetworkManager, PeerConnection};
-use std::sync::{Once, Arc};
-use std::sync::atomic::AtomicBool;
+use std::sync::Once;
+use stoffel_vm::net::{NetworkManager, PeerConnection, QuicNetworkManager};
+use tokio::time::{sleep, timeout, Duration};
 
 static INIT: Once = Once::new();
 
@@ -23,7 +22,10 @@ async fn test_quic_connection_basic() {
 
     let test_addr: SocketAddr = "127.0.0.1:9090".parse().unwrap();
     let mut server = QuicNetworkManager::new();
-    server.listen(test_addr).await.expect("Server should start listening");
+    server
+        .listen(test_addr)
+        .await
+        .expect("Server should start listening");
 
     // Spawn server task
     let server_handle = tokio::spawn(async move {
@@ -35,7 +37,10 @@ async fn test_quic_connection_basic() {
                     assert_eq!(message, "test message");
 
                     // Send response
-                    connection.send(b"response").await.expect("Should send response");
+                    connection
+                        .send(b"response")
+                        .await
+                        .expect("Should send response");
 
                     // Wait for client to receive the response before closing
                     sleep(Duration::from_millis(500)).await;
@@ -51,10 +56,16 @@ async fn test_quic_connection_basic() {
 
     // Create client and connect
     let mut client = QuicNetworkManager::new();
-    let mut connection = client.connect(test_addr).await.expect("Client should connect");
+    let mut connection = client
+        .connect(test_addr)
+        .await
+        .expect("Client should connect");
 
     // Send message
-    connection.send(b"test message").await.expect("Should send message");
+    connection
+        .send(b"test message")
+        .await
+        .expect("Should send message");
 
     // Receive response
     let response = connection.receive().await.expect("Should receive response");
@@ -76,7 +87,10 @@ async fn test_multiple_streams() {
     let test_addr: SocketAddr = "127.0.0.1:9091".parse().unwrap();
 
     let mut server = QuicNetworkManager::new();
-    server.listen(test_addr).await.expect("Server should start listening");
+    server
+        .listen(test_addr)
+        .await
+        .expect("Server should start listening");
 
     let server_handle = tokio::spawn(async move {
         // Just accept a connection
@@ -88,7 +102,10 @@ async fn test_multiple_streams() {
     let mut client = QuicNetworkManager::new();
 
     // This should succeed if the ALPN protocol negotiation works correctly
-    let mut connection = client.connect(test_addr).await.expect("Client should connect");
+    let mut connection = client
+        .connect(test_addr)
+        .await
+        .expect("Client should connect");
 
     // Close the connection
     connection.close().await.expect("Should close connection");

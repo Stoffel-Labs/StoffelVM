@@ -13,14 +13,14 @@
 //! The VM state is the central component that orchestrates all aspects of
 //! program execution, from function calls to object manipulation.
 
-use std::sync::Arc;
-use rustc_hash::FxHashMap;
-use smallvec::{smallvec, SmallVec};
 use crate::activations::{ActivationRecord, ActivationRecordPool};
 use crate::core_types::{Closure, ForeignObjectStorage, ObjectStore, Upvalue, Value};
 use crate::functions::{ForeignFunctionContext, Function};
 use crate::instructions::{Instruction, ResolvedInstruction};
 use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
+use rustc_hash::FxHashMap;
+use smallvec::{smallvec, SmallVec};
+use std::sync::Arc;
 
 /// Runtime state of the virtual machine
 ///
@@ -162,7 +162,12 @@ impl VMState {
     /// # Returns
     /// * `Ok(())` - If all hooks executed successfully
     /// * `Err(String)` - If any hook returned an error
-    pub fn trigger_register_write(&self, reg: usize, old_value: &Value, new_value: &Value) -> Result<(), String> {
+    pub fn trigger_register_write(
+        &self,
+        reg: usize,
+        old_value: &Value,
+        new_value: &Value,
+    ) -> Result<(), String> {
         let event = HookEvent::RegisterWrite(reg, old_value.clone(), new_value.clone());
         self.hook_manager.trigger(&event, self)
     }
@@ -183,7 +188,7 @@ impl VMState {
         let context = HookContext::new(
             &self.activation_records,
             self.current_instruction,
-            &self.functions
+            &self.functions,
         );
         self.hook_manager.trigger_with_context(event, &context)
     }
@@ -204,11 +209,16 @@ impl VMState {
     /// # Returns
     /// * `Ok(Value::Closure)` - The created closure
     /// * `Err(String)` - If an upvalue couldn't be found or a hook returned an error
-    pub fn create_closure(&mut self, function_name: &str, upvalue_names: &[String]) -> Result<Value, String> {
+    pub fn create_closure(
+        &mut self,
+        function_name: &str,
+        upvalue_names: &[String],
+    ) -> Result<Value, String> {
         // Find and collect all upvalues from the current scope
         let mut upvalues = Vec::new();
         for name in upvalue_names {
-            let value = self.find_upvalue(name)
+            let value = self
+                .find_upvalue(name)
                 .ok_or_else(|| format!("Could not find upvalue {} when creating closure", name))?;
 
             upvalues.push(Upvalue {
@@ -331,7 +341,10 @@ impl VMState {
                                     constants[const_idx].clone()
                                 } else {
                                     // Error: constant not found
-                                    return Err(format!("Constant index {} out of bounds", const_idx));
+                                    return Err(format!(
+                                        "Constant index {} out of bounds",
+                                        const_idx
+                                    ));
                                 }
                             } else {
                                 // Error: constants not available
@@ -339,41 +352,59 @@ impl VMState {
                             }
                         };
                         Instruction::LDI(reg, constant_value)
-                    },
+                    }
                     ResolvedInstruction::MOV(dest, src) => Instruction::MOV(dest, src),
-                    ResolvedInstruction::ADD(dest, src1, src2) => Instruction::ADD(dest, src1, src2),
-                    ResolvedInstruction::SUB(dest, src1, src2) => Instruction::SUB(dest, src1, src2),
-                    ResolvedInstruction::MUL(dest, src1, src2) => Instruction::MUL(dest, src1, src2),
-                    ResolvedInstruction::DIV(dest, src1, src2) => Instruction::DIV(dest, src1, src2),
-                    ResolvedInstruction::MOD(dest, src1, src2) => Instruction::MOD(dest, src1, src2),
-                    ResolvedInstruction::AND(dest, src1, src2) => Instruction::AND(dest, src1, src2),
+                    ResolvedInstruction::ADD(dest, src1, src2) => {
+                        Instruction::ADD(dest, src1, src2)
+                    }
+                    ResolvedInstruction::SUB(dest, src1, src2) => {
+                        Instruction::SUB(dest, src1, src2)
+                    }
+                    ResolvedInstruction::MUL(dest, src1, src2) => {
+                        Instruction::MUL(dest, src1, src2)
+                    }
+                    ResolvedInstruction::DIV(dest, src1, src2) => {
+                        Instruction::DIV(dest, src1, src2)
+                    }
+                    ResolvedInstruction::MOD(dest, src1, src2) => {
+                        Instruction::MOD(dest, src1, src2)
+                    }
+                    ResolvedInstruction::AND(dest, src1, src2) => {
+                        Instruction::AND(dest, src1, src2)
+                    }
                     ResolvedInstruction::OR(dest, src1, src2) => Instruction::OR(dest, src1, src2),
-                    ResolvedInstruction::XOR(dest, src1, src2) => Instruction::XOR(dest, src1, src2),
+                    ResolvedInstruction::XOR(dest, src1, src2) => {
+                        Instruction::XOR(dest, src1, src2)
+                    }
                     ResolvedInstruction::NOT(dest, src) => Instruction::NOT(dest, src),
-                    ResolvedInstruction::SHL(dest, src, amount) => Instruction::SHL(dest, src, amount),
-                    ResolvedInstruction::SHR(dest, src, amount) => Instruction::SHR(dest, src, amount),
+                    ResolvedInstruction::SHL(dest, src, amount) => {
+                        Instruction::SHL(dest, src, amount)
+                    }
+                    ResolvedInstruction::SHR(dest, src, amount) => {
+                        Instruction::SHR(dest, src, amount)
+                    }
                     ResolvedInstruction::JMP(target) => {
                         // Convert numeric target back to label for compatibility
                         // This is inefficient but necessary for hooks
                         let label = format!("label_{}", target);
                         Instruction::JMP(label)
-                    },
+                    }
                     ResolvedInstruction::JMPEQ(target) => {
                         let label = format!("label_{}", target);
                         Instruction::JMPEQ(label)
-                    },
+                    }
                     ResolvedInstruction::JMPNEQ(target) => {
                         let label = format!("label_{}", target);
                         Instruction::JMPNEQ(label)
-                    },
+                    }
                     ResolvedInstruction::JMPLT(target) => {
                         let label = format!("label_{}", target);
                         Instruction::JMPLT(label)
-                    },
+                    }
                     ResolvedInstruction::JMPGT(target) => {
                         let label = format!("label_{}", target);
                         Instruction::JMPGT(label)
-                    },
+                    }
                     ResolvedInstruction::CALL(func_idx) => {
                         // Get the function name from the constant pool
                         let function_name = {
@@ -385,14 +416,17 @@ impl VMState {
                                         _ => return Err(format!("Expected string constant for function name at index {}", func_idx))
                                     }
                                 } else {
-                                    return Err(format!("Function name constant index {} out of bounds", func_idx));
+                                    return Err(format!(
+                                        "Function name constant index {} out of bounds",
+                                        func_idx
+                                    ));
                                 }
                             } else {
                                 return Err(format!("Constant values not available for function"));
                             }
                         };
                         Instruction::CALL(function_name)
-                    },
+                    }
                     ResolvedInstruction::RET(reg) => Instruction::RET(reg),
                     ResolvedInstruction::PUSHARG(reg) => Instruction::PUSHARG(reg),
                     ResolvedInstruction::CMP(reg1, reg2) => Instruction::CMP(reg1, reg2),
@@ -460,7 +494,7 @@ impl VMState {
                         let event = HookEvent::RegisterWrite(dest_reg, old_value, value);
                         self.trigger_hook_with_snapshot(&event)?;
                     }
-                },
+                }
                 Instruction::LDI(dest_reg, value) => {
                     // Update register
                     let old_value;
@@ -472,7 +506,7 @@ impl VMState {
 
                     let event = HookEvent::RegisterWrite(dest_reg, old_value, value);
                     self.trigger_hook_with_snapshot(&event)?;
-                },
+                }
                 Instruction::MOV(dest_reg, src_reg) => {
                     // Get value from source register
                     let value;
@@ -494,7 +528,7 @@ impl VMState {
 
                     let write_event = HookEvent::RegisterWrite(dest_reg, old_value, value);
                     self.trigger_hook_with_snapshot(&write_event)?;
-                },
+                }
                 Instruction::ADD(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -508,10 +542,10 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         _ => return Err("Type error in ADD operation".to_string()),
                     }
-                },
+                }
                 Instruction::SUB(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -525,10 +559,10 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         _ => return Err("Type error in SUB operation".to_string()),
                     }
-                },
+                }
                 Instruction::MUL(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -542,10 +576,10 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         _ => return Err("Type error in MUL operation".to_string()),
                     }
-                },
+                }
                 Instruction::DIV(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -562,10 +596,10 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         _ => return Err("Type error in DIV operation".to_string()),
                     }
-                },
+                }
                 Instruction::MOD(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -582,10 +616,10 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         _ => return Err("Type error in MOD operation".to_string()),
                     }
-                },
+                }
                 Instruction::AND(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -602,7 +636,7 @@ impl VMState {
 
                     let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                     self.hook_manager.trigger(&event, self)?;
-                },
+                }
                 Instruction::OR(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -619,7 +653,7 @@ impl VMState {
 
                     let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                     self.hook_manager.trigger(&event, self)?;
-                },
+                }
                 Instruction::XOR(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -636,7 +670,7 @@ impl VMState {
 
                     let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                     self.hook_manager.trigger(&event, self)?;
-                },
+                }
                 Instruction::NOT(dest_reg, src_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src = &record.registers[src_reg];
@@ -652,7 +686,7 @@ impl VMState {
 
                     let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                     self.hook_manager.trigger(&event, self)?;
-                },
+                }
                 Instruction::SHL(dest_reg, src_reg, amount_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src = &record.registers[src_reg];
@@ -666,10 +700,10 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         _ => return Err("Type error in SHL operation".to_string()),
                     }
-                },
+                }
                 Instruction::SHR(dest_reg, src_reg, amount_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src = &record.registers[src_reg];
@@ -683,10 +717,10 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         _ => return Err("Type error in SHR operation".to_string()),
                     }
-                },
+                }
                 Instruction::JMP(ref label) => {
                     // If we're using resolved instructions, get the target from the resolved instruction
                     if use_resolved {
@@ -696,19 +730,30 @@ impl VMState {
                         };
 
                         if let ResolvedInstruction::JMP(target) = resolved_idx {
-                            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            self.activation_records
+                                .last_mut()
+                                .unwrap()
+                                .instruction_pointer = target;
                         } else {
-                            return Err(format!("Expected JMP instruction, got {:?}", resolved_idx));
+                            return Err(format!(
+                                "Expected JMP instruction, got {:?}",
+                                resolved_idx
+                            ));
                         }
                     } else {
                         // Otherwise, look up the label in the function's labels HashMap
-                        let target = vm_function.labels.get(label)
+                        let target = vm_function
+                            .labels
+                            .get(label)
                             .ok_or_else(|| format!("Label '{}' not found", label))?
                             .clone();
 
-                        self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                        self.activation_records
+                            .last_mut()
+                            .unwrap()
+                            .instruction_pointer = target;
                     }
-                },
+                }
                 Instruction::JMPEQ(ref label) => {
                     let should_jump = self.activation_records.last().unwrap().compare_flag == 0;
 
@@ -720,19 +765,30 @@ impl VMState {
                             };
 
                             if let ResolvedInstruction::JMPEQ(target) = resolved_idx {
-                                self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                                self.activation_records
+                                    .last_mut()
+                                    .unwrap()
+                                    .instruction_pointer = target;
                             } else {
-                                return Err(format!("Expected JMPEQ instruction, got {:?}", resolved_idx));
+                                return Err(format!(
+                                    "Expected JMPEQ instruction, got {:?}",
+                                    resolved_idx
+                                ));
                             }
                         } else {
-                            let target = vm_function.labels.get(label)
+                            let target = vm_function
+                                .labels
+                                .get(label)
                                 .ok_or_else(|| format!("Label '{}' not found", label))?
                                 .clone();
 
-                            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            self.activation_records
+                                .last_mut()
+                                .unwrap()
+                                .instruction_pointer = target;
                         }
                     }
-                },
+                }
                 Instruction::JMPNEQ(ref label) => {
                     let should_jump = self.activation_records.last().unwrap().compare_flag != 0;
 
@@ -744,19 +800,30 @@ impl VMState {
                             };
 
                             if let ResolvedInstruction::JMPNEQ(target) = resolved_idx {
-                                self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                                self.activation_records
+                                    .last_mut()
+                                    .unwrap()
+                                    .instruction_pointer = target;
                             } else {
-                                return Err(format!("Expected JMPNEQ instruction, got {:?}", resolved_idx));
+                                return Err(format!(
+                                    "Expected JMPNEQ instruction, got {:?}",
+                                    resolved_idx
+                                ));
                             }
                         } else {
-                            let target = vm_function.labels.get(label)
+                            let target = vm_function
+                                .labels
+                                .get(label)
                                 .ok_or_else(|| format!("Label '{}' not found", label))?
                                 .clone();
 
-                            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            self.activation_records
+                                .last_mut()
+                                .unwrap()
+                                .instruction_pointer = target;
                         }
                     }
-                },
+                }
                 Instruction::JMPLT(ref label) => {
                     // Jump if Less Than (compare_flag == -1)
                     let should_jump = self.activation_records.last().unwrap().compare_flag == -1;
@@ -769,19 +836,30 @@ impl VMState {
                             };
 
                             if let ResolvedInstruction::JMPLT(target) = resolved_idx {
-                                self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                                self.activation_records
+                                    .last_mut()
+                                    .unwrap()
+                                    .instruction_pointer = target;
                             } else {
-                                return Err(format!("Expected JMPLT instruction, got {:?}", resolved_idx));
+                                return Err(format!(
+                                    "Expected JMPLT instruction, got {:?}",
+                                    resolved_idx
+                                ));
                             }
                         } else {
-                            let target = vm_function.labels.get(label)
+                            let target = vm_function
+                                .labels
+                                .get(label)
                                 .ok_or_else(|| format!("Label '{}' not found", label))?
                                 .clone();
 
-                            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            self.activation_records
+                                .last_mut()
+                                .unwrap()
+                                .instruction_pointer = target;
                         }
                     }
-                },
+                }
                 Instruction::JMPGT(ref label) => {
                     // Jump if Greater Than (compare_flag == 1)
                     let should_jump = self.activation_records.last().unwrap().compare_flag == 1;
@@ -793,19 +871,30 @@ impl VMState {
                             };
 
                             if let ResolvedInstruction::JMPGT(target) = resolved_idx {
-                                self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                                self.activation_records
+                                    .last_mut()
+                                    .unwrap()
+                                    .instruction_pointer = target;
                             } else {
-                                return Err(format!("Expected JMPGT instruction, got {:?}", resolved_idx));
+                                return Err(format!(
+                                    "Expected JMPGT instruction, got {:?}",
+                                    resolved_idx
+                                ));
                             }
                         } else {
-                            let target = vm_function.labels.get(label)
+                            let target = vm_function
+                                .labels
+                                .get(label)
                                 .ok_or_else(|| format!("Label '{}' not found", label))?
                                 .clone();
 
-                            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+                            self.activation_records
+                                .last_mut()
+                                .unwrap()
+                                .instruction_pointer = target;
                         }
                     }
-                },
+                }
                 Instruction::CALL(ref function_name) => {
                     // Get arguments from stack
                     let args;
@@ -814,7 +903,9 @@ impl VMState {
                         args = current_record.stack.clone();
                     }
 
-                    let function = self.functions.get(function_name)
+                    let function = self
+                        .functions
+                        .get(function_name)
                         .ok_or_else(|| format!("Function \'{}\' not found", function_name))?
                         .clone();
 
@@ -839,15 +930,20 @@ impl VMState {
                     match function {
                         Function::VM(vm_func) => {
                             if vm_func.parameters.len() != args.len() {
-                                return Err(format!("Function {} expects {} arguments but got {}",
-                                                   function_name, vm_func.parameters.len(), args.len()));
+                                return Err(format!(
+                                    "Function {} expects {} arguments but got {}",
+                                    function_name,
+                                    vm_func.parameters.len(),
+                                    args.len()
+                                ));
                             }
 
                             // Initialize upvalues for the function
                             let mut upvalues = Vec::new();
                             for name in &vm_func.upvalues {
-                                let value = self.find_upvalue(name)
-                                    .ok_or_else(|| format!("Could not find upvalue {} when calling function", name))?;
+                                let value = self.find_upvalue(name).ok_or_else(|| {
+                                    format!("Could not find upvalue {} when calling function", name)
+                                })?;
 
                                 upvalues.push(Upvalue {
                                     name: name.clone(),
@@ -861,19 +957,26 @@ impl VMState {
                             };
                             let closure_value = Value::Closure(Arc::new(closure));
 
-                            let event = HookEvent::BeforeFunctionCall(closure_value, args.clone().to_vec());
+                            let event =
+                                HookEvent::BeforeFunctionCall(closure_value, args.clone().to_vec());
                             self.hook_manager.trigger(&event, self)?;
 
                             let new_record = ActivationRecord {
                                 function_name: function_name.clone(),
                                 locals: FxHashMap::default(),
-                                registers: SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]),
+                                registers: SmallVec::from_vec(vec![
+                                    Value::Unit;
+                                    vm_func.register_count
+                                ]),
                                 upvalues,
                                 instruction_pointer: 0,
                                 stack: SmallVec::new(),
                                 compare_flag: 0,
                                 instructions: SmallVec::from(vm_func.instructions.clone()),
-                                cached_instructions: vm_func.cached_instructions.as_ref().map(|v| SmallVec::from_vec(v.clone())),
+                                cached_instructions: vm_func
+                                    .cached_instructions
+                                    .as_ref()
+                                    .map(|v| SmallVec::from_vec(v.clone())),
                                 resolved_instructions: vm_func.resolved_instructions.clone(),
                                 constant_values: vm_func.constant_values.clone(),
                                 closure: None,
@@ -913,11 +1016,15 @@ impl VMState {
                                     self.hook_manager.trigger(&event, self)?;
                                 }
                             }
-                        },
+                        }
                         Function::Foreign(foreign_func) => {
-                            let func_value = Value::String(format!("<foreign function {}>", function_name));
+                            let func_value =
+                                Value::String(format!("<foreign function {}>", function_name));
 
-                            let event = HookEvent::BeforeFunctionCall(func_value.clone(), args.clone().to_vec());
+                            let event = HookEvent::BeforeFunctionCall(
+                                func_value.clone(),
+                                args.clone().to_vec(),
+                            );
                             self.hook_manager.trigger(&event, self)?;
 
                             let context = ForeignFunctionContext {
@@ -984,7 +1091,7 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         }
                     }
-                },
+                }
                 Instruction::RET(reg) => {
                     let current_record = self.activation_records.last().unwrap();
                     let return_value = current_record.registers[reg].clone();
@@ -1028,7 +1135,7 @@ impl VMState {
                     let closure_value = Value::String(format!("<function {}>", returning_from));
                     let event = HookEvent::AfterFunctionCall(closure_value, return_value);
                     self.hook_manager.trigger(&event, self)?;
-                },
+                }
                 Instruction::PUSHARG(reg) => {
                     let value = self.activation_records.last().unwrap().registers[reg].clone();
 
@@ -1037,7 +1144,7 @@ impl VMState {
 
                     let event = HookEvent::StackPush(value);
                     self.hook_manager.trigger(&event, self)?;
-                },
+                }
                 Instruction::CMP(reg1, reg2) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let val1 = &record.registers[reg1];
@@ -1045,23 +1152,33 @@ impl VMState {
 
                     let compare_result = match (val1, val2) {
                         (Value::Int(a), Value::Int(b)) => {
-                            if a < b { -1 } else if a > b { 1 } else { 0 }
-                        },
-                        (Value::String(a), Value::String(b)) => {
-                            if a < b { -1 } else if a > b { 1 } else { 0 }
-                        },
-                        (Value::Bool(a), Value::Bool(b)) => {
-                            match (a, b) {
-                                (false, true) => -1,
-                                (true, false) => 1,
-                                _ => 0,
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
                             }
+                        }
+                        (Value::String(a), Value::String(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        }
+                        (Value::Bool(a), Value::Bool(b)) => match (a, b) {
+                            (false, true) => -1,
+                            (true, false) => 1,
+                            _ => 0,
                         },
                         _ => return Err(format!("Cannot compare {:?} and {:?}", val1, val2)),
                     };
 
                     record.compare_flag = compare_result;
-                },
+                }
             }
 
             let event = HookEvent::AfterInstructionExecute(instruction.clone());
@@ -1072,8 +1189,10 @@ impl VMState {
     }
 
     pub fn call_foreign_function(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
-        let function = self.functions.get(name).ok_or_else(||
-            format!("Foreign function {} not found", name))?
+        let function = self
+            .functions
+            .get(name)
+            .ok_or_else(|| format!("Foreign function {} not found", name))?
             .clone();
 
         match function {
@@ -1094,10 +1213,11 @@ impl VMState {
                 self.hook_manager.trigger(&event, self)?;
 
                 Ok(result)
-            },
-            Function::VM(_) => {
-                Err(format!("Expected foreign function, but {} is a VM function", name))
             }
+            Function::VM(_) => Err(format!(
+                "Expected foreign function, but {} is a VM function",
+                name
+            )),
         }
     }
 }

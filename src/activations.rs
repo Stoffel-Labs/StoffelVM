@@ -13,12 +13,12 @@
 //! The module also provides an object pool for efficient activation record reuse,
 //! which helps reduce memory allocation overhead during function calls.
 
-use rustc_hash::FxHashMap;
-use std::fmt;
-use smallvec::SmallVec;
-use object_pool::{Pool, Reusable};
 use crate::core_types::{Upvalue, Value};
 use crate::instructions::Instruction;
+use object_pool::{Pool, Reusable};
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
+use std::fmt;
 
 /// Reference to a pooled activation record
 ///
@@ -78,9 +78,17 @@ impl ActivationRecord {
     /// * `compare_flag` - Comparison flag for conditional jumps
     /// * `instruction_pointer` - Current instruction pointer
     /// * `cached_instructions` - Cached instructions for faster execution
-    pub fn new(function_name: String, locals: FxHashMap<String, Value>, registers: SmallVec<[Value; 16]>,
-               instructions: SmallVec<[Instruction; 32]>, upvalues: Vec<Upvalue>, stack: SmallVec<[Value; 8]>,
-               compare_flag: i32, instruction_pointer: usize, cached_instructions: Option<SmallVec<[Instruction; 32]>>) -> Self {
+    pub fn new(
+        function_name: String,
+        locals: FxHashMap<String, Value>,
+        registers: SmallVec<[Value; 16]>,
+        instructions: SmallVec<[Instruction; 32]>,
+        upvalues: Vec<Upvalue>,
+        stack: SmallVec<[Value; 8]>,
+        compare_flag: i32,
+        instruction_pointer: usize,
+        cached_instructions: Option<SmallVec<[Instruction; 32]>>,
+    ) -> Self {
         ActivationRecord {
             function_name,
             locals,
@@ -137,20 +145,22 @@ impl ActivationRecordPool {
     /// # Arguments
     /// * `max_size` - Maximum number of activation records to keep in the pool
     pub fn new(max_size: usize) -> Self {
-        Self { pool: Pool::new(max_size, || ActivationRecord {
-            function_name: String::new(),
-            locals: FxHashMap::default(),
-            registers: SmallVec::new(),
-            instructions: SmallVec::new(),
-            upvalues: Vec::new(),
-            stack: SmallVec::new(),
-            compare_flag: 0,
-            instruction_pointer: 0,
-            cached_instructions: None,
-            resolved_instructions: None,
-            constant_values: None,
-            closure: None,
-        }) }
+        Self {
+            pool: Pool::new(max_size, || ActivationRecord {
+                function_name: String::new(),
+                locals: FxHashMap::default(),
+                registers: SmallVec::new(),
+                instructions: SmallVec::new(),
+                upvalues: Vec::new(),
+                stack: SmallVec::new(),
+                compare_flag: 0,
+                instruction_pointer: 0,
+                cached_instructions: None,
+                resolved_instructions: None,
+                constant_values: None,
+                closure: None,
+            }),
+        }
     }
 
     /// Get an activation record from the pool
