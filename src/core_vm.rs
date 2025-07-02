@@ -502,6 +502,13 @@ impl VirtualMachine {
 
             let type_name = match &ctx.args[0] {
                 Value::Int(_) => "integer",
+                Value::I32(_) => "integer",
+                Value::I16(_) => "integer",
+                Value::I8(_) => "integer",
+                Value::U8(_) => "integer",
+                Value::U16(_) => "integer",
+                Value::U32(_) => "integer",
+                Value::U64(_) => "integer",
                 Value::Float(_) => "float",
                 Value::Bool(_) => "boolean",
                 Value::String(_) => "string",
@@ -510,6 +517,7 @@ impl VirtualMachine {
                 Value::Foreign(_) => "userdata",
                 Value::Closure(_) => "function",
                 Value::Unit => "nil",
+                Value::Share(_, _) => "share",
             };
 
             Ok(Value::String(type_name.to_string()))

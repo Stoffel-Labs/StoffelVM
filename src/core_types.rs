@@ -137,6 +137,17 @@ impl std::hash::Hash for Closure {
     }
 }
 
+/// Enum to represent the underlying type of a secret share
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ShareType {
+    /// For i64 values
+    Int,
+    /// For fixed-point values
+    Float,
+    /// For boolean values
+    Bool,
+}
+
 /// Value types supported by the VM
 ///
 /// This enum represents all possible values that can be manipulated by the VM.
@@ -145,11 +156,25 @@ impl std::hash::Hash for Closure {
 ///
 /// The VM uses a dual-type system:
 /// - Clear values: Publicly visible values used for control flow and general computation
-/// - Secret values: Privately shared values used in secure multiparty computation (future)
+/// - Secret values: Privately shared values used in secure multiparty computation
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     /// 64-bit signed integer
     Int(i64),
+    /// 32-bit signed integer
+    I32(i32),
+    /// 16-bit signed integer
+    I16(i16),
+    /// 8-bit signed integer
+    I8(i8),
+    /// 8-bit unsigned integer
+    U8(u8),
+    /// 16-bit unsigned integer
+    U16(u16),
+    /// 32-bit unsigned integer
+    U32(u32),
+    /// 64-bit unsigned integer
+    U64(u64),
     /// Fixed-point floating point number (represented as i64 internally for Eq/Hash)
     Float(i64),
     /// Boolean value
@@ -166,12 +191,21 @@ pub enum Value {
     Closure(Arc<Closure>),
     /// Unit/void/nil value
     Unit,
+    /// Secret shared value (for SMPC)
+    Share(ShareType, Vec<u8>),
 }
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(i) => write!(f, "{}", i),
+            Value::I32(i) => write!(f, "{}i32", i),
+            Value::I16(i) => write!(f, "{}i16", i),
+            Value::I8(i) => write!(f, "{}i8", i),
+            Value::U8(i) => write!(f, "{}u8", i),
+            Value::U16(i) => write!(f, "{}u16", i),
+            Value::U32(i) => write!(f, "{}u32", i),
+            Value::U64(i) => write!(f, "{}u64", i),
             Value::Float(fp) => {
                 let float_val = *fp as f64 / 1000.0;
                 write!(f, "{}", float_val)
@@ -183,6 +217,7 @@ impl fmt::Debug for Value {
             Value::Foreign(id) => write!(f, "Foreign({})", id),
             Value::Closure(c) => write!(f, "Function({})", c.function_id),
             Value::Unit => write!(f, "()"),
+            Value::Share(share_type, _) => write!(f, "Share({:?})", share_type),
         }
     }
 }

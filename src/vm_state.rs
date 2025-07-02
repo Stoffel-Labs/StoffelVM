@@ -14,7 +14,7 @@
 //! program execution, from function calls to object manipulation.
 
 use crate::activations::{ActivationRecord, ActivationRecordPool};
-use crate::core_types::{Closure, ForeignObjectStorage, ObjectStore, Upvalue, Value};
+use crate::core_types::{Closure, ForeignObjectStorage, ObjectStore, ShareType, Upvalue, Value};
 use crate::functions::{ForeignFunctionContext, Function};
 use crate::instructions::{Instruction, ResolvedInstruction};
 use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
@@ -516,17 +516,50 @@ impl VMState {
                         value = current_record.registers[src_reg].clone();
                     }
 
+                    // Check if this is a clear-to-secret or secret-to-clear conversion
+                    let result_value = if dest_reg >= 16 && src_reg < 16 {
+                        // Clear to secret conversion (lower to upper half)
+                        match &value {
+                            Value::Int(i) => Value::Share(ShareType::Int, i.to_le_bytes().to_vec()),
+                            Value::Float(f) => Value::Share(ShareType::Float, f.to_le_bytes().to_vec()),
+                            Value::Bool(b) => Value::Share(ShareType::Bool, vec![*b as u8]),
+                            _ => return Err("Only primitive types (Int, Float, Bool) can be converted to shares".to_string()),
+                        }
+                    } else if dest_reg < 16 && src_reg >= 16 {
+                        // Secret to clear conversion (upper to lower half)
+                        let current_record = self.activation_records.last().unwrap();
+                        match &current_record.registers[src_reg] {
+                            Value::Share(ShareType::Int, data) => {
+                                let mut bytes = [0u8; 8];
+                                bytes.copy_from_slice(&data[0..8]);
+                                Value::Int(i64::from_le_bytes(bytes))
+                            },
+                            Value::Share(ShareType::Float, data) => {
+                                let mut bytes = [0u8; 8];
+                                bytes.copy_from_slice(&data[0..8]);
+                                Value::Float(i64::from_le_bytes(bytes))
+                            },
+                            Value::Share(ShareType::Bool, data) => {
+                                Value::Bool(data[0] != 0)
+                            },
+                            _ => return Err("Invalid share type for conversion to clear value".to_string()),
+                        }
+                    } else {
+                        // Regular MOV, no conversion
+                        value.clone()
+                    };
+
                     // Update destination register
                     {
                         let current_record = self.activation_records.last_mut().unwrap();
                         old_value = current_record.registers[dest_reg].clone();
-                        current_record.registers[dest_reg] = value.clone();
+                        current_record.registers[dest_reg] = result_value.clone();
                     }
 
                     let read_event = HookEvent::RegisterRead(src_reg, value.clone());
                     self.trigger_hook_with_snapshot(&read_event)?;
 
-                    let write_event = HookEvent::RegisterWrite(dest_reg, old_value, value);
+                    let write_event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                     self.trigger_hook_with_snapshot(&write_event)?;
                 }
                 Instruction::ADD(dest_reg, src1_reg, src2_reg) => {
@@ -542,7 +575,113 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        }
+                        },
+                        (Value::I32(a), Value::I32(b)) => {
+                            let result_value = Value::I32(a + b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            let result_value = Value::I16(a + b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            let result_value = Value::I8(a + b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            let result_value = Value::U8(a + b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            let result_value = Value::U16(a + b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            let result_value = Value::U32(a + b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            let result_value = Value::U64(a + b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share + Share (offline addition)
+                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
+                            // TODO: verify that this is the correct way to do it
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+                            let result = val1 + val2;
+
+                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
+                            // For fixed-point values
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+                            let result = val1 + val2;
+
+                            let result_value = Value::Share(ShareType::Float, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
+                            // For boolean values (XOR operation for addition in GF(2))
+                            let bit1 = data1[0] != 0;
+                            let bit2 = data2[0] != 0;
+                            let result = bit1 ^ bit2; // XOR for binary addition
+
+                            let result_value = Value::Share(ShareType::Bool, vec![result as u8]);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
                         _ => return Err("Type error in ADD operation".to_string()),
                     }
                 }
@@ -559,7 +698,114 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        }
+                        },
+                        (Value::I32(a), Value::I32(b)) => {
+                            let result_value = Value::I32(a - b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            let result_value = Value::I16(a - b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            let result_value = Value::I8(a - b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            let result_value = Value::U8(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            let result_value = Value::U16(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            let result_value = Value::U32(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            let result_value = Value::U64(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share - Share (offline subtraction)
+                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
+                            // For now, implement a simple subtraction of shares
+                            // In a real implementation, this would use the SMPC protocol
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+                            let result = val1 - val2;
+
+                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
+                            // For fixed-point values
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+                            let result = val1 - val2;
+
+                            let result_value = Value::Share(ShareType::Float, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
+                            // For boolean values (XOR operation for subtraction in GF(2), same as addition)
+                            let bit1 = data1[0] != 0;
+                            let bit2 = data2[0] != 0;
+                            let result = bit1 ^ bit2; // XOR for binary subtraction (same as addition in GF(2))
+
+                            let result_value = Value::Share(ShareType::Bool, vec![result as u8]);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
                         _ => return Err("Type error in SUB operation".to_string()),
                     }
                 }
@@ -576,7 +822,115 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        }
+                        },
+                        (Value::I32(a), Value::I32(b)) => {
+                            let result_value = Value::I32(a * b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            let result_value = Value::I16(a * b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            let result_value = Value::I8(a * b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            let result_value = Value::U8(a * *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            let result_value = Value::U16(a * *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            let result_value = Value::U32(a * *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            let result_value = Value::U64(a * *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share * Share (online multiplication)
+                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
+                            // For now, implement a simple multiplication of shares
+                            // In a real implementation, this would use the SMPC protocol
+                            // and would require online communication between parties
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+                            let result = val1 * val2;
+
+                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
+                            // For fixed-point values
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+                            let result = val1 * val2;
+
+                            let result_value = Value::Share(ShareType::Float, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
+                            // For boolean values (AND operation for multiplication in GF(2))
+                            let bit1 = data1[0] != 0;
+                            let bit2 = data2[0] != 0;
+                            let result = bit1 & bit2; // AND for binary multiplication
+
+                            let result_value = Value::Share(ShareType::Bool, vec![result as u8]);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
                         _ => return Err("Type error in MUL operation".to_string()),
                     }
                 }
@@ -596,7 +950,136 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        }
+                        },
+                        (Value::I32(a), Value::I32(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::I32(a / b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::I16(a / b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::I8(a / b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::U8(a / *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::U16(a / *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::U32(a / *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::U64(a / *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share / Share (online division)
+                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
+                            // For now, implement a simple division of shares
+                            // In a real implementation, this would use the SMPC protocol
+                            // and would require online communication between parties
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+
+                            // Check for division by zero
+                            if val2 == 0 {
+                                return Err("Division by zero in shared value".to_string());
+                            }
+
+                            let result = val1 / val2;
+
+                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
+                            // For fixed-point values
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+
+                            // Check for division by zero
+                            if val2 == 0 {
+                                return Err("Division by zero in shared value".to_string());
+                            }
+
+                            let result = val1 / val2;
+
+                            let result_value = Value::Share(ShareType::Float, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Division is not defined for boolean shares in GF(2)
                         _ => return Err("Type error in DIV operation".to_string()),
                     }
                 }
@@ -616,7 +1099,136 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        }
+                        },
+                        (Value::I32(a), Value::I32(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::I32(a % b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::I16(a % b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::I8(a % b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::U8(a % *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::U16(a % *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::U32(a % *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::U64(a % *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share % Share (online modulo)
+                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
+                            // For now, implement a simple modulo of shares
+                            // In a real implementation, this would use the SMPC protocol
+                            // and would require online communication between parties
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+
+                            // Check for modulo by zero
+                            if val2 == 0 {
+                                return Err("Modulo by zero in shared value".to_string());
+                            }
+
+                            let result = val1 % val2;
+
+                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
+                            // For fixed-point values
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+
+                            // Check for modulo by zero
+                            if val2 == 0 {
+                                return Err("Modulo by zero in shared value".to_string());
+                            }
+
+                            let result = val1 % val2;
+
+                            let result_value = Value::Share(ShareType::Float, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Modulo is not defined for boolean shares in GF(2)
                         _ => return Err("Type error in MOD operation".to_string()),
                     }
                 }
@@ -628,6 +1240,27 @@ impl VMState {
                     let result_value = match (src1, src2) {
                         (Value::Int(a), Value::Int(b)) => Value::Int(a & b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
+                        // Share & Share (bitwise AND for shares)
+                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+                            let result = val1 & val2;
+
+                            Value::Share(ShareType::Int, result.to_le_bytes().to_vec())
+                        },
+                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
+                            // For boolean shares (AND operation)
+                            let bit1 = data1[0] != 0;
+                            let bit2 = data2[0] != 0;
+                            let result = bit1 & bit2;
+
+                            Value::Share(ShareType::Bool, vec![result as u8])
+                        },
                         _ => return Err("Type error in AND operation".to_string()),
                     };
 
@@ -645,6 +1278,27 @@ impl VMState {
                     let result_value = match (src1, src2) {
                         (Value::Int(a), Value::Int(b)) => Value::Int(a | b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
+                        // Share | Share (bitwise OR for shares)
+                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+                            let result = val1 | val2;
+
+                            Value::Share(ShareType::Int, result.to_le_bytes().to_vec())
+                        },
+                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
+                            // For boolean shares (OR operation)
+                            let bit1 = data1[0] != 0;
+                            let bit2 = data2[0] != 0;
+                            let result = bit1 | bit2;
+
+                            Value::Share(ShareType::Bool, vec![result as u8])
+                        },
                         _ => return Err("Type error in OR operation".to_string()),
                     };
 
@@ -662,6 +1316,27 @@ impl VMState {
                     let result_value = match (src1, src2) {
                         (Value::Int(a), Value::Int(b)) => Value::Int(a ^ b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(a ^ b),
+                        // Share ^ Share (bitwise XOR for shares)
+                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+                            let result = val1 ^ val2;
+
+                            Value::Share(ShareType::Int, result.to_le_bytes().to_vec())
+                        },
+                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
+                            // For boolean shares (XOR operation)
+                            let bit1 = data1[0] != 0;
+                            let bit2 = data2[0] != 0;
+                            let result = bit1 ^ bit2;
+
+                            Value::Share(ShareType::Bool, vec![result as u8])
+                        },
                         _ => return Err("Type error in XOR operation".to_string()),
                     };
 
@@ -678,6 +1353,23 @@ impl VMState {
                     let result_value = match src {
                         Value::Int(a) => Value::Int(!a),
                         Value::Bool(a) => Value::Bool(!a),
+                        // ~Share (bitwise NOT for shares)
+                        Value::Share(ShareType::Int, data) => {
+                            let mut bytes = [0u8; 8];
+                            bytes.copy_from_slice(&data[0..8]);
+
+                            let val = i64::from_le_bytes(bytes);
+                            let result = !val;
+
+                            Value::Share(ShareType::Int, result.to_le_bytes().to_vec())
+                        },
+                        Value::Share(ShareType::Bool, data) => {
+                            // For boolean shares (NOT operation)
+                            let bit = data[0] != 0;
+                            let result = !bit;
+
+                            Value::Share(ShareType::Bool, vec![result as u8])
+                        },
                         _ => return Err("Type error in NOT operation".to_string()),
                     };
 
@@ -700,7 +1392,23 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        }
+                        },
+                        // Share << Int (shift left for shares)
+                        (Value::Share(ShareType::Int, data), Value::Int(b)) => {
+                            let mut bytes = [0u8; 8];
+                            bytes.copy_from_slice(&data[0..8]);
+
+                            let val = i64::from_le_bytes(bytes);
+                            let result = val << b;
+
+                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share << Share is not supported (amount must be a clear value)
                         _ => return Err("Type error in SHL operation".to_string()),
                     }
                 }
@@ -717,7 +1425,23 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        }
+                        },
+                        // Share >> Int (shift right for shares)
+                        (Value::Share(ShareType::Int, data), Value::Int(b)) => {
+                            let mut bytes = [0u8; 8];
+                            bytes.copy_from_slice(&data[0..8]);
+
+                            let val = i64::from_le_bytes(bytes);
+                            let result = val >> b;
+
+                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share >> Share is not supported (amount must be a clear value)
                         _ => return Err("Type error in SHR operation".to_string()),
                     }
                 }
@@ -1159,7 +1883,70 @@ impl VMState {
                             } else {
                                 0
                             }
-                        }
+                        },
+                        (Value::I32(a), Value::I32(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
                         (Value::String(a), Value::String(b)) => {
                             if a < b {
                                 -1
@@ -1168,11 +1955,61 @@ impl VMState {
                             } else {
                                 0
                             }
-                        }
+                        },
                         (Value::Bool(a), Value::Bool(b)) => match (a, b) {
                             (false, true) => -1,
                             (true, false) => 1,
                             _ => 0,
+                        },
+                        // Share comparison (Int)
+                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
+                            // TODO: implement this
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+
+                            if val1 < val2 {
+                                -1
+                            } else if val1 > val2 {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        // Share comparison (Float)
+                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
+                            // For fixed-point values
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+
+                            if val1 < val2 {
+                                -1
+                            } else if val1 > val2 {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        // Share comparison (Bool)
+                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
+                            // For boolean values
+                            let bit1 = data1[0] != 0;
+                            let bit2 = data2[0] != 0;
+
+                            match (bit1, bit2) {
+                                (false, true) => -1,
+                                (true, false) => 1,
+                                _ => 0,
+                            }
                         },
                         _ => return Err(format!("Cannot compare {:?} and {:?}", val1, val2)),
                     };
