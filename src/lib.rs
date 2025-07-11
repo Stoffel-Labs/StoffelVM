@@ -1,6 +1,8 @@
 pub mod activations;
 pub mod arithmetic_ops;
 pub mod bitwise_ops;
+pub mod cffi;
+pub mod compiled_binary;
 pub mod core_types;
 pub mod core_vm;
 pub mod functions;

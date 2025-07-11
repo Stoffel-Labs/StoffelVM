@@ -650,9 +650,10 @@ impl QuicNetworkManager {
             .map_err(|e| format!("Failed to generate certificate: {}", e))?;
 
         // Convert the certificate and key to DER format
-        let cert_der = CertificateDer::from(cert.serialize_der().unwrap());
-        let key_der =
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der()));
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key_der = PrivateKeyDer::Pkcs8(
+            PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+        );
 
         // Create a server crypto configuration with the certificate
         let mut server_crypto = rustls::ServerConfig::builder()
@@ -699,9 +700,6 @@ impl NetworkManager for QuicNetworkManager {
                 .await
                 .map_err(|e| format!("Failed to establish connection: {}", e))?;
 
-            // Create the peer connection
-            let peer_connection = Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>;
-
             // Find the node ID for this address or generate a new one
             let node_id = self.nodes.iter()
                 .find(|node| node.address() == address)
@@ -714,24 +712,12 @@ impl NetworkManager for QuicNetworkManager {
                     id
                 });
 
-            // Store the connection in the connections hashmap
-            // We need to create a new connection since we can't clone the trait object
+            // Store a clone of the connection in the connections hashmap
             let mut connections = self.connections.lock().await;
+            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), false)));
 
-            // For now, we'll just store the connection and return it
-            // In a real implementation, we would need to create a new connection
-            // with the same underlying QUIC connection
-            connections.insert(node_id, peer_connection);
-
-            // Create a new connection to return
-            // In a real implementation, this would share the same underlying QUIC connection
-            let new_connection = endpoint
-                .connect(address, "localhost")
-                .map_err(|e| format!("Failed to initiate connection: {}", e))?
-                .await
-                .map_err(|e| format!("Failed to establish connection: {}", e))?;
-
-            Ok(Box::new(QuicPeerConnection::new(new_connection, false)) as Box<dyn PeerConnection>)
+            // Return the original connection
+            Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
         })
     }
 
@@ -753,9 +739,6 @@ impl NetworkManager for QuicNetworkManager {
                 .await
                 .map_err(|e| format!("Failed to accept connection: {}", e))?;
 
-            // Create the peer connection
-            let peer_connection = Box::new(QuicPeerConnection::new(connection.clone(), true)) as Box<dyn PeerConnection>;
-
             // Get the remote address of the connection
             let remote_addr = connection.remote_address();
 
@@ -771,11 +754,11 @@ impl NetworkManager for QuicNetworkManager {
                     id
                 });
 
-            // Store the connection in the connections hashmap
+            // Store a clone of the connection in the connections hashmap
             let mut connections = self.connections.lock().await;
-            connections.insert(node_id, peer_connection);
+            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
 
-            // Create a new connection to return
+            // Return the original connection
             Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
         })
     }
