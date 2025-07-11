@@ -541,7 +541,7 @@ fn bench_core_execution(c: &mut Criterion) {
         None,
         3,
         vec![
-            Instruction::LDI(0, Value::Int(0)),  // Counter
+            Instruction::LDI(0, Value::Int(1)),  // Counter
             Instruction::LDI(1, Value::Int(10)), // Limit
             // loop_start:
             Instruction::CMP(0, 1),
