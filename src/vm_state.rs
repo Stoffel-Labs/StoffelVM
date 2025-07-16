@@ -185,6 +185,12 @@ impl VMState {
     /// * `Ok(())` - If all hooks executed successfully
     /// * `Err(String)` - If any hook returned an error
     pub fn trigger_hook_with_snapshot(&self, event: &HookEvent) -> Result<(), String> {
+        // Fast path: if no hooks are registered, return immediately
+        if self.hook_manager.hooks.is_empty() {
+            return Ok(());
+        }
+
+        // Only create context if hooks are registered
         let context = HookContext::new(
             &self.activation_records,
             self.current_instruction,
@@ -242,10 +248,11 @@ impl VMState {
     }
 
     pub fn execute_until_return(&mut self) -> Result<Value, String> {
-        // let mut temp_buffer = SmallVec::<[Value; 8]>::new();
-
         // Store the activation records length before we enter the loop
         let activation_records_len = self.activation_records_len();
+
+        // Check if hooks are enabled - this avoids checking in every instruction
+        let hooks_enabled = !self.hook_manager.hooks.is_empty();
 
         // Create a loop that doesn't hold a mutable borrow across iterations
         loop {
@@ -254,38 +261,30 @@ impl VMState {
                 return Err("Unexpected end of execution".to_string());
             }
 
+            // Get the current activation record once to avoid multiple lookups
+            let current_record = self.activation_records.last().unwrap();
+
             // Get the current record's function name and instruction pointer
-            let function_name;
-            let ip;
-            let use_resolved;
-            {
-                let current_record = self.activation_records.last().unwrap();
-                function_name = current_record.function_name.clone();
-                ip = current_record.instruction_pointer;
-                use_resolved = current_record.resolved_instructions.is_some();
-            }
+            let function_name = current_record.function_name.clone(); // Still need to clone for HashMap lookup
+            let ip = current_record.instruction_pointer;
+            let use_resolved = current_record.resolved_instructions.is_some();
 
             // Prepare the instruction cache
             self.instruction_cache.clear();
-            let cached_instructions = {
-                let current_record = self.activation_records.last().unwrap();
-                current_record.cached_instructions.clone()
-            };
 
-            if let Some(cached) = cached_instructions {
-                self.instruction_cache = cached;
+            // Optimize cached instructions handling
+            if let Some(cached) = &current_record.cached_instructions {
+                // Clone once instead of cloning each instruction individually
+                self.instruction_cache = cached.clone();
             } else {
-                let instructions = {
-                    let current_record = self.activation_records.last().unwrap();
-                    current_record.instructions.clone()
-                };
+                // Only clone instructions if we need to
+                let instructions = current_record.instructions.clone();
                 self.instruction_cache.extend(instructions);
 
-                // Update the cached instructions
-                {
-                    let current_record = self.activation_records.last_mut().unwrap();
-                    current_record.cached_instructions = Some(self.instruction_cache.clone());
-                }
+                // Update the cached instructions - need to release current_record first to avoid borrow conflict
+                let _ = current_record; // Release the borrow without dropping the reference
+                let current_record = self.activation_records.last_mut().unwrap();
+                current_record.cached_instructions = Some(self.instruction_cache.clone());
             }
 
             let vm_function = match self.functions.get(&function_name) {
@@ -453,7 +452,7 @@ impl VMState {
             }
 
             // Only create hook events if hooks are registered
-            if !self.hook_manager.hooks.is_empty() {
+            if hooks_enabled {
                 let event = HookEvent::BeforeInstructionExecute(instruction.clone());
                 self.trigger_hook_with_snapshot(&event)?;
             }
@@ -482,85 +481,111 @@ impl VMState {
                     }
 
                     // Update register
-                    let old_value;
                     {
                         let current_record = self.activation_records.last_mut().unwrap();
-                        old_value = current_record.registers[dest_reg].clone();
-                        current_record.registers[dest_reg] = value.clone();
-                    }
 
-                    // Only create hook events if hooks are registered
-                    if !self.hook_manager.hooks.is_empty() {
-                        let event = HookEvent::RegisterWrite(dest_reg, old_value, value);
-                        self.trigger_hook_with_snapshot(&event)?;
+                        // Only clone for hook events if hooks are registered
+                        let old_value = if !self.hook_manager.hooks.is_empty() {
+                            Some(current_record.registers[dest_reg].clone())
+                        } else {
+                            None
+                        };
+
+                        // Move value instead of cloning when possible
+                        current_record.registers[dest_reg] = value;
+
+                        // Only trigger hook if needed
+                        if let Some(old) = old_value {
+                            let event = HookEvent::RegisterWrite(dest_reg, old, current_record.registers[dest_reg].clone());
+                            self.trigger_hook_with_snapshot(&event)?;
+                        }
                     }
                 }
                 Instruction::LDI(dest_reg, value) => {
                     // Update register
-                    let old_value;
                     {
                         let current_record = self.activation_records.last_mut().unwrap();
-                        old_value = current_record.registers[dest_reg].clone();
-                        current_record.registers[dest_reg] = value.clone();
-                    }
 
-                    let event = HookEvent::RegisterWrite(dest_reg, old_value, value);
-                    self.trigger_hook_with_snapshot(&event)?;
+                        // Only clone for hook events if hooks are registered
+                        let old_value = if !self.hook_manager.hooks.is_empty() {
+                            Some(current_record.registers[dest_reg].clone())
+                        } else {
+                            None
+                        };
+
+                        // Move value instead of cloning when possible
+                        current_record.registers[dest_reg] = value.clone();
+
+                        // Only trigger hook if needed
+                        if let Some(old) = old_value {
+                            let event = HookEvent::RegisterWrite(dest_reg, old, current_record.registers[dest_reg].clone());
+                            self.trigger_hook_with_snapshot(&event)?;
+                        }
+                    }
                 }
                 Instruction::MOV(dest_reg, src_reg) => {
-                    // Get value from source register
-                    let value;
-                    let old_value;
+                    // Get value from source register and prepare result value
+                    let result_value;
                     {
                         let current_record = self.activation_records.last().unwrap();
-                        value = current_record.registers[src_reg].clone();
-                    }
+                        let src_value = &current_record.registers[src_reg];
 
-                    // Check if this is a clear-to-secret or secret-to-clear conversion
-                    let result_value = if dest_reg >= 16 && src_reg < 16 {
-                        // Clear to secret conversion (lower to upper half)
-                        match &value {
-                            Value::Int(i) => Value::Share(ShareType::Int, i.to_le_bytes().to_vec()),
-                            Value::Float(f) => Value::Share(ShareType::Float, f.to_le_bytes().to_vec()),
-                            Value::Bool(b) => Value::Share(ShareType::Bool, vec![*b as u8]),
-                            _ => return Err("Only primitive types (Int, Float, Bool) can be converted to shares".to_string()),
-                        }
-                    } else if dest_reg < 16 && src_reg >= 16 {
-                        // Secret to clear conversion (upper to lower half)
-                        let current_record = self.activation_records.last().unwrap();
-                        match &current_record.registers[src_reg] {
-                            Value::Share(ShareType::Int, data) => {
-                                let mut bytes = [0u8; 8];
-                                bytes.copy_from_slice(&data[0..8]);
-                                Value::Int(i64::from_le_bytes(bytes))
-                            },
-                            Value::Share(ShareType::Float, data) => {
-                                let mut bytes = [0u8; 8];
-                                bytes.copy_from_slice(&data[0..8]);
-                                Value::Float(i64::from_le_bytes(bytes))
-                            },
-                            Value::Share(ShareType::Bool, data) => {
-                                Value::Bool(data[0] != 0)
-                            },
-                            _ => return Err("Invalid share type for conversion to clear value".to_string()),
-                        }
-                    } else {
-                        // Regular MOV, no conversion
-                        value.clone()
-                    };
+                        // Check if this is a clear-to-secret or secret-to-clear conversion
+                        result_value = if dest_reg >= 16 && src_reg < 16 {
+                            // Clear to secret conversion (lower to upper half)
+                            match src_value {
+                                Value::Int(i) => Value::Share(ShareType::Int, i.to_le_bytes().to_vec()),
+                                Value::Float(f) => Value::Share(ShareType::Float, f.to_le_bytes().to_vec()),
+                                Value::Bool(b) => Value::Share(ShareType::Bool, vec![*b as u8]),
+                                _ => return Err("Only primitive types (Int, Float, Bool) can be converted to shares".to_string()),
+                            }
+                        } else if dest_reg < 16 && src_reg >= 16 {
+                            // Secret to clear conversion (upper to lower half)
+                            match src_value {
+                                Value::Share(ShareType::Int, data) => {
+                                    let mut bytes = [0u8; 8];
+                                    bytes.copy_from_slice(&data[0..8]);
+                                    Value::Int(i64::from_le_bytes(bytes))
+                                },
+                                Value::Share(ShareType::Float, data) => {
+                                    let mut bytes = [0u8; 8];
+                                    bytes.copy_from_slice(&data[0..8]);
+                                    Value::Float(i64::from_le_bytes(bytes))
+                                },
+                                Value::Share(ShareType::Bool, data) => {
+                                    Value::Bool(data[0] != 0)
+                                },
+                                _ => return Err("Invalid share type for conversion to clear value".to_string()),
+                            }
+                        } else {
+                            // Regular MOV, no conversion
+                            src_value.clone()
+                        };
+                    }
 
                     // Update destination register
                     {
                         let current_record = self.activation_records.last_mut().unwrap();
-                        old_value = current_record.registers[dest_reg].clone();
-                        current_record.registers[dest_reg] = result_value.clone();
+
+                        // Only clone values for hooks if hooks are registered
+                        if !self.hook_manager.hooks.is_empty() {
+                            let src_value = current_record.registers[src_reg].clone();
+                            let old_value = current_record.registers[dest_reg].clone();
+
+                            // Update the register
+                            current_record.registers[dest_reg] = result_value.clone();
+
+                            // Trigger hooks
+                            let read_event = HookEvent::RegisterRead(src_reg, src_value);
+                            self.trigger_hook_with_snapshot(&read_event)?;
+
+                            let write_event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.trigger_hook_with_snapshot(&write_event)?;
+                        } else {
+                            // Just update the register without hooks
+                            current_record.registers[dest_reg] = result_value;
+                        }
                     }
-
-                    let read_event = HookEvent::RegisterRead(src_reg, value.clone());
-                    self.trigger_hook_with_snapshot(&read_event)?;
-
-                    let write_event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                    self.trigger_hook_with_snapshot(&write_event)?;
                 }
                 Instruction::ADD(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
@@ -569,72 +594,168 @@ impl VMState {
 
                     match (src1, src2) {
                         (Value::Int(a), Value::Int(b)) => {
-                            let result_value = Value::Int(a + b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Create result directly
+                            let result = *a + *b;
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if hooks_enabled {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::Int(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         (Value::I32(a), Value::I32(b)) => {
-                            let result_value = Value::I32(a + b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Create result directly
+                            let result = *a + *b;
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::I32(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         (Value::I16(a), Value::I16(b)) => {
-                            let result_value = Value::I16(a + b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Create result directly
+                            let result = *a + *b;
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::I16(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         (Value::I8(a), Value::I8(b)) => {
-                            let result_value = Value::I8(a + b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Create result directly
+                            let result = *a + *b;
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::I8(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         (Value::U8(a), Value::U8(b)) => {
-                            let result_value = Value::U8(a + b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Create result directly
+                            let result = *a + *b;
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::U8(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         (Value::U16(a), Value::U16(b)) => {
-                            let result_value = Value::U16(a + b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Create result directly
+                            let result = *a + *b;
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::U16(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         (Value::U32(a), Value::U32(b)) => {
-                            let result_value = Value::U32(a + b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Create result directly
+                            let result = *a + *b;
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::U32(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         (Value::U64(a), Value::U64(b)) => {
-                            let result_value = Value::U64(a + b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Create result directly
+                            let result = *a + *b;
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::U64(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         // Share + Share (offline addition)
                         (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
-                            // TODO: verify that this is the correct way to do it
+                            // Use stack-allocated arrays instead of heap allocations
                             let mut bytes1 = [0u8; 8];
                             let mut bytes2 = [0u8; 8];
                             bytes1.copy_from_slice(&data1[0..8]);
@@ -644,15 +765,27 @@ impl VMState {
                             let val2 = i64::from_le_bytes(bytes2);
                             let result = val1 + val2;
 
-                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Use the result bytes directly without intermediate allocation
+                            let result_bytes = result.to_le_bytes().to_vec();
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if hooks_enabled {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Move the value instead of cloning
+                            record.registers[dest_reg] = Value::Share(ShareType::Int, result_bytes);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
-                            // For fixed-point values
+                            // Use stack-allocated arrays instead of heap allocations
                             let mut bytes1 = [0u8; 8];
                             let mut bytes2 = [0u8; 8];
                             bytes1.copy_from_slice(&data1[0..8]);
@@ -662,12 +795,25 @@ impl VMState {
                             let val2 = i64::from_le_bytes(bytes2);
                             let result = val1 + val2;
 
-                            let result_value = Value::Share(ShareType::Float, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Pre-allocate result buffer to avoid allocation
+                            let mut result_bytes = Vec::with_capacity(8);
+                            result_bytes.extend_from_slice(&result.to_le_bytes());
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Move the value instead of cloning
+                            record.registers[dest_reg] = Value::Share(ShareType::Float, result_bytes);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
                             // For boolean values (XOR operation for addition in GF(2))
@@ -675,12 +821,25 @@ impl VMState {
                             let bit2 = data2[0] != 0;
                             let result = bit1 ^ bit2; // XOR for binary addition
 
-                            let result_value = Value::Share(ShareType::Bool, vec![result as u8]);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Pre-allocate result buffer to avoid allocation
+                            let mut result_bytes = Vec::with_capacity(1);
+                            result_bytes.push(result as u8);
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Move the value instead of cloning
+                            record.registers[dest_reg] = Value::Share(ShareType::Bool, result_bytes);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
                         _ => return Err("Type error in ADD operation".to_string()),
                     }
@@ -1838,8 +1997,11 @@ impl VMState {
 
                     // If we only have one activation record (main function), just return
                     if self.activation_records.len() <= 1 {
-                        let event = HookEvent::AfterInstructionExecute(instruction.clone());
-                        self.hook_manager.trigger(&event, self)?;
+                        // Only create hook events if hooks are registered
+                        if !self.hook_manager.hooks.is_empty() {
+                            let event = HookEvent::AfterInstructionExecute(instruction.clone());
+                            self.hook_manager.trigger(&event, self)?;
+                        }
                         return Ok(return_value);
                     }
 
@@ -1850,24 +2012,39 @@ impl VMState {
                     let parent_record = self.activation_records.last_mut().unwrap();
 
                     // Set the return value in register 0 of the parent activation record
-                    let old_value = parent_record.registers[0].clone();
-                    parent_record.registers[0] = return_value.clone();
+                    if !self.hook_manager.hooks.is_empty() {
+                        // Only clone values and trigger hooks if hooks are registered
+                        let old_value = parent_record.registers[0].clone();
+                        parent_record.registers[0] = return_value.clone();
 
-                    let event = HookEvent::RegisterWrite(0, old_value, return_value.clone());
-                    self.hook_manager.trigger(&event, self)?;
+                        let event = HookEvent::RegisterWrite(0, old_value, return_value.clone());
+                        self.hook_manager.trigger(&event, self)?;
 
-                    let closure_value = Value::String(format!("<function {}>", returning_from));
-                    let event = HookEvent::AfterFunctionCall(closure_value, return_value);
-                    self.hook_manager.trigger(&event, self)?;
+                        let closure_value = Value::String(format!("<function {}>", returning_from));
+                        let event = HookEvent::AfterFunctionCall(closure_value, return_value);
+                        self.hook_manager.trigger(&event, self)?;
+                    } else {
+                        // Just set the return value without hooks
+                        parent_record.registers[0] = return_value;
+                    }
                 }
                 Instruction::PUSHARG(reg) => {
-                    let value = self.activation_records.last().unwrap().registers[reg].clone();
+                    if !self.hook_manager.hooks.is_empty() {
+                        // Only clone values and trigger hooks if hooks are registered
+                        let value = self.activation_records.last().unwrap().registers[reg].clone();
 
-                    let record = self.activation_records.last_mut().unwrap();
-                    record.stack.push(value.clone());
+                        let record = self.activation_records.last_mut().unwrap();
+                        record.stack.push(value.clone());
 
-                    let event = HookEvent::StackPush(value);
-                    self.hook_manager.trigger(&event, self)?;
+                        let event = HookEvent::StackPush(value);
+                        self.hook_manager.trigger(&event, self)?;
+                    } else {
+                        // Just push the value without hooks
+                        let value = self.activation_records.last().unwrap().registers[reg].clone();
+
+                        let record = self.activation_records.last_mut().unwrap();
+                        record.stack.push(value);
+                    }
                 }
                 Instruction::CMP(reg1, reg2) => {
                     let record = self.activation_records.last_mut().unwrap();
@@ -2018,8 +2195,11 @@ impl VMState {
                 }
             }
 
-            let event = HookEvent::AfterInstructionExecute(instruction.clone());
-            self.hook_manager.trigger(&event, self)?;
+            // Only create hook events if hooks are registered
+            if hooks_enabled {
+                let event = HookEvent::AfterInstructionExecute(instruction.clone());
+                self.hook_manager.trigger(&event, self)?;
+            }
             // The loop will never exit normally, it will always return from within
             // or continue to the next iteration
         }
