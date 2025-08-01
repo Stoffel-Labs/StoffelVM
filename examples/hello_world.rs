@@ -1,8 +1,8 @@
+use std::collections::HashMap;
+use stoffel_vm::core_types::Value;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::functions::VMFunction;
 use stoffel_vm::instructions::Instruction;
-use stoffel_vm::core_types::Value;
-use std::collections::HashMap;
 
 fn main() -> Result<(), String> {
     // Initialize the VM

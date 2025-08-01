@@ -1,8 +1,8 @@
 use crate::activations::ActivationRecord;
+use crate::core_types::{Upvalue, Value};
 use crate::functions::Function;
 use crate::instructions::Instruction;
-use crate::vm_state::{VMState};
-use crate::core_types::{Upvalue, Value};
+use crate::vm_state::VMState;
 
 /// Hook event types
 #[derive(Debug, Clone)]
@@ -39,7 +39,7 @@ impl<'a> HookContext<'a> {
         current_instruction: usize,
         functions: &'a rustc_hash::FxHashMap<String, Function>,
     ) -> Self {
-        HookContext { 
+        HookContext {
             activation_records,
             current_instruction,
             functions,
@@ -66,7 +66,8 @@ impl<'a> HookContext<'a> {
     }
 
     pub fn get_function_name(&self) -> Option<String> {
-        self.current_activation_record().map(|r| r.function_name.clone())
+        self.current_activation_record()
+            .map(|r| r.function_name.clone())
     }
 
     pub fn get_call_depth(&self) -> usize {
@@ -74,12 +75,12 @@ impl<'a> HookContext<'a> {
     }
 
     pub fn get_instruction_at(&self, function_name: &str, index: usize) -> Option<Instruction> {
-        self.functions.get(function_name).and_then(|func| {
-            match func {
+        self.functions
+            .get(function_name)
+            .and_then(|func| match func {
                 Function::VM(vm_func) => vm_func.instructions.get(index).cloned(),
-                _ => None
-            }
-        })
+                _ => None,
+            })
     }
 }
 
@@ -166,20 +167,26 @@ impl HookManager {
         let context = HookContext::new(
             &vm_state.activation_records,
             vm_state.current_instruction,
-            &vm_state.functions
+            &vm_state.functions,
         );
 
         self.trigger_with_context(event, &context)
     }
 
-    pub fn trigger_with_context(&self, event: &HookEvent, context: &HookContext) -> Result<(), String> {
+    pub fn trigger_with_context(
+        &self,
+        event: &HookEvent,
+        context: &HookContext,
+    ) -> Result<(), String> {
         // Fast path: if no hooks are registered, return immediately
         if self.hooks.is_empty() {
             return Ok(());
         }
 
         // Find matching hooks
-        let matching_hooks: Vec<_> = self.hooks.iter()
+        let matching_hooks: Vec<_> = self
+            .hooks
+            .iter()
             .filter(|hook| hook.enabled && (hook.predicate)(event))
             .collect();
 

@@ -4,4 +4,7 @@
 pub mod p2p;
 
 // Re-export key components
-pub use p2p::{QuicNetworkManager, QuicPeerConnection, PeerConnection, NetworkManager};
+pub use p2p::{
+    NetworkManager, PeerConnection, QuicMessage, QuicNetworkConfig, QuicNetworkManager, QuicNode,
+    QuicPeerConnection,
+};

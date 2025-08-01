@@ -1,9 +1,8 @@
+use std::collections::HashMap;
+use stoffel_vm::core_types::Value;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::functions::VMFunction;
 use stoffel_vm::instructions::Instruction;
-use stoffel_vm::core_types::Value;
-use std::collections::HashMap;
-
 
 // TODO: figure out why our noble memory safe program is in fact not memory safe in this
 
@@ -99,50 +98,42 @@ fn main() -> Result<(), String> {
             Instruction::CMP(0, 3),
             // If equal, call add function
             Instruction::JMPEQ("call_add".to_string()),
-
             // Load "subtract" for comparison
             Instruction::LDI(3, Value::String("subtract".to_string())),
             // Compare operation with "subtract"
             Instruction::CMP(0, 3),
             // If equal, call subtract function
             Instruction::JMPEQ("call_subtract".to_string()),
-
             // Load "multiply" for comparison
             Instruction::LDI(3, Value::String("multiply".to_string())),
             // Compare operation with "multiply"
             Instruction::CMP(0, 3),
             // If equal, call multiply function
             Instruction::JMPEQ("call_multiply".to_string()),
-
             // Load "divide" for comparison
             Instruction::LDI(3, Value::String("divide".to_string())),
             // Compare operation with "divide"
             Instruction::CMP(0, 3),
             // If equal, call divide function
             Instruction::JMPEQ("call_divide".to_string()),
-
             // If no match, return error message
             Instruction::LDI(0, Value::String("Invalid operation".to_string())),
             Instruction::RET(0),
-
             // call_add:
             Instruction::PUSHARG(1), // Push a
             Instruction::PUSHARG(2), // Push b
             Instruction::CALL("add".to_string()),
             Instruction::RET(0),
-
             // call_subtract:
             Instruction::PUSHARG(1), // Push a
             Instruction::PUSHARG(2), // Push b
             Instruction::CALL("subtract".to_string()),
             Instruction::RET(0),
-
             // call_multiply:
             Instruction::PUSHARG(1), // Push a
             Instruction::PUSHARG(2), // Push b
             Instruction::CALL("multiply".to_string()),
             Instruction::RET(0),
-
             // call_divide:
             Instruction::PUSHARG(1), // Push a
             Instruction::PUSHARG(2), // Push b
@@ -165,11 +156,7 @@ fn main() -> Result<(), String> {
     let b = 5;
 
     for op in operations {
-        let args = vec![
-            Value::String(op.to_string()),
-            Value::Int(a),
-            Value::Int(b),
-        ];
+        let args = vec![Value::String(op.to_string()), Value::Int(a), Value::Int(b)];
 
         let result = vm.execute_with_args("calculator", &args)?;
         println!("{} {} {} = {:?}", a, op, b, result);

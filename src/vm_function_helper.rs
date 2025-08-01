@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use crate::functions::VMFunction;
 use crate::instructions::Instruction;
+use std::collections::HashMap;
 
 /// Helper function to create a VMFunction with default values for the new fields
 pub fn create_vmfunction(
