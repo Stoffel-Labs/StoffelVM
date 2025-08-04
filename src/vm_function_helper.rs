@@ -13,7 +13,6 @@ pub fn create_vmfunction(
     labels: HashMap<String, usize>,
 ) -> VMFunction {
     VMFunction {
-        cached_instructions: None,
         resolved_instructions: None,
         constant_values: None,
         name,

@@ -1,21 +1,19 @@
 use crate::activations::{ActivationRecord, ActivationRecordPool};
-use crate::core_types::{Closure, Upvalue, Value};
 use crate::functions::{ForeignFunction, ForeignFunctionContext, Function, VMFunction};
-use crate::instructions::Instruction;
-use crate::mutex_helpers::lock_mutex_as_result;
 use crate::runtime_hooks::{HookContext, HookEvent};
+use crate::core_types::{Closure, Upvalue, Value};
 use crate::vm_state::VMState;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
 use std::sync::Arc;
+use rustc_hash::FxHashMap;
 
 /// The register-based virtual machine
 pub struct VirtualMachine {
     pub state: VMState,
     activation_pool: ActivationRecordPool,
-    instruction_cache: FxHashMap<String, Vec<Instruction>>,
 }
+
 
 impl Default for VirtualMachine {
     fn default() -> Self {
@@ -28,7 +26,6 @@ impl VirtualMachine {
         let mut vm = VirtualMachine {
             state: VMState::new(),
             activation_pool: ActivationRecordPool::new(1024),
-            instruction_cache: FxHashMap::default(),
         };
 
         // Register standard library functions
@@ -265,16 +262,12 @@ impl VirtualMachine {
 
                     // Ensure instructions are cached and resolved
                     let mut vm_func = vm_func.clone();
-                    if vm_func.cached_instructions.is_none() {
-                        vm_func.cache_instructions();
-                    }
                     if vm_func.resolved_instructions.is_none() {
                         vm_func.resolve_instructions();
                     }
 
                     // Trigger BeforeFunctionCall hook
-                    let event =
-                        HookEvent::BeforeFunctionCall(ctx.args[0].clone(), call_args.to_vec());
+                    let event = HookEvent::BeforeFunctionCall(ctx.args[0].clone(), call_args.to_vec());
                     ctx.vm_state.hook_manager.trigger(&event, ctx.vm_state)?;
 
                     // Setup the new activation record with the provided upvalues
@@ -287,10 +280,6 @@ impl VirtualMachine {
                         instruction_pointer: 0,
                         stack: smallvec![],
                         compare_flag: 0,
-                        cached_instructions: vm_func
-                            .cached_instructions
-                            .as_ref()
-                            .map(|v| SmallVec::from_vec(v.clone())),
                         resolved_instructions: vm_func.resolved_instructions.clone(),
                         constant_values: vm_func.constant_values.clone(),
                         closure: Some(ctx.args[0].clone()), // Store the original closure
@@ -303,9 +292,7 @@ impl VirtualMachine {
                     // Set up parameters in registers and locals
                     for (i, param_name) in vm_func.parameters.iter().enumerate() {
                         record.registers[i] = call_args[i].clone();
-                        record
-                            .locals
-                            .insert(param_name.clone(), call_args[i].clone());
+                        record.locals.insert(param_name.clone(), call_args[i].clone());
                     }
 
                     // Push to the activation record stack
@@ -408,10 +395,7 @@ impl VirtualMachine {
                         old_value = upvalue.value.clone();
                         upvalue.value = new_value.clone();
                         found = true;
-                        println!(
-                            "Updated upvalue {} in current record: {:?} -> {:?}",
-                            name, old_value, new_value
-                        );
+                        println!("Updated upvalue {} in current record: {:?} -> {:?}", name, old_value, new_value);
                         break;
                     }
                 }
@@ -502,13 +486,6 @@ impl VirtualMachine {
 
             let type_name = match &ctx.args[0] {
                 Value::Int(_) => "integer",
-                Value::I32(_) => "integer",
-                Value::I16(_) => "integer",
-                Value::I8(_) => "integer",
-                Value::U8(_) => "integer",
-                Value::U16(_) => "integer",
-                Value::U32(_) => "integer",
-                Value::U64(_) => "integer",
                 Value::Float(_) => "float",
                 Value::Bool(_) => "boolean",
                 Value::String(_) => "string",
@@ -517,6 +494,13 @@ impl VirtualMachine {
                 Value::Foreign(_) => "userdata",
                 Value::Closure(_) => "function",
                 Value::Unit => "nil",
+                Value::I32(_) => "int32",
+                Value::I16(_) => "int16",
+                Value::I8(_) => "int8",
+                Value::U8(_) => "uint8",
+                Value::U16(_) => "uint16",
+                Value::U32(_) => "uint32",
+                Value::U64(_) => "uint64",
                 Value::Share(_, _) => "share",
             };
 
@@ -527,7 +511,6 @@ impl VirtualMachine {
     // Register a VM function
     pub fn register_function(&mut self, mut function: VMFunction) {
         // Cache and resolve instructions for the function
-        function.cache_instructions();
         function.resolve_instructions();
 
         self.state
@@ -588,11 +571,7 @@ impl VirtualMachine {
         self.state.hook_manager.disable_hook(hook_id)
     }
 
-    pub fn execute_with_args(
-        &mut self,
-        function_name: &str,
-        args: &[Value],
-    ) -> Result<Value, String> {
+    pub fn execute_with_args(&mut self, function_name: &str, args: &[Value]) -> Result<Value, String> {
         // First check if the function exists and what type it is
         let function = match self.state.functions.get(function_name) {
             Some(f) => f.clone(),
@@ -607,7 +586,7 @@ impl VirtualMachine {
                     vm_state: &mut self.state,
                 })?;
                 return Ok(result);
-            }
+            },
             Function::VM(vm_func) => {
                 if args.len() != vm_func.parameters.len() {
                     return Err(format!(
@@ -620,9 +599,6 @@ impl VirtualMachine {
 
                 // Ensure instructions are cached and resolved
                 let mut vm_func = vm_func.clone();
-                if vm_func.cached_instructions.is_none() {
-                    vm_func.cache_instructions();
-                }
                 if vm_func.resolved_instructions.is_none() {
                     vm_func.resolve_instructions();
                 }
@@ -630,25 +606,19 @@ impl VirtualMachine {
                 // Clone the needed data before setting up the activation record to avoid borrow conflicts
                 let function_name = function_name.to_string();
                 let parameters = vm_func.parameters.clone();
-                let args = args.to_vec(); // Clone the arguments to avoid reference issues
+                let args = args.to_vec();  // Clone the arguments to avoid reference issues
 
                 let mut initial_record = self.activation_pool.get();
                 initial_record.function_name = function_name;
-                initial_record.cached_instructions = Some(SmallVec::from(
-                    vm_func.cached_instructions.as_ref().unwrap().clone(),
-                ));
                 initial_record.resolved_instructions = vm_func.resolved_instructions.clone();
                 initial_record.constant_values = vm_func.constant_values.clone();
 
                 // Initialize registers with the appropriate size and default values
-                initial_record.registers =
-                    SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]);
+                initial_record.registers = SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]);
 
                 for (i, (param_name, arg_value)) in parameters.iter().zip(args.iter()).enumerate() {
                     initial_record.registers[i] = arg_value.clone();
-                    initial_record
-                        .locals
-                        .insert(param_name.clone(), arg_value.clone());
+                    initial_record.locals.insert(param_name.clone(), arg_value.clone());
                 }
 
                 // Clone the record and drop the Reusable to avoid borrowing conflicts
@@ -678,18 +648,12 @@ impl VirtualMachine {
 
         // Ensure instructions are cached and resolved
         let mut vm_func = vm_func.clone();
-        if vm_func.cached_instructions.is_none() {
-            vm_func.cache_instructions();
-        }
         if vm_func.resolved_instructions.is_none() {
             vm_func.resolve_instructions();
         }
 
         let mut initial_record = self.activation_pool.get();
         initial_record.function_name = main_function.to_string();
-        initial_record.cached_instructions = Some(SmallVec::from(
-            vm_func.cached_instructions.as_ref().unwrap().clone(),
-        ));
         initial_record.resolved_instructions = vm_func.resolved_instructions.clone();
         initial_record.constant_values = vm_func.constant_values.clone();
 
@@ -726,20 +690,9 @@ impl VirtualMachine {
             None => return Err(format!("Function {} not found", function_name)),
         };
 
-        // Verify that instructions are already cached and resolved
-        if vm_func.cached_instructions.is_none() || vm_func.resolved_instructions.is_none() {
-            return Err(format!(
-                "Function {} must be executed at least once before benchmarking",
-                function_name
-            ));
-        }
-
         // Create activation record with resolved instructions
         let mut initial_record = self.activation_pool.get();
         initial_record.function_name = function_name.to_string();
-        initial_record.cached_instructions = Some(SmallVec::from(
-            vm_func.cached_instructions.as_ref().unwrap().clone(),
-        ));
         initial_record.resolved_instructions = vm_func.resolved_instructions.clone();
         initial_record.constant_values = vm_func.constant_values.clone();
 
@@ -775,18 +728,20 @@ mod tests {
     use crate::activations::ActivationRecord;
     use crate::functions::VMFunction;
     use crate::instructions::Instruction;
-    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use parking_lot::Mutex;
     use std::time::Instant;
+    use crate::mutex_helpers::lock_mutex_as_result;
 
     // Helper function to create a test VM
     // Each test gets its own VM instance to allow parallel test execution
     fn setup_vm() -> VirtualMachine {
         // Create a new VM with its own independent state
         // Use a static VM instance as the base for all test VMs
-        static BASE_VM: once_cell::sync::Lazy<VirtualMachine> =
-            once_cell::sync::Lazy::new(|| VirtualMachine::new());
+        static BASE_VM: once_cell::sync::Lazy<VirtualMachine> = once_cell::sync::Lazy::new(|| {
+            VirtualMachine::new()
+        });
 
         // Clone the base VM with its own independent state
         // This allows tests to run in parallel without locking each other
@@ -807,7 +762,6 @@ mod tests {
         labels: HashMap<String, usize>,
     ) -> VMFunction {
         VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name,
@@ -836,14 +790,14 @@ mod tests {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(5)),          // r0 = 5
-                Instruction::LDI(1, Value::Int(10)),         // r1 = 10
-                Instruction::CMP(0, 1),                      // Compare r0 < r1 (sets flag to -1)
+                Instruction::LDI(0, Value::Int(5)),  // r0 = 5
+                Instruction::LDI(1, Value::Int(10)), // r1 = 10
+                Instruction::CMP(0, 1),              // Compare r0 < r1 (sets flag to -1)
                 Instruction::JMPLT("less_than".to_string()), // Jump if less than
-                Instruction::LDI(2, Value::Int(0)),          // Should be skipped
+                Instruction::LDI(2, Value::Int(0)),  // Should be skipped
                 Instruction::JMP("end".to_string()),
                 // less_than:
-                Instruction::LDI(2, Value::Int(1)), // Set result to 1 if jump taken
+                Instruction::LDI(2, Value::Int(1)),  // Set result to 1 if jump taken
                 // end:
                 Instruction::RET(2),
             ],
@@ -864,7 +818,6 @@ mod tests {
         labels.insert("end".to_string(), 7);
 
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_greater_than_jump".to_string(),
@@ -873,14 +826,14 @@ mod tests {
             parent: None,
             register_count: 3,
             instructions: vec![
-                Instruction::LDI(0, Value::Int(15)),            // r0 = 15
-                Instruction::LDI(1, Value::Int(10)),            // r1 = 10
-                Instruction::CMP(0, 1),                         // Compare r0 > r1 (sets flag to 1)
+                Instruction::LDI(0, Value::Int(15)), // r0 = 15
+                Instruction::LDI(1, Value::Int(10)), // r1 = 10
+                Instruction::CMP(0, 1),              // Compare r0 > r1 (sets flag to 1)
                 Instruction::JMPGT("greater_than".to_string()), // Jump if greater than
-                Instruction::LDI(2, Value::Int(0)),             // Should be skipped
+                Instruction::LDI(2, Value::Int(0)),  // Should be skipped
                 Instruction::JMP("end".to_string()),
                 // greater_than:
-                Instruction::LDI(2, Value::Int(1)), // Set result to 1 if jump taken
+                Instruction::LDI(2, Value::Int(1)),  // Set result to 1 if jump taken
                 // end:
                 Instruction::RET(2),
             ],
@@ -901,7 +854,6 @@ mod tests {
         let mut vm = setup_vm();
 
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_load".to_string(),
@@ -932,7 +884,6 @@ mod tests {
         let mut vm = setup_vm();
 
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_objects".to_string(),
@@ -970,7 +921,6 @@ mod tests {
         let mut vm = setup_vm();
 
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_nested_objects".to_string(),
@@ -1023,7 +973,6 @@ mod tests {
         let mut vm = setup_vm();
 
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_arrays".to_string(),
@@ -1062,7 +1011,6 @@ mod tests {
         let mut vm = setup_vm();
 
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_array_length".to_string(),
@@ -1105,7 +1053,6 @@ mod tests {
         let mut vm = setup_vm();
 
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_array_string_keys".to_string(),
@@ -1144,7 +1091,6 @@ mod tests {
 
         // Counter creator function
         let create_counter = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "create_counter".to_string(),
@@ -1173,7 +1119,6 @@ mod tests {
         };
 
         let increment = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "increment".to_string(),
@@ -1208,7 +1153,6 @@ mod tests {
 
         // Test function
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_closures".to_string(),
@@ -1304,7 +1248,6 @@ mod tests {
 
         // Counter creator function
         let create_counter = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "create_counter".to_string(),
@@ -1328,7 +1271,6 @@ mod tests {
 
         // Increment function
         let increment = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "increment".to_string(),
@@ -1358,7 +1300,6 @@ mod tests {
 
         // Test function with multiple counters
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_multiple_closures".to_string(),
@@ -1443,7 +1384,9 @@ mod tests {
 
         // 4. Hook for register operations
         vm.register_hook(
-            |event| matches!(event, HookEvent::RegisterWrite(_, _, _)),
+            |event| {
+                matches!(event, HookEvent::RegisterWrite(_, _, _))
+            },
             move |event, ctx| {
                 if let HookEvent::RegisterWrite(reg, old, new) = event {
                     println!("REGISTER WRITE: r{} = {:?} (was {:?})", reg, new, old);
@@ -1897,8 +1840,7 @@ mod tests {
         vm.register_hook(
             |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
             move |_, _| {
-                if let Ok(mut calls) = crate::mutex_helpers::lock_mutex_as_result(&hook_calls_clone)
-                {
+                if let Ok(mut calls) = crate::mutex_helpers::lock_mutex_as_result(&hook_calls_clone) {
                     *calls += 1;
                 }
                 Ok(())
@@ -1944,9 +1886,7 @@ mod tests {
             move |event, ctx| {
                 // Add the ctx parameter
                 if let HookEvent::RegisterWrite(reg, _, new_value) = event {
-                    if let Ok(mut log) =
-                        crate::mutex_helpers::lock_mutex_as_result(&register_writes_clone)
-                    {
+                    if let Ok(mut log) = crate::mutex_helpers::lock_mutex_as_result(&register_writes_clone) {
                         // Make sure types match here - reg is already usize, keep it that way
                         log.push((*reg, new_value.clone()));
                     }
@@ -2006,10 +1946,7 @@ mod tests {
                         ops.push(("read", name.clone(), value.clone()));
                     }
                     HookEvent::UpvalueWrite(name, old_value, new_value) => {
-                        println!(
-                            "UpvalueWrite: {} = {:?} -> {:?}",
-                            name, old_value, new_value
-                        );
+                        println!("UpvalueWrite: {} = {:?} -> {:?}", name, old_value, new_value);
                         let mut ops = upvalue_ops_clone.lock();
                         ops.push(("write", name.clone(), new_value.clone()));
                     }
@@ -2041,10 +1978,7 @@ mod tests {
             |event| matches!(event, HookEvent::RegisterWrite(_, _, _)),
             move |event, _ctx| {
                 if let HookEvent::RegisterWrite(reg, old_value, new_value) = event {
-                    println!(
-                        "RegisterWrite: r{} = {:?} -> {:?}",
-                        reg, old_value, new_value
-                    );
+                    println!("RegisterWrite: r{} = {:?} -> {:?}", reg, old_value, new_value);
                 }
                 Ok(())
             },
@@ -2098,7 +2032,6 @@ mod tests {
 
         // Test function
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_upvalue_hooks".to_string(),
@@ -2126,7 +2059,7 @@ mod tests {
         println!("Test function instructions:");
         for (i, instruction) in test_function.instructions.iter().enumerate() {
             println!("  {}: {:?}", i, instruction);
-        }
+        };
 
         vm.register_function(create_counter);
         vm.register_function(increment);
@@ -2662,7 +2595,6 @@ mod tests {
             instruction_pointer: 0,
             stack: smallvec![],
             compare_flag: 0,
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             closure: None,
@@ -2765,7 +2697,7 @@ mod tests {
         {
             let mut hook_calls_guard = hook_calls.lock();
             assert_eq!(*hook_calls_guard, 4); // 4 instructions executed
-                                              // Reset counter
+            // Reset counter
             *hook_calls_guard = 0;
         } // Explicitly drop the lock
 
@@ -2834,7 +2766,7 @@ mod tests {
         {
             let mut hook_calls_guard = hook_calls.lock();
             assert_eq!(*hook_calls_guard, 4); // 4 instructions executed
-                                              // Reset counter
+            // Reset counter
             *hook_calls_guard = 0;
         } // Explicitly drop the lock
 
@@ -2928,7 +2860,6 @@ mod tests {
         labels.insert("loop_end".to_string(), 9); // Loop end is at position 9 (0-indexed)
 
         let sum_squares = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "sum_squares".to_string(),
@@ -2967,7 +2898,6 @@ mod tests {
 
         // Test function
         let test_function = VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name: "test_complex".to_string(),
