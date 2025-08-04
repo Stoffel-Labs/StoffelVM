@@ -13,14 +13,14 @@
 //! The VM state is the central component that orchestrates all aspects of
 //! program execution, from function calls to object manipulation.
 
-use std::sync::Arc;
-use rustc_hash::FxHashMap;
-use smallvec::{smallvec, SmallVec};
 use crate::activations::{ActivationRecord, ActivationRecordPool};
-use crate::core_types::{Closure, ForeignObjectStorage, ObjectStore, Upvalue, Value};
+use crate::core_types::{Closure, ForeignObjectStorage, ObjectStore, ShareType, Upvalue, Value};
 use crate::functions::{ForeignFunctionContext, Function};
 use crate::instructions::{Instruction, ResolvedInstruction};
 use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
+use rustc_hash::FxHashMap;
+use smallvec::{smallvec, SmallVec};
+use std::sync::Arc;
 
 /// Runtime state of the virtual machine
 ///
@@ -37,6 +37,8 @@ pub struct VMState {
     pub activation_records: SmallVec<[ActivationRecord; 8]>,
     /// Current instruction being executed
     pub current_instruction: usize,
+    /// Cache for instructions during execution
+    pub instruction_cache: SmallVec<[Instruction; 32]>,
     /// Pool for efficient activation record reuse
     pub activation_pool: ActivationRecordPool,
     /// Storage for objects and arrays
@@ -68,6 +70,7 @@ impl VMState {
             functions: FxHashMap::default(),
             activation_records: smallvec![],
             current_instruction: 0,
+            instruction_cache: SmallVec::with_capacity(32),
             activation_pool: ActivationRecordPool::new(1024),
             object_store: ObjectStore::new(),
             foreign_objects: ForeignObjectStorage::new(),
@@ -159,7 +162,12 @@ impl VMState {
     /// # Returns
     /// * `Ok(())` - If all hooks executed successfully
     /// * `Err(String)` - If any hook returned an error
-    pub fn trigger_register_write(&self, reg: usize, old_value: &Value, new_value: &Value) -> Result<(), String> {
+    pub fn trigger_register_write(
+        &self,
+        reg: usize,
+        old_value: &Value,
+        new_value: &Value,
+    ) -> Result<(), String> {
         let event = HookEvent::RegisterWrite(reg, old_value.clone(), new_value.clone());
         self.hook_manager.trigger(&event, self)
     }
@@ -177,10 +185,16 @@ impl VMState {
     /// * `Ok(())` - If all hooks executed successfully
     /// * `Err(String)` - If any hook returned an error
     pub fn trigger_hook_with_snapshot(&self, event: &HookEvent) -> Result<(), String> {
+        // Fast path: if no hooks are registered, return immediately
+        if self.hook_manager.hooks.is_empty() {
+            return Ok(());
+        }
+
+        // Only create context if hooks are registered
         let context = HookContext::new(
             &self.activation_records,
             self.current_instruction,
-            &self.functions
+            &self.functions,
         );
         self.hook_manager.trigger_with_context(event, &context)
     }
@@ -201,11 +215,16 @@ impl VMState {
     /// # Returns
     /// * `Ok(Value::Closure)` - The created closure
     /// * `Err(String)` - If an upvalue couldn't be found or a hook returned an error
-    pub fn create_closure(&mut self, function_name: &str, upvalue_names: &[String]) -> Result<Value, String> {
+    pub fn create_closure(
+        &mut self,
+        function_name: &str,
+        upvalue_names: &[String],
+    ) -> Result<Value, String> {
         // Find and collect all upvalues from the current scope
         let mut upvalues = Vec::new();
         for name in upvalue_names {
-            let value = self.find_upvalue(name)
+            let value = self
+                .find_upvalue(name)
                 .ok_or_else(|| format!("Could not find upvalue {} when creating closure", name))?;
 
             upvalues.push(Upvalue {
@@ -229,10 +248,11 @@ impl VMState {
     }
 
     pub fn execute_until_return(&mut self) -> Result<Value, String> {
-        // let mut temp_buffer = SmallVec::<[Value; 8]>::new();
-
         // Store the activation records length before we enter the loop
         let activation_records_len = self.activation_records_len();
+
+        // Check if hooks are enabled - this avoids checking in every instruction
+        let hooks_enabled = !self.hook_manager.hooks.is_empty();
 
         // Create a loop that doesn't hold a mutable borrow across iterations
         loop {
@@ -241,10 +261,11 @@ impl VMState {
                 return Err("Unexpected end of execution".to_string());
             }
 
-            // Get the current record's function name and instruction pointer
-            // Use a temporary variable to avoid multiple lookups
+            // Get the current activation record once to avoid multiple lookups
             let current_record = self.activation_records.last().unwrap();
-            let function_name = current_record.function_name.clone();
+
+            // Get the current record's function name and instruction pointer
+            let function_name = current_record.function_name.clone(); // Still need to clone for HashMap lookup
             let ip = current_record.instruction_pointer;
             let use_resolved = current_record.resolved_instructions.is_some();
 
@@ -276,10 +297,11 @@ impl VMState {
             };
 
             // Check if we're at the end of the function
-            // Use a direct lookup to avoid creating a new scope
             let is_end_of_function = if use_resolved {
-                let current_record = self.activation_records.last().unwrap();
-                let resolved_len = current_record.resolved_instructions.as_ref().unwrap().len();
+                let resolved_len = {
+                    let current_record = self.activation_records.last().unwrap();
+                    current_record.resolved_instructions.as_ref().unwrap().len()
+                };
                 ip >= resolved_len
             } else {
                 ip >= vm_function.instructions.len()
@@ -301,9 +323,10 @@ impl VMState {
             // Get the instruction to execute
             let instruction = if use_resolved {
                 // We'll still need the original instruction for hooks and debugging
-                // Get the resolved instruction directly
-                let current_record = self.activation_records.last().unwrap();
-                let resolved_idx = current_record.resolved_instructions.as_ref().unwrap()[ip];
+                let resolved_idx = {
+                    let current_record = self.activation_records.last().unwrap();
+                    current_record.resolved_instructions.as_ref().unwrap()[ip]
+                };
 
                 // Convert resolved instruction back to regular instruction for hooks
                 // This is necessary for compatibility with the hook system
@@ -311,54 +334,77 @@ impl VMState {
                     ResolvedInstruction::LD(reg, offset) => Instruction::LD(reg, offset),
                     ResolvedInstruction::LDI(reg, const_idx) => {
                         // Get the constant value from the constant pool using the stored constant index
-                        // We already have the current record, so we can use it directly
-                        let constant_value = if let Some(constants) = &current_record.constant_values {
-                            if const_idx < constants.len() {
-                                constants[const_idx].clone()
+                        let constant_value = {
+                            let current_record = self.activation_records.last().unwrap();
+                            if let Some(constants) = &current_record.constant_values {
+                                if const_idx < constants.len() {
+                                    constants[const_idx].clone()
+                                } else {
+                                    // Error: constant not found
+                                    return Err(format!(
+                                        "Constant index {} out of bounds",
+                                        const_idx
+                                    ));
+                                }
                             } else {
-                                // Error: constant not found
-                                return Err(format!("Constant index {} out of bounds", const_idx));
+                                // Error: constants not available
+                                return Err(format!("Constant values not available for function"));
                             }
-                        } else {
-                            // Error: constants not available
-                            return Err(format!("Constant values not available for function"));
                         };
                         Instruction::LDI(reg, constant_value)
-                    },
+                    }
                     ResolvedInstruction::MOV(dest, src) => Instruction::MOV(dest, src),
-                    ResolvedInstruction::ADD(dest, src1, src2) => Instruction::ADD(dest, src1, src2),
-                    ResolvedInstruction::SUB(dest, src1, src2) => Instruction::SUB(dest, src1, src2),
-                    ResolvedInstruction::MUL(dest, src1, src2) => Instruction::MUL(dest, src1, src2),
-                    ResolvedInstruction::DIV(dest, src1, src2) => Instruction::DIV(dest, src1, src2),
-                    ResolvedInstruction::MOD(dest, src1, src2) => Instruction::MOD(dest, src1, src2),
-                    ResolvedInstruction::AND(dest, src1, src2) => Instruction::AND(dest, src1, src2),
+                    ResolvedInstruction::ADD(dest, src1, src2) => {
+                        Instruction::ADD(dest, src1, src2)
+                    }
+                    ResolvedInstruction::SUB(dest, src1, src2) => {
+                        Instruction::SUB(dest, src1, src2)
+                    }
+                    ResolvedInstruction::MUL(dest, src1, src2) => {
+                        Instruction::MUL(dest, src1, src2)
+                    }
+                    ResolvedInstruction::DIV(dest, src1, src2) => {
+                        Instruction::DIV(dest, src1, src2)
+                    }
+                    ResolvedInstruction::MOD(dest, src1, src2) => {
+                        Instruction::MOD(dest, src1, src2)
+                    }
+                    ResolvedInstruction::AND(dest, src1, src2) => {
+                        Instruction::AND(dest, src1, src2)
+                    }
                     ResolvedInstruction::OR(dest, src1, src2) => Instruction::OR(dest, src1, src2),
-                    ResolvedInstruction::XOR(dest, src1, src2) => Instruction::XOR(dest, src1, src2),
+                    ResolvedInstruction::XOR(dest, src1, src2) => {
+                        Instruction::XOR(dest, src1, src2)
+                    }
                     ResolvedInstruction::NOT(dest, src) => Instruction::NOT(dest, src),
-                    ResolvedInstruction::SHL(dest, src, amount) => Instruction::SHL(dest, src, amount),
-                    ResolvedInstruction::SHR(dest, src, amount) => Instruction::SHR(dest, src, amount),
+                    ResolvedInstruction::SHL(dest, src, amount) => {
+                        Instruction::SHL(dest, src, amount)
+                    }
+                    ResolvedInstruction::SHR(dest, src, amount) => {
+                        Instruction::SHR(dest, src, amount)
+                    }
                     ResolvedInstruction::JMP(target) => {
                         // Convert numeric target back to label for compatibility
                         // This is inefficient but necessary for hooks
                         let label = format!("label_{}", target);
                         Instruction::JMP(label)
-                    },
+                    }
                     ResolvedInstruction::JMPEQ(target) => {
                         let label = format!("label_{}", target);
                         Instruction::JMPEQ(label)
-                    },
+                    }
                     ResolvedInstruction::JMPNEQ(target) => {
                         let label = format!("label_{}", target);
                         Instruction::JMPNEQ(label)
-                    },
+                    }
                     ResolvedInstruction::JMPLT(target) => {
                         let label = format!("label_{}", target);
                         Instruction::JMPLT(label)
-                    },
+                    }
                     ResolvedInstruction::JMPGT(target) => {
                         let label = format!("label_{}", target);
                         Instruction::JMPGT(label)
-                    },
+                    }
                     ResolvedInstruction::CALL(func_idx) => {
                         // Get the function name from the constant pool
                         let function_name = {
@@ -370,21 +416,28 @@ impl VMState {
                                         _ => return Err(format!("Expected string constant for function name at index {}", func_idx))
                                     }
                                 } else {
-                                    return Err(format!("Function name constant index {} out of bounds", func_idx));
+                                    return Err(format!(
+                                        "Function name constant index {} out of bounds",
+                                        func_idx
+                                    ));
                                 }
                             } else {
                                 return Err(format!("Constant values not available for function"));
                             }
                         };
                         Instruction::CALL(function_name)
-                    },
+                    }
                     ResolvedInstruction::RET(reg) => Instruction::RET(reg),
                     ResolvedInstruction::PUSHARG(reg) => Instruction::PUSHARG(reg),
                     ResolvedInstruction::CMP(reg1, reg2) => Instruction::CMP(reg1, reg2),
                 }
             } else {
-                // Directly use the VM function's instructions
-                vm_function.instructions[ip].clone()
+                if self.instruction_cache.is_empty() {
+                    // If instruction cache is empty, get instructions from the function
+                    let instructions = vm_function.instructions.clone();
+                    self.instruction_cache.extend(instructions);
+                }
+                self.instruction_cache[ip].clone()
             };
 
             self.current_instruction = ip;
@@ -396,7 +449,7 @@ impl VMState {
             }
 
             // Only create hook events if hooks are registered
-            if !self.hook_manager.hooks.is_empty() {
+            if hooks_enabled {
                 let event = HookEvent::BeforeInstructionExecute(instruction.clone());
                 self.trigger_hook_with_snapshot(&event)?;
             }
@@ -405,9 +458,12 @@ impl VMState {
             let instruction_clone = instruction.clone();
             match instruction_clone {
                 Instruction::LD(dest_reg, offset) => {
-                    // Get the current activation record once and use it for all operations
-                    let current_record = self.activation_records.last().unwrap();
-                    let stack_len = current_record.stack.len();
+                    // Get stack length and check bounds
+                    let stack_len;
+                    {
+                        let current_record = self.activation_records.last().unwrap();
+                        stack_len = current_record.stack.len();
+                    }
 
                     let idx = (stack_len as i32) + offset - 1;
                     if idx < 0 || idx >= stack_len as i32 {
@@ -415,55 +471,109 @@ impl VMState {
                     }
 
                     // Get value from stack
-                    let value = current_record.stack[idx as usize].clone();
+                    let value;
+                    {
+                        let current_record = self.activation_records.last().unwrap();
+                        value = current_record.stack[idx as usize].clone();
+                    }
 
-                    // Update register (need to get a mutable reference now)
-                    let old_value;
+                    // Update register
                     {
                         let current_record = self.activation_records.last_mut().unwrap();
-                        old_value = current_record.registers[dest_reg].clone();
-                        current_record.registers[dest_reg] = value.clone();
-                    }
 
-                    // Only create hook events if hooks are registered
-                    if !self.hook_manager.hooks.is_empty() {
-                        let event = HookEvent::RegisterWrite(dest_reg, old_value, value);
-                        self.trigger_hook_with_snapshot(&event)?;
+                        // Only clone for hook events if hooks are registered
+                        let old_value = if !self.hook_manager.hooks.is_empty() {
+                            Some(current_record.registers[dest_reg].clone())
+                        } else {
+                            None
+                        };
+
+                        // Move value instead of cloning when possible
+                        current_record.registers[dest_reg] = value;
+
+                        // Only trigger hook if needed
+                        if let Some(old) = old_value {
+                            let event = HookEvent::RegisterWrite(dest_reg, old, current_record.registers[dest_reg].clone());
+                            self.trigger_hook_with_snapshot(&event)?;
+                        }
                     }
-                },
+                }
                 Instruction::LDI(dest_reg, value) => {
                     // Update register
-                    let old_value;
                     {
                         let current_record = self.activation_records.last_mut().unwrap();
-                        old_value = current_record.registers[dest_reg].clone();
-                        current_record.registers[dest_reg] = value.clone();
-                    }
 
-                    let event = HookEvent::RegisterWrite(dest_reg, old_value, value);
-                    self.trigger_hook_with_snapshot(&event)?;
-                },
+                        // Only clone for hook events if hooks are registered
+                        let old_value = if !self.hook_manager.hooks.is_empty() {
+                            Some(current_record.registers[dest_reg].clone())
+                        } else {
+                            None
+                        };
+
+                        // Move value instead of cloning when possible
+                        current_record.registers[dest_reg] = value.clone();
+
+                        // Only trigger hook if needed
+                        if let Some(old) = old_value {
+                            let event = HookEvent::RegisterWrite(dest_reg, old, current_record.registers[dest_reg].clone());
+                            self.trigger_hook_with_snapshot(&event)?;
+                        }
+                    }
+                }
                 Instruction::MOV(dest_reg, src_reg) => {
-                    // Get value from source register and update destination register in one go
-                    // This reduces the number of clones and activation record lookups
-                    let value;
-                    let old_value;
+                    // Get value from source register and prepare result value
+                    let result_value;
+                    {
+                        let current_record = self.activation_records.last().unwrap();
+                        let src_value = &current_record.registers[src_reg];
+
+                        // Check if this is a clear-to-secret or secret-to-clear conversion
+                        result_value = if dest_reg >= 16 && src_reg < 16 {
+                            // Clear to secret conversion (lower to upper half)
+                            match src_value {
+                                Value::Int(i) => todo!(),
+                                Value::Float(f) => todo!(),
+                                Value::Bool(b) => todo!(),
+                                _ => return Err("Only primitive types (Int, Float, Bool) can be converted to shares".to_string()),
+                            }
+                        } else if dest_reg < 16 && src_reg >= 16 {
+                            // Secret to clear conversion (upper to lower half)
+                            match src_value {
+                                Value::Share(ShareType::Int(_), data) => todo!(),
+                                Value::Share(ShareType::Float(_), data) => todo!(),
+                                Value::Share(ShareType::Bool(_), data) => todo!(),
+                                _ => return Err("Invalid share type for conversion to clear value".to_string()),
+                            }
+                        } else {
+                            // Regular MOV, no conversion
+                            src_value.clone()
+                        };
+                    }
+
+                    // Update destination register
                     {
                         let current_record = self.activation_records.last_mut().unwrap();
-                        value = current_record.registers[src_reg].clone();
-                        old_value = current_record.registers[dest_reg].clone();
-                        current_record.registers[dest_reg] = value.clone();
-                    }
 
-                    // Only create hook events if hooks are registered
-                    if !self.hook_manager.hooks.is_empty() {
-                        let read_event = HookEvent::RegisterRead(src_reg, value.clone());
-                        self.trigger_hook_with_snapshot(&read_event)?;
+                        // Only clone values for hooks if hooks are registered
+                        if !self.hook_manager.hooks.is_empty() {
+                            let src_value = current_record.registers[src_reg].clone();
+                            let old_value = current_record.registers[dest_reg].clone();
 
-                        let write_event = HookEvent::RegisterWrite(dest_reg, old_value, value);
-                        self.trigger_hook_with_snapshot(&write_event)?;
+                            // Update the register
+                            current_record.registers[dest_reg] = result_value.clone();
+
+                            // Trigger hooks
+                            let read_event = HookEvent::RegisterRead(src_reg, src_value);
+                            self.trigger_hook_with_snapshot(&read_event)?;
+
+                            let write_event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.trigger_hook_with_snapshot(&write_event)?;
+                        } else {
+                            // Just update the register without hooks
+                            current_record.registers[dest_reg] = result_value;
+                        }
                     }
-                },
+                }
                 Instruction::ADD(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -471,16 +581,172 @@ impl VMState {
 
                     match (src1, src2) {
                         (Value::Int(a), Value::Int(b)) => {
-                            let result_value = Value::Int(a + b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
+                            // Create result directly
+                            let result = *a + *b;
 
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
+                            // Only clone for hook if hooks are registered
+                            let old_value = if hooks_enabled {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::Int(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
                         },
+                        (Value::I32(a), Value::I32(b)) => {
+                            // Create result directly
+                            let result = *a + *b;
+
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::I32(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            // Create result directly
+                            let result = *a + *b;
+
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::I16(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            // Create result directly
+                            let result = *a + *b;
+
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::I8(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            // Create result directly
+                            let result = *a + *b;
+
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::U8(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            // Create result directly
+                            let result = *a + *b;
+
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::U16(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            // Create result directly
+                            let result = *a + *b;
+
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::U32(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            // Create result directly
+                            let result = *a + *b;
+
+                            // Only clone for hook if hooks are registered
+                            let old_value = if !self.hook_manager.hooks.is_empty() {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+
+                            // Store result without cloning
+                            record.registers[dest_reg] = Value::U64(result);
+
+                            // Only trigger hook if needed
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                        },
+                        // Share + Share (offline addition)
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in ADD operation".to_string()),
                     }
-                },
+                }
                 Instruction::SUB(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -495,9 +761,69 @@ impl VMState {
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
                         },
+                        (Value::I32(a), Value::I32(b)) => {
+                            let result_value = Value::I32(a - b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            let result_value = Value::I16(a - b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            let result_value = Value::I8(a - b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            let result_value = Value::U8(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            let result_value = Value::U16(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            let result_value = Value::U32(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            let result_value = Value::U64(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share - Share (offline subtraction)
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in SUB operation".to_string()),
                     }
-                },
+                }
                 Instruction::MUL(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -512,9 +838,69 @@ impl VMState {
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
                         },
+                        (Value::I32(a), Value::I32(b)) => {
+                            let result_value = Value::I32(a * b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            let result_value = Value::I16(a * b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            let result_value = Value::I8(a * b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            let result_value = Value::U8(a * *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            let result_value = Value::U16(a * *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            let result_value = Value::U32(a * *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            let result_value = Value::U64(a * *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share * Share (online multiplication)
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in MUL operation".to_string()),
                     }
-                },
+                }
                 Instruction::DIV(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -532,9 +918,89 @@ impl VMState {
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
                         },
+                        (Value::I32(a), Value::I32(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::I32(a / b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::I16(a / b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::I8(a / b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::U8(a / *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::U16(a / *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::U32(a / *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            if *b == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            let result_value = Value::U64(a / *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share / Share (online division)
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
                         _ => return Err("Type error in DIV operation".to_string()),
                     }
-                },
+                }
                 Instruction::MOD(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -552,9 +1018,90 @@ impl VMState {
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
                         },
+                        (Value::I32(a), Value::I32(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::I32(a % b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::I16(a % b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::I8(a % b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::U8(a % *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::U16(a % *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::U32(a % *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            if *b == 0 {
+                                return Err("Modulo by zero".to_string());
+                            }
+                            let result_value = Value::U64(a % *b);
+                            let old_value = record.registers[dest_reg].clone();
+                            record.registers[dest_reg] = result_value.clone();
+
+                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            self.hook_manager.trigger(&event, self)?;
+                        },
+                        // Share % Share (online modulo)
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
+                        // Modulo is not defined for boolean shares in GF(2)
                         _ => return Err("Type error in MOD operation".to_string()),
                     }
-                },
+                }
                 Instruction::AND(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -563,6 +1110,9 @@ impl VMState {
                     let result_value = match (src1, src2) {
                         (Value::Int(a), Value::Int(b)) => Value::Int(a & b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
+                        // Share & Share (bitwise AND for shares)
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in AND operation".to_string()),
                     };
 
@@ -571,7 +1121,7 @@ impl VMState {
 
                     let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                     self.hook_manager.trigger(&event, self)?;
-                },
+                }
                 Instruction::OR(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -580,6 +1130,9 @@ impl VMState {
                     let result_value = match (src1, src2) {
                         (Value::Int(a), Value::Int(b)) => Value::Int(a | b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
+                        // Share | Share (bitwise OR for shares)
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in OR operation".to_string()),
                     };
 
@@ -588,7 +1141,7 @@ impl VMState {
 
                     let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                     self.hook_manager.trigger(&event, self)?;
-                },
+                }
                 Instruction::XOR(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
@@ -597,6 +1150,9 @@ impl VMState {
                     let result_value = match (src1, src2) {
                         (Value::Int(a), Value::Int(b)) => Value::Int(a ^ b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(a ^ b),
+                        // Share ^ Share (bitwise XOR for shares)
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in XOR operation".to_string()),
                     };
 
@@ -605,7 +1161,7 @@ impl VMState {
 
                     let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                     self.hook_manager.trigger(&event, self)?;
-                },
+                }
                 Instruction::NOT(dest_reg, src_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src = &record.registers[src_reg];
@@ -613,6 +1169,9 @@ impl VMState {
                     let result_value = match src {
                         Value::Int(a) => Value::Int(!a),
                         Value::Bool(a) => Value::Bool(!a),
+                        // ~Share (bitwise NOT for shares)
+                        Value::Share(ShareType::Int(_), data) => todo!(),
+                        Value::Share(ShareType::Bool(_), data) => todo!(),
                         _ => return Err("Type error in NOT operation".to_string()),
                     };
 
@@ -621,7 +1180,7 @@ impl VMState {
 
                     let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                     self.hook_manager.trigger(&event, self)?;
-                },
+                }
                 Instruction::SHL(dest_reg, src_reg, amount_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src = &record.registers[src_reg];
@@ -636,9 +1195,12 @@ impl VMState {
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
                         },
+                        // Share << Int (shift left for shares)
+                        (Value::Share(ShareType::Int(_), data), Value::Int(b)) => todo!(),
+                        // Share << Share is not supported (amount must be a clear value)
                         _ => return Err("Type error in SHL operation".to_string()),
                     }
-                },
+                }
                 Instruction::SHR(dest_reg, src_reg, amount_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let src = &record.registers[src_reg];
@@ -653,144 +1215,186 @@ impl VMState {
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
                         },
+                        // Share >> Int (shift right for shares)
+                        (Value::Share(ShareType::Int(_), data), Value::Int(b)) => todo!(),
+                        // Share >> Share is not supported (amount must be a clear value)
                         _ => return Err("Type error in SHR operation".to_string()),
                     }
-                },
+                }
                 Instruction::JMP(ref label) => {
                     // If we're using resolved instructions, get the target from the resolved instruction
                     if use_resolved {
-                        // Get the resolved instruction directly
-                        let current_record = self.activation_records.last().unwrap();
-                        let resolved_idx = current_record.resolved_instructions.as_ref().unwrap()[ip];
+                        let resolved_idx = {
+                            let current_record = self.activation_records.last().unwrap();
+                            current_record.resolved_instructions.as_ref().unwrap()[ip]
+                        };
 
                         if let ResolvedInstruction::JMP(target) = resolved_idx {
-                            // Update the instruction pointer
-                            let current_record = self.activation_records.last_mut().unwrap();
-                            current_record.instruction_pointer = target;
+                            self.activation_records
+                                .last_mut()
+                                .unwrap()
+                                .instruction_pointer = target;
                         } else {
-                            return Err(format!("Expected JMP instruction, got {:?}", resolved_idx));
+                            return Err(format!(
+                                "Expected JMP instruction, got {:?}",
+                                resolved_idx
+                            ));
                         }
                     } else {
                         // Otherwise, look up the label in the function's labels HashMap
-                        let target = vm_function.labels.get(label)
+                        let target = vm_function
+                            .labels
+                            .get(label)
                             .ok_or_else(|| format!("Label '{}' not found", label))?
                             .clone();
 
-                        // Update the instruction pointer
-                        let current_record = self.activation_records.last_mut().unwrap();
-                        current_record.instruction_pointer = target;
+                        self.activation_records
+                            .last_mut()
+                            .unwrap()
+                            .instruction_pointer = target;
                     }
-                },
+                }
                 Instruction::JMPEQ(ref label) => {
                     let should_jump = self.activation_records.last().unwrap().compare_flag == 0;
 
                     if should_jump {
                         if use_resolved {
-                            // Get the resolved instruction directly
-                            let current_record = self.activation_records.last().unwrap();
-                            let resolved_idx = current_record.resolved_instructions.as_ref().unwrap()[ip];
+                            let resolved_idx = {
+                                let current_record = self.activation_records.last().unwrap();
+                                current_record.resolved_instructions.as_ref().unwrap()[ip]
+                            };
 
                             if let ResolvedInstruction::JMPEQ(target) = resolved_idx {
-                                // Update the instruction pointer
-                                let current_record = self.activation_records.last_mut().unwrap();
-                                current_record.instruction_pointer = target;
+                                self.activation_records
+                                    .last_mut()
+                                    .unwrap()
+                                    .instruction_pointer = target;
                             } else {
-                                return Err(format!("Expected JMPEQ instruction, got {:?}", resolved_idx));
+                                return Err(format!(
+                                    "Expected JMPEQ instruction, got {:?}",
+                                    resolved_idx
+                                ));
                             }
                         } else {
-                            let target = vm_function.labels.get(label)
+                            let target = vm_function
+                                .labels
+                                .get(label)
                                 .ok_or_else(|| format!("Label '{}' not found", label))?
                                 .clone();
 
-                            // Update the instruction pointer
-                            let current_record = self.activation_records.last_mut().unwrap();
-                            current_record.instruction_pointer = target;
+                            self.activation_records
+                                .last_mut()
+                                .unwrap()
+                                .instruction_pointer = target;
                         }
                     }
-                },
+                }
                 Instruction::JMPNEQ(ref label) => {
                     let should_jump = self.activation_records.last().unwrap().compare_flag != 0;
 
                     if should_jump {
                         if use_resolved {
-                            // Get the resolved instruction directly
-                            let current_record = self.activation_records.last().unwrap();
-                            let resolved_idx = current_record.resolved_instructions.as_ref().unwrap()[ip];
+                            let resolved_idx = {
+                                let current_record = self.activation_records.last().unwrap();
+                                current_record.resolved_instructions.as_ref().unwrap()[ip]
+                            };
 
                             if let ResolvedInstruction::JMPNEQ(target) = resolved_idx {
-                                // Update the instruction pointer
-                                let current_record = self.activation_records.last_mut().unwrap();
-                                current_record.instruction_pointer = target;
+                                self.activation_records
+                                    .last_mut()
+                                    .unwrap()
+                                    .instruction_pointer = target;
                             } else {
-                                return Err(format!("Expected JMPNEQ instruction, got {:?}", resolved_idx));
+                                return Err(format!(
+                                    "Expected JMPNEQ instruction, got {:?}",
+                                    resolved_idx
+                                ));
                             }
                         } else {
-                            let target = vm_function.labels.get(label)
+                            let target = vm_function
+                                .labels
+                                .get(label)
                                 .ok_or_else(|| format!("Label '{}' not found", label))?
                                 .clone();
 
-                            // Update the instruction pointer
-                            let current_record = self.activation_records.last_mut().unwrap();
-                            current_record.instruction_pointer = target;
+                            self.activation_records
+                                .last_mut()
+                                .unwrap()
+                                .instruction_pointer = target;
                         }
                     }
-                },
+                }
                 Instruction::JMPLT(ref label) => {
                     // Jump if Less Than (compare_flag == -1)
                     let should_jump = self.activation_records.last().unwrap().compare_flag == -1;
 
                     if should_jump {
                         if use_resolved {
-                            // Get the resolved instruction directly
-                            let current_record = self.activation_records.last().unwrap();
-                            let resolved_idx = current_record.resolved_instructions.as_ref().unwrap()[ip];
+                            let resolved_idx = {
+                                let current_record = self.activation_records.last().unwrap();
+                                current_record.resolved_instructions.as_ref().unwrap()[ip]
+                            };
 
                             if let ResolvedInstruction::JMPLT(target) = resolved_idx {
-                                // Update the instruction pointer
-                                let current_record = self.activation_records.last_mut().unwrap();
-                                current_record.instruction_pointer = target;
+                                self.activation_records
+                                    .last_mut()
+                                    .unwrap()
+                                    .instruction_pointer = target;
                             } else {
-                                return Err(format!("Expected JMPLT instruction, got {:?}", resolved_idx));
+                                return Err(format!(
+                                    "Expected JMPLT instruction, got {:?}",
+                                    resolved_idx
+                                ));
                             }
                         } else {
-                            let target = vm_function.labels.get(label)
+                            let target = vm_function
+                                .labels
+                                .get(label)
                                 .ok_or_else(|| format!("Label '{}' not found", label))?
                                 .clone();
 
-                            // Update the instruction pointer
-                            let current_record = self.activation_records.last_mut().unwrap();
-                            current_record.instruction_pointer = target;
+                            self.activation_records
+                                .last_mut()
+                                .unwrap()
+                                .instruction_pointer = target;
                         }
                     }
-                },
+                }
                 Instruction::JMPGT(ref label) => {
                     // Jump if Greater Than (compare_flag == 1)
                     let should_jump = self.activation_records.last().unwrap().compare_flag == 1;
-                    
                     if should_jump {
                         if use_resolved {
-                            // Get the resolved instruction directly
-                            let current_record = self.activation_records.last().unwrap();
-                            let resolved_idx = current_record.resolved_instructions.as_ref().unwrap()[ip];
+                            let resolved_idx = {
+                                let current_record = self.activation_records.last().unwrap();
+                                current_record.resolved_instructions.as_ref().unwrap()[ip]
+                            };
 
                             if let ResolvedInstruction::JMPGT(target) = resolved_idx {
-                                // Update the instruction pointer
-                                let current_record = self.activation_records.last_mut().unwrap();
-                                current_record.instruction_pointer = target;
+                                self.activation_records
+                                    .last_mut()
+                                    .unwrap()
+                                    .instruction_pointer = target;
                             } else {
-                                return Err(format!("Expected JMPGT instruction, got {:?}", resolved_idx));
+                                return Err(format!(
+                                    "Expected JMPGT instruction, got {:?}",
+                                    resolved_idx
+                                ));
                             }
                         } else {
-                            let target = vm_function.labels.get(label)
+                            let target = vm_function
+                                .labels
+                                .get(label)
                                 .ok_or_else(|| format!("Label '{}' not found", label))?
                                 .clone();
 
-                            // Update the instruction pointer
-                            let current_record = self.activation_records.last_mut().unwrap();
-                            current_record.instruction_pointer = target;
+                            self.activation_records
+                                .last_mut()
+                                .unwrap()
+                                .instruction_pointer = target;
                         }
                     }
-                },
+                }
                 Instruction::CALL(ref function_name) => {
                     // Get arguments from stack
                     let args;
@@ -799,7 +1403,9 @@ impl VMState {
                         args = current_record.stack.clone();
                     }
 
-                    let function = self.functions.get(function_name)
+                    let function = self
+                        .functions
+                        .get(function_name)
                         .ok_or_else(|| format!("Function \'{}\' not found", function_name))?
                         .clone();
 
@@ -824,15 +1430,20 @@ impl VMState {
                     match function {
                         Function::VM(vm_func) => {
                             if vm_func.parameters.len() != args.len() {
-                                return Err(format!("Function {} expects {} arguments but got {}",
-                                                   function_name, vm_func.parameters.len(), args.len()));
+                                return Err(format!(
+                                    "Function {} expects {} arguments but got {}",
+                                    function_name,
+                                    vm_func.parameters.len(),
+                                    args.len()
+                                ));
                             }
 
                             // Initialize upvalues for the function
                             let mut upvalues = Vec::new();
                             for name in &vm_func.upvalues {
-                                let value = self.find_upvalue(name)
-                                    .ok_or_else(|| format!("Could not find upvalue {} when calling function", name))?;
+                                let value = self.find_upvalue(name).ok_or_else(|| {
+                                    format!("Could not find upvalue {} when calling function", name)
+                                })?;
 
                                 upvalues.push(Upvalue {
                                     name: name.clone(),
@@ -846,13 +1457,17 @@ impl VMState {
                             };
                             let closure_value = Value::Closure(Arc::new(closure));
 
-                            let event = HookEvent::BeforeFunctionCall(closure_value, args.clone().to_vec());
+                            let event =
+                                HookEvent::BeforeFunctionCall(closure_value, args.clone().to_vec());
                             self.hook_manager.trigger(&event, self)?;
 
                             let new_record = ActivationRecord {
                                 function_name: function_name.clone(),
                                 locals: FxHashMap::default(),
-                                registers: SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]),
+                                registers: SmallVec::from_vec(vec![
+                                    Value::Unit;
+                                    vm_func.register_count
+                                ]),
                                 upvalues,
                                 instruction_pointer: 0,
                                 stack: SmallVec::new(),
@@ -897,11 +1512,15 @@ impl VMState {
                                     self.hook_manager.trigger(&event, self)?;
                                 }
                             }
-                        },
+                        }
                         Function::Foreign(foreign_func) => {
-                            let func_value = Value::String(format!("<foreign function {}>", function_name));
+                            let func_value =
+                                Value::String(format!("<foreign function {}>", function_name));
 
-                            let event = HookEvent::BeforeFunctionCall(func_value.clone(), args.clone().to_vec());
+                            let event = HookEvent::BeforeFunctionCall(
+                                func_value.clone(),
+                                args.clone().to_vec(),
+                            );
                             self.hook_manager.trigger(&event, self)?;
 
                             let context = ForeignFunctionContext {
@@ -968,7 +1587,7 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         }
                     }
-                },
+                }
                 Instruction::RET(reg) => {
                     let current_record = self.activation_records.last().unwrap();
                     let return_value = current_record.registers[reg].clone();
@@ -991,8 +1610,11 @@ impl VMState {
 
                     // If we only have one activation record (main function), just return
                     if self.activation_records.len() <= 1 {
-                        let event = HookEvent::AfterInstructionExecute(instruction.clone());
-                        self.hook_manager.trigger(&event, self)?;
+                        // Only create hook events if hooks are registered
+                        if !self.hook_manager.hooks.is_empty() {
+                            let event = HookEvent::AfterInstructionExecute(instruction.clone());
+                            self.hook_manager.trigger(&event, self)?;
+                        }
                         return Ok(return_value);
                     }
 
@@ -1003,25 +1625,40 @@ impl VMState {
                     let parent_record = self.activation_records.last_mut().unwrap();
 
                     // Set the return value in register 0 of the parent activation record
-                    let old_value = parent_record.registers[0].clone();
-                    parent_record.registers[0] = return_value.clone();
+                    if !self.hook_manager.hooks.is_empty() {
+                        // Only clone values and trigger hooks if hooks are registered
+                        let old_value = parent_record.registers[0].clone();
+                        parent_record.registers[0] = return_value.clone();
 
-                    let event = HookEvent::RegisterWrite(0, old_value, return_value.clone());
-                    self.hook_manager.trigger(&event, self)?;
+                        let event = HookEvent::RegisterWrite(0, old_value, return_value.clone());
+                        self.hook_manager.trigger(&event, self)?;
 
-                    let closure_value = Value::String(format!("<function {}>", returning_from));
-                    let event = HookEvent::AfterFunctionCall(closure_value, return_value);
-                    self.hook_manager.trigger(&event, self)?;
-                },
+                        let closure_value = Value::String(format!("<function {}>", returning_from));
+                        let event = HookEvent::AfterFunctionCall(closure_value, return_value);
+                        self.hook_manager.trigger(&event, self)?;
+                    } else {
+                        // Just set the return value without hooks
+                        parent_record.registers[0] = return_value;
+                    }
+                }
                 Instruction::PUSHARG(reg) => {
-                    let value = self.activation_records.last().unwrap().registers[reg].clone();
+                    if !self.hook_manager.hooks.is_empty() {
+                        // Only clone values and trigger hooks if hooks are registered
+                        let value = self.activation_records.last().unwrap().registers[reg].clone();
 
-                    let record = self.activation_records.last_mut().unwrap();
-                    record.stack.push(value.clone());
+                        let record = self.activation_records.last_mut().unwrap();
+                        record.stack.push(value.clone());
 
-                    let event = HookEvent::StackPush(value);
-                    self.hook_manager.trigger(&event, self)?;
-                },
+                        let event = HookEvent::StackPush(value);
+                        self.hook_manager.trigger(&event, self)?;
+                    } else {
+                        // Just push the value without hooks
+                        let value = self.activation_records.last().unwrap().registers[reg].clone();
+
+                        let record = self.activation_records.last_mut().unwrap();
+                        record.stack.push(value);
+                    }
+                }
                 Instruction::CMP(reg1, reg2) => {
                     let record = self.activation_records.last_mut().unwrap();
                     let val1 = &record.registers[reg1];
@@ -1029,13 +1666,136 @@ impl VMState {
 
                     let compare_result = match (val1, val2) {
                         (Value::Int(a), Value::Int(b)) => {
-                            if a < b { -1 } else if a > b { 1 } else { 0 }
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::I32(a), Value::I32(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::I16(a), Value::I16(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::I8(a), Value::I8(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::U8(a), Value::U8(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::U16(a), Value::U16(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::U32(a), Value::U32(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        (Value::U64(a), Value::U64(b)) => {
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
                         },
                         (Value::String(a), Value::String(b)) => {
-                            if a < b { -1 } else if a > b { 1 } else { 0 }
+                            if a < b {
+                                -1
+                            } else if a > b {
+                                1
+                            } else {
+                                0
+                            }
                         },
-                        (Value::Bool(a), Value::Bool(b)) => {
-                            match (a, b) {
+                        (Value::Bool(a), Value::Bool(b)) => match (a, b) {
+                            (false, true) => -1,
+                            (true, false) => 1,
+                            _ => 0,
+                        },
+                        // Share comparison (Int)
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => {
+                            // TODO: implement this
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+
+                            if val1 < val2 {
+                                -1
+                            } else if val1 > val2 {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        // Share comparison (Float)
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => {
+                            // For fixed-point values
+                            let mut bytes1 = [0u8; 8];
+                            let mut bytes2 = [0u8; 8];
+                            bytes1.copy_from_slice(&data1[0..8]);
+                            bytes2.copy_from_slice(&data2[0..8]);
+
+                            let val1 = i64::from_le_bytes(bytes1);
+                            let val2 = i64::from_le_bytes(bytes2);
+
+                            if val1 < val2 {
+                                -1
+                            } else if val1 > val2 {
+                                1
+                            } else {
+                                0
+                            }
+                        },
+                        // Share comparison (Bool)
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => {
+                            // For boolean values
+                            let bit1 = data1[0] != 0;
+                            let bit2 = data2[0] != 0;
+
+                            match (bit1, bit2) {
                                 (false, true) => -1,
                                 (true, false) => 1,
                                 _ => 0,
@@ -1045,19 +1805,24 @@ impl VMState {
                     };
 
                     record.compare_flag = compare_result;
-                },
+                }
             }
 
-            let event = HookEvent::AfterInstructionExecute(instruction.clone());
-            self.hook_manager.trigger(&event, self)?;
+            // Only create hook events if hooks are registered
+            if hooks_enabled {
+                let event = HookEvent::AfterInstructionExecute(instruction.clone());
+                self.hook_manager.trigger(&event, self)?;
+            }
             // The loop will never exit normally, it will always return from within
             // or continue to the next iteration
         }
     }
 
     pub fn call_foreign_function(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
-        let function = self.functions.get(name).ok_or_else(||
-            format!("Foreign function {} not found", name))?
+        let function = self
+            .functions
+            .get(name)
+            .ok_or_else(|| format!("Foreign function {} not found", name))?
             .clone();
 
         match function {
@@ -1078,10 +1843,11 @@ impl VMState {
                 self.hook_manager.trigger(&event, self)?;
 
                 Ok(result)
-            },
-            Function::VM(_) => {
-                Err(format!("Expected foreign function, but {} is a VM function", name))
             }
+            Function::VM(_) => Err(format!(
+                "Expected foreign function, but {} is a VM function",
+                name
+            )),
         }
     }
 }
