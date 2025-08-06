@@ -24,7 +24,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use stoffelmpc_network::{Message, Network, NetworkError, Node, PartyId};
+use stoffelnet::network_utils::{Message, Network, NetworkError, Node, PartyId};
 use tokio::sync::Mutex;
 use ark_ff::Field;
 use uuid::Uuid;

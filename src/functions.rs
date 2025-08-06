@@ -40,8 +40,6 @@ use smallvec::SmallVec;
 /// - Label-based control flow
 #[derive(Clone)]
 pub struct VMFunction {
-    /// Cached copy of instructions for faster execution
-    pub cached_instructions: Option<Vec<Instruction>>,
     /// Optimized instructions with resolved indices
     pub resolved_instructions: Option<SmallVec<[ResolvedInstruction; 32]>>,
     /// Constant values extracted from instructions
@@ -83,7 +81,6 @@ impl VMFunction {
         labels: HashMap<String, usize>,
     ) -> Self {
         VMFunction {
-            cached_instructions: None,
             resolved_instructions: None,
             constant_values: None,
             name,
@@ -93,17 +90,6 @@ impl VMFunction {
             register_count,
             instructions,
             labels,
-        }
-    }
-
-    /// Cache the function's instructions for faster execution
-    ///
-    /// This creates a copy of the instructions that can be used during execution
-    /// without modifying the original instructions.
-    pub fn cache_instructions(&mut self) {
-        if self.cached_instructions.is_none() {
-            let cached = self.instructions.clone();
-            self.cached_instructions = Some(cached);
         }
     }
 

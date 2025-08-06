@@ -140,12 +140,26 @@ impl std::hash::Hash for Closure {
 /// Enum to represent the underlying type of a secret share
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ShareType {
-    /// For i64 values
-    Int,
-    /// For fixed-point values
-    Float,
-    /// For boolean values
-    Bool,
+    /// 64-bit signed integer
+    Int(i64), // TODO: make this i64
+    /// 32-bit signed integer
+    I32(i32),
+    /// 16-bit signed integer
+    I16(i16),
+    /// 8-bit signed integer
+    I8(i8),
+    /// 8-bit unsigned integer
+    U8(u8),
+    /// 16-bit unsigned integer
+    U16(u16),
+    /// 32-bit unsigned integer
+    U32(u32),
+    /// 64-bit unsigned integer
+    U64(u64),
+    /// Fixed-point floating point number (represented as i64 internally for Eq/Hash)
+    Float(i64),
+    /// Boolean value
+    Bool(bool),
 }
 
 /// Value types supported by the VM

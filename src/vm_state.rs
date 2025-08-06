@@ -269,22 +269,23 @@ impl VMState {
             let ip = current_record.instruction_pointer;
             let use_resolved = current_record.resolved_instructions.is_some();
 
-            // Prepare the instruction cache
-            self.instruction_cache.clear();
-
-            // Optimize cached instructions handling
-            if let Some(cached) = &current_record.cached_instructions {
-                // Clone once instead of cloning each instruction individually
-                self.instruction_cache = cached.clone();
-            } else {
-                // Only clone instructions if we need to
-                let instructions = current_record.instructions.clone();
-                self.instruction_cache.extend(instructions);
-
-                // Update the cached instructions - need to release current_record first to avoid borrow conflict
-                let _ = current_record; // Release the borrow without dropping the reference
-                let current_record = self.activation_records.last_mut().unwrap();
-                current_record.cached_instructions = Some(self.instruction_cache.clone());
+            // Ensure we have resolved instructions for optimal execution
+            // First check if we need to resolve instructions
+            let needs_resolving = {
+                let current_record = self.activation_records.last().unwrap();
+                current_record.resolved_instructions.is_none()
+            };
+            
+            // If we need to resolve instructions, do it now
+            if needs_resolving {
+                // Get the function and resolve its instructions if needed
+                if let Some(Function::VM(mut vm_func)) = self.functions.get(&function_name).cloned() {
+                    vm_func.resolve_instructions();
+                    // Now update the activation record
+                    let current_record = self.activation_records.last_mut().unwrap();
+                    current_record.resolved_instructions = vm_func.resolved_instructions.clone();
+                    current_record.constant_values = vm_func.constant_values.clone();
+                }
             }
 
             let vm_function = match self.functions.get(&function_name) {
@@ -435,10 +436,6 @@ impl VMState {
                     // If instruction cache is empty, get instructions from the function
                     let instructions = vm_function.instructions.clone();
                     self.instruction_cache.extend(instructions);
-
-                    // Update the cached instructions in the current record
-                    let current_record = self.activation_records.last_mut().unwrap();
-                    current_record.cached_instructions = Some(self.instruction_cache.clone());
                 }
                 self.instruction_cache[ip].clone()
             };
@@ -534,27 +531,17 @@ impl VMState {
                         result_value = if dest_reg >= 16 && src_reg < 16 {
                             // Clear to secret conversion (lower to upper half)
                             match src_value {
-                                Value::Int(i) => Value::Share(ShareType::Int, i.to_le_bytes().to_vec()),
-                                Value::Float(f) => Value::Share(ShareType::Float, f.to_le_bytes().to_vec()),
-                                Value::Bool(b) => Value::Share(ShareType::Bool, vec![*b as u8]),
+                                Value::Int(i) => todo!(),
+                                Value::Float(f) => todo!(),
+                                Value::Bool(b) => todo!(),
                                 _ => return Err("Only primitive types (Int, Float, Bool) can be converted to shares".to_string()),
                             }
                         } else if dest_reg < 16 && src_reg >= 16 {
                             // Secret to clear conversion (upper to lower half)
                             match src_value {
-                                Value::Share(ShareType::Int, data) => {
-                                    let mut bytes = [0u8; 8];
-                                    bytes.copy_from_slice(&data[0..8]);
-                                    Value::Int(i64::from_le_bytes(bytes))
-                                },
-                                Value::Share(ShareType::Float, data) => {
-                                    let mut bytes = [0u8; 8];
-                                    bytes.copy_from_slice(&data[0..8]);
-                                    Value::Float(i64::from_le_bytes(bytes))
-                                },
-                                Value::Share(ShareType::Bool, data) => {
-                                    Value::Bool(data[0] != 0)
-                                },
+                                Value::Share(ShareType::Int(_), data) => todo!(),
+                                Value::Share(ShareType::Float(_), data) => todo!(),
+                                Value::Share(ShareType::Bool(_), data) => todo!(),
                                 _ => return Err("Invalid share type for conversion to clear value".to_string()),
                             }
                         } else {
@@ -754,93 +741,9 @@ impl VMState {
                             }
                         },
                         // Share + Share (offline addition)
-                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
-                            // Use stack-allocated arrays instead of heap allocations
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-                            let result = val1 + val2;
-
-                            // Use the result bytes directly without intermediate allocation
-                            let result_bytes = result.to_le_bytes().to_vec();
-
-                            // Only clone for hook if hooks are registered
-                            let old_value = if hooks_enabled {
-                                Some(record.registers[dest_reg].clone())
-                            } else {
-                                None
-                            };
-
-                            // Move the value instead of cloning
-                            record.registers[dest_reg] = Value::Share(ShareType::Int, result_bytes);
-
-                            // Only trigger hook if needed
-                            if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
-                                self.hook_manager.trigger(&event, self)?;
-                            }
-                        },
-                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
-                            // Use stack-allocated arrays instead of heap allocations
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-                            let result = val1 + val2;
-
-                            // Pre-allocate result buffer to avoid allocation
-                            let mut result_bytes = Vec::with_capacity(8);
-                            result_bytes.extend_from_slice(&result.to_le_bytes());
-
-                            // Only clone for hook if hooks are registered
-                            let old_value = if !self.hook_manager.hooks.is_empty() {
-                                Some(record.registers[dest_reg].clone())
-                            } else {
-                                None
-                            };
-
-                            // Move the value instead of cloning
-                            record.registers[dest_reg] = Value::Share(ShareType::Float, result_bytes);
-
-                            // Only trigger hook if needed
-                            if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
-                                self.hook_manager.trigger(&event, self)?;
-                            }
-                        },
-                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
-                            // For boolean values (XOR operation for addition in GF(2))
-                            let bit1 = data1[0] != 0;
-                            let bit2 = data2[0] != 0;
-                            let result = bit1 ^ bit2; // XOR for binary addition
-
-                            // Pre-allocate result buffer to avoid allocation
-                            let mut result_bytes = Vec::with_capacity(1);
-                            result_bytes.push(result as u8);
-
-                            // Only clone for hook if hooks are registered
-                            let old_value = if !self.hook_manager.hooks.is_empty() {
-                                Some(record.registers[dest_reg].clone())
-                            } else {
-                                None
-                            };
-
-                            // Move the value instead of cloning
-                            record.registers[dest_reg] = Value::Share(ShareType::Bool, result_bytes);
-
-                            // Only trigger hook if needed
-                            if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
-                                self.hook_manager.trigger(&event, self)?;
-                            }
-                        },
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in ADD operation".to_string()),
                     }
                 }
@@ -915,56 +818,9 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         },
                         // Share - Share (offline subtraction)
-                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
-                            // For now, implement a simple subtraction of shares
-                            // In a real implementation, this would use the SMPC protocol
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-                            let result = val1 - val2;
-
-                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
-                            // For fixed-point values
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-                            let result = val1 - val2;
-
-                            let result_value = Value::Share(ShareType::Float, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
-                            // For boolean values (XOR operation for subtraction in GF(2), same as addition)
-                            let bit1 = data1[0] != 0;
-                            let bit2 = data2[0] != 0;
-                            let result = bit1 ^ bit2; // XOR for binary subtraction (same as addition in GF(2))
-
-                            let result_value = Value::Share(ShareType::Bool, vec![result as u8]);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in SUB operation".to_string()),
                     }
                 }
@@ -1039,57 +895,9 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         },
                         // Share * Share (online multiplication)
-                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
-                            // For now, implement a simple multiplication of shares
-                            // In a real implementation, this would use the SMPC protocol
-                            // and would require online communication between parties
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-                            let result = val1 * val2;
-
-                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
-                            // For fixed-point values
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-                            let result = val1 * val2;
-
-                            let result_value = Value::Share(ShareType::Float, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
-                            // For boolean values (AND operation for multiplication in GF(2))
-                            let bit1 = data1[0] != 0;
-                            let bit2 = data2[0] != 0;
-                            let result = bit1 & bit2; // AND for binary multiplication
-
-                            let result_value = Value::Share(ShareType::Bool, vec![result as u8]);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in MUL operation".to_string()),
                     }
                 }
@@ -1188,57 +996,8 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         },
                         // Share / Share (online division)
-                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
-                            // For now, implement a simple division of shares
-                            // In a real implementation, this would use the SMPC protocol
-                            // and would require online communication between parties
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-
-                            // Check for division by zero
-                            if val2 == 0 {
-                                return Err("Division by zero in shared value".to_string());
-                            }
-
-                            let result = val1 / val2;
-
-                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
-                            // For fixed-point values
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-
-                            // Check for division by zero
-                            if val2 == 0 {
-                                return Err("Division by zero in shared value".to_string());
-                            }
-
-                            let result = val1 / val2;
-
-                            let result_value = Value::Share(ShareType::Float, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        // Division is not defined for boolean shares in GF(2)
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
                         _ => return Err("Type error in DIV operation".to_string()),
                     }
                 }
@@ -1337,56 +1096,8 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         },
                         // Share % Share (online modulo)
-                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
-                            // For now, implement a simple modulo of shares
-                            // In a real implementation, this would use the SMPC protocol
-                            // and would require online communication between parties
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-
-                            // Check for modulo by zero
-                            if val2 == 0 {
-                                return Err("Modulo by zero in shared value".to_string());
-                            }
-
-                            let result = val1 % val2;
-
-                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
-                            // For fixed-point values
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-
-                            // Check for modulo by zero
-                            if val2 == 0 {
-                                return Err("Modulo by zero in shared value".to_string());
-                            }
-
-                            let result = val1 % val2;
-
-                            let result_value = Value::Share(ShareType::Float, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
                         // Modulo is not defined for boolean shares in GF(2)
                         _ => return Err("Type error in MOD operation".to_string()),
                     }
@@ -1400,26 +1111,8 @@ impl VMState {
                         (Value::Int(a), Value::Int(b)) => Value::Int(a & b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
                         // Share & Share (bitwise AND for shares)
-                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-                            let result = val1 & val2;
-
-                            Value::Share(ShareType::Int, result.to_le_bytes().to_vec())
-                        },
-                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
-                            // For boolean shares (AND operation)
-                            let bit1 = data1[0] != 0;
-                            let bit2 = data2[0] != 0;
-                            let result = bit1 & bit2;
-
-                            Value::Share(ShareType::Bool, vec![result as u8])
-                        },
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in AND operation".to_string()),
                     };
 
@@ -1438,26 +1131,8 @@ impl VMState {
                         (Value::Int(a), Value::Int(b)) => Value::Int(a | b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
                         // Share | Share (bitwise OR for shares)
-                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-                            let result = val1 | val2;
-
-                            Value::Share(ShareType::Int, result.to_le_bytes().to_vec())
-                        },
-                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
-                            // For boolean shares (OR operation)
-                            let bit1 = data1[0] != 0;
-                            let bit2 = data2[0] != 0;
-                            let result = bit1 | bit2;
-
-                            Value::Share(ShareType::Bool, vec![result as u8])
-                        },
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in OR operation".to_string()),
                     };
 
@@ -1476,26 +1151,8 @@ impl VMState {
                         (Value::Int(a), Value::Int(b)) => Value::Int(a ^ b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(a ^ b),
                         // Share ^ Share (bitwise XOR for shares)
-                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
-                            let mut bytes1 = [0u8; 8];
-                            let mut bytes2 = [0u8; 8];
-                            bytes1.copy_from_slice(&data1[0..8]);
-                            bytes2.copy_from_slice(&data2[0..8]);
-
-                            let val1 = i64::from_le_bytes(bytes1);
-                            let val2 = i64::from_le_bytes(bytes2);
-                            let result = val1 ^ val2;
-
-                            Value::Share(ShareType::Int, result.to_le_bytes().to_vec())
-                        },
-                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
-                            // For boolean shares (XOR operation)
-                            let bit1 = data1[0] != 0;
-                            let bit2 = data2[0] != 0;
-                            let result = bit1 ^ bit2;
-
-                            Value::Share(ShareType::Bool, vec![result as u8])
-                        },
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
                         _ => return Err("Type error in XOR operation".to_string()),
                     };
 
@@ -1513,22 +1170,8 @@ impl VMState {
                         Value::Int(a) => Value::Int(!a),
                         Value::Bool(a) => Value::Bool(!a),
                         // ~Share (bitwise NOT for shares)
-                        Value::Share(ShareType::Int, data) => {
-                            let mut bytes = [0u8; 8];
-                            bytes.copy_from_slice(&data[0..8]);
-
-                            let val = i64::from_le_bytes(bytes);
-                            let result = !val;
-
-                            Value::Share(ShareType::Int, result.to_le_bytes().to_vec())
-                        },
-                        Value::Share(ShareType::Bool, data) => {
-                            // For boolean shares (NOT operation)
-                            let bit = data[0] != 0;
-                            let result = !bit;
-
-                            Value::Share(ShareType::Bool, vec![result as u8])
-                        },
+                        Value::Share(ShareType::Int(_), data) => todo!(),
+                        Value::Share(ShareType::Bool(_), data) => todo!(),
                         _ => return Err("Type error in NOT operation".to_string()),
                     };
 
@@ -1553,20 +1196,7 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         },
                         // Share << Int (shift left for shares)
-                        (Value::Share(ShareType::Int, data), Value::Int(b)) => {
-                            let mut bytes = [0u8; 8];
-                            bytes.copy_from_slice(&data[0..8]);
-
-                            let val = i64::from_le_bytes(bytes);
-                            let result = val << b;
-
-                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
+                        (Value::Share(ShareType::Int(_), data), Value::Int(b)) => todo!(),
                         // Share << Share is not supported (amount must be a clear value)
                         _ => return Err("Type error in SHL operation".to_string()),
                     }
@@ -1586,20 +1216,7 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         },
                         // Share >> Int (shift right for shares)
-                        (Value::Share(ShareType::Int, data), Value::Int(b)) => {
-                            let mut bytes = [0u8; 8];
-                            bytes.copy_from_slice(&data[0..8]);
-
-                            let val = i64::from_le_bytes(bytes);
-                            let result = val >> b;
-
-                            let result_value = Value::Share(ShareType::Int, result.to_le_bytes().to_vec());
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
+                        (Value::Share(ShareType::Int(_), data), Value::Int(b)) => todo!(),
                         // Share >> Share is not supported (amount must be a clear value)
                         _ => return Err("Type error in SHR operation".to_string()),
                     }
@@ -1856,10 +1473,6 @@ impl VMState {
                                 stack: SmallVec::new(),
                                 compare_flag: 0,
                                 instructions: SmallVec::from(vm_func.instructions.clone()),
-                                cached_instructions: vm_func
-                                    .cached_instructions
-                                    .as_ref()
-                                    .map(|v| SmallVec::from_vec(v.clone())),
                                 resolved_instructions: vm_func.resolved_instructions.clone(),
                                 constant_values: vm_func.constant_values.clone(),
                                 closure: None,
@@ -2139,7 +1752,7 @@ impl VMState {
                             _ => 0,
                         },
                         // Share comparison (Int)
-                        (Value::Share(ShareType::Int, data1), Value::Share(ShareType::Int, data2)) => {
+                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => {
                             // TODO: implement this
                             let mut bytes1 = [0u8; 8];
                             let mut bytes2 = [0u8; 8];
@@ -2158,7 +1771,7 @@ impl VMState {
                             }
                         },
                         // Share comparison (Float)
-                        (Value::Share(ShareType::Float, data1), Value::Share(ShareType::Float, data2)) => {
+                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => {
                             // For fixed-point values
                             let mut bytes1 = [0u8; 8];
                             let mut bytes2 = [0u8; 8];
@@ -2177,7 +1790,7 @@ impl VMState {
                             }
                         },
                         // Share comparison (Bool)
-                        (Value::Share(ShareType::Bool, data1), Value::Share(ShareType::Bool, data2)) => {
+                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => {
                             // For boolean values
                             let bit1 = data1[0] != 0;
                             let bit2 = data2[0] != 0;
