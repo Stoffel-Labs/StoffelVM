@@ -60,8 +60,8 @@ fn bench_basic_operations(c: &mut Criterion) {
             None,
             4,
             vec![
-                Instruction::LDI(0, Value::Int(10)),
-                Instruction::LDI(1, Value::Int(20)),
+                Instruction::LDI(0, Value::I64(10)),
+                Instruction::LDI(1, Value::I64(20)),
                 Instruction::ADD(2, 0, 1),
                 Instruction::MUL(3, 2, 1),
                 Instruction::RET(3),
@@ -85,7 +85,7 @@ fn bench_basic_operations(c: &mut Criterion) {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(42)),
+                Instruction::LDI(0, Value::I64(42)),
                 Instruction::MOV(1, 0),
                 Instruction::MOV(2, 1),
                 Instruction::RET(2),
@@ -129,7 +129,7 @@ fn bench_function_calls(c: &mut Criterion) {
             None,
             2,
             vec![
-                Instruction::LDI(0, Value::Int(42)),
+                Instruction::LDI(0, Value::I64(42)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("simple_function".to_string()),
                 Instruction::RET(0),
@@ -184,7 +184,7 @@ fn bench_function_calls(c: &mut Criterion) {
 
         group.bench_function("closure", |b| {
             b.iter(|| {
-                let args = vec![Value::Int(5)];
+                let args = vec![Value::I64(5)];
                 black_box(vm.execute_with_args("create_adder", &args).unwrap())
             });
         });
@@ -213,7 +213,7 @@ fn bench_object_operations(c: &mut Criterion) {
                 Instruction::PUSHARG(1),
                 Instruction::LDI(2, Value::String("field".to_string())),
                 Instruction::PUSHARG(2),
-                Instruction::LDI(3, Value::Int(42)),
+                Instruction::LDI(3, Value::I64(42)),
                 Instruction::PUSHARG(3),
                 Instruction::CALL("set_field".to_string()),
                 // Get field
@@ -252,12 +252,12 @@ fn bench_array_operations(c: &mut Criterion) {
                 Instruction::MOV(1, 0),
                 // Push elements
                 Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::Int(42)),
+                Instruction::LDI(2, Value::I64(42)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("array_push".to_string()),
                 // Get element
                 Instruction::PUSHARG(1),
-                Instruction::LDI(3, Value::Int(1)),
+                Instruction::LDI(3, Value::I64(1)),
                 Instruction::PUSHARG(3),
                 Instruction::CALL("get_field".to_string()),
                 Instruction::RET(0),
@@ -287,8 +287,8 @@ fn bench_hook_system(c: &mut Criterion) {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(1)),
-                Instruction::LDI(1, Value::Int(2)),
+                Instruction::LDI(0, Value::I64(1)),
+                Instruction::LDI(1, Value::I64(2)),
                 Instruction::ADD(2, 0, 1),
                 Instruction::RET(2),
             ],
@@ -332,8 +332,8 @@ fn bench_optimized_hook_system(c: &mut Criterion) {
         5,
         vec![
             // Mix of different instruction types
-            Instruction::LDI(0, Value::Int(10)),
-            Instruction::LDI(1, Value::Int(20)),
+            Instruction::LDI(0, Value::I64(10)),
+            Instruction::LDI(1, Value::I64(20)),
             Instruction::ADD(2, 0, 1),
             Instruction::MUL(3, 2, 1),
             Instruction::MOV(4, 3),
@@ -436,8 +436,8 @@ fn bench_optimized_operations(c: &mut Criterion) {
         None,
         4,
         vec![
-            Instruction::LDI(0, Value::Int(10)),
-            Instruction::LDI(1, Value::Int(20)),
+            Instruction::LDI(0, Value::I64(10)),
+            Instruction::LDI(1, Value::I64(20)),
             Instruction::ADD(2, 0, 1),
             Instruction::MUL(3, 2, 1),
             Instruction::RET(3),
@@ -462,7 +462,7 @@ fn bench_optimized_operations(c: &mut Criterion) {
         None,
         3,
         vec![
-            Instruction::LDI(0, Value::Int(42)),
+            Instruction::LDI(0, Value::I64(42)),
             Instruction::MOV(1, 0),
             Instruction::MOV(2, 1),
             Instruction::RET(2),
@@ -502,8 +502,8 @@ fn bench_core_execution(c: &mut Criterion) {
         None,
         4,
         vec![
-            Instruction::LDI(0, Value::Int(10)),
-            Instruction::LDI(1, Value::Int(20)),
+            Instruction::LDI(0, Value::I64(10)),
+            Instruction::LDI(1, Value::I64(20)),
             Instruction::ADD(2, 0, 1),
             Instruction::MUL(3, 2, 1),
             Instruction::RET(3),
@@ -520,7 +520,7 @@ fn bench_core_execution(c: &mut Criterion) {
         None,
         3,
         vec![
-            Instruction::LDI(0, Value::Int(42)),
+            Instruction::LDI(0, Value::I64(42)),
             Instruction::MOV(1, 0),
             Instruction::MOV(2, 1),
             Instruction::RET(2),
@@ -541,8 +541,8 @@ fn bench_core_execution(c: &mut Criterion) {
         None,
         3,
         vec![
-            Instruction::LDI(0, Value::Int(1)),  // Counter
-            Instruction::LDI(1, Value::Int(10)), // Limit
+            Instruction::LDI(0, Value::I64(1)),  // Counter
+            Instruction::LDI(1, Value::I64(10)), // Limit
             // loop_start:
             Instruction::CMP(0, 1),
             Instruction::JMPGT("loop_end".to_string()),
@@ -604,8 +604,8 @@ fn bench_individual_instructions(c: &mut Criterion) {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(10)),
-                Instruction::LDI(1, Value::Int(20)),
+                Instruction::LDI(0, Value::I64(10)),
+                Instruction::LDI(1, Value::I64(20)),
                 // Only benchmark this instruction
                 Instruction::ADD(2, 0, 1),
                 Instruction::RET(2),
@@ -630,8 +630,8 @@ fn bench_individual_instructions(c: &mut Criterion) {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(10)),
-                Instruction::LDI(1, Value::Int(20)),
+                Instruction::LDI(0, Value::I64(10)),
+                Instruction::LDI(1, Value::I64(20)),
                 // Only benchmark this instruction
                 Instruction::MUL(2, 0, 1),
                 Instruction::RET(2),
@@ -656,7 +656,7 @@ fn bench_individual_instructions(c: &mut Criterion) {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(42)),
+                Instruction::LDI(0, Value::I64(42)),
                 // Only benchmark this instruction
                 Instruction::MOV(1, 0),
                 Instruction::RET(1),
@@ -718,7 +718,7 @@ fn bench_parameterized(c: &mut Criterion) {
         // Create a function with *size* instructions
         let mut instructions = Vec::new();
         for i in 0..*size {
-            instructions.push(Instruction::LDI(0, Value::Int(i as i64)));
+            instructions.push(Instruction::LDI(0, Value::I64(i as i64)));
         }
         instructions.push(Instruction::RET(0));
 
@@ -763,7 +763,7 @@ fn bench_memory_overhead(c: &mut Criterion) {
         // Push elements
         for i in 0..*size {
             instructions.push(Instruction::PUSHARG(1));
-            instructions.push(Instruction::LDI(2, Value::Int(i as i64)));
+            instructions.push(Instruction::LDI(2, Value::I64(i as i64)));
             instructions.push(Instruction::PUSHARG(2));
             instructions.push(Instruction::CALL("array_push".to_string()));
         }

@@ -156,7 +156,7 @@ fn main() -> Result<(), String> {
     let b = 5;
 
     for op in operations {
-        let args = vec![Value::String(op.to_string()), Value::Int(a), Value::Int(b)];
+        let args = vec![Value::String(op.to_string()), Value::I64(a), Value::I64(b)];
 
         let result = vm.execute_with_args("calculator", &args)?;
         println!("{} {} {} = {:?}", a, op, b, result);

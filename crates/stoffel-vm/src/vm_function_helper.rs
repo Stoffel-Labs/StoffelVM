@@ -1,5 +1,5 @@
-use crate::functions::VMFunction;
-use crate::instructions::Instruction;
+use stoffel_vm_types::functions::VMFunction;
+use stoffel_vm_types::instructions::Instruction;
 use std::collections::HashMap;
 
 /// Helper function to create a VMFunction with default values for the new fields
