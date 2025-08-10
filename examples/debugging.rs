@@ -23,7 +23,7 @@ fn main() -> Result<(), String> {
         5,
         vec![
             // Check if n == 1
-            Instruction::LDI(1, Value::Int(1)),
+            Instruction::LDI(1, Value::I64(1)),
             Instruction::CMP(0, 1),
             Instruction::JMPEQ("base_case".to_string()),
             // Check if n < 1
@@ -31,11 +31,11 @@ fn main() -> Result<(), String> {
             Instruction::JMPNEQ("recursive_case".to_string()),
             Instruction::JMP("base_case".to_string()),
             // base_case: return 1
-            Instruction::LDI(0, Value::Int(1)),
+            Instruction::LDI(0, Value::I64(1)),
             Instruction::RET(0),
             // recursive_case: return n * factorial(n-1)
             Instruction::MOV(3, 0),
-            Instruction::LDI(1, Value::Int(1)),
+            Instruction::LDI(1, Value::I64(1)),
             Instruction::SUB(2, 0, 1),
             Instruction::PUSHARG(2),
             Instruction::CALL("factorial".to_string()),
@@ -122,7 +122,7 @@ fn main() -> Result<(), String> {
     );
 
     // Execute the factorial function with argument 5
-    let args = vec![Value::Int(5)];
+    let args = vec![Value::I64(5)];
     let result = vm.execute_with_args("factorial", &args)?;
 
     println!("factorial(5) = {:?}", result);

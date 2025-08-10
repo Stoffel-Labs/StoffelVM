@@ -13,10 +13,10 @@
 //! The VM state is the central component that orchestrates all aspects of
 //! program execution, from function calls to object manipulation.
 
-use crate::activations::{ActivationRecord, ActivationRecordPool};
-use crate::core_types::{Closure, ForeignObjectStorage, ObjectStore, ShareType, Upvalue, Value};
-use crate::functions::{ForeignFunctionContext, Function};
-use crate::instructions::{Instruction, ResolvedInstruction};
+use stoffel_vm_types::activations::{ActivationRecord, ActivationRecordPool};
+use stoffel_vm_types::core_types::{Closure, ForeignObjectStorage, ObjectStore, ShareType, Upvalue, Value};
+use crate::foreign_functions::{ForeignFunctionContext, Function};
+use stoffel_vm_types::instructions::{Instruction, ResolvedInstruction};
 use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
 use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
@@ -531,7 +531,7 @@ impl VMState {
                         result_value = if dest_reg >= 16 && src_reg < 16 {
                             // Clear to secret conversion (lower to upper half)
                             match src_value {
-                                Value::Int(i) => todo!(),
+                                Value::I64(i) => todo!(),
                                 Value::Float(f) => todo!(),
                                 Value::Bool(b) => todo!(),
                                 _ => return Err("Only primitive types (Int, Float, Bool) can be converted to shares".to_string()),
@@ -580,7 +580,7 @@ impl VMState {
                     let src2 = &record.registers[src2_reg];
 
                     match (src1, src2) {
-                        (Value::Int(a), Value::Int(b)) => {
+                        (Value::I64(a), Value::I64(b)) => {
                             // Create result directly
                             let result = *a + *b;
 
@@ -592,7 +592,7 @@ impl VMState {
                             };
 
                             // Store result without cloning
-                            record.registers[dest_reg] = Value::Int(result);
+                            record.registers[dest_reg] = Value::I64(result);
 
                             // Only trigger hook if needed
                             if let Some(old) = old_value {
@@ -753,8 +753,8 @@ impl VMState {
                     let src2 = &record.registers[src2_reg];
 
                     match (src1, src2) {
-                        (Value::Int(a), Value::Int(b)) => {
-                            let result_value = Value::Int(a - b);
+                        (Value::I64(a), Value::I64(b)) => {
+                            let result_value = Value::I64(a - b);
                             let old_value = record.registers[dest_reg].clone();
                             record.registers[dest_reg] = result_value.clone();
 
@@ -830,8 +830,8 @@ impl VMState {
                     let src2 = &record.registers[src2_reg];
 
                     match (src1, src2) {
-                        (Value::Int(a), Value::Int(b)) => {
-                            let result_value = Value::Int(a * b);
+                        (Value::I64(a), Value::I64(b)) => {
+                            let result_value = Value::I64(a * b);
                             let old_value = record.registers[dest_reg].clone();
                             record.registers[dest_reg] = result_value.clone();
 
@@ -907,11 +907,11 @@ impl VMState {
                     let src2 = &record.registers[src2_reg];
 
                     match (src1, src2) {
-                        (Value::Int(a), Value::Int(b)) => {
+                        (Value::I64(a), Value::I64(b)) => {
                             if *b == 0 {
                                 return Err("Division by zero".to_string());
                             }
-                            let result_value = Value::Int(a / b);
+                            let result_value = Value::I64(a / b);
                             let old_value = record.registers[dest_reg].clone();
                             record.registers[dest_reg] = result_value.clone();
 
@@ -1007,11 +1007,11 @@ impl VMState {
                     let src2 = &record.registers[src2_reg];
 
                     match (src1, src2) {
-                        (Value::Int(a), Value::Int(b)) => {
+                        (Value::I64(a), Value::I64(b)) => {
                             if *b == 0 {
                                 return Err("Modulo by zero".to_string());
                             }
-                            let result_value = Value::Int(a % b);
+                            let result_value = Value::I64(a % b);
                             let old_value = record.registers[dest_reg].clone();
                             record.registers[dest_reg] = result_value.clone();
 
@@ -1108,7 +1108,7 @@ impl VMState {
                     let src2 = &record.registers[src2_reg];
 
                     let result_value = match (src1, src2) {
-                        (Value::Int(a), Value::Int(b)) => Value::Int(a & b),
+                        (Value::I64(a), Value::I64(b)) => Value::I64(a & b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
                         // Share & Share (bitwise AND for shares)
                         (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
@@ -1128,7 +1128,7 @@ impl VMState {
                     let src2 = &record.registers[src2_reg];
 
                     let result_value = match (src1, src2) {
-                        (Value::Int(a), Value::Int(b)) => Value::Int(a | b),
+                        (Value::I64(a), Value::I64(b)) => Value::I64(a | b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
                         // Share | Share (bitwise OR for shares)
                         (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
@@ -1148,7 +1148,7 @@ impl VMState {
                     let src2 = &record.registers[src2_reg];
 
                     let result_value = match (src1, src2) {
-                        (Value::Int(a), Value::Int(b)) => Value::Int(a ^ b),
+                        (Value::I64(a), Value::I64(b)) => Value::I64(a ^ b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(a ^ b),
                         // Share ^ Share (bitwise XOR for shares)
                         (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
@@ -1167,7 +1167,7 @@ impl VMState {
                     let src = &record.registers[src_reg];
 
                     let result_value = match src {
-                        Value::Int(a) => Value::Int(!a),
+                        Value::I64(a) => Value::I64(!a),
                         Value::Bool(a) => Value::Bool(!a),
                         // ~Share (bitwise NOT for shares)
                         Value::Share(ShareType::Int(_), data) => todo!(),
@@ -1187,8 +1187,8 @@ impl VMState {
                     let amount = &record.registers[amount_reg];
 
                     match (src, amount) {
-                        (Value::Int(a), Value::Int(b)) => {
-                            let result_value = Value::Int(a << b);
+                        (Value::I64(a), Value::I64(b)) => {
+                            let result_value = Value::I64(a << b);
                             let old_value = record.registers[dest_reg].clone();
                             record.registers[dest_reg] = result_value.clone();
 
@@ -1196,7 +1196,7 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         },
                         // Share << Int (shift left for shares)
-                        (Value::Share(ShareType::Int(_), data), Value::Int(b)) => todo!(),
+                        (Value::Share(ShareType::Int(_), data), Value::I64(b)) => todo!(),
                         // Share << Share is not supported (amount must be a clear value)
                         _ => return Err("Type error in SHL operation".to_string()),
                     }
@@ -1207,8 +1207,8 @@ impl VMState {
                     let amount = &record.registers[amount_reg];
 
                     match (src, amount) {
-                        (Value::Int(a), Value::Int(b)) => {
-                            let result_value = Value::Int(a >> b);
+                        (Value::I64(a), Value::I64(b)) => {
+                            let result_value = Value::I64(a >> b);
                             let old_value = record.registers[dest_reg].clone();
                             record.registers[dest_reg] = result_value.clone();
 
@@ -1216,7 +1216,7 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         },
                         // Share >> Int (shift right for shares)
-                        (Value::Share(ShareType::Int(_), data), Value::Int(b)) => todo!(),
+                        (Value::Share(ShareType::Int(_), data), Value::I64(b)) => todo!(),
                         // Share >> Share is not supported (amount must be a clear value)
                         _ => return Err("Type error in SHR operation".to_string()),
                     }
@@ -1665,7 +1665,7 @@ impl VMState {
                     let val2 = &record.registers[reg2];
 
                     let compare_result = match (val1, val2) {
-                        (Value::Int(a), Value::Int(b)) => {
+                        (Value::I64(a), Value::I64(b)) => {
                             if a < b {
                                 -1
                             } else if a > b {

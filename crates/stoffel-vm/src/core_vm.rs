@@ -1,7 +1,8 @@
-use crate::activations::{ActivationRecord, ActivationRecordPool};
-use crate::functions::{ForeignFunction, ForeignFunctionContext, Function, VMFunction};
+use stoffel_vm_types::activations::{ActivationRecord, ActivationRecordPool};
+use crate::foreign_functions::{ForeignFunction, ForeignFunctionContext, Function};
+use stoffel_vm_types::functions::VMFunction;
 use crate::runtime_hooks::{HookContext, HookEvent};
-use crate::core_types::{Closure, Upvalue, Value};
+use stoffel_vm_types::core_types::{Closure, Upvalue, Value};
 use crate::vm_state::VMState;
 use parking_lot::Mutex;
 use smallvec::{smallvec, SmallVec};
@@ -49,7 +50,7 @@ impl VirtualMachine {
         self.register_foreign_function("create_array", |ctx| {
             let capacity = if ctx.args.len() > 0 {
                 match &ctx.args[0] {
-                    Value::Int(n) => *n as usize,
+                    Value::I64(n) => *n as usize,
                     _ => 0,
                 }
             } else {
@@ -147,7 +148,7 @@ impl VirtualMachine {
             match &ctx.args[0] {
                 Value::Array(id) => {
                     if let Some(arr) = ctx.vm_state.object_store.get_array(*id) {
-                        Ok(Value::Int(arr.length() as i64))
+                        Ok(Value::I64(arr.length() as i64))
                     } else {
                         Err(format!("Array with ID {} not found", id))
                     }
@@ -164,11 +165,11 @@ impl VirtualMachine {
             match &ctx.args[0] {
                 Value::Array(id) => {
                     if let Some(arr) = ctx.vm_state.object_store.get_array_mut(*id) {
-                        let idx = Value::Int((arr.length() + 1) as i64);
+                        let idx = Value::I64((arr.length() + 1) as i64);
                         for value in &ctx.args[1..] {
                             arr.set(idx.clone(), value.clone());
                         }
-                        Ok(Value::Int(arr.length() as i64))
+                        Ok(Value::I64(arr.length() as i64))
                     } else {
                         Err(format!("Array with ID {} not found", id))
                     }
@@ -324,14 +325,23 @@ impl VirtualMachine {
                 }
                 other => {
                     let type_name = match other {
-                        Value::Int(_) => "integer",
+                        Value::I64(_) => "int64",
                         Value::Float(_) => "float",
                         Value::Bool(_) => "boolean",
                         Value::String(_) => "string",
                         Value::Object(_) => "object",
                         Value::Array(_) => "array",
-                        Value::Foreign(_) => "foreign",
-                        Value::Unit => "unit",
+                        Value::Foreign(_) => "cffi_function",
+                        Value::Closure(_) => "function",
+                        Value::Unit => "nil",
+                        Value::I32(_) => "int32",
+                        Value::I16(_) => "int16",
+                        Value::I8(_) => "int8",
+                        Value::U8(_) => "uint8",
+                        Value::U16(_) => "uint16",
+                        Value::U32(_) => "uint32",
+                        Value::U64(_) => "uint64",
+                        Value::Share(_, _) => "share",
                         _ => "unknown",
                     };
                     Err(format!(
@@ -485,13 +495,13 @@ impl VirtualMachine {
             }
 
             let type_name = match &ctx.args[0] {
-                Value::Int(_) => "integer",
+                Value::I64(_) => "int64",
                 Value::Float(_) => "float",
                 Value::Bool(_) => "boolean",
                 Value::String(_) => "string",
                 Value::Object(_) => "object",
                 Value::Array(_) => "array",
-                Value::Foreign(_) => "userdata",
+                Value::Foreign(_) => "cffi_function",
                 Value::Closure(_) => "function",
                 Value::Unit => "nil",
                 Value::I32(_) => "int32",
@@ -725,9 +735,9 @@ impl VirtualMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activations::ActivationRecord;
-    use crate::functions::VMFunction;
-    use crate::instructions::Instruction;
+    use stoffel_vm_types::activations::ActivationRecord;
+    use stoffel_vm_types::functions::VMFunction;
+    use stoffel_vm_types::instructions::Instruction;
     use std::collections::HashMap;
     use std::sync::Arc;
     use parking_lot::Mutex;
@@ -790,14 +800,14 @@ mod tests {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(5)),  // r0 = 5
-                Instruction::LDI(1, Value::Int(10)), // r1 = 10
+                Instruction::LDI(0, Value::I64(5)),  // r0 = 5
+                Instruction::LDI(1, Value::I64(10)), // r1 = 10
                 Instruction::CMP(0, 1),              // Compare r0 < r1 (sets flag to -1)
                 Instruction::JMPLT("less_than".to_string()), // Jump if less than
-                Instruction::LDI(2, Value::Int(0)),  // Should be skipped
+                Instruction::LDI(2, Value::I64(0)),  // Should be skipped
                 Instruction::JMP("end".to_string()),
                 // less_than:
-                Instruction::LDI(2, Value::Int(1)),  // Set result to 1 if jump taken
+                Instruction::LDI(2, Value::I64(1)),  // Set result to 1 if jump taken
                 // end:
                 Instruction::RET(2),
             ],
@@ -806,7 +816,7 @@ mod tests {
 
         vm.register_function(test_function);
         let result = vm.execute("test_less_than_jump").unwrap();
-        assert_eq!(result, Value::Int(1)); // Expect 1 because 5 < 10
+        assert_eq!(result, Value::I64(1)); // Expect 1 because 5 < 10
     }
 
     #[test]
@@ -826,14 +836,14 @@ mod tests {
             parent: None,
             register_count: 3,
             instructions: vec![
-                Instruction::LDI(0, Value::Int(15)), // r0 = 15
-                Instruction::LDI(1, Value::Int(10)), // r1 = 10
+                Instruction::LDI(0, Value::I64(15)), // r0 = 15
+                Instruction::LDI(1, Value::I64(10)), // r1 = 10
                 Instruction::CMP(0, 1),              // Compare r0 > r1 (sets flag to 1)
                 Instruction::JMPGT("greater_than".to_string()), // Jump if greater than
-                Instruction::LDI(2, Value::Int(0)),  // Should be skipped
+                Instruction::LDI(2, Value::I64(0)),  // Should be skipped
                 Instruction::JMP("end".to_string()),
                 // greater_than:
-                Instruction::LDI(2, Value::Int(1)),  // Set result to 1 if jump taken
+                Instruction::LDI(2, Value::I64(1)),  // Set result to 1 if jump taken
                 // end:
                 Instruction::RET(2),
             ],
@@ -842,7 +852,7 @@ mod tests {
 
         vm.register_function(test_function);
         let result = vm.execute("test_greater_than_jump").unwrap();
-        assert_eq!(result, Value::Int(1)); // Expect 1 because 15 > 10
+        assert_eq!(result, Value::I64(1)); // Expect 1 because 15 > 10
     }
 
     // Example of using new jumps for <=
@@ -863,7 +873,7 @@ mod tests {
             register_count: 3,
             instructions: vec![
                 // Push value to stack
-                Instruction::LDI(0, Value::Int(42)),
+                Instruction::LDI(0, Value::I64(42)),
                 Instruction::PUSHARG(0),
                 // Load from stack to register
                 Instruction::LD(1, 0),
@@ -876,7 +886,7 @@ mod tests {
 
         vm.register_function(test_function);
         let result = vm.execute("test_load").unwrap();
-        assert_eq!(result, Value::Int(42));
+        assert_eq!(result, Value::I64(42));
     }
 
     #[test]
@@ -939,7 +949,7 @@ mod tests {
                 Instruction::PUSHARG(2),
                 Instruction::LDI(3, Value::String("value".to_string())),
                 Instruction::PUSHARG(3),
-                Instruction::LDI(4, Value::Int(42)),
+                Instruction::LDI(4, Value::I64(42)),
                 Instruction::PUSHARG(4),
                 Instruction::CALL("set_field".to_string()),
                 // Set parent.child = child
@@ -965,7 +975,7 @@ mod tests {
 
         vm.register_function(test_function);
         let result = vm.execute("test_nested_objects").unwrap();
-        assert_eq!(result, Value::Int(42));
+        assert_eq!(result, Value::I64(42));
     }
 
     #[test]
@@ -982,18 +992,18 @@ mod tests {
             register_count: 5,
             instructions: vec![
                 // Create array
-                Instruction::LDI(0, Value::Int(5)),
+                Instruction::LDI(0, Value::I64(5)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("create_array".to_string()),
                 Instruction::MOV(1, 0),
                 // Push elements
                 Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::Int(42)),
+                Instruction::LDI(2, Value::I64(42)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("array_push".to_string()),
                 // Get element at index 1
                 Instruction::PUSHARG(1),
-                Instruction::LDI(3, Value::Int(1)),
+                Instruction::LDI(3, Value::I64(1)),
                 Instruction::PUSHARG(3),
                 Instruction::CALL("get_field".to_string()),
                 Instruction::RET(0),
@@ -1003,7 +1013,7 @@ mod tests {
 
         vm.register_function(test_function);
         let result = vm.execute("test_arrays").unwrap();
-        assert_eq!(result, Value::Int(42));
+        assert_eq!(result, Value::I64(42));
     }
 
     #[test]
@@ -1024,15 +1034,15 @@ mod tests {
                 Instruction::MOV(1, 0),
                 // Push multiple elements
                 Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::Int(10)),
+                Instruction::LDI(2, Value::I64(10)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("array_push".to_string()),
                 Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::Int(20)),
+                Instruction::LDI(2, Value::I64(20)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("array_push".to_string()),
                 Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::Int(30)),
+                Instruction::LDI(2, Value::I64(30)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("array_push".to_string()),
                 // Get array length
@@ -1045,7 +1055,7 @@ mod tests {
 
         vm.register_function(test_function);
         let result = vm.execute("test_array_length").unwrap();
-        assert_eq!(result, Value::Int(3));
+        assert_eq!(result, Value::I64(3));
     }
 
     #[test]
@@ -1162,7 +1172,7 @@ mod tests {
             register_count: 8,
             instructions: vec![
                 // Create counter with initial value 10
-                Instruction::LDI(0, Value::Int(10)),
+                Instruction::LDI(0, Value::I64(10)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("create_counter".to_string()),
                 Instruction::MOV(1, 0), // Save closure in r1
@@ -1175,7 +1185,7 @@ mod tests {
                 Instruction::CALL("print".to_string()),
                 // First call to increment
                 Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::Int(5)),
+                Instruction::LDI(2, Value::I64(5)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("call_closure".to_string()),
                 Instruction::MOV(3, 0), // Save first result in r3
@@ -1184,7 +1194,7 @@ mod tests {
                 Instruction::CALL("print".to_string()),
                 // Second call to increment
                 Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::Int(7)),
+                Instruction::LDI(2, Value::I64(7)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("call_closure".to_string()),
                 Instruction::MOV(4, 0), // Save second result in r4
@@ -1239,7 +1249,7 @@ mod tests {
         }
 
         // Check expected value
-        assert_eq!(result, Value::Int(22));
+        assert_eq!(result, Value::I64(22));
     }
 
     #[test]
@@ -1309,24 +1319,24 @@ mod tests {
             register_count: 5,
             instructions: vec![
                 // Create counter1 with initial value 10
-                Instruction::LDI(0, Value::Int(10)),
+                Instruction::LDI(0, Value::I64(10)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("create_counter".to_string()),
                 Instruction::MOV(1, 0),
                 // Create counter2 with initial value 20
-                Instruction::LDI(0, Value::Int(20)),
+                Instruction::LDI(0, Value::I64(20)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("create_counter".to_string()),
                 Instruction::MOV(2, 0),
                 // Call counter1 with 5
                 Instruction::PUSHARG(1),
-                Instruction::LDI(0, Value::Int(5)),
+                Instruction::LDI(0, Value::I64(5)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("call_closure".to_string()),
                 Instruction::MOV(3, 0),
                 // Call counter2 with 10
                 Instruction::PUSHARG(2),
-                Instruction::LDI(0, Value::Int(10)),
+                Instruction::LDI(0, Value::I64(10)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("call_closure".to_string()),
                 Instruction::MOV(4, 0),
@@ -1507,7 +1517,7 @@ mod tests {
         }
 
         // The test should return an integer value, which is the result of calling the second counter with 10
-        assert_eq!(result, Value::Int(40)); // 20 + 10 + 10 = 40
+        assert_eq!(result, Value::I64(40)); // 20 + 10 + 10 = 40
     }
 
     #[test]
@@ -1571,13 +1581,13 @@ mod tests {
             5,
             vec![
                 // Create adder with x=10
-                Instruction::LDI(0, Value::Int(10)),
+                Instruction::LDI(0, Value::I64(10)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("create_adder".to_string()),
                 Instruction::MOV(1, 0),
                 // Call adder with y=5
                 Instruction::PUSHARG(1),
-                Instruction::LDI(0, Value::Int(5)),
+                Instruction::LDI(0, Value::I64(5)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("call_closure".to_string()),
                 Instruction::RET(0),
@@ -1590,7 +1600,7 @@ mod tests {
         vm.register_function(test_function);
 
         let result = vm.execute("test_nested_closures").unwrap();
-        assert_eq!(result, Value::Int(15)); // 10 + 5 = 15
+        assert_eq!(result, Value::I64(15)); // 10 + 5 = 15
     }
 
     #[test]
@@ -1604,7 +1614,7 @@ mod tests {
             }
 
             match &ctx.args[0] {
-                Value::Int(n) => Ok(Value::Int(n * 2)),
+                Value::I64(n) => Ok(Value::I64(n * 2)),
                 _ => Err("double expects an integer".to_string()),
             }
         });
@@ -1616,7 +1626,7 @@ mod tests {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(21)),
+                Instruction::LDI(0, Value::I64(21)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("double".to_string()),
                 Instruction::RET(0),
@@ -1626,7 +1636,7 @@ mod tests {
 
         vm.register_function(test_function);
         let result = vm.execute("test_foreign").unwrap();
-        assert_eq!(result, Value::Int(42));
+        assert_eq!(result, Value::I64(42));
     }
 
     #[test]
@@ -1642,12 +1652,12 @@ mod tests {
             let mut total = 0;
             for arg in ctx.args.iter() {
                 match arg {
-                    Value::Int(n) => total += n,
+                    Value::I64(n) => total += n,
                     _ => return Err("sum expects integers".to_string()),
                 }
             }
 
-            Ok(Value::Int(total))
+            Ok(Value::I64(total))
         });
 
         let test_function = VMFunction::new(
@@ -1657,11 +1667,11 @@ mod tests {
             None,
             4,
             vec![
-                Instruction::LDI(0, Value::Int(10)),
+                Instruction::LDI(0, Value::I64(10)),
                 Instruction::PUSHARG(0),
-                Instruction::LDI(1, Value::Int(20)),
+                Instruction::LDI(1, Value::I64(20)),
                 Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::Int(12)),
+                Instruction::LDI(2, Value::I64(12)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("sum".to_string()),
                 Instruction::RET(0),
@@ -1671,7 +1681,7 @@ mod tests {
 
         vm.register_function(test_function);
         let result = vm.execute("test_foreign_multi_args").unwrap();
-        assert_eq!(result, Value::Int(42));
+        assert_eq!(result, Value::I64(42));
     }
 
     #[test]
@@ -1701,7 +1711,7 @@ mod tests {
                     {
                         let locked = obj_arc.lock();
                         // Return the actual value, not the pointer
-                        Ok(Value::Int(locked.value as i64))
+                        Ok(Value::I64(locked.value as i64))
                     } else {
                         Err("Invalid foreign object".to_string())
                     }
@@ -1728,7 +1738,7 @@ mod tests {
 
         vm.register_function(test_function);
         let result = vm.execute("test_foreign_object").unwrap();
-        assert_eq!(result, Value::Int(42));
+        assert_eq!(result, Value::I64(42));
     }
 
     #[test]
@@ -1766,7 +1776,7 @@ mod tests {
                         ctx.vm_state.foreign_objects.get_object::<Counter>(*id)
                     {
                         let amount = match &ctx.args[1] {
-                            Value::Int(n) => n,
+                            Value::I64(n) => n,
                             other => {
                                 return Err(format!(
                                     "Second argument must be an integer, got {:?}",
@@ -1780,7 +1790,7 @@ mod tests {
                         new_value = counter.value;
                         println!("Incremented counter to: {}", new_value);
 
-                        Ok(Value::Int(new_value as i64))
+                        Ok(Value::I64(new_value as i64))
                     } else {
                         Err(format!(
                             "Foreign object with ID {} not found or wrong type",
@@ -1806,7 +1816,7 @@ mod tests {
                 Instruction::LDI(0, counter_value.clone()),
                 Instruction::PUSHARG(0),
                 // Increment by 10
-                Instruction::LDI(1, Value::Int(10)),
+                Instruction::LDI(1, Value::I64(10)),
                 Instruction::PUSHARG(1),
                 Instruction::CALL("increment_counter".to_string()),
                 // First result (11) is now in r0
@@ -1815,7 +1825,7 @@ mod tests {
                 Instruction::LDI(0, counter_value), // This is the key fix
                 Instruction::PUSHARG(0),
                 // Increment by 32
-                Instruction::LDI(1, Value::Int(32)),
+                Instruction::LDI(1, Value::I64(32)),
                 Instruction::PUSHARG(1),
                 Instruction::CALL("increment_counter".to_string()),
                 Instruction::RET(0),
@@ -1825,7 +1835,7 @@ mod tests {
 
         vm.register_function(test_function);
         let result = vm.execute("test_foreign_object_mutation").unwrap();
-        assert_eq!(result, Value::Int(42)); // 0 + 10 + 32 = 42
+        assert_eq!(result, Value::I64(42)); // 0 + 10 + 32 = 42
     }
 
     #[test]
@@ -1855,8 +1865,8 @@ mod tests {
             None,
             2,
             vec![
-                Instruction::LDI(0, Value::Int(1)),
-                Instruction::LDI(1, Value::Int(2)),
+                Instruction::LDI(0, Value::I64(1)),
+                Instruction::LDI(1, Value::I64(2)),
                 Instruction::ADD(0, 0, 1),
                 Instruction::RET(0),
             ],
@@ -1866,7 +1876,7 @@ mod tests {
         vm.register_function(test_function);
         let result = vm.execute("test_hooks").unwrap();
 
-        assert_eq!(result, Value::Int(3));
+        assert_eq!(result, Value::I64(3));
         if let Ok(hook_calls) = crate::mutex_helpers::lock_mutex_as_result(&hook_calls) {
             assert_eq!(*hook_calls, 4); // 4 instructions executed
         };
@@ -1903,8 +1913,8 @@ mod tests {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(10)),
-                Instruction::LDI(1, Value::Int(20)),
+                Instruction::LDI(0, Value::I64(10)),
+                Instruction::LDI(1, Value::I64(20)),
                 Instruction::ADD(2, 0, 1),
                 Instruction::RET(2),
             ],
@@ -1914,13 +1924,13 @@ mod tests {
         vm.register_function(test_function);
         let result = vm.execute("test_register_hooks").unwrap();
 
-        assert_eq!(result, Value::Int(30));
+        assert_eq!(result, Value::I64(30));
 
         if let Ok(writes) = crate::mutex_helpers::lock_mutex_as_result(&register_writes) {
             assert_eq!(writes.len(), 3);
-            assert_eq!(writes[0], (0, Value::Int(10)));
-            assert_eq!(writes[1], (1, Value::Int(20)));
-            assert_eq!(writes[2], (2, Value::Int(30)));
+            assert_eq!(writes[0], (0, Value::I64(10)));
+            assert_eq!(writes[1], (1, Value::I64(20)));
+            assert_eq!(writes[2], (2, Value::I64(30)));
         };
     }
 
@@ -2041,13 +2051,13 @@ mod tests {
             register_count: 5,
             instructions: vec![
                 // Create counter with initial value 10
-                Instruction::LDI(0, Value::Int(10)),
+                Instruction::LDI(0, Value::I64(10)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("create_counter".to_string()),
                 Instruction::MOV(1, 0),
                 // Call increment with 5
                 Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::Int(5)),
+                Instruction::LDI(2, Value::I64(5)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("call_closure".to_string()),
                 Instruction::RET(0),
@@ -2071,10 +2081,10 @@ mod tests {
         let ops = upvalue_ops.lock();
         println!("Upvalue operations: {:?}", ops);
         assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0], ("read", "start".to_string(), Value::Int(10)));
-        assert_eq!(ops[1], ("write", "start".to_string(), Value::Int(20)));
+        assert_eq!(ops[0], ("read", "start".to_string(), Value::I64(10)));
+        assert_eq!(ops[1], ("write", "start".to_string(), Value::I64(20)));
 
-        assert_eq!(result, Value::Int(20)); // The result is 20 because the upvalue is updated to 20
+        assert_eq!(result, Value::I64(20)); // The result is 20 because the upvalue is updated to 20
     }
 
     #[test]
@@ -2089,8 +2099,8 @@ mod tests {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(10)),
-                Instruction::LDI(1, Value::Int(0)),
+                Instruction::LDI(0, Value::I64(10)),
+                Instruction::LDI(1, Value::I64(0)),
                 Instruction::DIV(2, 0, 1),
                 Instruction::RET(2),
             ],
@@ -2137,7 +2147,7 @@ mod tests {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(10)),
+                Instruction::LDI(0, Value::I64(10)),
                 Instruction::LDI(1, Value::String("not a number".to_string())),
                 Instruction::ADD(2, 0, 1),
                 Instruction::RET(2),
@@ -2188,9 +2198,9 @@ mod tests {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Int(10)),
+                Instruction::LDI(0, Value::I64(10)),
                 Instruction::PUSHARG(0),
-                Instruction::LDI(1, Value::Int(20)),
+                Instruction::LDI(1, Value::I64(20)),
                 Instruction::PUSHARG(1),
                 Instruction::CALL("sum".to_string()),
                 Instruction::RET(0),
@@ -2205,22 +2215,22 @@ mod tests {
             }
 
             match (&ctx.args[0], &ctx.args[1]) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+                (Value::I64(a), Value::I64(b)) => Ok(Value::I64(a + b)),
                 _ => Err("sum expects integers".to_string()),
             }
         });
 
         vm.register_function(test_function);
         let result = vm.execute("test_stack").unwrap();
-        assert_eq!(result, Value::Int(30));
+        assert_eq!(result, Value::I64(30));
 
         let ops = stack_ops.lock();
         println!("{}", format!("{:?}", ops));
         assert_eq!(ops.len(), 4);
-        assert_eq!(ops[0], ("push", Value::Int(10)));
-        assert_eq!(ops[1], ("push", Value::Int(20)));
-        assert_eq!(ops[2], ("pop", Value::Int(20)));
-        assert_eq!(ops[3], ("pop", Value::Int(10)));
+        assert_eq!(ops[0], ("push", Value::I64(10)));
+        assert_eq!(ops[1], ("push", Value::I64(20)));
+        assert_eq!(ops[2], ("pop", Value::I64(20)));
+        assert_eq!(ops[3], ("pop", Value::I64(10)));
     }
 
     #[test]
@@ -2241,33 +2251,33 @@ mod tests {
             5,
             vec![
                 // Check if n == 0
-                Instruction::LDI(1, Value::Int(0)),
+                Instruction::LDI(1, Value::I64(0)),
                 Instruction::CMP(0, 1),
                 Instruction::JMPEQ("base_case_zero".to_string()),
                 // Check if n == 1
-                Instruction::LDI(1, Value::Int(1)),
+                Instruction::LDI(1, Value::I64(1)),
                 Instruction::CMP(0, 1),
                 Instruction::JMPEQ("base_case_one".to_string()),
                 // Otherwise, recursive case
                 Instruction::JMP("recursive_case".to_string()),
                 // base_case_zero: return 0
-                Instruction::LDI(0, Value::Int(0)),
+                Instruction::LDI(0, Value::I64(0)),
                 Instruction::RET(0),
                 // base_case_one: return 1
-                Instruction::LDI(0, Value::Int(1)),
+                Instruction::LDI(0, Value::I64(1)),
                 Instruction::RET(0),
                 // recursive_case: return fibonacci(n-1) + fibonacci(n-2)
                 // Save n
                 Instruction::MOV(4, 0), // Save n in r4
                 // Calculate fibonacci(n-1)
-                Instruction::LDI(1, Value::Int(1)),
+                Instruction::LDI(1, Value::I64(1)),
                 Instruction::SUB(2, 0, 1),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("fibonacci".to_string()),
                 Instruction::MOV(3, 0),
                 // Calculate fibonacci(n-2)
                 Instruction::MOV(0, 4), // Restore n from r4
-                Instruction::LDI(1, Value::Int(2)),
+                Instruction::LDI(1, Value::I64(2)),
                 Instruction::SUB(2, 0, 1),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("fibonacci".to_string()),
@@ -2286,7 +2296,7 @@ mod tests {
             None,
             2,
             vec![
-                Instruction::LDI(0, Value::Int(10)),
+                Instruction::LDI(0, Value::I64(10)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("fibonacci".to_string()),
                 Instruction::RET(0),
@@ -2298,7 +2308,7 @@ mod tests {
         vm.register_function(test_function);
 
         let result = vm.execute("test_fibonacci").unwrap();
-        assert_eq!(result, Value::Int(55)); // fib(10) = 55
+        assert_eq!(result, Value::I64(55)); // fib(10) = 55
     }
 
     #[test]
@@ -2318,7 +2328,7 @@ mod tests {
             5,
             vec![
                 // Check if n == 1
-                Instruction::LDI(1, Value::Int(1)), // r1 = 1
+                Instruction::LDI(1, Value::I64(1)), // r1 = 1
                 Instruction::CMP(0, 1),             // Compare n with 1
                 Instruction::JMPEQ("base_case".to_string()), // If n == 1, go to base case
                 // Check if n < 1 by comparing 1 with n
@@ -2329,13 +2339,13 @@ mod tests {
                 // If execution reaches here, n must be < 1, so go to base case
                 Instruction::JMP("base_case".to_string()),
                 // base_case: (n <= 1)
-                Instruction::LDI(0, Value::Int(1)), // Return 1
+                Instruction::LDI(0, Value::I64(1)), // Return 1
                 Instruction::RET(0),
                 // recursive_case: (n > 1)
                 // Save n
                 Instruction::MOV(3, 0), // r3 = n
                 // Calculate n-1
-                Instruction::LDI(1, Value::Int(1)), // r1 = 1
+                Instruction::LDI(1, Value::I64(1)), // r1 = 1
                 Instruction::SUB(2, 0, 1),          // r2 = n - 1
                 // Call factorial(n-1)
                 Instruction::PUSHARG(2),
@@ -2357,7 +2367,7 @@ mod tests {
             None,
             2,
             vec![
-                Instruction::LDI(0, Value::Int(5)),
+                Instruction::LDI(0, Value::I64(5)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("factorial".to_string()),
                 Instruction::RET(0),
@@ -2532,7 +2542,7 @@ mod tests {
                     println!("  Depth {}: CMP r{} r{} = {}", depth, reg1, reg2, flag);
                 }
 
-                assert_eq!(value, Value::Int(120)); // 5! = 120
+                assert_eq!(value, Value::I64(120)); // 5! = 120
             }
             Err(e) => {
                 println!("\nERROR: {}", e);
@@ -2558,12 +2568,12 @@ mod tests {
             4,
             vec![
                 // Initialize counter
-                Instruction::LDI(1, Value::Int(0)),
+                Instruction::LDI(1, Value::I64(0)),
                 // loop_start:
                 Instruction::CMP(1, 0),
                 Instruction::JMPEQ("loop_end".to_string()),
                 // Increment counter
-                Instruction::LDI(2, Value::Int(1)),
+                Instruction::LDI(2, Value::I64(1)),
                 Instruction::ADD(1, 1, 2),
                 // Do some work (arithmetic)
                 Instruction::MUL(3, 1, 2),
@@ -2585,7 +2595,7 @@ mod tests {
             function_name: "loop_test".to_string(),
             locals: FxHashMap::default(),
             registers: smallvec![
-                Value::Int(iterations),
+                Value::I64(iterations),
                 Value::Unit,
                 Value::Unit,
                 Value::Unit,
@@ -2605,7 +2615,7 @@ mod tests {
         let result = vm.execute_until_return().unwrap();
         let duration = start.elapsed();
 
-        assert_eq!(result, Value::Int(iterations));
+        assert_eq!(result, Value::I64(iterations));
         println!(
             "Performance test: {} iterations in {:?}",
             iterations, duration
@@ -2625,7 +2635,7 @@ mod tests {
             5,
             vec![
                 // Test integer type
-                Instruction::LDI(0, Value::Int(42)),
+                Instruction::LDI(0, Value::I64(42)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("type".to_string()),
                 Instruction::MOV(1, 0),
@@ -2681,8 +2691,8 @@ mod tests {
             None,
             2,
             vec![
-                Instruction::LDI(0, Value::Int(1)),
-                Instruction::LDI(1, Value::Int(2)),
+                Instruction::LDI(0, Value::I64(1)),
+                Instruction::LDI(1, Value::I64(2)),
                 Instruction::ADD(0, 0, 1),
                 Instruction::RET(0),
             ],
@@ -2693,7 +2703,7 @@ mod tests {
 
         // First run with hook enabled
         let result = vm.execute("test_hook_toggle").unwrap();
-        assert_eq!(result, Value::Int(3));
+        assert_eq!(result, Value::I64(3));
         {
             let mut hook_calls_guard = hook_calls.lock();
             assert_eq!(*hook_calls_guard, 4); // 4 instructions executed
@@ -2706,7 +2716,7 @@ mod tests {
 
         // Run again with hook disabled
         let result = vm.execute("test_hook_toggle").unwrap();
-        assert_eq!(result, Value::Int(3));
+        assert_eq!(result, Value::I64(3));
         {
             let hook_calls_guard = hook_calls.lock();
             assert_eq!(*hook_calls_guard, 0); // No hook calls
@@ -2717,7 +2727,7 @@ mod tests {
 
         // Run again with hook re-enabled
         let result = vm.execute("test_hook_toggle").unwrap();
-        assert_eq!(result, Value::Int(3));
+        assert_eq!(result, Value::I64(3));
         {
             let hook_calls_guard = hook_calls.lock();
             assert_eq!(*hook_calls_guard, 4); // 4 more instructions executed
@@ -2750,8 +2760,8 @@ mod tests {
             None,
             2,
             vec![
-                Instruction::LDI(0, Value::Int(1)),
-                Instruction::LDI(1, Value::Int(2)),
+                Instruction::LDI(0, Value::I64(1)),
+                Instruction::LDI(1, Value::I64(2)),
                 Instruction::ADD(0, 0, 1),
                 Instruction::RET(0),
             ],
@@ -2762,7 +2772,7 @@ mod tests {
 
         // First run with hook registered
         let result = vm.execute("test_hook_unregister").unwrap();
-        assert_eq!(result, Value::Int(3));
+        assert_eq!(result, Value::I64(3));
         {
             let mut hook_calls_guard = hook_calls.lock();
             assert_eq!(*hook_calls_guard, 4); // 4 instructions executed
@@ -2775,7 +2785,7 @@ mod tests {
 
         // Run again with hook unregistered
         let result = vm.execute("test_hook_unregister").unwrap();
-        assert_eq!(result, Value::Int(3));
+        assert_eq!(result, Value::I64(3));
         {
             let hook_calls_guard = hook_calls.lock();
             assert_eq!(*hook_calls_guard, 0); // No hook calls
@@ -2831,13 +2841,13 @@ mod tests {
             Vec::new(),
             None,
             1,
-            vec![Instruction::LDI(0, Value::Int(42)), Instruction::RET(0)],
+            vec![Instruction::LDI(0, Value::I64(42)), Instruction::RET(0)],
             HashMap::new(),
         );
 
         vm.register_function(test_function);
         let result = vm.execute("test_hook_priority").unwrap();
-        assert_eq!(result, Value::Int(42));
+        assert_eq!(result, Value::I64(42));
         {
             let hook_order_guard = hook_order.lock();
             // Check that hooks executed in priority order (highest first)
@@ -2869,9 +2879,9 @@ mod tests {
             register_count: 5,
             instructions: vec![
                 // Initialize sum = 0
-                Instruction::LDI(1, Value::Int(0)),
+                Instruction::LDI(1, Value::I64(0)),
                 // Initialize i = 1
-                Instruction::LDI(2, Value::Int(1)),
+                Instruction::LDI(2, Value::I64(1)),
                 // loop_start:
                 // Check if i > n (we want to exit if true)
                 Instruction::CMP(2, 0), // Compare i (r2) with n (r0)
@@ -2884,7 +2894,7 @@ mod tests {
                 // sum += square
                 Instruction::ADD(1, 1, 3),
                 // i++
-                Instruction::LDI(4, Value::Int(1)),
+                Instruction::LDI(4, Value::I64(1)),
                 Instruction::ADD(2, 2, 4),
                 // Go back to loop start
                 Instruction::JMP("loop_start".to_string()),
@@ -2906,7 +2916,7 @@ mod tests {
             parent: None,
             register_count: 2,
             instructions: vec![
-                Instruction::LDI(0, Value::Int(5)),
+                Instruction::LDI(0, Value::I64(5)),
                 Instruction::PUSHARG(0),
                 Instruction::CALL("sum_squares".to_string()),
                 Instruction::RET(0),
@@ -2918,6 +2928,6 @@ mod tests {
         vm.register_function(test_function);
 
         let result = vm.execute("test_complex").unwrap();
-        assert_eq!(result, Value::Int(55)); // 1 + 4 + 9 + 16 + 25 = 55
+        assert_eq!(result, Value::I64(55)); // 1 + 4 + 9 + 16 + 25 = 55
     }
 }

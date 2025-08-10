@@ -1,7 +1,7 @@
-use crate::activations::ActivationRecord;
-use crate::core_types::{Upvalue, Value};
-use crate::functions::Function;
-use crate::instructions::Instruction;
+use stoffel_vm_types::activations::ActivationRecord;
+use stoffel_vm_types::core_types::{Upvalue, Value};
+use crate::foreign_functions::Function;
+use stoffel_vm_types::instructions::Instruction;
 use crate::vm_state::VMState;
 
 /// Hook event types

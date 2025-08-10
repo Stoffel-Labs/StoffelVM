@@ -56,7 +56,7 @@ impl Array {
 
     pub fn get(&self, key: &Value) -> Option<&Value> {
         match key {
-            Value::Int(idx) if *idx >= 1 && (*idx as usize) <= self.length_hint => {
+            Value::I64(idx) if *idx >= 1 && (*idx as usize) <= self.length_hint => {
                 Some(&self.elements[*idx as usize - 1])
             }
             _ => self.extra_fields.get(key),
@@ -65,7 +65,7 @@ impl Array {
 
     pub fn set(&mut self, key: Value, value: Value) {
         match key {
-            Value::Int(idx) if idx >= 1 => {
+            Value::I64(idx) if idx >= 1 => {
                 self.length_hint = self.length_hint.max(idx as usize);
                 let idx_usize = idx as usize - 1;
                 if idx_usize < 32 {
@@ -75,7 +75,7 @@ impl Array {
                     }
                     self.elements[idx_usize] = value;
                 } else {
-                    self.extra_fields.insert(Value::Int(idx), value);
+                    self.extra_fields.insert(Value::I64(idx), value);
                 }
             }
             _ => {
@@ -174,7 +174,7 @@ pub enum ShareType {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     /// 64-bit signed integer
-    Int(i64),
+    I64(i64),
     /// 32-bit signed integer
     I32(i32),
     /// 16-bit signed integer
@@ -212,7 +212,7 @@ pub enum Value {
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Int(i) => write!(f, "{}", i),
+            Value::I64(i) => write!(f, "{}", i),
             Value::I32(i) => write!(f, "{}i32", i),
             Value::I16(i) => write!(f, "{}i16", i),
             Value::I8(i) => write!(f, "{}i8", i),

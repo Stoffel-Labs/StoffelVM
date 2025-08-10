@@ -441,7 +441,7 @@ impl CompiledBinary {
             Value::Unit => {
                 writer.write_all(&[0u8])?; // Type tag for Unit
             },
-            Value::Int(i) => {
+            Value::I64(i) => {
                 writer.write_all(&[1u8])?; // Type tag for Int
                 writer.write_all(&i.to_le_bytes())?;
             },
@@ -791,7 +791,7 @@ impl CompiledBinary {
             1 => {
                 let mut bytes = [0u8; 8];
                 reader.read_exact(&mut bytes)?;
-                Ok(Value::Int(i64::from_le_bytes(bytes)))
+                Ok(Value::I64(i64::from_le_bytes(bytes)))
             },
             2 => {
                 let mut bytes = [0u8; 4];
@@ -1369,7 +1369,7 @@ mod tests {
             None,
             2,
             vec![
-                Instruction::LDI(0, Value::Int(42)),
+                Instruction::LDI(0, Value::I64(42)),
                 Instruction::RET(0),
             ],
             HashMap::new(),
@@ -1399,7 +1399,7 @@ mod tests {
         match &vm_functions[0].instructions[0] {
             Instruction::LDI(reg, value) => {
                 assert_eq!(*reg, 0);
-                assert_eq!(*value, Value::Int(42));
+                assert_eq!(*value, Value::I64(42));
             }
             _ => panic!("Expected LDI instruction"),
         }
@@ -1422,7 +1422,7 @@ mod tests {
             None,
             2,
             vec![
-                Instruction::LDI(0, Value::Int(42)),
+                Instruction::LDI(0, Value::I64(42)),
                 Instruction::RET(0),
             ],
             HashMap::new(),
@@ -1471,12 +1471,12 @@ mod tests {
             4,
             vec![
                 // Initialize result to 1
-                Instruction::LDI(1, Value::Int(1)),
+                Instruction::LDI(1, Value::I64(1)),
                 // Initialize counter to n
                 Instruction::MOV(2, 0),
                 // loop_start:
                 // Check if counter <= 1
-                Instruction::LDI(3, Value::Int(1)),
+                Instruction::LDI(3, Value::I64(1)),
                 Instruction::CMP(2, 3),
                 Instruction::JMPEQ("loop_end".to_string()),
                 // result = result * counter
