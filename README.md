@@ -138,3 +138,34 @@ fn main() -> Result<(), String> {
 Now that you're familiar with the basics of Stoffel VM, you should:
 1. Explore the [examples directory](examples) for example programs!
 2. Create more complex programs with control flow and closures
+
+
+## CLI: Run a compiled Stoffel binary
+
+A minimal CLI is included to run a compiled Stoffel bytecode/binary file.
+
+Build the CLI:
+
+```bash
+cargo build --release -p stoffel-vm
+```
+
+Run a compiled program (default entry function is `main`):
+
+```bash
+./target/release/stoffel-run path/to/program.stfbin [entry_function]
+```
+
+What it does:
+- Loads the compiled binary from disk using `stoffel-vm-types::compiled_binary::utils::load_from_file`
+- Converts it to VM functions and registers them in the VM
+- Registers the standard library (so built-ins like `print` work)
+- Executes the specified entry function and prints the returned value
+
+Example:
+
+```bash
+./target/release/stoffel-run examples/hello_world.stfbin
+```
+
+Note: Ensure your compiled binary contains the entry function you intend to run (e.g., `main`).
