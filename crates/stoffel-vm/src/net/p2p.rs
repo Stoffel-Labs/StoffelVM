@@ -24,10 +24,12 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use stoffelnet::network_utils::{Message, Network, NetworkError, Node, PartyId};
+use stoffelnet::network_utils::{ClientId, Message, Network, NetworkError, Node, PartyId};
 use tokio::sync::Mutex;
 use ark_ff::Field;
+use async_trait::async_trait;
 use uuid::Uuid;
+use once_cell::sync::Lazy;
 
 /// Represents a connection to a peer
 ///
@@ -781,6 +783,7 @@ impl NetworkManager for QuicNetworkManager {
 /// Implementation of the Network trait for QuicNetworkManager
 ///
 /// This implementation uses the QUIC protocol for communication between nodes.
+#[async_trait]
 impl Network for QuicNetworkManager {
     type NodeType = QuicNode;
     type NetworkConfig = QuicNetworkConfig;
@@ -868,6 +871,18 @@ impl Network for QuicNetworkManager {
 
     fn node_mut(&mut self, id: PartyId) -> Option<&mut Self::NodeType> {
         self.nodes.iter_mut().find(|node| node.id() == id)
+    }
+
+    async fn send_to_client(&self, client: ClientId, message: &[u8]) -> Result<usize, NetworkError> {
+        todo!()
+    }
+
+    fn clients(&self) -> Vec<ClientId> {
+        todo!()
+    }
+
+    fn is_client_connected(&self, client: ClientId) -> bool {
+        todo!()
     }
 }
 

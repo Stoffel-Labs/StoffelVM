@@ -47,6 +47,9 @@ pub struct VMState {
     pub foreign_objects: ForeignObjectStorage,
     /// Hook manager for debugging and instrumentation
     pub hook_manager: HookManager,
+    /// Optional MPC engine used to drive secret-sharing protocols
+    #[cfg(feature = "mpc")]
+    pub mpc_engine: Option<Arc<dyn crate::net::mpc_engine::MpcEngine>>,
 }
 
 impl Default for VMState {
@@ -75,6 +78,8 @@ impl VMState {
             object_store: ObjectStore::new(),
             foreign_objects: ForeignObjectStorage::new(),
             hook_manager: HookManager::new(),
+            #[cfg(feature = "mpc")]
+            mpc_engine: None,
         }
     }
 
@@ -825,6 +830,18 @@ impl VMState {
                     }
                 }
                 Instruction::MUL(dest_reg, src1_reg, src2_reg) => {
+                    #[cfg(feature = "mpc")]
+                    let engine = {
+                        let e = self
+                            .mpc_engine()
+                            .as_ref()
+                            .cloned()
+                            .ok_or_else(|| "MPC engine not configured".to_string())?;
+                        if !e.is_ready() {
+                            return Err("MPC engine configured but not ready".to_string());
+                        }
+                        e
+                    };
                     let record = self.activation_records.last_mut().unwrap();
                     let src1 = &record.registers[src1_reg];
                     let src2 = &record.registers[src2_reg];
@@ -895,9 +912,57 @@ impl VMState {
                             self.hook_manager.trigger(&event, self)?;
                         },
                         // Share * Share (online multiplication)
-                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
+                        (Value::Share(ty1 @ ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => {
+                            #[cfg(feature = "mpc")]
+                            {
+                                let product = engine
+                                    .multiply_share(ty1.clone(), &data1, &data2)
+                                    .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
+                                let result_value = Value::Share(ty1.clone(), product);
+                                let old_value = record.registers[dest_reg].clone();
+                                record.registers[dest_reg] = result_value.clone();
+                                let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                            #[cfg(not(feature = "mpc"))]
+                            {
+                                return Err("MUL of secret shares requires 'mpc' feature".to_string());
+                            }
+                        },
+                        (Value::Share(ty1 @ ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => {
+                            #[cfg(feature = "mpc")]
+                            {
+                                let product = engine
+                                    .multiply_share(ty1.clone(), &data1, &data2)
+                                    .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
+                                let result_value = Value::Share(ty1.clone(), product);
+                                let old_value = record.registers[dest_reg].clone();
+                                record.registers[dest_reg] = result_value.clone();
+                                let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                            #[cfg(not(feature = "mpc"))]
+                            {
+                                return Err("MUL of secret shares requires 'mpc' feature".to_string());
+                            }
+                        },
+                        (Value::Share(ty1 @ ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => {
+                            #[cfg(feature = "mpc")]
+                            {
+                                let product = engine
+                                    .multiply_share(ty1.clone(), &data1, &data2)
+                                    .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
+                                let result_value = Value::Share(ty1.clone(), product);
+                                let old_value = record.registers[dest_reg].clone();
+                                record.registers[dest_reg] = result_value.clone();
+                                let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                            #[cfg(not(feature = "mpc"))]
+                            {
+                                return Err("MUL of secret shares requires 'mpc' feature".to_string());
+                            }
+                        }
                         _ => return Err("Type error in MUL operation".to_string()),
                     }
                 }
@@ -1848,6 +1913,33 @@ impl VMState {
                 "Expected foreign function, but {} is a VM function",
                 name
             )),
+        }
+    }
+}
+
+
+// --- MPC engine integration helpers (feature-gated) ---
+#[cfg(feature = "mpc")]
+impl VMState {
+    /// Attach an MPC engine to the VM state. Call `engine.start()` externally before use.
+    pub fn set_mpc_engine(
+        &mut self,
+        engine: Arc<dyn crate::net::mpc_engine::MpcEngine>,
+    ) {
+        self.mpc_engine = Some(engine);
+    }
+
+    /// Get a clone of the configured MPC engine, if any.
+    pub fn mpc_engine(&self) -> Option<Arc<dyn crate::net::mpc_engine::MpcEngine>> {
+        self.mpc_engine.as_ref().map(Arc::clone)
+    }
+
+    /// Ensure an MPC engine is configured and ready.
+    pub fn ensure_mpc_ready(&self) -> Result<(), String> {
+        match &self.mpc_engine {
+            Some(engine) if engine.is_ready() => Ok(()),
+            Some(_) => Err("MPC engine configured but not ready".to_string()),
+            None => Err("MPC engine not configured".to_string()),
         }
     }
 }

@@ -21,12 +21,12 @@ use std::sync::Arc;
 
 /// Represents an array in the VM
 ///
-/// Arrays in StoffelVM are 1-indexed (like Lua) and support both numeric indices
+/// Arrays in StoffelVM are 0-indexed and support both numeric indices
 /// and arbitrary keys (similar to JavaScript arrays or Lua tables).
 /// The implementation uses a hybrid approach:
 /// - Small arrays (indices < 32) use a contiguous SmallVec for efficient access
 /// - Larger indices and non-numeric keys use a hash map
-/// - A length hint is maintained for O(1) length queries
+/// - A length hint is maintained for O(1) length queries (stores len = last_index + 1)
 #[derive(Debug, Clone)]
 pub struct Array {
     /// Contiguous storage for small arrays (optimized for indices < 32)
@@ -56,8 +56,8 @@ impl Array {
 
     pub fn get(&self, key: &Value) -> Option<&Value> {
         match key {
-            Value::I64(idx) if *idx >= 1 && (*idx as usize) <= self.length_hint => {
-                Some(&self.elements[*idx as usize - 1])
+            Value::I64(idx) if *idx >= 0 && (*idx as usize) < self.length_hint => {
+                Some(&self.elements[*idx as usize])
             }
             _ => self.extra_fields.get(key),
         }
@@ -65,9 +65,10 @@ impl Array {
 
     pub fn set(&mut self, key: Value, value: Value) {
         match key {
-            Value::I64(idx) if idx >= 1 => {
-                self.length_hint = self.length_hint.max(idx as usize);
-                let idx_usize = idx as usize - 1;
+            Value::I64(idx) if idx >= 0 => {
+                let idx_usize = idx as usize;
+                // Update length_hint to one past the highest occupied numeric index
+                self.length_hint = self.length_hint.max(idx_usize.saturating_add(1));
                 if idx_usize < 32 {
                     // Small array optimization
                     if idx_usize >= self.elements.len() {
