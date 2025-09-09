@@ -10,7 +10,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 libc = "0.2"
-stoffelmpc-mpc =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "honeybadger-node-improvements", optional = true }
+stoffelmpc-mpc =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "honeybadger-node-improvements" }
 #stoffelmpc-common =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "randousha"}
 stoffelnet =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
 stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
@@ -36,11 +36,9 @@ futures = "0.3.31"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 ark-std = { version = "0.5.0", features = ["getrandom"] }
-ark-bls12-381 = "0.5.0"
+ark-bls12-381 = { version = "0.5.0" }
+ark-serialize = "0.5.0"
 
-[features]
-default = []
-mpc = ["stoffelmpc-mpc"]
 
 [dev-dependencies]
 criterion = { version = "0.6.0", features = ["html_reports"] }

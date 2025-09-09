@@ -29,7 +29,6 @@ use tokio::sync::Mutex;
 use ark_ff::Field;
 use async_trait::async_trait;
 use uuid::Uuid;
-use once_cell::sync::Lazy;
 
 /// Represents a connection to a peer
 ///

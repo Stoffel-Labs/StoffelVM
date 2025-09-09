@@ -48,7 +48,6 @@ pub struct VMState {
     /// Hook manager for debugging and instrumentation
     pub hook_manager: HookManager,
     /// Optional MPC engine used to drive secret-sharing protocols
-    #[cfg(feature = "mpc")]
     pub mpc_engine: Option<Arc<dyn crate::net::mpc_engine::MpcEngine>>,
 }
 
@@ -78,7 +77,6 @@ impl VMState {
             object_store: ObjectStore::new(),
             foreign_objects: ForeignObjectStorage::new(),
             hook_manager: HookManager::new(),
-            #[cfg(feature = "mpc")]
             mpc_engine: None,
         }
     }
@@ -532,27 +530,75 @@ impl VMState {
                         let current_record = self.activation_records.last().unwrap();
                         let src_value = &current_record.registers[src_reg];
 
-                        // Check if this is a clear-to-secret or secret-to-clear conversion
-                        result_value = if dest_reg >= 16 && src_reg < 16 {
-                            // Clear to secret conversion (lower to upper half)
-                            match src_value {
-                                Value::I64(i) => todo!(),
-                                Value::Float(f) => todo!(),
-                                Value::Bool(b) => todo!(),
-                                _ => return Err("Only primitive types (Int, Float, Bool) can be converted to shares".to_string()),
-                            }
-                        } else if dest_reg < 16 && src_reg >= 16 {
-                            // Secret to clear conversion (upper to lower half)
-                            match src_value {
-                                Value::Share(ShareType::Int(_), data) => todo!(),
-                                Value::Share(ShareType::Float(_), data) => todo!(),
-                                Value::Share(ShareType::Bool(_), data) => todo!(),
-                                _ => return Err("Invalid share type for conversion to clear value".to_string()),
-                            }
-                        } else {
-                            // Regular MOV, no conversion
-                            src_value.clone()
-                        };
+                        // MOV with optional secret/clear conversion when MPC feature is enabled
+                        {
+                            result_value = if dest_reg >= 16 && src_reg < 16 {
+                                // Clear -> Secret
+                                let engine = {
+                                    let e = self
+                                        .mpc_engine()
+                                        .as_ref()
+                                        .cloned()
+                                        .ok_or_else(|| "MPC engine not configured".to_string())?;
+                                    if !e.is_ready() {
+                                        return Err("MPC engine configured but not ready".to_string());
+                                    }
+                                    e
+                                };
+                                match src_value {
+                                    Value::I64(_) => {
+                                        let ty = ShareType::Int(0);
+                                        let bytes = engine
+                                            .input_share(ty.clone(), src_value)
+                                            .map_err(|e| format!("MPC input_share failed: {}", e))?;
+                                        Value::Share(ty, bytes)
+                                    }
+                                    Value::Float(_) => {
+                                        let ty = ShareType::Float(0);
+                                        let bytes = engine
+                                            .input_share(ty.clone(), src_value)
+                                            .map_err(|e| format!("MPC input_share failed: {}", e))?;
+                                        Value::Share(ty, bytes)
+                                    }
+                                    Value::Bool(_) => {
+                                        let ty = ShareType::Bool(false);
+                                        let bytes = engine
+                                            .input_share(ty.clone(), src_value)
+                                            .map_err(|e| format!("MPC input_share failed: {}", e))?;
+                                        Value::Share(ty, bytes)
+                                    }
+                                    _ => return Err("Only primitive types (Int, Float, Bool) can be converted to shares".to_string()),
+                                }
+                            } else if dest_reg < 16 && src_reg >= 16 {
+                                // Secret -> Clear
+                                let engine = {
+                                    let e = self
+                                        .mpc_engine()
+                                        .as_ref()
+                                        .cloned()
+                                        .ok_or_else(|| "MPC engine not configured".to_string())?;
+                                    if !e.is_ready() {
+                                        return Err("MPC engine configured but not ready".to_string());
+                                    }
+                                    e
+                                };
+                                match src_value {
+                                    Value::Share(ty @ ShareType::Int(_), data) => engine
+                                        .open_share(ty.clone(), data)
+                                        .map_err(|e| format!("MPC open_share failed: {}", e))?,
+                                    Value::Share(ty @ ShareType::Float(_), data) => engine
+                                        .open_share(ty.clone(), data)
+                                        .map_err(|e| format!("MPC open_share failed: {}", e))?,
+                                    Value::Share(ty @ ShareType::Bool(_), data) => engine
+                                        .open_share(ty.clone(), data)
+                                        .map_err(|e| format!("MPC open_share failed: {}", e))?,
+                                    _ => return Err("Invalid share type for conversion to clear value".to_string()),
+                                }
+                            } else {
+                                // Regular MOV
+                                src_value.clone()
+                            };
+                        }
                     }
 
                     // Update destination register
@@ -830,141 +876,76 @@ impl VMState {
                     }
                 }
                 Instruction::MUL(dest_reg, src1_reg, src2_reg) => {
-                    #[cfg(feature = "mpc")]
-                    let engine = {
-                        let e = self
-                            .mpc_engine()
-                            .as_ref()
-                            .cloned()
-                            .ok_or_else(|| "MPC engine not configured".to_string())?;
-                        if !e.is_ready() {
-                            return Err("MPC engine configured but not ready".to_string());
-                        }
-                        e
+                    // Snapshot operands immutably first to avoid borrowing `self` immutably
+                    // while holding a mutable borrow of the activation record.
+                    let (left, right) = {
+                        let record = self.activation_records.last().unwrap();
+                        (record.registers[src1_reg].clone(), record.registers[src2_reg].clone())
                     };
-                    let record = self.activation_records.last_mut().unwrap();
-                    let src1 = &record.registers[src1_reg];
-                    let src2 = &record.registers[src2_reg];
 
-                    match (src1, src2) {
-                        (Value::I64(a), Value::I64(b)) => {
-                            let result_value = Value::I64(a * b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::I32(a), Value::I32(b)) => {
-                            let result_value = Value::I32(a * b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::I16(a), Value::I16(b)) => {
-                            let result_value = Value::I16(a * b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::I8(a), Value::I8(b)) => {
-                            let result_value = Value::I8(a * b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::U8(a), Value::U8(b)) => {
-                            let result_value = Value::U8(a * *b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::U16(a), Value::U16(b)) => {
-                            let result_value = Value::U16(a * *b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::U32(a), Value::U32(b)) => {
-                            let result_value = Value::U32(a * *b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
-                        (Value::U64(a), Value::U64(b)) => {
-                            let result_value = Value::U64(a * *b);
-                            let old_value = record.registers[dest_reg].clone();
-                            record.registers[dest_reg] = result_value.clone();
-
-                            let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                            self.hook_manager.trigger(&event, self)?;
-                        },
+                    // Compute the result value without holding a mutable borrow of the record
+                    let computed: Value = match (&left, &right) {
+                        (Value::I64(a), Value::I64(b)) => Value::I64(a * b),
+                        (Value::I32(a), Value::I32(b)) => Value::I32(a * b),
+                        (Value::I16(a), Value::I16(b)) => Value::I16(a * b),
+                        (Value::I8(a), Value::I8(b)) => Value::I8(a * b),
+                        (Value::U8(a), Value::U8(b)) => Value::U8(a * *b),
+                        (Value::U16(a), Value::U16(b)) => Value::U16(a * *b),
+                        (Value::U32(a), Value::U32(b)) => Value::U32(a * *b),
+                        (Value::U64(a), Value::U64(b)) => Value::U64(a * *b),
                         // Share * Share (online multiplication)
                         (Value::Share(ty1 @ ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => {
-                            #[cfg(feature = "mpc")]
-                            {
-                                let product = engine
-                                    .multiply_share(ty1.clone(), &data1, &data2)
-                                    .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
-                                let result_value = Value::Share(ty1.clone(), product);
-                                let old_value = record.registers[dest_reg].clone();
-                                record.registers[dest_reg] = result_value.clone();
-                                let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                                self.hook_manager.trigger(&event, self)?;
+                            let engine = self
+                                .mpc_engine()
+                                .as_ref()
+                                .cloned()
+                                .ok_or_else(|| "MPC engine not configured".to_string())?;
+                            if !engine.is_ready() {
+                                return Err("MPC engine configured but not ready".to_string());
                             }
-                            #[cfg(not(feature = "mpc"))]
-                            {
-                                return Err("MUL of secret shares requires 'mpc' feature".to_string());
-                            }
-                        },
+                            let product = engine
+                                .multiply_share(ty1.clone(), data1, data2)
+                                .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
+                            Value::Share(ty1.clone(), product)
+                        }
                         (Value::Share(ty1 @ ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => {
-                            #[cfg(feature = "mpc")]
-                            {
-                                let product = engine
-                                    .multiply_share(ty1.clone(), &data1, &data2)
-                                    .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
-                                let result_value = Value::Share(ty1.clone(), product);
-                                let old_value = record.registers[dest_reg].clone();
-                                record.registers[dest_reg] = result_value.clone();
-                                let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                                self.hook_manager.trigger(&event, self)?;
+                            let engine = self
+                                .mpc_engine()
+                                .as_ref()
+                                .cloned()
+                                .ok_or_else(|| "MPC engine not configured".to_string())?;
+                            if !engine.is_ready() {
+                                return Err("MPC engine configured but not ready".to_string());
                             }
-                            #[cfg(not(feature = "mpc"))]
-                            {
-                                return Err("MUL of secret shares requires 'mpc' feature".to_string());
-                            }
-                        },
+                            let product = engine
+                                .multiply_share(ty1.clone(), data1, data2)
+                                .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
+                            Value::Share(ty1.clone(), product)
+                        }
                         (Value::Share(ty1 @ ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => {
-                            #[cfg(feature = "mpc")]
-                            {
-                                let product = engine
-                                    .multiply_share(ty1.clone(), &data1, &data2)
-                                    .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
-                                let result_value = Value::Share(ty1.clone(), product);
-                                let old_value = record.registers[dest_reg].clone();
-                                record.registers[dest_reg] = result_value.clone();
-                                let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
-                                self.hook_manager.trigger(&event, self)?;
+                            let engine = self
+                                .mpc_engine()
+                                .as_ref()
+                                .cloned()
+                                .ok_or_else(|| "MPC engine not configured".to_string())?;
+                            if !engine.is_ready() {
+                                return Err("MPC engine configured but not ready".to_string());
                             }
-                            #[cfg(not(feature = "mpc"))]
-                            {
-                                return Err("MUL of secret shares requires 'mpc' feature".to_string());
-                            }
+                            let product = engine
+                                .multiply_share(ty1.clone(), data1, data2)
+                                .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
+                            Value::Share(ty1.clone(), product)
                         }
                         _ => return Err("Type error in MUL operation".to_string()),
-                    }
+                    };
+
+                    // Now write the result while borrowing the record mutably
+                    let record = self.activation_records.last_mut().unwrap();
+                    let old_value = record.registers[dest_reg].clone();
+                    record.registers[dest_reg] = computed.clone();
+
+                    let event = HookEvent::RegisterWrite(dest_reg, old_value, computed);
+                    self.hook_manager.trigger(&event, self)?;
                 }
                 Instruction::DIV(dest_reg, src1_reg, src2_reg) => {
                     let record = self.activation_records.last_mut().unwrap();
@@ -1918,8 +1899,7 @@ impl VMState {
 }
 
 
-// --- MPC engine integration helpers (feature-gated) ---
-#[cfg(feature = "mpc")]
+// --- MPC engine integration helpers ---
 impl VMState {
     /// Attach an MPC engine to the VM state. Call `engine.start()` externally before use.
     pub fn set_mpc_engine(

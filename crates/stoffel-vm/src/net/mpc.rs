@@ -1,5 +1,4 @@
 //! HoneyBadger MPC integration helpers for the Stoffel VM.
-//! This module is compiled only when the `mpc` feature is enabled.
 //! It provides constructors for nodes/clients and message pumps to drive the protocol.
 //! Use the MpcEngine abstraction (net::mpc_engine) to attach an engine to VMState for VM usage.
 use std::collections::HashMap;
@@ -43,8 +42,8 @@ where
 
 
 pub fn receive<F, R, S, N>(
-    mut receivers: Vec<Receiver<Vec<u8>>>,
-    mut nodes: Vec<HoneyBadgerMPCNode<F, R>>,
+    receivers: Vec<Receiver<Vec<u8>>>,
+    nodes: Vec<HoneyBadgerMPCNode<F, R>>,
     net: Arc<N>,
 ) where
     F: FftField,
@@ -53,11 +52,9 @@ pub fn receive<F, R, S, N>(
     S: SecretSharingScheme<F>,
     HoneyBadgerMPCNode<F, R>: MPCProtocol<F, S, N>,
 {
-    // One task per server node/receiver. Each task owns a clone of the node and receiver.
-    for (i, mut node) in nodes.into_iter().enumerate() {
+    // One task per server node/receiver. Pair nodes with their corresponding receivers.
+    for (i, (mut node, mut rx)) in nodes.into_iter().zip(receivers.into_iter()).enumerate() {
         let net_clone = net.clone();
-        let mut rx = receivers
-            .remove(0 /* pop from front for correspondence */);
         tokio::spawn(async move {
             while let Some(raw) = rx.recv().await {
                 if let Err(e) = node.process(raw, net_clone.clone()).await {

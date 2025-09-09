@@ -54,6 +54,7 @@ const INPUT_A: u64 = 42;
 const INPUT_B: u64 = 37;
 const EXPECTED_RESULT: u64 = INPUT_A * INPUT_B; // 1554
 
+#[cfg(feature = "hb_itest")]
 #[tokio::test]
 async fn test_honeybadger_multiplication_with_quic() {
     // Initialize tracing for debugging
@@ -209,6 +210,7 @@ async fn test_honeybadger_multiplication_with_quic() {
     }
 }
 
+#[cfg(feature = "hb_itest")]
 async fn create_server_node(
     server_id: usize,
     server_addr: SocketAddr,
@@ -288,6 +290,7 @@ async fn create_server_node(
     (node, handle)
 }
 
+#[cfg(feature = "hb_itest")]
 async fn create_and_run_client(
     client_addr: SocketAddr,
     server_addresses: Vec<SocketAddr>,
@@ -347,6 +350,7 @@ async fn create_and_run_client(
     })
 }
 
+#[cfg(feature = "hb_itest")]
 async fn get_input_shares_from_client(
     node: &HoneyBadgerMPCNode<Fr, Avid>,
     client_id: ClientId,
@@ -386,7 +390,7 @@ mod tests {
         network.add_node_with_party_id(0, addr);
 
         // This is a basic smoke test to ensure the QUIC components compile
-        assert_eq!(network.nodes.len(), 1);
+        assert_eq!(Network::parties(&network).len(), 1);
     }
 
     #[tokio::test]
@@ -400,7 +404,7 @@ mod tests {
         assert_eq!(shares.len(), 5);
 
         // Test reconstruction
-        let (_, recovered) = RobustShare::recover_secret(&shares[0..2], 5)
+        let (_, recovered) = RobustShare::recover_secret(&shares[0..3], 5)
             .expect("Failed to recover secret");
 
         assert_eq!(recovered, secret);

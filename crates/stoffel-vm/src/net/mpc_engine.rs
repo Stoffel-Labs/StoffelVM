@@ -23,6 +23,13 @@ pub trait MpcEngine: Send + Sync {
     /// Start background tasks (e.g., message pumps). Safe to call multiple times.
     fn start(&self) -> Result<(), String>;
 
+    /// Convert a clear value into a secret share byte representation for the given type.
+    fn input_share(
+        &self,
+        ty: stoffel_vm_types::core_types::ShareType,
+        clear: &stoffel_vm_types::core_types::Value,
+    ) -> Result<Vec<u8>, String>;
+
     /// Multiply two secret shares (opaque byte formats) of the given type.
     /// Returns the resulting share bytes on success.
     fn multiply_share(
@@ -31,6 +38,13 @@ pub trait MpcEngine: Send + Sync {
         left: &[u8],
         right: &[u8],
     ) -> Result<Vec<u8>, String>;
+
+    /// Open (reveal) a secret share as a clear VM value of the same type.
+    fn open_share(
+        &self,
+        ty: stoffel_vm_types::core_types::ShareType,
+        share_bytes: &[u8],
+    ) -> Result<stoffel_vm_types::core_types::Value, String>;
 
     /// Graceful shutdown of background tasks and network resources.
     fn shutdown(&self);
@@ -53,6 +67,16 @@ impl MpcEngine for NoopMpcEngine {
     fn instance_id(&self) -> u64 { self.instance_id }
     fn is_ready(&self) -> bool { false }
     fn start(&self) -> Result<(), String> { Ok(()) }
+    fn input_share(
+        &self,
+        ty: stoffel_vm_types::core_types::ShareType,
+        _clear: &stoffel_vm_types::core_types::Value,
+    ) -> Result<Vec<u8>, String> {
+        Err(format!(
+            "NoopMpcEngine does not support input_share for {:?}. Attach a real MPC engine.",
+            ty
+        ))
+    }
     fn multiply_share(
         &self,
         ty: stoffel_vm_types::core_types::ShareType,
@@ -61,6 +85,16 @@ impl MpcEngine for NoopMpcEngine {
     ) -> Result<Vec<u8>, String> {
         Err(format!(
             "NoopMpcEngine does not support multiply_share for {:?}. Attach a real MPC engine.",
+            ty
+        ))
+    }
+    fn open_share(
+        &self,
+        ty: stoffel_vm_types::core_types::ShareType,
+        _share_bytes: &[u8],
+    ) -> Result<stoffel_vm_types::core_types::Value, String> {
+        Err(format!(
+            "NoopMpcEngine does not support open_share for {:?}. Attach a real MPC engine.",
             ty
         ))
     }
