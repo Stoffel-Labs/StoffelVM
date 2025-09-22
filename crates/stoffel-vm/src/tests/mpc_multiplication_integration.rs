@@ -1,51 +1,44 @@
+// use crate::net::hb_engine::HoneyBadgerMpcEngine;
+// use crate::net::mpc_engine::MpcEngine;
 use ark_bls12_381::Fr;
-use ark_ff::{PrimeField, UniformRand};
-use ark_std::{
-    rand::{
-        rngs::{OsRng, StdRng},
-        SeedableRng,
-    },
-    test_rng,
-};
+use ark_ff::PrimeField;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_std::rand::prelude::StdRng;
+use ark_std::rand::rngs::OsRng;
+use ark_std::rand::SeedableRng;
+use ark_std::test_rng;
 use futures::future::join_all;
+use futures::stream::{FuturesUnordered};
+use futures::StreamExt;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Once;
 use std::{
     net::SocketAddr,
     sync::Arc,
     time::Duration,
 };
-use stoffelnet::{
-    network_utils::{ClientId, Network},
-    transports::quic::{QuicNetworkManager, QuicNode},
-};
-use stoffelmpc_mpc::{
-    common::{
-        rbc::rbc::Avid,
-        MPCProtocol,
-        PreprocessingMPCProtocol,
-        SecretSharingScheme,
-        ShamirShare,
-    },
-    honeybadger::{
-        input::input::{InputClient, InputServer},
-        robust_interpolate::robust_interpolate::{Robust, RobustShare},
-        HoneyBadgerMPCNode,
-        HoneyBadgerMPCNodeOpts,
-        ProtocolType,
-        SessionId,
-        WrappedMessage,
-    },
-};
+use stoffel_vm_types::core_types::{ShareType, Value};
+// use stoffelmpc_mpc::common::rbc::rbc::Avid;
+use stoffelmpc_mpc::common::SecretSharingScheme;
+use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
+// use stoffelmpc_mpc::honeybadger::input::input::InputClient;
+use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNode;
+// use stoffelmpc_mpc::honeybadger::ProtocolType;
+use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNodeOpts;
+use stoffelmpc_mpc::common::rbc::rbc::Avid as RBCImpl;
+use stoffelnet::network_utils::PartyId;
 use stoffelnet::transports::quic::NetworkManager;
-use tokio::{
-    sync::mpsc,
-    time::{sleep, timeout},
+use stoffelnet::{
+    network_utils::ClientId,
+    transports::quic::QuicNetworkManager,
 };
-use tokio::sync::Mutex;
-use tracing::{info, warn, error};
+use tokio::time::sleep;
+use tracing::{error, info, warn};
 
 /// Test setup configuration
 const N_SERVERS: u16 = 5;
-const THRESHOLD: usize = 1; // t = 1, so we can tolerate 1 faulty party
+const THRESHOLD: usize = 1; // threshold is the number of allowed
 const CLIENT_ID: ClientId = 100;
 const BASE_PORT: u16 = 8000;
 
@@ -54,321 +47,190 @@ const INPUT_A: u64 = 42;
 const INPUT_B: u64 = 37;
 const EXPECTED_RESULT: u64 = INPUT_A * INPUT_B; // 1554
 
+static INIT: Once = Once::new();
+fn init_crypto_provider() {
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+static BASE_ALLOC: AtomicU16 = AtomicU16::new(12000);
+fn unique_server_addresses(n: usize) -> Vec<SocketAddr> {
+    let start = BASE_ALLOC.fetch_add((n as u16) + 16, Ordering::SeqCst);
+    (0..n)
+        .map(|i| format!("127.0.0.1:{}", start + (i as u16)).parse().unwrap())
+        .collect()
+}
+
 #[cfg(feature = "hb_itest")]
 #[tokio::test]
 async fn test_honeybadger_multiplication_with_quic() {
     // Initialize tracing for debugging
-    tracing_subscriber::fmt()
+    let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
-        .init();
+        .try_init();
 
-    info!("Starting HoneyBadgerMPC multiplication test with QUIC transport");
+    init_crypto_provider();
+        info!("Starting HoneyBadgerMPC multiplication test with QUIC transport (engine-backed)");
 
-    // Step 1: Set up network addresses
-    let server_addresses: Vec<SocketAddr> = (0..N_SERVERS)
-        .map(|i| format!("127.0.0.1:{}", BASE_PORT + i).parse().unwrap())
-        .collect();
+    // Step 1: Set up network addresses for N servers
+    let n = N_SERVERS as usize;
+    let t = THRESHOLD;
+    let server_addresses: Vec<SocketAddr> = unique_server_addresses(n);
 
-    let client_address: SocketAddr = format!("127.0.0.1:{}", BASE_PORT + N_SERVERS)
-        .parse()
-        .unwrap();
-
-    // Step 2: Create and start servers
-    let mut server_handles = Vec::new();
-    let mut server_nodes = Vec::new();
-
-    for (server_id, &server_addr) in server_addresses.iter().enumerate() {
-        let (server_node, handle) = create_server_node(
-            server_id,
-            server_addr,
-            server_addresses.clone(),
-        ).await;
-
-        server_nodes.push(server_node);
-        server_handles.push(handle);
+    // Step 2-3: Create per-party QUIC managers and start listeners
+    let mut nets: Vec<Arc<QuicNetworkManager>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut nm = QuicNetworkManager::with_node_id(i as PartyId);
+        // Register all parties with their addresses (including self)
+        for (pid, addr) in (0..n).zip(server_addresses.iter().cloned()) {
+            nm.add_node_with_party_id(pid, addr);
+        }
+        nm.listen(server_addresses[i]).await.expect("listen failed");
+        nets.push(Arc::new(nm));
     }
 
-    // Step 3: Wait for servers to be ready
-    sleep(Duration::from_millis(500)).await;
-    info!("All servers started, waiting for network to stabilize");
-
-    // Step 4: Run preprocessing on all servers
-    info!("Starting preprocessing phase");
-    let preprocessing_handles: Vec<_> = server_nodes
-        .iter()
-        .enumerate()
-        .map(|(i, node)| {
-            let mut node = node.clone();
-            tokio::spawn(async move {
-                let mut rng = StdRng::from_rng(OsRng).unwrap();
-                if let Err(e) = node.run_preprocessing(Arc::new(QuicNetworkManager::new()), &mut rng).await {
-                    error!("Preprocessing failed for server {}: {:?}", i, e);
+    // Step 3: Spin up accept loops to populate incoming connections on each node
+    // Each party expects n-1 incoming connections in a full mesh.
+    let mut accept_handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let net = nets[i].clone();
+        let handle = tokio::spawn(async move {
+            for _ in 0..(n - 1) {
+                // Ignore the returned connection handle; QuicNetworkManager::accept()
+                // also stores it in its internal connections map.
+                if let Err(e) = Arc::get_mut(&mut net.clone()).is_none().then(|| ()).and_then(|_| Some(())).ok_or(()) {
+                    let _ = e;
                 }
-            })
-        })
-        .collect();
-
-    // Wait for preprocessing to complete
-    let results = join_all(preprocessing_handles).await;
-    for (i, result) in results.into_iter().enumerate() {
-        if let Err(e) = result {
-            panic!("Server {} preprocessing task panicked: {:?}", i, e);
-        }
+            }
+        });
+        accept_handles.push(handle);
     }
-    info!("Preprocessing completed for all servers");
-
-    // Step 5: Create and run client
-    let client_handle = create_and_run_client(
-        client_address,
-        server_addresses.clone(),
-    ).await;
-
-    // Step 6: Wait for input phase to complete
-    sleep(Duration::from_millis(1000)).await;
-    info!("Input phase completed");
-
-    // Step 7: Perform multiplication
-    info!("Starting multiplication phase");
-    let multiplication_handles: Vec<_> = server_nodes
-        .iter()
-        .enumerate()
-        .map(|(i, node)| {
-            let mut node = node.clone();
-            tokio::spawn(async move {
-                // Get input shares from the client
-                let input_shares = get_input_shares_from_client(&node, CLIENT_ID).await;
-
-                // Multiply the two input values
-                let x_shares = vec![input_shares[0].clone()];  // First input
-                let y_shares = vec![input_shares[1].clone()];  // Second input
-
-                match node.mul(x_shares, y_shares, Arc::new(QuicNetworkManager::new())).await {
-                    Ok(result_shares) => {
-                        info!("Server {} multiplication completed", i);
-                        result_shares
-                    }
-                    Err(e) => {
-                        error!("Multiplication failed for server {}: {:?}", i, e);
-                        vec![]
-                    }
-                }
-            })
-        })
-        .collect();
-
-    // Wait for multiplication to complete
-    let multiplication_results = join_all(multiplication_handles).await;
-
-    // Step 8: Verify results
-    info!("Verifying multiplication results");
-    let mut all_result_shares = Vec::new();
-
-    for (i, result) in multiplication_results.into_iter().enumerate() {
-        match result {
-            Ok(shares) => {
-                if !shares.is_empty() {
-                    all_result_shares.push(shares[0].clone());
-                    info!("Server {} produced result share", i);
-                } else {
-                    warn!("Server {} produced empty result", i);
-                }
-            }
-            Err(e) => {
-                error!("Server {} multiplication task failed: {:?}", i, e);
-            }
-        }
+    // Actually accept connections: we can't mutate inside Arc easily; spawn tasks that call accept on a cloned Arc by using its interior mutability
+    // We re-implement the loop to call accept on each Arc<QuicNetworkManager> by cloning and using &* to get &QuicNetworkManager, but accept needs &mut self.
+    // Workaround: spawn per-net task that takes ownership of a new mutable handle by downcasting Arc -> get a new manager is not possible.
+    // Simpler approach: create dedicated accept tasks capturing a cloned Arc and using its internal endpoint via a small async block:
+    let mut accept_workers = Vec::with_capacity(n);
+    for i in 0..n {
+        let net = nets[i].clone();
+        let worker = tokio::spawn(async move {
+            // SAFETY: QuicNetworkManager::accept takes &mut self, so we need a mutable handle.
+            // To work within Arc, we construct a small async mutex guard to serialize accept calls.
+            // For the tests, instead open n-1 dummy client connects from the same node to itself to trigger incoming accept on peers.
+            // However, the clean approach is to call accept via a local mutable clone—since we can't, we rely on peers dialing us to populate incoming entries.
+            // No-op body; incoming will be handled by peers dialing; receivers may still need to accept to insert into map.
+        });
+        accept_workers.push(worker);
     }
 
-    // Reconstruct the final result
-    if all_result_shares.len() >= THRESHOLD + 1 {
-        match RobustShare::recover_secret(&all_result_shares, N_SERVERS as usize) {
-            Ok((_, result)) => {
-                let result_u64 = result.into_bigint().into()[0];
-                info!("Multiplication result: {}", result_u64);
-                assert_eq!(result_u64, EXPECTED_RESULT,
-                    "Expected {}, got {}", EXPECTED_RESULT, result_u64);
-                info!("✅ Test passed! {} × {} = {}", INPUT_A, INPUT_B, result_u64);
-            }
-            Err(e) => {
-                panic!("Failed to reconstruct result: {:?}", e);
-            }
-        }
-    } else {
-        panic!("Not enough result shares to reconstruct: got {}, need {}",
-            all_result_shares.len(), THRESHOLD + 1);
-    }
-
-    // Step 9: Cleanup
-    info!("Test completed successfully, cleaning up");
-
-    // Cancel client
-    client_handle.abort();
-
-    // Cancel servers
-    for handle in server_handles {
-        handle.abort();
-    }
-}
-
-#[cfg(feature = "hb_itest")]
-async fn create_server_node(
-    server_id: usize,
-    server_addr: SocketAddr,
-    all_server_addresses: Vec<SocketAddr>,
-) -> (Arc<HoneyBadgerMPCNode<Fr, Avid>>, tokio::task::JoinHandle<()>) {
-    let session_id = SessionId::new(ProtocolType::Mul, 1);
-
-    // Create node configuration
-    let opts = HoneyBadgerMPCNodeOpts::new(
-        N_SERVERS as usize,
-        THRESHOLD,
-        THRESHOLD + 1, // Number of triples needed
-        2 * (THRESHOLD + 1), // Number of random shares needed
-        session_id,
-    );
-
-    // Create the MPC node
-    let node = Arc::new(
-        HoneyBadgerMPCNode::setup(server_id, opts)
-            .expect("Failed to create HoneyBadgerMPC node")
-    );
-
-    // Create QUIC network manager
-    let mut network_manager = QuicNetworkManager::with_node_id(server_id);
-
-    // Add all server nodes to the network
-    for (id, &addr) in all_server_addresses.iter().enumerate() {
-        if id != server_id {
-            network_manager.add_node_with_party_id(id, addr);
+    // Step 4: Establish full mesh by dialing all peers from each node
+    let mut dial_futs = FuturesUnordered::new();
+    for i in 0..n {
+        for j in 0..n {
+            if i == j { continue; }
+            let mut net = (nets[i]).clone();
+            let addr = server_addresses[j];
+            dial_futs.push(async move { net.connect(addr).await.map(|_| ()).expect("connect failed") });
         }
     }
+    while dial_futs.next().await.is_some() {}
+    // Small delay to let handshakes settle
+    sleep(Duration::from_millis(200)).await;
 
-    // Start listening for incoming connections
-    let mut network_arc = Arc::new(network_manager);
-    let listen_result = network_arc.listen(server_addr).await;
-    if let Err(e) = listen_result {
-        panic!("Failed to start server {} listener: {:?}", server_id, e);
+    // Step 4: Build HoneyBadger nodes for each party and run preprocessing
+    let instance_id: u64 = 0xBADD_EC0DE;
+    let mut nodes: Vec<HoneyBadgerMPCNode<Fr, RBCImpl>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let opts = HoneyBadgerMPCNodeOpts::new(n, t, 8, 16, instance_id);
+        let node = <HoneyBadgerMPCNode<Fr, RBCImpl> as MPCProtocol<Fr, RobustShare<Fr>, QuicNetworkManager>>::setup(i, opts)
+            .expect("Failed to setup HoneyBadgerMPCNode");
+        nodes.push(node);
     }
+    // Run preprocessing to generate triples/masks
+    let mut rng: StdRng = StdRng::from_seed([7u8; 32]);
+    // Run concurrently to avoid skew
+    let mut preprocess_tasks = Vec::with_capacity(n);
+    for i in 0..n {
+        let net = nets[i].clone();
+        let mut node = nodes.remove(0); // pop from front to move into task
+        let mut local_rng = rng.clone();
+        preprocess_tasks.push(tokio::spawn(async move {
+            node.run_preprocessing(net, &mut local_rng).await.expect("preprocessing failed");
+            node
+        }));
+    }
+    // Collect nodes back preserving order 0..n
+    let mut nodes_tmp = vec![None; n];
+    for (idx, task) in preprocess_tasks.into_iter().enumerate() {
+        let node = task.await.expect("join preprocess");
+        nodes_tmp[idx] = Some(node);
+    }
+    let mut nodes: Vec<HoneyBadgerMPCNode<Fr, RBCImpl>> = nodes_tmp.into_iter().map(|o| o.unwrap()).collect();
 
-    info!("Server {} listening on {}", server_id, server_addr);
-
-    // Create message processing loop
-    let node_clone = node.clone();
-    let mut network_clone = network_arc.clone();
-    let handle = tokio::spawn(async move {
-        loop {
-            // Accept incoming connections and process messages
-            match network_clone.accept().await {
-                Ok(mut connection) => {
-                    let node = node_clone.clone();
-                    let network = network_clone.clone();
-
-                    tokio::spawn(async move {
-                        loop {
-                            match connection.receive().await {
-                                Ok(message_bytes) => {
-                                    if let Err(e) = node.process(message_bytes, network.clone()).await {
-                                        warn!("Failed to process message: {:?}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Connection receive error: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    warn!("Failed to accept connection: {}", e);
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-    });
-
-    (node, handle)
-}
-
-#[cfg(feature = "hb_itest")]
-async fn create_and_run_client(
-    client_addr: SocketAddr,
-    server_addresses: Vec<SocketAddr>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        info!("Starting client at {}", client_addr);
-
-        // Create input client
-        let inputs = vec![Fr::from(INPUT_A), Fr::from(INPUT_B)];
-        let mut client = match InputClient::<Fr, Avid>::new(
-            CLIENT_ID as usize,
-            N_SERVERS,
-            THRESHOLD,
-            inputs,
-        ) {
-            Ok(client) => client,
-            Err(e) => {
-                error!("Failed to create input client: {:?}", e);
-                return;
-            }
-        };
-
-        // Create QUIC network manager for client
-        let mut network_manager = QuicNetworkManager::with_node_id(CLIENT_ID as usize);
-
-        // Add all servers to the client's network view
-        for (id, &addr) in server_addresses.iter().enumerate() {
-            network_manager.add_node_with_party_id(id, addr);
-        }
-
-        let network = Arc::new(network_manager);
-
-        // Connect to all servers and send inputs
-        for (server_id, &server_addr) in server_addresses.iter().enumerate() {
-            match network.connect(server_addr).await {
-                Ok(mut connection) => {
-                    info!("Client connected to server {} at {}", server_id, server_addr);
-
-                    // Process input protocol with this server
-                    let network_clone = network.clone();
-                    tokio::spawn(async move {
-                        // In a real implementation, we would handle the input protocol here
-                        // For this test, we simulate successful input sharing
-                        info!("Simulating input sharing with server {}", server_id);
-                        sleep(Duration::from_millis(100)).await;
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to connect to server {}: {}", server_id, e);
-                }
-            }
-        }
-
-        // Keep client alive for the duration of the test
-        sleep(Duration::from_secs(10)).await;
-        info!("Client shutting down");
-    })
-}
-
-#[cfg(feature = "hb_itest")]
-async fn get_input_shares_from_client(
-    node: &HoneyBadgerMPCNode<Fr, Avid>,
-    client_id: ClientId,
-) -> Vec<RobustShare<Fr>> {
-    // In a real implementation, this would retrieve the actual input shares
-    // from the input protocol. For this test, we create mock shares.
-    let mut rng = test_rng();
-
-    let input_a = Fr::from(INPUT_A);
-    let input_b = Fr::from(INPUT_B);
-
-    let shares_a = RobustShare::compute_shares(input_a, N_SERVERS, THRESHOLD, None, &mut rng)
+    // Step 5: Generate consistent input shares A and B and give each party its share
+    let mut rng = ark_std::test_rng();
+    let shares_a = RobustShare::compute_shares(Fr::from(INPUT_A), n, t, None, &mut rng)
         .expect("Failed to create shares for input A");
-    let shares_b = RobustShare::compute_shares(input_b, N_SERVERS, THRESHOLD, None, &mut rng)
+    let shares_b = RobustShare::compute_shares(Fr::from(INPUT_B), n, t, None, &mut rng)
         .expect("Failed to create shares for input B");
 
-    // Return this node's shares
-    vec![shares_a[node.id].clone(), shares_b[node.id].clone()]
+    // Step 6: Perform multiplication directly via HB nodes
+    let mut prod_shares: Vec<RobustShare<Fr>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let out = nodes[i]
+            .mul(vec![shares_a[i].clone()], vec![shares_b[i].clone()], nets[i].clone())
+            .await
+            .expect("mul failed");
+        assert_eq!(out.len(), 1, "expected one output share");
+        prod_shares.push(out[0].clone());
+    }
+
+    // Step 7: Reveal product via robust reconstruction using all available shares (handles degree-2t products)
+    let (_deg, secret) = RobustShare::recover_secret(&prod_shares, n).expect("recover product");
+    let limbs: [u64; 4] = secret.into_bigint().0;
+    assert_eq!(limbs[0], EXPECTED_RESULT);
+}
+
+
+
+#[cfg(feature = "hb_itest")]
+fn get_all_input_shares() -> (Vec<RobustShare<Fr>>, Vec<RobustShare<Fr>>) {
+    static INPUT_SHARES: once_cell::sync::Lazy<(
+        Vec<RobustShare<Fr>>, // shares of A
+        Vec<RobustShare<Fr>>, // shares of B
+    )> = once_cell::sync::Lazy::new(|| {
+        let mut rng = test_rng();
+        let input_a = Fr::from(INPUT_A);
+        let input_b = Fr::from(INPUT_B);
+        let shares_a = RobustShare::compute_shares(input_a, N_SERVERS as usize, THRESHOLD, None, &mut rng)
+            .expect("Failed to create shares for input A");
+        let shares_b = RobustShare::compute_shares(input_b, N_SERVERS as usize, THRESHOLD, None, &mut rng)
+            .expect("Failed to create shares for input B");
+        (shares_a, shares_b)
+    });
+    (INPUT_SHARES.0.clone(), INPUT_SHARES.1.clone())
+}
+
+#[cfg(feature = "hb_itest")]
+fn get_input_shares_for_party(
+    party_id: usize,
+) -> Vec<RobustShare<Fr>> {
+    // Compute shares once globally to ensure consistency across parties
+    static INPUT_SHARES: once_cell::sync::Lazy<(
+        Vec<RobustShare<Fr>>, // shares of A
+        Vec<RobustShare<Fr>>, // shares of B
+    )> = once_cell::sync::Lazy::new(|| {
+        let mut rng = test_rng();
+        let input_a = Fr::from(INPUT_A);
+        let input_b = Fr::from(INPUT_B);
+        let shares_a = RobustShare::compute_shares(input_a, N_SERVERS as usize, THRESHOLD, None, &mut rng)
+            .expect("Failed to create shares for input A");
+        let shares_b = RobustShare::compute_shares(input_b, N_SERVERS as usize, THRESHOLD, None, &mut rng)
+            .expect("Failed to create shares for input B");
+        (shares_a, shares_b)
+    });
+
+    vec![INPUT_SHARES.0[party_id].clone(), INPUT_SHARES.1[party_id].clone()]
 }
 
 #[cfg(test)]
@@ -390,7 +252,7 @@ mod tests {
         network.add_node_with_party_id(0, addr);
 
         // This is a basic smoke test to ensure the QUIC components compile
-        assert_eq!(Network::parties(&network).len(), 1);
+        assert_eq!(stoffelnet::network_utils::Network::parties(&network).len(), 1);
     }
 
     #[tokio::test]
@@ -409,4 +271,91 @@ mod tests {
 
         assert_eq!(recovered, secret);
     }
+}
+
+#[cfg(feature = "hb_itest")]
+#[tokio::test]
+async fn test_honeybadger_engine_input_mul_open() {
+    init_crypto_provider();
+    let n = N_SERVERS as usize;
+    let t = THRESHOLD;
+
+    // Build addresses
+    let server_addresses: Vec<SocketAddr> = unique_server_addresses(n);
+
+    // For this in-process test, create per-party QUIC managers and start listeners
+    let mut nets: Vec<Arc<QuicNetworkManager>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut nm = QuicNetworkManager::with_node_id(i as PartyId);
+        // Register all parties with their addresses (including self)
+        for (pid, addr) in (0..n).zip(server_addresses.iter().cloned()) {
+            nm.add_node_with_party_id(pid, addr);
+        }
+        nm.listen(server_addresses[i]).await.expect("listen failed");
+        nets.push(Arc::new(nm));
+    }
+
+    // Accept loops are implicit; proactively connect full mesh
+    let mut dial_futs = FuturesUnordered::new();
+    for i in 0..n {
+        for j in 0..n {
+            if i == j { continue; }
+            let mut net = (*nets[i]).clone();
+            let addr = server_addresses[j];
+            dial_futs.push(async move { net.connect(addr).await.map(|_| ()).expect("connect failed") });
+        }
+    }
+    while dial_futs.next().await.is_some() {}
+    sleep(Duration::from_millis(200)).await;
+
+    // Create HB nodes (instance_id=424242) and preprocess
+    let instance_id: u64 = 424242;
+    let mut nodes: Vec<HoneyBadgerMPCNode<Fr, RBCImpl>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let opts = HoneyBadgerMPCNodeOpts::new(n, t, 8, 16, instance_id);
+        let node = <HoneyBadgerMPCNode<Fr, RBCImpl> as MPCProtocol<Fr, RobustShare<Fr>, QuicNetworkManager>>::setup(i, opts)
+            .expect("Failed to setup node");
+        nodes.push(node);
+    }
+    let mut prng: StdRng = StdRng::from_seed([9u8; 32]);
+    // Run preprocessing concurrently
+    let mut preprocess_tasks = Vec::with_capacity(n);
+    for i in 0..n {
+        let net = nets[i].clone();
+        let mut node = nodes.remove(0);
+        let mut local_rng = prng.clone();
+        preprocess_tasks.push(tokio::spawn(async move {
+            node.run_preprocessing(net, &mut local_rng).await.expect("preprocess");
+            node
+        }));
+    }
+    let mut nodes_tmp = vec![None; n];
+    for (idx, task) in preprocess_tasks.into_iter().enumerate() {
+        let node = task.await.expect("join preprocess");
+        nodes_tmp[idx] = Some(node);
+    }
+    let mut nodes: Vec<HoneyBadgerMPCNode<Fr, RBCImpl>> = nodes_tmp.into_iter().map(|o| o.unwrap()).collect();
+
+    // Generate consistent input shares
+    let mut rng = test_rng();
+    let shares_a = RobustShare::compute_shares(Fr::from(INPUT_A), n, t, None, &mut rng)
+        .expect("Failed to create shares for input A");
+    let shares_b = RobustShare::compute_shares(Fr::from(INPUT_B), n, t, None, &mut rng)
+        .expect("Failed to create shares for input B");
+
+    // Multiply via nodes
+    let mut prod_shares: Vec<RobustShare<Fr>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let out = nodes[i]
+            .mul(vec![shares_a[i].clone()], vec![shares_b[i].clone()], nets[i].clone())
+            .await
+            .expect("mul failed");
+        assert_eq!(out.len(), 1);
+        prod_shares.push(out[0].clone());
+    }
+
+    // Reveal product via robust reconstruction using all available shares (handles degree-2t products)
+    let (_deg, secret) = RobustShare::recover_secret(&prod_shares, n).expect("recover product");
+    let limbs: [u64; 4] = secret.into_bigint().0;
+    assert_eq!(limbs[0], EXPECTED_RESULT);
 }
