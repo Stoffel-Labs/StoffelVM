@@ -10,7 +10,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 libc = "0.2"
-stoffelmpc-mpc =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "honeybadger-node-improvements" }
+stoffelmpc-mpc =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git" }
 #stoffelmpc-common =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "randousha"}
 stoffelnet =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
 stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
@@ -29,20 +29,26 @@ rustc-hash = "2.1.1"
 smallvec = "1.11"
 parking_lot = "0.12"
 once_cell = "1.19.0"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "default"] }
 ark-ff = "0.5.0"
 uuid = { version = "1.17.0", features = ["v4", "serde"] }
 futures = "0.3.31"
 tracing = "0.1.41"
-tracing-subscriber = "0.3.19"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 ark-std = { version = "0.5.0", features = ["getrandom"] }
 ark-bls12-381 = { version = "0.5.0" }
-ark-serialize = "0.5.0"
+ark-serialize = { version = "0.5.0", features = ["ark-serialize-derive"] }
+bincode = { version = "1.3.3", default-features = true }
+blake3 = "1.5.4"
+hex = "0.4"
+dirs = "5"
+dashmap = "5"
 
+[features]
+hb_itest = []
 
 [dev-dependencies]
 criterion = { version = "0.6.0", features = ["html_reports"] }
-bincode = "1.3"
 
 [[bench]]
 name = "vm_benchmarks"

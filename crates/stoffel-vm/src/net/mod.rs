@@ -5,6 +5,9 @@ pub mod p2p;
 pub mod mpc;
 pub mod mpc_engine;
 pub mod hb_engine;
+pub mod discovery;
+pub mod program_sync;
+pub mod session;
 
 // Re-export key components
 pub use p2p::{
@@ -13,9 +16,11 @@ pub use p2p::{
 };
 
 // Re-export MPC helpers and engine unconditionally
-pub use mpc::{
-    create_clients, create_global_nodes, default_node_opts, new_default_node, receive,
-    receive_client,
+pub use mpc::default_node_opts;
+// Re-export discovery helpers
+pub use discovery::{
+    bootstrap_with_bootnode, run_bootnode, wait_until_min_parties, DiscoveryMessage,
 };
-pub use mpc_engine::{MpcEngine, NoopMpcEngine};
-pub use hb_engine::HoneyBadgerMpcEngine;
+// Re-export program sync + session helpers
+pub use program_sync::{ProgramSyncMessage, agree_and_sync_program, program_id_from_bytes};
+pub use session::{SessionInfo, agree_session_with_bootnode, CONTROL_STREAM_ID, PROGRAM_STREAM_ID};
