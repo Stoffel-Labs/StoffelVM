@@ -11,6 +11,7 @@ use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId};
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
+use crate::net::mpc::NetEnvelope;
 
 /// Configuration for HoneyBadger MPC over QUIC
 #[derive(Debug, Clone)]
@@ -195,13 +196,33 @@ impl<F: FftField + 'static> HoneyBadgerQuicServer<F> {
         network: Arc<QuicNetworkManager>,
         data: Vec<u8>,
     ) -> Result<(), HoneyBadgerError> {
+        use crate::net::mpc::NetEnvelope;
         let preview_len = data.len().min(64);
         let hex_preview: String = data[..preview_len].iter().map(|b| format!("{:02x}", b)).collect();
         debug!("[MSG:RECV] node handling {} bytes (hex[0..{}]={})", data.len(), preview_len, hex_preview);
-        // Pass Arc<QuicNetworkManager> directly; it is internally synchronized
-        // Serialize node processing to avoid re-entrancy
-        let mut node_guard = node.lock().await;
-        node_guard.process(data, network.clone()).await
+
+        // Ignore plaintext handshake lines (legacy first-stream handshake)
+        if data.starts_with(b"ROLE:") {
+            debug!("[ENV] Ignoring plaintext handshake line at server: {}", String::from_utf8_lossy(&data));
+            return Ok(());
+        }
+
+        // Try to parse as generic envelope; if that fails, assume raw HB message bytes
+        match NetEnvelope::try_deserialize(&data) {
+            Ok(NetEnvelope::Handshake { role, id }) => {
+                debug!("[ENV] Handshake envelope received at server: role={}, id={}", role, id);
+                Ok(())
+            }
+            Ok(NetEnvelope::HoneyBadger(payload)) => {
+                let mut node_guard = node.lock().await;
+                node_guard.process(payload, network.clone()).await
+            }
+            Err(_) => {
+                // Backward-compatibility: treat as raw HB message bytes
+                let mut node_guard = node.lock().await;
+                node_guard.process(data, network.clone()).await
+            }
+        }
     }
 
     /// Connects to all configured peer nodes
@@ -293,6 +314,31 @@ impl<F: FftField + 'static> HoneyBadgerQuicServer<F> {
 
         let mut node = self.node.lock().await;
         node.mul(x, y, self.network.clone()).await
+    }
+
+    /// Run the real input protocol: servers send mask shares to client, client broadcasts masked inputs
+    pub async fn run_input_protocol(&self, client_id: ClientId, input_len: usize) -> Result<(), HoneyBadgerError> {
+        // Take input_len random shares from preprocessing and send to client via InputServer::init
+        let shares = {
+            let mut node_guard = self.node.lock().await;
+            let mut preproc = node_guard.preprocessing_material.lock().await;
+            let taken = preproc.take_random_shares(input_len)?;
+            taken
+        };
+        // Now call input.init which sends MaskShare to the client
+        let node = self.node.lock().await;
+        node.preprocess
+            .input
+            .init(client_id, shares, input_len, self.network.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// Retrieve input shares produced by the input protocol for a given client
+    pub async fn get_input_shares(&self, client_id: ClientId) -> Option<Vec<RobustShare<F>>> {
+        let node = self.node.lock().await;
+        let map_guard = node.preprocess.input.input_shares.lock().await;
+        map_guard.get(&client_id).cloned()
     }
 
     /// Stops the server
@@ -408,9 +454,13 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                              self.client_id, i, address);
 
                         // Send client identification handshake
-                        let handshake = format!("ROLE:CLIENT:{}\n", self.client_id);
+                        let handshake = NetEnvelope::Handshake {
+                            role: "CLIENT".to_string(),
+                            id: self.client_id,
+                        };
+                        // let handshake = format!("ROLE:CLIENT:{}\n", self.client_id);
                         info!("[HB-QUIC] Client {} sending handshake to {}", self.client_id, address);
-                        if let Err(e) = connection.send(handshake.as_bytes()).await {
+                        if let Err(e) = connection.send(&bincode::serialize(&handshake).unwrap()).await {
                             warn!("Client {} failed to send handshake to server {}: {}",
                                  self.client_id, i, e);
                         }
@@ -428,9 +478,29 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                                         let preview_len = data.len().min(64);
                                         let hex_preview: String = data[..preview_len].iter().map(|b| format!("{:02x}", b)).collect();
                                         debug!("[MSG:RECV] client {} handling {} bytes (hex[0..{}]={})", client_id, data.len(), preview_len, hex_preview);
-                                        let mut client_guard = client_clone.lock().await;
-                                        if let Err(e) = client_guard.process(data, network_clone.clone()).await {
-                                            error!("Client {} failed to process message: {:?}", client_id, e);
+                                        use crate::net::mpc::NetEnvelope;
+                                        // Ignore plaintext handshake lines (legacy)
+                                        if data.starts_with(b"ROLE:") {
+                                            debug!("[ENV] Client ignoring plaintext handshake line: {}", String::from_utf8_lossy(&data));
+                                            continue;
+                                        }
+                                        // Try envelope first, fallback to raw HB bytes
+                                        match NetEnvelope::try_deserialize(&data) {
+                                            Ok(NetEnvelope::Handshake { role, id }) => {
+                                                debug!("[ENV] Client received handshake envelope: role={}, id={}", role, id);
+                                            }
+                                            Ok(NetEnvelope::HoneyBadger(payload)) => {
+                                                let mut client_guard = client_clone.lock().await;
+                                                if let Err(e) = client_guard.process(payload, network_clone.clone()).await {
+                                                    error!("Client {} failed to process message: {:?}", client_id, e);
+                                                }
+                                            }
+                                            Err(_) => {
+                                                let mut client_guard = client_clone.lock().await;
+                                                if let Err(e) = client_guard.process(data, network_clone.clone()).await {
+                                                    error!("Client {} failed to process message: {:?}", client_id, e);
+                                                }
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -789,32 +859,18 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Step 5: Client inputs secret values (this will secret-share them to servers)
-        info!("Client inputting secret values...");
+        info!("Client inputting secret values via real input protocol...");
 
-        // In a real implementation, the client would send input messages to servers
-        // For this test, we'll simulate the input phase by manually distributing shares
-        let mut rng = ark_std::test_rng();
-
-        // Generate secret shares for each input value
-        let mut server_shares_x = Vec::new();
-        let mut server_shares_y = Vec::new();
-
-        // Create shares for first input value (x = 7)
-        let shares_x = RobustShare::compute_shares(input_values[0], n_parties, threshold, None, &mut rng)
-            .expect("Failed to create shares for x");
-
-        // Create shares for second input value (y = 11)
-        let shares_y = RobustShare::compute_shares(input_values[1], n_parties, threshold, None, &mut rng)
-            .expect("Failed to create shares for y");
-
-        // Distribute shares to servers (in practice this would happen via the input protocol)
-        for i in 0..n_parties {
-            server_shares_x.push(shares_x[i].clone());
-            server_shares_y.push(shares_y[i].clone());
+        // Trigger the input protocol on each server: send mask shares to client
+        for server in &servers {
+            server
+                .run_input_protocol(client_id, input_values.len())
+                .await
+                .expect("Server failed to send mask shares to client");
         }
 
-        info!("Secret sharing completed. Each server has shares of x={} and y={}",
-                input_values[0], input_values[1]);
+        // Allow time for client to reconstruct masks and broadcast masked inputs via RBC
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Step 6: Perform secure multiplication on servers
         info!("Performing secure multiplication...");
@@ -822,16 +878,25 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, server)| {
-                let x_share = vec![server_shares_x[i].clone()];
-                let y_share = vec![server_shares_y[i].clone()];
+                let cid = client_id;
                 async move {
-                    match server.multiply(x_share, y_share).await {
-                        Ok(result) => {
-                            println!("Multiplication completed for server {}, got {} result shares", i, result.len());
-                            result
-                        },
-                        Err(e) => {
-                            println!("Multiplication failed for server {}: {:?}", i, e);
+                    match server.get_input_shares(cid).await {
+                        Some(shares) if shares.len() >= 2 => {
+                            let x_share = vec![shares[0].clone()];
+                            let y_share = vec![shares[1].clone()];
+                            match server.multiply(x_share, y_share).await {
+                                Ok(result) => {
+                                    println!("Multiplication completed for server {}, got {} result shares", i, result.len());
+                                    result
+                                },
+                                Err(e) => {
+                                    println!("Multiplication failed for server {}: {:?}", i, e);
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        _ => {
+                            println!("Multiplication skipped for server {}: input shares not ready", i);
                             Vec::new()
                         }
                     }
