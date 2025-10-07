@@ -214,10 +214,12 @@ impl<F: FftField + 'static> HoneyBadgerQuicServer<F> {
                 Ok(())
             }
             Ok(NetEnvelope::HoneyBadger(payload)) => {
+                debug!("Received HoneyBadger message at server: {}", String::from_utf8_lossy(&payload));
                 let mut node_guard = node.lock().await;
                 node_guard.process(payload, network.clone()).await
             }
             Err(_) => {
+                debug!("[ENV] Ignoring message at server: {}", String::from_utf8_lossy(&data));
                 // Backward-compatibility: treat as raw HB message bytes
                 let mut node_guard = node.lock().await;
                 node_guard.process(data, network.clone()).await
@@ -242,7 +244,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicServer<F> {
 
             let mut retry_count = 0;
             loop {
-                let connection_result = dialer.connect(peer_addr).await;
+                let connection_result = dialer.connect_as_server(peer_addr, self.node_id).await;
 
                 match connection_result {
                     Ok(mut connection) => {
@@ -428,6 +430,22 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
         })
     }
 
+    /// Adds a server with a known PartyId and address to the client's party map.
+    /// This mirrors FakeNetwork behavior where the client knows PartyIds upfront.
+    pub fn add_server_with_id(&mut self, party_id: PartyId, address: SocketAddr) {
+        // Keep the address list for dialing
+        self.server_addresses.push(address);
+        // Also register the server mapping (PartyId -> SocketAddr) so future sends/broadcasts
+        // can resolve PartyIds deterministically.
+        let mut manager = self.network.as_ref().clone();
+        manager.add_node_with_party_id(party_id, address);
+        self.network = Arc::new(manager);
+        info!(
+            "Client {} registered server party_id={} at {}",
+            self.client_id, party_id, address
+        );
+    }
+
     /// Adds a server address to connect to
     pub fn add_server(&mut self, address: SocketAddr) {
         self.server_addresses.push(address);
@@ -446,24 +464,12 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
 
             loop {
                 info!("[HB-QUIC] Client {} dial attempt {} to {}", self.client_id, retry_count + 1, address);
-                let connection_result = dialer.connect(address).await;
+                let connection_result = dialer.connect_as_client(address, self.client_id).await;
 
                 match connection_result {
                     Ok(mut connection) => {
                         info!("Client {} successfully connected to server {} at {}",
                              self.client_id, i, address);
-
-                        // Send client identification handshake
-                        let handshake = NetEnvelope::Handshake {
-                            role: "CLIENT".to_string(),
-                            id: self.client_id,
-                        };
-                        // let handshake = format!("ROLE:CLIENT:{}\n", self.client_id);
-                        info!("[HB-QUIC] Client {} sending handshake to {}", self.client_id, address);
-                        if let Err(e) = connection.send(&bincode::serialize(&handshake).unwrap()).await {
-                            warn!("Client {} failed to send handshake to server {}: {}",
-                                 self.client_id, i, e);
-                        }
 
                         // Spawn message handler for this connection
                         let network_clone = self.network.clone();
@@ -825,11 +831,26 @@ mod tests {
             config.clone(),
         ).await.expect("Failed to create client");
 
-        // Add all servers to client
-        for &address in &server_addresses {
-            client.add_server(address);
+        // Add all servers to client WITH their PartyIds so PartyId-based sends work (like FakeNetwork)
+        for (pid, &address) in server_addresses.iter().enumerate() {
+            client.add_server_with_id(pid, address);
         }
 
+        // Optional sanity check: ensure client can resolve all parties by id before protocols start
+        {
+            let parties = client.network.parties();
+            info!(
+                "Client {} sees {} parties in map",
+                client.client_id,
+                parties.len()
+            );
+            for pid in 0..n_parties {
+                assert!(
+                    client.network.node(pid).is_some(),
+                    "Client missing party mapping for server id {}", pid
+                );
+            }
+        }
         // Connect client to all servers
         client.connect_to_servers().await.expect("Failed to connect to servers");
 
