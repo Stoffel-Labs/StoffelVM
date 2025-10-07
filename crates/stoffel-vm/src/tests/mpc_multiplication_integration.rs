@@ -773,7 +773,7 @@ mod tests {
         // Configuration
         let n_parties = 5;
         let threshold = 1;
-        let n_triples = 5; // We'll multiply 2 values, so need at least 2 triples
+        let n_triples = 3; // We'll multiply 2 values, so need at least 2 triples
         let n_random_shares = 20; // Need shares for input masking + triples
         let instance_id = 54321;
         let base_port = 9100;
