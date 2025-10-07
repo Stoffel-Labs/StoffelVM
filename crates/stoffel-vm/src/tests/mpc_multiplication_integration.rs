@@ -3,6 +3,8 @@
 use ark_ff::FftField;
 use async_trait::async_trait;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use bincode::Error;
+use serde::Deserialize;
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCClient, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts, WrappedMessage};
@@ -220,6 +222,16 @@ impl<F: FftField + 'static> HoneyBadgerQuicServer<F> {
             }
             Err(_) => {
                 debug!("[ENV] Ignoring message at server: {}", String::from_utf8_lossy(&data));
+                let deserialize_result: Result<WrappedMessage, _> = bincode::deserialize(&data);
+
+                match deserialize_result {
+                    Ok(message) => {
+                        info!("Received {:?}", message);
+                    }
+                    _ => {
+                        debug!("[ENV] Ignoring message at server: {}", String::from_utf8_lossy(&data));
+                    }
+                }
                 // Backward-compatibility: treat as raw HB message bytes
                 let mut node_guard = node.lock().await;
                 node_guard.process(data, network.clone()).await
