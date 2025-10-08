@@ -34,7 +34,7 @@ impl Default for HoneyBadgerQuicConfig {
     fn default() -> Self {
         Self {
             network_config: QuicNetworkConfig::default(),
-            mpc_timeout: Duration::from_secs(60),
+            mpc_timeout: Duration::from_secs(5),
             buffer_size: 1000,
             max_connection_retries: 5,
             connection_retry_delay: Duration::from_millis(100),
@@ -794,7 +794,7 @@ mod tests {
         let input_values = vec![Fr::from(7), Fr::from(11)]; // Will compute 7 * 11 = 77
 
         let mut config = HoneyBadgerQuicConfig::default();
-        // config.mpc_timeout = Duration::from_secs(30);
+        config.mpc_timeout = Duration::from_secs(5);
         // config.connection_retry_delay = Duration::from_millis(50);
 
         // Step 1: Create and start 5 servers
@@ -987,6 +987,180 @@ mod tests {
         }
 
         info!("Test completed successfully!");
+    }
+
+    #[tokio::test]
+    async fn test_preprocessing_only() {
+        init_crypto_provider();
+        setup_test_tracing();
+
+        info!("=== Starting Preprocessing-Only Test ===");
+
+        // Minimal configuration for faster debugging
+        let n_parties = 5;
+        let threshold = 1;
+        let n_triples = 3; // Minimal number of triples
+        let n_random_shares = 5; // Minimal random shares
+        let instance_id = 99999;
+        let base_port = 9200;
+
+        let mut config = HoneyBadgerQuicConfig::default();
+        config.mpc_timeout = Duration::from_secs(10);
+        config.connection_retry_delay = Duration::from_millis(100);
+
+        info!("Configuration: n_parties={}, threshold={}, n_triples={}, n_random_shares={}",
+              n_parties, threshold, n_triples, n_random_shares);
+
+        // Step 1: Create servers
+        info!("Step 1: Creating {} servers...", n_parties);
+        let mut servers = setup_honeybadger_quic_network::<Fr>(
+            n_parties,
+            threshold,
+            n_triples,
+            n_random_shares,
+            instance_id,
+            base_port,
+            config.clone(),
+        ).await.expect("Failed to create servers");
+        info!("✓ Created {} servers", servers.len());
+
+        // Step 2: Start all servers
+        info!("Step 2: Starting servers...");
+        for server in &mut servers {
+            server.start().await.expect("Failed to start server");
+            info!("✓ Started server {}", server.node_id);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Step 3: Connect servers to each other
+        info!("Step 3: Connecting servers to each other...");
+        for server in &servers {
+            info!("Connecting server {} to peers...", server.node_id);
+            server.connect_to_peers().await.expect("Failed to connect to peers");
+            info!("✓ Server {} connected to peers", server.node_id);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Step 4: Verify network connectivity with a simple ping-pong test
+        info!("Step 4: Verifying network connectivity...");
+        for (i, server) in servers.iter().enumerate() {
+            let parties = server.network.parties();
+            info!("Server {} sees {} parties in network map", i, parties.len());
+            for party in parties {
+                info!("  - Party {} at {}", party.id(), party.address());
+            }
+            
+            // Verify each server can resolve all other parties
+            for peer_id in 0..n_parties {
+                match server.network.node(peer_id) {
+                    Some(node) => {
+                        info!("✓ Server {} can resolve peer {} at {}", i, peer_id, node.address());
+                    }
+                    None => {
+                        error!("✗ Server {} CANNOT resolve peer {}", i, peer_id);
+                        panic!("Network connectivity check failed: Server {} cannot resolve peer {}", i, peer_id);
+                    }
+                }
+            }
+        }
+        info!("✓ Network connectivity verified");
+
+        // Step 5: Run preprocessing with timeout and detailed logging
+        info!("Step 5: Running preprocessing on all servers...");
+        info!("Each server will generate {} triples and {} random shares", n_triples, n_random_shares);
+
+        let preprocessing_timeout = Duration::from_secs(30);
+        
+        let preprocessing_handles: Vec<_> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, server)| {
+                let server_clone = server.node.clone();
+                let network_clone = server.network.clone();
+                
+                tokio::spawn(async move {
+                    info!("[Server {}] Starting preprocessing...", i);
+                    let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+                    
+                    let result = tokio::time::timeout(
+                        preprocessing_timeout,
+                        async {
+                            let mut node = server_clone.lock().await;
+                            info!("[Server {}] Acquired node lock, calling run_preprocessing", i);
+                            let res = node.run_preprocessing(network_clone.clone(), &mut rng).await;
+                            info!("[Server {}] run_preprocessing returned: {:?}", i, res.is_ok());
+                            res
+                        }
+                    ).await;
+
+                    match result {
+                        Ok(Ok(())) => {
+                            info!("[Server {}] ✓ Preprocessing completed successfully", i);
+                            Ok(())
+                        }
+                        Ok(Err(e)) => {
+                            error!("[Server {}] ✗ Preprocessing failed with error: {:?}", i, e);
+                            Err(format!("Preprocessing error: {:?}", e))
+                        }
+                        Err(_) => {
+                            error!("[Server {}] ✗ Preprocessing TIMED OUT after {:?}", i, preprocessing_timeout);
+                            Err(format!("Timeout after {:?}", preprocessing_timeout))
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all preprocessing tasks to complete
+        let results = futures::future::join_all(preprocessing_handles).await;
+        
+        // Check results
+        let mut all_succeeded = true;
+        for (i, result) in results.iter().enumerate() {
+            match result {
+                Ok(Ok(())) => {
+                    info!("Server {} preprocessing: SUCCESS", i);
+                }
+                Ok(Err(e)) => {
+                    error!("Server {} preprocessing: FAILED - {}", i, e);
+                    all_succeeded = false;
+                }
+                Err(e) => {
+                    error!("Server {} preprocessing task: PANICKED - {:?}", i, e);
+                    all_succeeded = false;
+                }
+            }
+        }
+
+        // Step 6: Verify preprocessing material was actually generated
+        if all_succeeded {
+            info!("Step 6: Verifying preprocessing material...");
+            for (i, server) in servers.iter().enumerate() {
+                let node = server.node.lock().await;
+                let preproc = node.preprocessing_material.lock().await;
+
+                let (triples_count, random_shares_count) = preproc.len();
+
+                
+                info!("Server {} has {} triples and {} random shares",
+                      i, triples_count, random_shares_count);
+                
+                assert!(triples_count > 0, "Server {} has no triples!", i);
+                assert!(random_shares_count > 0, "Server {} has no random shares!", i);
+            }
+            info!("✓ All servers have preprocessing material");
+        }
+
+        // Step 7: Cleanup
+        info!("Step 7: Cleaning up...");
+        for mut server in servers {
+            server.stop().await;
+        }
+
+        // Final assertion
+        assert!(all_succeeded, "Preprocessing failed on one or more servers");
+        
+        info!("=== Preprocessing-Only Test PASSED ===");
     }
 
     // Helper function for test tracing setup
