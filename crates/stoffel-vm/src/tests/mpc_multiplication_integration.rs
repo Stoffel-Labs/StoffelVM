@@ -428,7 +428,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
         let client = Arc::new(Mutex::new(mpc_client));
 
         // Create network manager
-        let network = Arc::new(QuicNetworkManager::with_random_id());
+        let network = Arc::new(QuicNetworkManager::new());
 
         info!("Created HoneyBadger QUIC client {}", client_id);
 
@@ -1049,7 +1049,7 @@ mod tests {
             for party in parties {
                 info!("  - Party {} at {}", party.id(), party.address());
             }
-            
+
             // Verify each server can resolve all other parties
             for peer_id in 0..n_parties {
                 match server.network.node(peer_id) {
@@ -1070,18 +1070,18 @@ mod tests {
         info!("Each server will generate {} triples and {} random shares", n_triples, n_random_shares);
 
         let preprocessing_timeout = Duration::from_secs(30);
-        
+
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
             .map(|(i, server)| {
                 let server_clone = server.node.clone();
                 let network_clone = server.network.clone();
-                
+
                 tokio::spawn(async move {
                     info!("[Server {}] Starting preprocessing...", i);
                     let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-                    
+
                     let result = tokio::time::timeout(
                         preprocessing_timeout,
                         async {
@@ -1113,7 +1113,7 @@ mod tests {
 
         // Wait for all preprocessing tasks to complete
         let results = futures::future::join_all(preprocessing_handles).await;
-        
+
         // Check results
         let mut all_succeeded = true;
         for (i, result) in results.iter().enumerate() {
@@ -1141,10 +1141,10 @@ mod tests {
 
                 let (triples_count, random_shares_count) = preproc.len();
 
-                
+
                 info!("Server {} has {} triples and {} random shares",
                       i, triples_count, random_shares_count);
-                
+
                 assert!(triples_count > 0, "Server {} has no triples!", i);
                 assert!(random_shares_count > 0, "Server {} has no random shares!", i);
             }
@@ -1159,7 +1159,7 @@ mod tests {
 
         // Final assertion
         assert!(all_succeeded, "Preprocessing failed on one or more servers");
-        
+
         info!("=== Preprocessing-Only Test PASSED ===");
     }
 
