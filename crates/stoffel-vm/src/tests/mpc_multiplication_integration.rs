@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+use tokio::sync::Mutex;
 
 /// Configuration for HoneyBadger MPC over QUIC
 #[derive(Debug, Clone)]
@@ -330,7 +331,7 @@ pub enum ClientActorMessage {
 /// A HoneyBadger MPC client using QUIC networking with actor model
 pub struct HoneyBadgerQuicClient<F: FftField> {
     /// QUIC network manager
-    pub network: Arc<QuicNetworkManager>,
+    pub network: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
     /// Configuration
     pub config: HoneyBadgerQuicConfig,
     /// Server addresses to connect to
@@ -366,8 +367,8 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
             input_len,
         )?;
 
-        // Create network manager
-        let network = Arc::new(QuicNetworkManager::new());
+        // Create network manager with interior mutability
+        let network = Arc::new(Mutex::new(QuicNetworkManager::new()));
 
         // Create actor channel
         let (actor_tx, actor_rx) = mpsc::channel(1000);
@@ -395,7 +396,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
     async fn run_actor(
         mut client: HoneyBadgerMPCClient<F, Avid>,
         mut rx: mpsc::Receiver<ClientActorMessage>,
-        network: Arc<QuicNetworkManager>,
+        network: Arc<Mutex<QuicNetworkManager>>,
     ) -> HoneyBadgerMPCClient<F, Avid> {
         let client_id = client.id;
         info!("Starting actor loop for client {}", client_id);
@@ -425,7 +426,8 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                         continue;
                     }
 
-                    if let Err(e) = client.process(data, network.clone()).await {
+                    let network_guard = network.lock().await;
+                    if let Err(e) = client.process(data, Arc::new(network_guard.clone())).await {
                         error!(
                                     "Client {} failed to process message: {:?}",
                                     client_id, e
@@ -470,11 +472,10 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
     }
 
     /// Adds a server with a known PartyId and address to the client's party map.
-    pub fn add_server_with_id(&mut self, party_id: PartyId, address: SocketAddr) {
+    pub async fn add_server_with_id(&mut self, party_id: PartyId, address: SocketAddr) {
         self.server_addresses.push(address);
-        let mut manager = self.network.as_ref().clone();
+        let mut manager = self.network.lock().await;
         manager.add_node_with_party_id(party_id, address);
-        self.network = Arc::new(manager);
         info!(
             "Client {} registered server party_id={} at {}",
             self.client_id, party_id, address
@@ -494,13 +495,17 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
             info!("[HB-QUIC] Client {} will connect to [{}] {}", self.client_id, idx, addr);
         }
 
-        let mut dialer = self.network.as_ref().clone();
+        let mut dialer = self.network.clone();
         for (i, &address) in self.server_addresses.iter().enumerate() {
             let mut retry_count = 0;
 
             loop {
                 info!("[HB-QUIC] Client {} dial attempt {} to {}", self.client_id, retry_count + 1, address);
-                let connection_result = dialer.connect_as_client(address, self.client_id).await;
+                
+                let connection_result = {
+                    let mut dialer = self.network.lock().await;
+                    dialer.connect_as_client(address, self.client_id).await
+                };
 
                 match connection_result {
                     Ok(connection) => {
@@ -822,8 +827,17 @@ mod tests {
             info!("✓ Client {} connected to servers", client.client_id);
         }
         info!("✓ All clients connected to servers");
-        
-        
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Step 5: Verify client connectivity
+        info!("Step 5: Verifying client connectivity...");
+        for (i, client) in clients.iter().enumerate() {
+            let connected_servers = client.network.lock().await.parties().len();
+            info!("Client {} sees {} servers in network map", i, connected_servers);
+            assert_eq!(connected_servers, n_parties, "Client {} only sees {} servers but expected {}", i, connected_servers, n_parties);
+        }
+        info!("✓ Client connectivity verified");
 
         // Step 5: Verify network connectivity with a simple ping-pong test
         info!("Step 4: Verifying network connectivity...");
@@ -1086,20 +1100,24 @@ mod tests {
                 .expect("Failed to connect to peers");
             info!("✓ Server {} connected to peers", server.node_id);
         }
-        // tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Step 4: Connect clients to servers
+        info!("Step 4: Connecting clients to servers...");
+        for client in &mut clients {
+            info!("Connecting client {} to servers...", client.client_id);
+            client.connect_to_servers().await.expect("Failed to connect client to servers");
+            info!("✓ Client {} connected to servers", client.client_id);
+        }
+        info!("✓ All clients connected to servers");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Step 5: Verify client connectivity
         info!("Step 5: Verifying client connectivity...");
         for (i, client) in clients.iter().enumerate() {
-            let connected_servers = client.network.parties().len();
+            let connected_servers = client.network.lock().await.parties().len();
             info!("Client {} sees {} servers in network map", i, connected_servers);
-            assert!(
-                connected_servers == n_parties,
-                "Client {} only sees {} servers but expected {}",
-                i,
-                connected_servers,
-                n_parties
-            );
+            assert_eq!(connected_servers, n_parties, "Client {} only sees {} servers but expected {}", i, connected_servers, n_parties);
         }
         info!("✓ Client connectivity verified");
 
