@@ -209,7 +209,7 @@ pub enum Value {
     Closure(Arc<Closure>),
     /// Unit/void/nil value
     Unit,
-    /// Secret shared value (for SMPC)
+    /// Secret shared value (for SMPC) TODO: Change 
     Share(ShareType, Vec<u8>),
 }
 

@@ -5,12 +5,13 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts};
-use stoffelnet::network_utils::{Network, NetworkError, Node, PartyId};
+use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCClient, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts, WrappedMessage};
+use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId};
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tracing::{error, info, warn};
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, warn};
 
 /// Configuration for HoneyBadger MPC over QUIC
 #[derive(Debug, Clone)]
@@ -312,6 +313,332 @@ impl<F: FftField + 'static> HoneyBadgerQuicServer<F> {
     }
 }
 
+/// Message types for the client actor
+pub enum ClientActorMessage {
+    /// Process incoming network data
+    ProcessData(Vec<u8>),
+    /// Shutdown the actor
+    Shutdown,
+}
+
+// /// State that can be extracted from the client
+// pub struct ClientState<F: FftField> {
+//     pub client_id: ClientId,
+//     // Add other state fields as needed
+// }
+
+/// A HoneyBadger MPC client using QUIC networking with actor model
+pub struct HoneyBadgerQuicClient<F: FftField> {
+    /// QUIC network manager
+    pub network: Arc<QuicNetworkManager>,
+    /// Configuration
+    pub config: HoneyBadgerQuicConfig,
+    /// Server addresses to connect to
+    server_addresses: Vec<SocketAddr>,
+    /// Client ID
+    pub client_id: ClientId,
+    /// Connection tasks
+    connection_tasks: Vec<JoinHandle<()>>,
+    /// Channel to send messages to the actor
+    actor_tx: mpsc::Sender<ClientActorMessage>,
+    /// Actor task handle
+    actor_task: Option<JoinHandle<HoneyBadgerMPCClient<F, Avid>>>,
+}
+
+impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
+    /// Creates a new HoneyBadger QUIC client
+    pub async fn new(
+        client_id: ClientId,
+        n_parties: usize,
+        threshold: usize,
+        instance_id: u64,
+        inputs: Vec<F>,
+        input_len: usize,
+        config: HoneyBadgerQuicConfig,
+    ) -> Result<Self, HoneyBadgerError> {
+        // Create the MPC client
+        let mpc_client = HoneyBadgerMPCClient::new(
+            client_id,
+            n_parties,
+            threshold,
+            instance_id,
+            inputs,
+            input_len,
+        )?;
+
+        // Create network manager
+        let network = Arc::new(QuicNetworkManager::new());
+
+        // Create actor channel
+        let (actor_tx, actor_rx) = mpsc::channel(1000);
+
+        // Spawn the actor task
+        let network_clone = network.clone();
+        let actor_task = tokio::spawn(async move {
+            Self::run_actor(mpc_client, actor_rx, network_clone).await
+        });
+
+        info!("Created HoneyBadger QUIC client {}", client_id);
+
+        Ok(Self {
+            network,
+            config,
+            server_addresses: Vec::new(),
+            client_id,
+            connection_tasks: Vec::new(),
+            actor_tx,
+            actor_task: Some(actor_task),
+        })
+    }
+
+    /// Actor loop that owns the MPC client
+    async fn run_actor(
+        mut client: HoneyBadgerMPCClient<F, Avid>,
+        mut rx: mpsc::Receiver<ClientActorMessage>,
+        network: Arc<QuicNetworkManager>,
+    ) -> HoneyBadgerMPCClient<F, Avid> {
+        let client_id = client.id;
+        info!("Starting actor loop for client {}", client_id);
+
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ClientActorMessage::ProcessData(data) => {
+                    info!("[HB-QUIC] Client {} received {} bytes", client_id, data.len());
+                    let preview_len = data.len().min(64);
+                    let hex_preview: String = data[..preview_len]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect();
+                    debug!(
+                        "[MSG:RECV] client {} handling {} bytes (hex[0..{}]={})",
+                        client_id, data.len(), preview_len, hex_preview
+                    );
+
+                    use crate::net::mpc::NetEnvelope;
+
+                    // Ignore plaintext handshake lines (legacy)
+                    if data.starts_with(b"ROLE:") {
+                        debug!(
+                            "[ENV] Client ignoring plaintext handshake line: {}",
+                            String::from_utf8_lossy(&data)
+                        );
+                        continue;
+                    }
+
+                    if let Err(e) = client.process(data, network.clone()).await {
+                        error!(
+                                    "Client {} failed to process message: {:?}",
+                                    client_id, e
+                                );
+                    }
+
+                    // // Try envelope first, fallback to raw HB bytes
+                    // match NetEnvelope::try_deserialize(&data) {
+                    //     Ok(NetEnvelope::Handshake { role, id }) => {
+                    //         debug!(
+                    //             "[ENV] Client received handshake envelope: role={}, id={}",
+                    //             role, id
+                    //         );
+                    //     }
+                    //     Ok(NetEnvelope::HoneyBadger(payload)) => {
+                    //         if let Err(e) = client.process(payload, network.clone()).await {
+                    //             error!(
+                    //                 "Client {} failed to process message: {:?}",
+                    //                 client_id, e
+                    //             );
+                    //         }
+                    //     }
+                    //     Err(_) => {
+                    //         if let Err(e) = client.process(data, network.clone()).await {
+                    //             error!(
+                    //                 "Client {} failed to process message: {:?}",
+                    //                 client_id, e
+                    //             );
+                    //         }
+                    //     }
+                    // }
+                }
+                ClientActorMessage::Shutdown => {
+                    info!("Client {} actor received shutdown signal", client_id);
+                    break;
+                }
+            }
+        }
+
+        info!("Actor loop for client {} terminated", client_id);
+        client
+    }
+
+    /// Adds a server with a known PartyId and address to the client's party map.
+    pub fn add_server_with_id(&mut self, party_id: PartyId, address: SocketAddr) {
+        self.server_addresses.push(address);
+        let mut manager = self.network.as_ref().clone();
+        manager.add_node_with_party_id(party_id, address);
+        self.network = Arc::new(manager);
+        info!(
+            "Client {} registered server party_id={} at {}",
+            self.client_id, party_id, address
+        );
+    }
+
+    /// Adds a server address to connect to
+    pub fn add_server(&mut self, address: SocketAddr) {
+        self.server_addresses.push(address);
+        info!("Client {} added server at {}", self.client_id, address);
+    }
+
+    /// Connects to all configured servers
+    pub async fn connect_to_servers(&mut self) -> Result<(), HoneyBadgerError> {
+        info!("Client {} connecting to {} servers", self.client_id, self.server_addresses.len());
+        for (idx, addr) in self.server_addresses.iter().enumerate() {
+            info!("[HB-QUIC] Client {} will connect to [{}] {}", self.client_id, idx, addr);
+        }
+
+        let mut dialer = self.network.as_ref().clone();
+        for (i, &address) in self.server_addresses.iter().enumerate() {
+            let mut retry_count = 0;
+
+            loop {
+                info!("[HB-QUIC] Client {} dial attempt {} to {}", self.client_id, retry_count + 1, address);
+                let connection_result = dialer.connect_as_client(address, self.client_id).await;
+
+                match connection_result {
+                    Ok(connection) => {
+                        info!("Client {} successfully connected to server {} at {}",
+                             self.client_id, i, address);
+
+                        // Spawn message handler for this connection
+                        let actor_tx = self.actor_tx.clone();
+                        let client_id = self.client_id;
+
+                        let task = tokio::spawn(async move {
+                            loop {
+                                match connection.receive().await {
+                                    Ok(data) => {
+                                        if let Err(e) = actor_tx
+                                            .send(ClientActorMessage::ProcessData(data))
+                                            .await
+                                        {
+                                            error!("Client {} failed to send to actor: {:?}", client_id, e);
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        info!("Client {} connection to server closed: {}", client_id, e);
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+
+                        self.connection_tasks.push(task);
+                        break;
+                    }
+                    Err(e) => {
+                        retry_count += 1;
+                        if retry_count >= self.config.max_connection_retries {
+                            error!("Client {} failed to connect to server {} at {} after {} attempts: {}",
+                                  self.client_id, i, address, retry_count, e);
+                            return Err(HoneyBadgerError::NetworkError(NetworkError::Timeout));
+                        }
+
+                        info!("Client {} connection attempt {} to server {} failed: {}",
+                              self.client_id, retry_count, i, e);
+                        tokio::time::sleep(self.config.connection_retry_delay).await;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+
+    /// Stops the client and closes all connections, returning the MPC client
+    pub async fn stop(mut self) -> Result<HoneyBadgerMPCClient<F, Avid>, HoneyBadgerError> {
+        info!("Stopping HoneyBadger QUIC client {}", self.client_id);
+
+        // Send shutdown message to actor
+        let _ = self.actor_tx.send(ClientActorMessage::Shutdown).await;
+
+        // Wait for actor to complete and return client
+        let client = if let Some(task) = self.actor_task.take() {
+            task.await.map_err(|e| {
+                error!("Failed to join actor task: {:?}", e);
+                HoneyBadgerError::NetworkError(NetworkError::Timeout)
+            })?
+        } else {
+            return Err(HoneyBadgerError::NetworkError(NetworkError::Timeout));
+        };
+
+        // Wait for all connection tasks to complete
+        for task in self.connection_tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+
+        info!("Stopped HoneyBadger QUIC client {}", self.client_id);
+
+        Ok(client)
+    }
+}
+
+
+impl<F: FftField + 'static> Drop for HoneyBadgerQuicClient<F> {
+    fn drop(&mut self) {
+        // Abort all running tasks
+        if let Some(task) = self.actor_task.take() {
+            task.abort();
+        }
+
+        for task in self.connection_tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+/// Helper functions for setting up HoneyBadger MPC over QUIC
+
+/// Sets up HoneyBadger MPC clients to connect to a QUIC network
+pub async fn setup_honeybadger_quic_clients<F: FftField + 'static>(
+    client_ids: Vec<ClientId>,
+    server_addresses: Vec<SocketAddr>,
+    n_parties: usize,
+    threshold: usize,
+    instance_id: u64,
+    inputs: Vec<Vec<F>>,
+    input_len: usize,
+    config: HoneyBadgerQuicConfig,
+) -> Result<Vec<HoneyBadgerQuicClient<F>>, HoneyBadgerError> {
+    let mut clients = Vec::new();
+
+    info!("Setting up {} HoneyBadger QUIC clients", client_ids.len());
+
+    for (i, &client_id) in client_ids.iter().enumerate() {
+        let client_inputs = inputs.get(i).cloned().unwrap_or_default();
+
+        let mut client = HoneyBadgerQuicClient::new(
+            client_id,
+            n_parties,
+            threshold,
+            instance_id,
+            client_inputs,
+            input_len,
+            config.clone(),
+        ).await?;
+
+        // Add all servers
+        for &address in &server_addresses {
+            client.add_server(address);
+        }
+
+        clients.push(client);
+    }
+
+    info!("Created {} HoneyBadger QUIC clients", clients.len());
+    Ok(clients)
+}
+
 /// Helper functions for setting up HoneyBadger MPC over QUIC
 
 /// Sets up a complete HoneyBadger MPC network with QUIC
@@ -395,6 +722,494 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_preprocessing_client_mul() {
+        init_crypto_provider();
+        setup_test_tracing();
+
+        info!("=== Starting Preprocessing-Only Test ===");
+
+        // Minimal configuration for faster debugging
+        let n_parties = 5;
+        let threshold = 1;
+        let n_triples = 2 * threshold + 1; // Minimal number of triples
+        let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
+        let instance_id = 99999;
+        let base_port = 9200;
+        let session_id = SessionId::new(ProtocolType::Mul, 0, 0, 111);
+        let clientid: Vec<ClientId> = vec![100, 200];
+        let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
+        let no_of_multiplications = input_values.len();
+
+        let mut config = HoneyBadgerQuicConfig::default();
+        config.mpc_timeout = Duration::from_secs(10);
+        config.connection_retry_delay = Duration::from_millis(100);
+
+        // Step 1: Create servers
+        info!("Step 1: Creating {} servers...", n_parties);
+        let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
+            n_parties,
+            threshold,
+            n_triples,
+            n_random_shares,
+            instance_id,
+            base_port,
+            config.clone(),
+        )
+            .await
+            .expect("Failed to create servers");
+        info!("✓ Created {} servers", servers.len());
+
+        // Get server addresses
+        let server_addresses: Vec<SocketAddr> = (0..n_parties)
+            .map(|i| format!("127.0.0.1:{}", base_port + i as u16).parse().unwrap())
+            .collect();
+
+        info!("Server addresses:");
+        for (i, addr) in server_addresses.iter().enumerate() {
+            info!("Server {}: {}", i, addr);
+        }
+
+        let mut clients = setup_honeybadger_quic_clients::<Fr>(
+            clientid.clone(),
+            server_addresses,
+            n_parties,
+            threshold,
+            instance_id,
+            vec![input_values],
+            2,
+            config.clone(),
+        )
+            .await
+            .expect("Failed to create clients");
+
+        // Step 2: Start all servers
+        info!("Step 2: Starting servers...");
+        for (i, server) in servers.iter_mut().enumerate() {
+            //Reciever for each node
+            let mut node = server.node.clone();
+            let network = server.network.clone();
+            let mut rx = recv.remove(0);
+            tokio::spawn(async move {
+                while let Some(raw_msg) = rx.recv().await {
+                    if let Err(e) = node.process(raw_msg, network.clone()).await {
+                        tracing::error!("Node {i} failed to process message: {e:?}");
+                    }
+                }
+                tracing::info!("Receiver task for node {i} ended");
+            });
+            server.start().await.expect("Failed to start server");
+            info!("✓ Started server {}", server.node_id);
+        }
+        // tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Step 3: Connect servers to each other
+        info!("Step 3: Connecting servers to each other...");
+        for server in &servers {
+            info!("Connecting server {} to peers...", server.node_id);
+            server
+                .connect_to_peers()
+                .await
+                .expect("Failed to connect to peers");
+            info!("✓ Server {} connected to peers", server.node_id);
+        }
+
+
+        // Step 4: Connect clients to servers
+        info!("Step 4: Connecting clients to servers...");
+        for client in &mut clients {
+            info!("Connecting client {} to servers...", client.client_id);
+            client.connect_to_servers().await.expect("Failed to connect client to servers");
+            info!("✓ Client {} connected to servers", client.client_id);
+        }
+        info!("✓ All clients connected to servers");
+        
+        
+
+        // Step 5: Verify network connectivity with a simple ping-pong test
+        info!("Step 4: Verifying network connectivity...");
+        for (i, server) in servers.iter().enumerate() {
+            let parties = server.network.parties();
+            info!("Server {} sees {} parties in network map", i, parties.len());
+            for party in parties {
+                info!("  - Party {} at {}", party.id(), party.address());
+            }
+
+            // Verify each server can resolve all other parties
+            for peer_id in 0..n_parties {
+                match server.network.node(peer_id) {
+                    Some(node) => {
+                        info!(
+                            "✓ Server {} can resolve peer {} at {}",
+                            i,
+                            peer_id,
+                            node.address()
+                        );
+                    }
+                    None => {
+                        error!("✗ Server {} CANNOT resolve peer {}", i, peer_id);
+                        panic!(
+                            "Network connectivity check failed: Server {} cannot resolve peer {}",
+                            i, peer_id
+                        );
+                    }
+                }
+            }
+        }
+        info!("✓ Network connectivity verified");
+
+        // Step 5: Run preprocessing with timeout and detailed logging
+        info!("Step 5: Running preprocessing on all servers...");
+        info!(
+            "Each server will generate {} triples and {} random shares",
+            n_triples, n_random_shares
+        );
+
+        let preprocessing_timeout = Duration::from_secs(30);
+        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, instance_id);
+        let preprocessing_handles: Vec<_> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, server)| {
+                let mut node_arc = server.node.clone();
+                let network_clone = server.network.clone();
+
+                tokio::spawn(async move {
+                    info!("[Server {}] Starting preprocessing...", i);
+                    let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+                    let result = tokio::time::timeout(preprocessing_timeout, async {
+                        node_arc
+                            .run_preprocessing(network_clone.clone(), &mut rng)
+                            .await
+                    })
+                        .await;
+
+                    match result {
+                        Ok(Ok(())) => {
+                            info!("[Server {}] ✓ Preprocessing completed successfully", i);
+                            Ok(())
+                        }
+                        Ok(Err(e)) => {
+                            error!("[Server {}] ✗ Preprocessing failed with error: {:?}", i, e);
+                            Err(format!("Preprocessing error: {:?}", e))
+                        }
+                        Err(_) => {
+                            error!(
+                                "[Server {}] ✗ Preprocessing TIMED OUT after {:?}",
+                                i, preprocessing_timeout
+                            );
+                            Err(format!("Timeout after {:?}", preprocessing_timeout))
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all preprocessing tasks to complete
+        let results = futures::future::join_all(preprocessing_handles).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        for (_, server) in servers.iter_mut().enumerate() {
+            let local_shares = server.node
+                .preprocessing_material
+                .lock()
+                .await
+                .take_random_shares(2)
+                .unwrap();
+            match server.node
+                .preprocess
+                .input
+                .init(clientid[0], local_shares, 2, server.network.clone())
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    eprint!("{e}");
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        //----------------------------------------RUN MULTIPLICATION----------------------------------------
+
+        let mut handles = Vec::new();
+        for pid in 0..n_parties {
+            let mut node = servers[pid].node.clone();
+            let net = servers[pid].network.clone();
+
+            let (x_shares, y_shares) = {
+                let input_store = node.preprocess.input.input_shares.lock().await;
+                let inputs = input_store.get(&clientid[0]).unwrap();
+                (
+                    vec![inputs[0].clone(), inputs[1].clone()],
+                    vec![inputs[0].clone(), inputs[1].clone()],
+                )
+            };
+
+            let handle = tokio::spawn(async move {
+                {
+                    node.mul(x_shares.clone(), y_shares.clone(), net.clone())
+                        .await
+                        .expect("mul failed");
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all mul tasks to finish
+        futures::future::join_all(handles).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        //----------------------------------------VALIDATE VALUES----------------------------------------
+
+        let output_clientid: ClientId = 200;
+        // Each server sends its output shares
+        for (i, server) in servers.iter().enumerate() {
+            let net = server.network.clone();
+            let storage_map = server.node.operations.mul.mult_storage.lock().await;
+            if let Some(storage_mutex) = storage_map.get(&session_id) {
+                let storage = storage_mutex.lock().await;
+
+                if storage.protocol_output.is_empty() {
+                    panic!("protocol_output empty for node {}", i);
+                }
+                let shares_mult_for_node: Vec<RobustShare<Fr>> = storage.protocol_output.clone();
+                assert_eq!(shares_mult_for_node.len(), no_of_multiplications);
+                match server.node
+                    .output
+                    .init(
+                        output_clientid,
+                        shares_mult_for_node,
+                        no_of_multiplications,
+                        net.clone(),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Server init error: {e}"),
+                }
+            } else {
+                panic!(
+                    "no mult_storage entry for session {:?} on node {}",
+                    session_id, i
+                );
+            }
+        }
+
+    }
+
+    #[tokio::test]
+    async fn test_client_input_only() {
+        init_crypto_provider();
+        setup_test_tracing();
+
+        info!("=== Starting Preprocessing-Only Test ===");
+
+        // Minimal configuration for faster debugging
+        let n_parties = 5;
+        let threshold = 1;
+        let n_triples = 2 * threshold + 1; // Minimal number of triples
+        let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
+        let instance_id = 99999;
+        let base_port = 9200;
+        let clientid: Vec<ClientId> = vec![100, 200];
+        let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
+
+        let mut config = HoneyBadgerQuicConfig::default();
+        config.mpc_timeout = Duration::from_secs(10);
+        config.connection_retry_delay = Duration::from_millis(100);
+
+        // Step 1: Create servers
+        info!("Step 1: Creating {} servers...", n_parties);
+        let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
+            n_parties,
+            threshold,
+            n_triples,
+            n_random_shares,
+            instance_id,
+            base_port,
+            config.clone(),
+        )
+            .await
+            .expect("Failed to create servers");
+        info!("✓ Created {} servers", servers.len());
+
+        // Get server addresses
+        let server_addresses: Vec<SocketAddr> = (0..n_parties)
+            .map(|i| format!("127.0.0.1:{}", base_port + i as u16).parse().unwrap())
+            .collect();
+
+        info!("Server addresses:");
+        for (i, addr) in server_addresses.iter().enumerate() {
+            info!("Server {}: {}", i, addr);
+        }
+
+        let mut clients = setup_honeybadger_quic_clients::<Fr>(
+            clientid.clone(),
+            server_addresses,
+            n_parties,
+            threshold,
+            instance_id,
+            vec![input_values],
+            2,
+            config.clone(),
+        )
+            .await
+            .expect("Failed to create clients");
+
+        // Step 2: Start all servers
+        info!("Step 2: Starting servers...");
+        for (i, server) in servers.iter_mut().enumerate() {
+            //Reciever for each node
+            let mut node = server.node.clone();
+            let network = server.network.clone();
+            let mut rx = recv.remove(0);
+            tokio::spawn(async move {
+                while let Some(raw_msg) = rx.recv().await {
+                    if let Err(e) = node.process(raw_msg, network.clone()).await {
+                        tracing::error!("Node {i} failed to process message: {e:?}");
+                    }
+                }
+                tracing::info!("Receiver task for node {i} ended");
+            });
+            server.start().await.expect("Failed to start server");
+            info!("✓ Started server {}", server.node_id);
+        }
+        // tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Step 3: Connect servers to each other
+        info!("Step 3: Connecting servers to each other...");
+        for server in &servers {
+            info!("Connecting server {} to peers...", server.node_id);
+            server
+                .connect_to_peers()
+                .await
+                .expect("Failed to connect to peers");
+            info!("✓ Server {} connected to peers", server.node_id);
+        }
+        // tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Step 5: Verify client connectivity
+        info!("Step 5: Verifying client connectivity...");
+        for (i, client) in clients.iter().enumerate() {
+            let connected_servers = client.network.parties().len();
+            info!("Client {} sees {} servers in network map", i, connected_servers);
+            assert!(
+                connected_servers == n_parties,
+                "Client {} only sees {} servers but expected {}",
+                i,
+                connected_servers,
+                n_parties
+            );
+        }
+        info!("✓ Client connectivity verified");
+
+
+        // Step 4: Verify network connectivity with a simple ping-pong test
+        info!("Step 4: Verifying network connectivity...");
+        for (i, server) in servers.iter().enumerate() {
+            let parties = server.network.parties();
+            info!("Server {} sees {} parties in network map", i, parties.len());
+            for party in parties {
+                info!("  - Party {} at {}", party.id(), party.address());
+            }
+
+            // Verify each server can resolve all other parties
+            for peer_id in 0..n_parties {
+                match server.network.node(peer_id) {
+                    Some(node) => {
+                        info!(
+                            "✓ Server {} can resolve peer {} at {}",
+                            i,
+                            peer_id,
+                            node.address()
+                        );
+                    }
+                    None => {
+                        error!("✗ Server {} CANNOT resolve peer {}", i, peer_id);
+                        panic!(
+                            "Network connectivity check failed: Server {} cannot resolve peer {}",
+                            i, peer_id
+                        );
+                    }
+                }
+            }
+        }
+        info!("✓ Network connectivity verified");
+
+        // Step 5: Run preprocessing with timeout and detailed logging
+        info!("Step 5: Running preprocessing on all servers...");
+        info!(
+            "Each server will generate {} triples and {} random shares",
+            n_triples, n_random_shares
+        );
+
+        let preprocessing_timeout = Duration::from_secs(30);
+        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, instance_id);
+        let preprocessing_handles: Vec<_> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, server)| {
+                let mut node_arc = server.node.clone();
+                let network_clone = server.network.clone();
+
+                tokio::spawn(async move {
+                    info!("[Server {}] Starting preprocessing...", i);
+                    let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+                    let result = tokio::time::timeout(preprocessing_timeout, async {
+                        node_arc
+                            .run_preprocessing(network_clone.clone(), &mut rng)
+                            .await
+                    })
+                        .await;
+
+                    match result {
+                        Ok(Ok(())) => {
+                            info!("[Server {}] ✓ Preprocessing completed successfully", i);
+                            Ok(())
+                        }
+                        Ok(Err(e)) => {
+                            error!("[Server {}] ✗ Preprocessing failed with error: {:?}", i, e);
+                            Err(format!("Preprocessing error: {:?}", e))
+                        }
+                        Err(_) => {
+                            error!(
+                                "[Server {}] ✗ Preprocessing TIMED OUT after {:?}",
+                                i, preprocessing_timeout
+                            );
+                            Err(format!("Timeout after {:?}", preprocessing_timeout))
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all preprocessing tasks to complete
+        let results = futures::future::join_all(preprocessing_handles).await;
+
+        for (_, server) in servers.iter_mut().enumerate() {
+            let local_shares = server.node
+                .preprocessing_material
+                .lock()
+                .await
+                .take_random_shares(2)
+                .unwrap();
+            match server.node
+                .preprocess
+                .input
+                .init(clientid[0], local_shares, 2, server.network.clone())
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    eprint!("{e}");
+                }
+            }
+        }
+
+
+    }
+
+    #[tokio::test]
     async fn test_preprocessing_only() {
         init_crypto_provider();
         setup_test_tracing();
@@ -446,7 +1261,7 @@ mod tests {
             server.start().await.expect("Failed to start server");
             info!("✓ Started server {}", server.node_id);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Step 3: Connect servers to each other
         info!("Step 3: Connecting servers to each other...");
@@ -458,7 +1273,7 @@ mod tests {
                 .expect("Failed to connect to peers");
             info!("✓ Server {} connected to peers", server.node_id);
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Step 4: Verify network connectivity with a simple ping-pong test
         info!("Step 4: Verifying network connectivity...");
@@ -490,9 +1305,9 @@ mod tests {
                 }
             }
         }
-        info!("✓ Network connectivity verified");
+        info!("✓ Server network connectivity verified");
 
-        // Step 5: Run preprocessing with timeout and detailed logging
+        // Step 6: Run preprocessing with timeout and detailed logging
         info!("Step 5: Running preprocessing on all servers...");
         info!(
             "Each server will generate {} triples and {} random shares",
