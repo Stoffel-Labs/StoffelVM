@@ -740,7 +740,7 @@ mod tests {
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
         let instance_id = 99999;
         let base_port = 9200;
-        let session_id = SessionId::new(ProtocolType::Mul, 0, 0, 111);
+        let session_id = SessionId::new(ProtocolType::Mul, 0, 0, instance_id);
         let clientid: Vec<ClientId> = vec![100, 200];
         let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
         let no_of_multiplications = input_values.len();
