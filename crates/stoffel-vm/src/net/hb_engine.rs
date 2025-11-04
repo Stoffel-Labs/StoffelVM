@@ -2,29 +2,32 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use ark_bls12_381::Fr;
 use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_std::rand::SeedableRng;
 use tokio::sync::Mutex;
-use stoffelmpc_mpc::common::SecretSharingScheme;
+use stoffelmpc_mpc::common::{SecretSharingScheme, MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use crate::net::p2p::QuicNetworkManager;
-// Note: tests pass Arc<Mutex<QuicNetworkManager>> where required; HoneyBadger APIs accept Arc<N>.
+use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts, SessionId, ProtocolType};
+use stoffelnet::network_utils::ClientId;
+use stoffelnet::transports::quic::QuicNetworkManager;
 use crate::net::mpc_engine::MpcEngine;
 use stoffel_vm_types::core_types::{ShareType, Value};
 
 // RBC/SSS type aliases used by HB implementation
 use stoffelmpc_mpc::common::rbc::rbc::Avid as RBCImpl;
 
-/// Minimal HoneyBadger-backed engine. Single-party-local wrapper that can
-/// perform share input (local robust-shamir splitting) and online multiplication
-/// via the underlying HoneyBadgerMPCNode. Network topology is expected to be
-/// prepared outside with QUIC; for this minimal engine, we create the node and
-/// rely on external network manager usage inside the protocol calls.
+/// HoneyBadger-backed MPC engine that integrates with the VM.
+/// This wraps a real HoneyBadgerMPCNode and provides MPC operations
+/// (input sharing, multiplication, output reconstruction) to the VM.
 pub struct HoneyBadgerMpcEngine {
     instance_id: u64,
     party_id: usize,
     n: usize,
     t: usize,
     net: Arc<QuicNetworkManager>,
+    node: Arc<Mutex<HoneyBadgerMPCNode<Fr, RBCImpl>>>,
     ready: AtomicBool,
+    /// Session counter for multiplication operations
+    mul_session_counter: Arc<Mutex<usize>>,
 }
 
 impl HoneyBadgerMpcEngine {
@@ -34,7 +37,13 @@ impl HoneyBadgerMpcEngine {
     }
 
     pub async fn preprocess(&self) -> Result<(), String> {
-        // Minimal stub: mark ready without network preprocessing to avoid cross-crate trait conflicts
+        // Run the actual preprocessing protocol to generate triples and random shares
+        let mut node = self.node.lock().await;
+        let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+        node.run_preprocessing(self.net.clone(), &mut rng)
+            .await
+            .map_err(|e| format!("Preprocessing failed: {:?}", e))?;
+
         self.ready.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -46,15 +55,44 @@ impl HoneyBadgerMpcEngine {
         right: &[u8],
     ) -> Result<Vec<u8>, String> {
         if !self.is_ready() { return Err("MPC engine not ready".into()); }
+
         match ty {
             ShareType::Int(_) | ShareType::Bool(_) | ShareType::Float(_) => {
-                let l = Self::decode_share(left)?;
-                let r = Self::decode_share(right)?;
-                // Local multiply of the decoded shares (placeholder for real MPC)
-                let mut prod = l.clone();
-                prod.share[0] = l.share[0] * r.share[0];
-                prod.degree = 2 * self.t;
-                Self::encode_share(&prod)
+                // Decode the input shares
+                let left_share = Self::decode_share(left)?;
+                let right_share = Self::decode_share(right)?;
+
+                // Get next session ID for this multiplication
+                let session_idx = {
+                    let mut counter = self.mul_session_counter.lock().await;
+                    let idx = *counter;
+                    *counter += 1;
+                    idx
+                };
+
+                let session_id = SessionId::new(ProtocolType::Mul, session_idx as u8, 0, self.instance_id);
+
+                // Perform MPC multiplication
+                let mut node = self.node.lock().await;
+                let x_shares = vec![left_share];
+                let y_shares = vec![right_share];
+
+                node.mul(x_shares, y_shares, self.net.clone())
+                    .await
+                    .map_err(|e| format!("MPC multiplication failed: {:?}", e))?;
+
+                // Retrieve the result from the multiplication storage
+                let storage_map = node.operations.mul.mult_storage.lock().await;
+                let storage_mutex = storage_map.get(&session_id)
+                    .ok_or_else(|| format!("No result for session {:?}", session_id))?;
+                let storage = storage_mutex.lock().await;
+
+                if storage.protocol_output.is_empty() {
+                    return Err("Multiplication produced no output".to_string());
+                }
+
+                let result_share = &storage.protocol_output[0];
+                Self::encode_share(result_share)
             }
             _ => Err("Unsupported share type for multiply_share".to_string()),
         }
@@ -69,16 +107,73 @@ impl HoneyBadgerMpcEngine {
     pub fn net(&self) -> Arc<QuicNetworkManager> { self.net.clone() }
     pub fn party_id(&self) -> usize { self.party_id }
 
-    pub fn new(instance_id: u64, party_id: usize, n: usize, t: usize, _n_triples: usize, _n_random: usize, net: Arc<QuicNetworkManager>) -> Arc<Self> {
-        // Minimal constructor: we do not initialize a HoneyBadger node here to avoid cross-crate trait constraints.
-        Arc::new(Self {
+    /// Initialize input shares from a client. This must be called after preprocessing.
+    /// The client provides shares for all parties, and each party stores its own share.
+    pub async fn init_client_input(&self, client_id: ClientId, shares: Vec<RobustShare<Fr>>) -> Result<(), String> {
+        if !self.is_ready() {
+            return Err("MPC engine not ready".into());
+        }
+
+        // Take random shares from preprocessing material for the input protocol
+        let num_shares = shares.len();
+        let local_shares = {
+            let node = self.node.lock().await;
+            let mut prep_material = node.preprocessing_material.lock().await;
+            prep_material
+                .take_random_shares(num_shares)
+                .map_err(|e| format!("Failed to take random shares: {:?}", e))?
+        };
+
+        // Initialize the input protocol with the client's shares
+        let mut node = self.node.lock().await;
+        node.preprocess
+            .input
+            .init(client_id, local_shares, num_shares, self.net.clone())
+            .await
+            .map_err(|e| format!("Failed to initialize client input: {:?}", e))?;
+
+        Ok(())
+    }
+
+    /// Get the shares for a specific client after input initialization
+    pub async fn get_client_shares(&self, client_id: ClientId) -> Result<Vec<RobustShare<Fr>>, String> {
+        let node = self.node.lock().await;
+        let input_store = node.preprocess.input.input_shares.lock().await;
+        let shares = input_store
+            .get(&client_id)
+            .ok_or_else(|| format!("No shares found for client {}", client_id))?
+            .clone();
+        Ok(shares)
+    }
+
+    pub fn new(instance_id: u64, party_id: usize, n: usize, t: usize, n_triples: usize, n_random: usize, net: Arc<QuicNetworkManager>) -> Result<Arc<Self>, String> {
+        // Create the MPC node options
+        let mpc_opts = HoneyBadgerMPCNodeOpts::new(
+            n,
+            t,
+            n_triples,
+            n_random,
+            instance_id,
+        );
+
+        // Create the MPC node
+        let node = <HoneyBadgerMPCNode<Fr, RBCImpl> as MPCProtocol<
+            Fr,
+            RobustShare<Fr>,
+            QuicNetworkManager,
+        >>::setup(party_id, mpc_opts)
+            .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
+
+        Ok(Arc::new(Self {
             instance_id,
             party_id,
             n,
             t,
             net,
+            node: Arc::new(Mutex::new(node)),
             ready: AtomicBool::new(false),
-        })
+            mul_session_counter: Arc::new(Mutex::new(0)),
+        }))
     }
 
     fn ensure_rt() -> Result<tokio::runtime::Handle, String> {
@@ -145,16 +240,9 @@ impl MpcEngine for HoneyBadgerMpcEngine {
         left: &[u8],
         right: &[u8],
     ) -> Result<Vec<u8>, String> {
-        if !self.is_ready() { return Err("MPC engine not ready".into()); }
-        match ty {
-            ShareType::Int(_) | ShareType::Bool(_) | ShareType::Float(_) => {
-                let _l = Self::decode_share(left)?;
-                let _r = Self::decode_share(right)?;
-                // Avoid blocking in async contexts
-                return Err("multiply_share called inside async runtime; use multiply_share_async".to_string());
-            }
-            _ => Err("Unsupported share type for multiply_share".to_string()),
-        }
+        // Block on the async version using the current runtime
+        let rt = Self::ensure_rt()?;
+        rt.block_on(self.multiply_share_async(ty, left, right))
     }
 
     fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {

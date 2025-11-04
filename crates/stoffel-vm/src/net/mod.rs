@@ -8,6 +8,7 @@ pub mod hb_engine;
 pub mod discovery;
 pub mod program_sync;
 pub mod session;
+pub mod client_store;
 
 // Re-export key components
 pub use p2p::{

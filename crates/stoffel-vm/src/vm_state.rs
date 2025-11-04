@@ -1922,4 +1922,72 @@ impl VMState {
             None => Err("MPC engine not configured".to_string()),
         }
     }
+
+    /// Load a client's input share from the global client store
+    ///
+    /// # Arguments
+    /// * `client_id` - The ID of the client
+    /// * `index` - The index of the share to retrieve (0-based)
+    ///
+    /// # Returns
+    /// A `Value::Share` containing the serialized share, or an error if not found
+    pub fn load_client_share(&self, client_id: stoffelnet::network_utils::ClientId, index: usize) -> Result<Value, String> {
+        use ark_serialize::CanonicalSerialize;
+        use crate::net::client_store::get_global_store;
+
+        let store = get_global_store();
+        let share = store
+            .get_client_share(client_id, index)
+            .ok_or_else(|| format!("No share found for client {} at index {}", client_id, index))?;
+
+        // Serialize the share to bytes
+        let mut share_bytes = Vec::new();
+        share
+            .serialize_compressed(&mut share_bytes)
+            .map_err(|e| format!("Failed to serialize share: {}", e))?;
+
+        Ok(Value::Share(ShareType::Int(64), share_bytes))
+    }
+
+    /// Load all of a client's input shares from the global client store
+    ///
+    /// # Arguments
+    /// * `client_id` - The ID of the client
+    ///
+    /// # Returns
+    /// A vector of `Value::Share` containing all shares for this client
+    pub fn load_client_inputs(&self, client_id: stoffelnet::network_utils::ClientId) -> Result<Vec<Value>, String> {
+        use ark_serialize::CanonicalSerialize;
+        use crate::net::client_store::get_global_store;
+
+        let store = get_global_store();
+        let shares = store
+            .get_client_input(client_id)
+            .ok_or_else(|| format!("No inputs found for client {}", client_id))?;
+
+        let mut values = Vec::with_capacity(shares.len());
+        for share in shares {
+            let mut share_bytes = Vec::new();
+            share
+                .serialize_compressed(&mut share_bytes)
+                .map_err(|e| format!("Failed to serialize share: {}", e))?;
+            values.push(Value::Share(ShareType::Int(64), share_bytes));
+        }
+
+        Ok(values)
+    }
+
+    /// Check if a client has provided inputs in the global store
+    pub fn has_client_input(&self, client_id: stoffelnet::network_utils::ClientId) -> bool {
+        use crate::net::client_store::get_global_store;
+        let store = get_global_store();
+        store.has_client_input(client_id)
+    }
+
+    /// Get the number of shares a client has provided
+    pub fn get_client_input_count(&self, client_id: stoffelnet::network_utils::ClientId) -> usize {
+        use crate::net::client_store::get_global_store;
+        let store = get_global_store();
+        store.get_client_input_count(client_id)
+    }
 }

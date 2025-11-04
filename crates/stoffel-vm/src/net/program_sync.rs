@@ -1,17 +1,23 @@
+// crates/stoffel-vm/src/net/program_sync.rs
+//! # Program Synchronization
+//!
+//! This module handles the synchronization of compiled programs between VMs in a distributed network.
+//! When multiple VMs need to run the same program, they use this module to:
+//! 1. Agree on a common program ID and entry point
+//! 2. Exchange program bytecode efficiently
+//! 3. Cache programs locally to avoid redundant transfers
+//!
+//! The protocol uses a simple message-based approach over QUIC connections.
+
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::fs;
-use std::io::{Read, Write};
+use stoffelnet::transports::quic::PeerConnection;
+use stoffelnet::network_utils::PartyId;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use bincode;
-use crate::net::p2p::PeerConnection;
-use crate::net::session::{PROGRAM_STREAM_ID, CONTROL_STREAM_ID};
-use stoffelnet::network_utils::PartyId;
 use blake3::Hasher;
+use std::fs;
 
-const DEFAULT_CHUNK: usize = 64 * 1024;
-
+/// Message types for program synchronization protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProgramSyncMessage {
     ProgramAnnounce {
@@ -26,24 +32,30 @@ pub enum ProgramSyncMessage {
     },
     ProgramFetchRequest {
         program_id: [u8; 32],
-        ranges: Vec<(u64, u64)>, // [start, end)
+    },
+    ProgramBytes {
+        program_id: [u8; 32],
+        bytes: Vec<u8>,
     },
     ProgramComplete {
         program_id: [u8; 32],
     },
 }
 
+/// Returns the cache directory for storing synced programs
 pub fn cache_dir() -> PathBuf {
     std::env::var("STOFFEL_CACHE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| dirs::home_dir().unwrap_or_else(|| ".".into()).join(".stoffel").join("programs"))
 }
 
+/// Returns the path where a program with the given ID should be cached
 pub fn program_path(program_id: &[u8; 32]) -> PathBuf {
     let hex = hex::encode(program_id);
     cache_dir().join(hex)
 }
 
+/// Computes a BLAKE3 hash of the program bytes to use as its ID
 pub fn program_id_from_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(b"stoffel-program-v1");
@@ -51,70 +63,52 @@ pub fn program_id_from_bytes(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().as_bytes().clone()
 }
 
+/// Ensures the cache directory exists
 pub fn ensure_cache_dir() -> Result<(), String> {
     let dir = cache_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())
 }
 
-pub async fn send_ctrl(conn: &mut dyn PeerConnection, msg: &ProgramSyncMessage) -> Result<(), String> {
+/// Sends a control message to a peer using stoffelnet's simple send/receive
+pub async fn send_ctrl(conn: &dyn PeerConnection, msg: &ProgramSyncMessage) -> Result<(), String> {
     let bytes = bincode::serialize(msg).map_err(|e| e.to_string())?;
-    conn.send_on_stream(CONTROL_STREAM_ID, &bytes).await
+    conn.send(&bytes).await
 }
 
-pub async fn recv_ctrl(conn: &mut dyn PeerConnection) -> Result<ProgramSyncMessage, String> {
-    let buf = conn.receive_from_stream(CONTROL_STREAM_ID).await?;
+/// Receives a control message from a peer
+pub async fn recv_ctrl(conn: &dyn PeerConnection) -> Result<ProgramSyncMessage, String> {
+    let buf = conn.receive().await?;
     let msg: ProgramSyncMessage = bincode::deserialize(&buf).map_err(|e| e.to_string())?;
     Ok(msg)
 }
 
-pub async fn send_program_bytes(conn: &mut dyn PeerConnection, program_id: [u8; 32], bytes: Arc<Vec<u8>>) -> Result<(), String> {
-    // Stream bytes sequentially on PROGRAM_STREAM_ID
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let end = (offset + DEFAULT_CHUNK).min(bytes.len());
-        let chunk = &bytes[offset..end];
-        // frame: program_id(32) + offset(u64) + len(u32) + data
-        let mut frame = Vec::with_capacity(32 + 8 + 4 + chunk.len());
-        frame.extend_from_slice(&program_id);
-        frame.extend_from_slice(&(offset as u64).to_le_bytes());
-        frame.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
-        frame.extend_from_slice(chunk);
-        conn.send_on_stream(PROGRAM_STREAM_ID, &frame).await?;
-        offset = end;
-    }
-    Ok(())
+/// Sends program bytecode to a peer
+pub async fn send_program_bytes(
+    conn: &dyn PeerConnection,
+    program_id: [u8; 32],
+    bytes: Arc<Vec<u8>>,
+) -> Result<(), String> {
+    let msg = ProgramSyncMessage::ProgramBytes { program_id, bytes: bytes.to_vec() };
+    send_ctrl(conn, &msg).await
 }
 
-pub async fn recv_program_bytes(conn: &mut dyn PeerConnection, expected_id: [u8; 32], expected_size: usize) -> Result<Vec<u8>, String> {
-    let mut out = vec![0u8; expected_size];
-    let mut received: BTreeSet<(usize, usize)> = BTreeSet::new();
-    let mut total = 0usize;
-    while total < expected_size {
-        let buf = conn.receive_from_stream(PROGRAM_STREAM_ID).await?;
-        if buf.len() < 32 + 8 + 4 {
-            return Err("short program frame".into());
+/// Receives program bytecode from a peer
+pub async fn recv_program_bytes(conn: &dyn PeerConnection, expected_id: [u8; 32]) -> Result<Vec<u8>, String> {
+    let msg = recv_ctrl(conn).await?;
+    match msg {
+        ProgramSyncMessage::ProgramBytes { program_id, bytes } => {
+            if program_id != expected_id {
+                return Err("program_id mismatch".into());
+            }
+            Ok(bytes)
         }
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&buf[0..32]);
-        if id != expected_id {
-            return Err("program_id mismatch in stream".into());
-        }
-        let off = u64::from_le_bytes(buf[32..40].try_into().unwrap()) as usize;
-        let len = u32::from_le_bytes(buf[40..44].try_into().unwrap()) as usize;
-        let data = &buf[44..];
-        if data.len() != len || off + len > expected_size {
-            return Err("invalid frame bounds".into());
-        }
-        out[off..off + len].copy_from_slice(data);
-        received.insert((off, off + len));
-        total += len;
+        _ => Err("expected ProgramBytes message".into()),
     }
-    Ok(out)
 }
 
 /// High-level helper to ensure all parties agree on the program and those who don't have it fetch it.
 pub async fn agree_and_sync_program(
-    bn_conn: &mut dyn PeerConnection,
+    bn_conn: &dyn PeerConnection,
     my_party: PartyId,
     entry: &str,
     maybe_program_bytes: Option<Vec<u8>>,
@@ -147,25 +141,33 @@ pub async fn agree_and_sync_program(
         ProgramSyncMessage::ProgramAnnounce { party_id: _, program_id, size, entry } => (program_id, size as usize, entry),
         _ => return Err("unexpected control message (expected ProgramAnnounce)".into()),
     };
+
     // Ack
     let ack = ProgramSyncMessage::ProgramAck { party_id: my_party, program_id: agreed_pid };
     send_ctrl(bn_conn, &ack).await?;
 
-    // If absent locally, fetch over program stream from bootnode
+    // If absent locally, fetch from bootnode
     let local_path = program_path(&agreed_pid);
     if !local_path.exists() {
-        // request ranges (entire file)
-        let req = ProgramSyncMessage::ProgramFetchRequest { program_id: agreed_pid, ranges: vec![(0, agreed_size as u64)] };
+        // request the program
+        let req = ProgramSyncMessage::ProgramFetchRequest { program_id: agreed_pid };
         send_ctrl(bn_conn, &req).await?;
-        let bytes = recv_program_bytes(bn_conn, agreed_pid, agreed_size).await?;
+
+        // receive the bytes
+        let bytes = recv_program_bytes(bn_conn, agreed_pid).await?;
+
         // verify hash
         let pid2 = program_id_from_bytes(&bytes);
         if pid2 != agreed_pid {
             return Err("downloaded program hash mismatch".into());
         }
+
         fs::write(&local_path, &bytes).map_err(|e| e.to_string())?;
-        // complete
-        let _ = send_ctrl(bn_conn, &ProgramSyncMessage::ProgramComplete { program_id: agreed_pid }).await;
+
+        // send completion acknowledgment
+        let complete = ProgramSyncMessage::ProgramComplete { program_id: agreed_pid };
+        send_ctrl(bn_conn, &complete).await?;
     }
+
     Ok((agreed_pid, agreed_size, agreed_entry))
 }

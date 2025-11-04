@@ -7,15 +7,14 @@ use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 use stoffel_vm_types::compiled_binary::{CompiledBinary};
 use std::fs::File;
 use std::io::Read;
-use stoffel_vm::net::NetworkManager;
 use stoffel_vm::net::{run_bootnode, wait_until_min_parties, agree_and_sync_program, program_id_from_bytes, bootstrap_with_bootnode};
-use stoffel_vm::net::p2p::QuicNetworkManager;
 use stoffelnet::network_utils::Network;
 use std::sync::Arc;
 use std::time::Duration;
 use stoffel_vm::net::session::{agree_session_with_bootnode};
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
 use rand::RngCore;
+use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 
 // Use a Tokio runtime for async operations
 #[tokio::main]
@@ -153,14 +152,14 @@ async fn main() {
             }
         }
         // program agreement + sync
-        let mut bn_conn = mgr.connect(bootnode).await.expect("connect bootnode");
+        let bn_conn = mgr.connect(bootnode).await.expect("connect bootnode");
         // local bytes if provided
         if let Some(p) = &path_opt {
             let bytes = std::fs::read(p).expect("read program");
             program_id = program_id_from_bytes(&bytes);
             program_bytes = Some(bytes);
         }
-        let (pid, _sz, agreed_entry_s) = agree_and_sync_program(&mut *bn_conn, my_id, &entry, program_bytes.clone()).await.expect("program agree/sync");
+        let (pid, _sz, agreed_entry_s) = agree_and_sync_program(&*bn_conn, my_id, &entry, program_bytes.clone()).await.expect("program agree/sync");
         program_id = pid;
         agreed_entry = agreed_entry_s;
         let net = Arc::new(mgr);
@@ -294,6 +293,13 @@ async fn main() {
             8, 16,
             net.clone(),
         );
+        let engine = match engine {
+            Ok(eng) => eng,
+            Err(e) => {
+                eprintln!("Failed to create MPC engine: {}", e);
+                exit(13);
+            }
+        };
         // Fully async preprocessing
         if let Err(e) = engine.start_async().await {
             eprintln!("MPC preprocessing failed: {}", e);
