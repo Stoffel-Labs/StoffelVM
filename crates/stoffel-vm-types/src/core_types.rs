@@ -56,9 +56,9 @@ impl Array {
 
     pub fn get(&self, key: &Value) -> Option<&Value> {
         match key {
-            // Lua-inspired: arrays are 1-indexed. Valid numeric keys are 1..=length
-            Value::I64(idx) if *idx >= 1 && (*idx as usize) <= self.length_hint => {
-                Some(&self.elements[(*idx as usize) - 1])
+            // 0-indexed arrays: Valid numeric keys are 0..<length
+            Value::I64(idx) if *idx >= 0 && (*idx as usize) < self.length_hint => {
+                Some(&self.elements[*idx as usize])
             }
             _ => self.extra_fields.get(key),
         }
@@ -66,18 +66,17 @@ impl Array {
 
     pub fn set(&mut self, key: Value, value: Value) {
         match key {
-            // 1-indexed arrays: only indices >= 1 are valid for the dense part
-            Value::I64(idx) if idx >= 1 => {
-                let idx_usize = idx as usize; // 1-based
-                // Update length_hint to the highest occupied numeric index
-                self.length_hint = self.length_hint.max(idx_usize);
-                let dense_index = idx_usize - 1; // convert to 0-based for storage
-                if dense_index < 32 {
+            // 0-indexed arrays: only indices >= 0 are valid for the dense part
+            Value::I64(idx) if idx >= 0 => {
+                let idx_usize = idx as usize; // 0-based
+                // Update length_hint to the highest occupied numeric index + 1
+                self.length_hint = self.length_hint.max(idx_usize + 1);
+                if idx_usize < 32 {
                     // Small array optimization
-                    if dense_index >= self.elements.len() {
-                        self.elements.resize(dense_index + 1, Value::Unit);
+                    if idx_usize >= self.elements.len() {
+                        self.elements.resize(idx_usize + 1, Value::Unit);
                     }
-                    self.elements[dense_index] = value;
+                    self.elements[idx_usize] = value;
                 } else {
                     self.extra_fields.insert(Value::I64(idx), value);
                 }
