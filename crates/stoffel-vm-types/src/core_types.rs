@@ -21,12 +21,12 @@ use std::sync::Arc;
 
 /// Represents an array in the VM
 ///
-/// Arrays in StoffelVM are 1-indexed (like Lua) and support both numeric indices
+/// Arrays in StoffelVM are 0-indexed and support both numeric indices
 /// and arbitrary keys (similar to JavaScript arrays or Lua tables).
 /// The implementation uses a hybrid approach:
 /// - Small arrays (indices < 32) use a contiguous SmallVec for efficient access
 /// - Larger indices and non-numeric keys use a hash map
-/// - A length hint is maintained for O(1) length queries
+/// - A length hint is maintained for O(1) length queries (stores len = last_index + 1)
 #[derive(Debug, Clone)]
 pub struct Array {
     /// Contiguous storage for small arrays (optimized for indices < 32)
@@ -56,8 +56,9 @@ impl Array {
 
     pub fn get(&self, key: &Value) -> Option<&Value> {
         match key {
-            Value::I64(idx) if *idx >= 1 && (*idx as usize) <= self.length_hint => {
-                Some(&self.elements[*idx as usize - 1])
+            // 0-indexed arrays: Valid numeric keys are 0..<length
+            Value::I64(idx) if *idx >= 0 && (*idx as usize) < self.length_hint => {
+                Some(&self.elements[*idx as usize])
             }
             _ => self.extra_fields.get(key),
         }
@@ -65,9 +66,11 @@ impl Array {
 
     pub fn set(&mut self, key: Value, value: Value) {
         match key {
-            Value::I64(idx) if idx >= 1 => {
-                self.length_hint = self.length_hint.max(idx as usize);
-                let idx_usize = idx as usize - 1;
+            // 0-indexed arrays: only indices >= 0 are valid for the dense part
+            Value::I64(idx) if idx >= 0 => {
+                let idx_usize = idx as usize; // 0-based
+                // Update length_hint to the highest occupied numeric index + 1
+                self.length_hint = self.length_hint.max(idx_usize + 1);
                 if idx_usize < 32 {
                     // Small array optimization
                     if idx_usize >= self.elements.len() {
@@ -205,7 +208,7 @@ pub enum Value {
     Closure(Arc<Closure>),
     /// Unit/void/nil value
     Unit,
-    /// Secret shared value (for SMPC)
+    /// Secret shared value (for SMPC) TODO: Change 
     Share(ShareType, Vec<u8>),
 }
 

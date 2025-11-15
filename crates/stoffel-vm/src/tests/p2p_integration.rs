@@ -32,11 +32,13 @@ struct PongMessage {
     seq_num: u32,
 }
 
-fn init_crypto_provider() {
+pub(crate) fn init_crypto_provider() {
     INIT.call_once(|| {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("Failed to install rustls crypto provider");
+        // If a provider is already installed, do nothing.
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            // Ignore error if another test installs it concurrently
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
     });
 }
 
@@ -301,7 +303,7 @@ async fn perform_ping_pong_exchanges(server_addrs: &[SocketAddr; 3]) -> Vec<Vec<
                 let pong_received_time = current_time_ms();
 
                 // Deserialize pong
-                let pong = bincode::deserialize::<PongMessage>(&pong_data)
+                let pong: PongMessage = bincode::deserialize(&pong_data)
                     .expect("Should deserialize pong message");
 
                 // Calculate server processing time (time between receiving ping and sending pong)

@@ -165,9 +165,11 @@ impl VirtualMachine {
             match &ctx.args[0] {
                 Value::Array(id) => {
                     if let Some(arr) = ctx.vm_state.object_store.get_array_mut(*id) {
-                        let idx = Value::I64((arr.length() + 1) as i64);
-                        for value in &ctx.args[1..] {
-                            arr.set(idx.clone(), value.clone());
+                        let start = arr.length();
+                        for (offset, value) in ctx.args[1..].iter().enumerate() {
+                            // Lua-inspired 1-based arrays: next index is start + 1
+                            let idx = Value::I64((start + 1 + offset) as i64);
+                            arr.set(idx, value.clone());
                         }
                         Ok(Value::I64(arr.length() as i64))
                     } else {
