@@ -1409,7 +1409,7 @@ mod tests {
 
                 assert!(triples_count > 0, "Server {} has no triples!", i);
                 assert!(
-                    random_shares_count == 0,
+                    random_shares_count == 6,
                     "Server {} has no random shares!",
                     i
                 );

@@ -59,7 +59,8 @@ fn setup_test_tracing() {
     });
 }
 
-#[tokio::test]
+// Use a multi-thread runtime to allow synchronous bridges inside the VM's MPC engine
+#[tokio::test(flavor = "multi_thread")]
 async fn test_vm_mpc_multiplication_integration() {
     init_crypto_provider();
     setup_test_tracing();

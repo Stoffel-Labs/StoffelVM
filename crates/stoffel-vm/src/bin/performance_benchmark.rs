@@ -14,7 +14,7 @@ fn main() {
     // Create a benchmark function that performs a lot of arithmetic operations
     let mut labels = HashMap::new();
     labels.insert("loop_start".to_string(), 1);
-    labels.insert("loop_end".to_string(), 7);
+    labels.insert("loop_end".to_string(), 8);
 
     let benchmark_function = VMFunction::new(
         "benchmark".to_string(),
