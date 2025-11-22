@@ -5,10 +5,8 @@
 //! shares to execute programs that require secret inputs.
 
 use ark_bls12_381::Fr;
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelnet::network_utils::ClientId;
 
@@ -30,14 +28,14 @@ pub struct ClientInputEntry {
 #[derive(Debug, Default)]
 pub struct ClientInputStore {
     /// Map from client ID to their input shares
-    entries: RwLock<HashMap<ClientId, ClientInputEntry>>,
+    entries: RwLock<BTreeMap<ClientId, ClientInputEntry>>,
 }
 
 impl ClientInputStore {
     /// Create a new empty client input store
     pub fn new() -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
+            entries: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -128,15 +126,18 @@ impl ClientInputStore {
         let entries = self.entries.read();
         entries.is_empty()
     }
-}
 
-/// Global singleton instance of the client input store
-pub static GLOBAL_CLIENT_STORE: Lazy<Arc<ClientInputStore>> =
-    Lazy::new(|| Arc::new(ClientInputStore::new()));
+    /// Return the client ID at a given index (sorted order).
+    pub fn client_id_at(&self, index: usize) -> Option<ClientId> {
+        let entries = self.entries.read();
+        entries.keys().nth(index).copied()
+    }
 
-/// Get a reference to the global client input store
-pub fn get_global_store() -> Arc<ClientInputStore> {
-    GLOBAL_CLIENT_STORE.clone()
+    /// Return all client IDs in sorted order.
+    pub fn client_ids(&self) -> Vec<ClientId> {
+        let entries = self.entries.read();
+        entries.keys().copied().collect()
+    }
 }
 
 #[cfg(test)]

@@ -1,11 +1,11 @@
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-use std::time::Duration;
-use rand::RngCore;
-use stoffelnet::network_utils::PartyId;
 use crate::net::discovery::DiscoveryMessage;
 use crate::net::p2p::PeerConnection;
 use bincode;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::time::Duration;
+use stoffelnet::network_utils::PartyId;
 
 pub const CONTROL_STREAM_ID: u64 = 1;
 pub const PROGRAM_STREAM_ID: u64 = 2;
@@ -23,7 +23,11 @@ pub enum SessionMessage {
     // Sent by leader/bootnode
     SessionAnnounce(SessionInfo),
     // Sent by parties
-    SessionAck { party_id: PartyId, program_id: [u8; 32], instance_id: u64 },
+    SessionAck {
+        party_id: PartyId,
+        program_id: [u8; 32],
+        instance_id: u64,
+    },
 }
 
 pub fn random_instance_id() -> u64 {
@@ -37,7 +41,10 @@ pub async fn send_ctrl(conn: &mut dyn PeerConnection, msg: &impl Serialize) -> R
     conn.send_on_stream(CONTROL_STREAM_ID, &bytes).await
 }
 
-pub async fn recv_ctrl<T: for<'a> serde::Deserialize<'a>>(conn: &mut dyn PeerConnection, _timeout: Option<Duration>) -> Result<T, String> {
+pub async fn recv_ctrl<T: for<'a> serde::Deserialize<'a>>(
+    conn: &mut dyn PeerConnection,
+    _timeout: Option<Duration>,
+) -> Result<T, String> {
     // simple version: ignore timeout for now; QUIC reliable
     let buf = conn.receive_from_stream(CONTROL_STREAM_ID).await?;
     let val: T = bincode::deserialize(&buf).map_err(|e| e.to_string())?;

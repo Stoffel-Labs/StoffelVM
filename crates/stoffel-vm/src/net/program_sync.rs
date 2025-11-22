@@ -9,13 +9,13 @@
 //!
 //! The protocol uses a simple message-based approach over QUIC connections.
 
+use blake3::Hasher;
 use serde::{Deserialize, Serialize};
-use stoffelnet::transports::quic::PeerConnection;
-use stoffelnet::network_utils::PartyId;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use blake3::Hasher;
-use std::fs;
+use stoffelnet::network_utils::PartyId;
+use stoffelnet::transports::quic::PeerConnection;
 
 /// Message types for program synchronization protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +46,12 @@ pub enum ProgramSyncMessage {
 pub fn cache_dir() -> PathBuf {
     std::env::var("STOFFEL_CACHE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_else(|| ".".into()).join(".stoffel").join("programs"))
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| ".".into())
+                .join(".stoffel")
+                .join("programs")
+        })
 }
 
 /// Returns the path where a program with the given ID should be cached
@@ -88,12 +93,18 @@ pub async fn send_program_bytes(
     program_id: [u8; 32],
     bytes: Arc<Vec<u8>>,
 ) -> Result<(), String> {
-    let msg = ProgramSyncMessage::ProgramBytes { program_id, bytes: bytes.to_vec() };
+    let msg = ProgramSyncMessage::ProgramBytes {
+        program_id,
+        bytes: bytes.to_vec(),
+    };
     send_ctrl(conn, &msg).await
 }
 
 /// Receives program bytecode from a peer
-pub async fn recv_program_bytes(conn: &dyn PeerConnection, expected_id: [u8; 32]) -> Result<Vec<u8>, String> {
+pub async fn recv_program_bytes(
+    conn: &dyn PeerConnection,
+    expected_id: [u8; 32],
+) -> Result<Vec<u8>, String> {
     let msg = recv_ctrl(conn).await?;
     match msg {
         ProgramSyncMessage::ProgramBytes { program_id, bytes } => {
@@ -138,19 +149,29 @@ pub async fn agree_and_sync_program(
     // Receive leader's announce with canonical pid/size/entry
     let announce2 = recv_ctrl(bn_conn).await?;
     let (agreed_pid, agreed_size, agreed_entry) = match announce2 {
-        ProgramSyncMessage::ProgramAnnounce { party_id: _, program_id, size, entry } => (program_id, size as usize, entry),
+        ProgramSyncMessage::ProgramAnnounce {
+            party_id: _,
+            program_id,
+            size,
+            entry,
+        } => (program_id, size as usize, entry),
         _ => return Err("unexpected control message (expected ProgramAnnounce)".into()),
     };
 
     // Ack
-    let ack = ProgramSyncMessage::ProgramAck { party_id: my_party, program_id: agreed_pid };
+    let ack = ProgramSyncMessage::ProgramAck {
+        party_id: my_party,
+        program_id: agreed_pid,
+    };
     send_ctrl(bn_conn, &ack).await?;
 
     // If absent locally, fetch from bootnode
     let local_path = program_path(&agreed_pid);
     if !local_path.exists() {
         // request the program
-        let req = ProgramSyncMessage::ProgramFetchRequest { program_id: agreed_pid };
+        let req = ProgramSyncMessage::ProgramFetchRequest {
+            program_id: agreed_pid,
+        };
         send_ctrl(bn_conn, &req).await?;
 
         // receive the bytes
@@ -165,7 +186,9 @@ pub async fn agree_and_sync_program(
         fs::write(&local_path, &bytes).map_err(|e| e.to_string())?;
 
         // send completion acknowledgment
-        let complete = ProgramSyncMessage::ProgramComplete { program_id: agreed_pid };
+        let complete = ProgramSyncMessage::ProgramComplete {
+            program_id: agreed_pid,
+        };
         send_ctrl(bn_conn, &complete).await?;
     }
 

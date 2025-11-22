@@ -1,21 +1,34 @@
 //! Simple bootnode-based discovery for StoffelVM over QUIC.
 //! Assumes nodes are directly reachable (no NAT traversal).
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use super::program_sync::{
+    recv_ctrl as recv_prog_ctrl, send_ctrl as send_prog_ctrl, send_program_bytes,
+    ProgramSyncMessage,
+};
+use super::session::{SessionInfo, SessionMessage};
 use bincode;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::Mutex, time::sleep};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use stoffelnet::network_utils::{Network, PartyId};
 use stoffelnet::transports::quic::{NetworkManager, PeerConnection, QuicNetworkManager};
-use super::program_sync::{ProgramSyncMessage, send_ctrl as send_prog_ctrl, recv_ctrl as recv_prog_ctrl, send_program_bytes};
-use super::session::{SessionInfo, SessionMessage};
+use tokio::{sync::Mutex, time::sleep};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DiscoveryMessage {
-    Register { party_id: PartyId, listen_addr: SocketAddr },
+    Register {
+        party_id: PartyId,
+        listen_addr: SocketAddr,
+    },
     RequestPeers,
-    PeerList { peers: Vec<(PartyId, SocketAddr)> },
-    PeerJoined { party_id: PartyId, listen_addr: SocketAddr },
-    PeerLeft { party_id: PartyId },
+    PeerList {
+        peers: Vec<(PartyId, SocketAddr)>,
+    },
+    PeerJoined {
+        party_id: PartyId,
+        listen_addr: SocketAddr,
+    },
+    PeerLeft {
+        party_id: PartyId,
+    },
     Heartbeat,
 }
 
@@ -39,13 +52,17 @@ pub async fn run_bootnode(bind: SocketAddr) -> Result<(), String> {
                     Ok(buf) => {
                         if let Ok(msg) = bincode::deserialize::<DiscoveryMessage>(&buf) {
                             match msg {
-                                DiscoveryMessage::Register { party_id, listen_addr } => {
+                                DiscoveryMessage::Register {
+                                    party_id,
+                                    listen_addr,
+                                } => {
                                     let mut st = state.lock().await;
                                     let is_new = !st.contains_key(&party_id);
                                     st.insert(party_id, listen_addr);
 
                                     // reply with full peer list (excluding self)
-                                    let peers: Vec<(PartyId, SocketAddr)> = st.iter()
+                                    let peers: Vec<(PartyId, SocketAddr)> = st
+                                        .iter()
                                         .filter(|(pid, _)| **pid != party_id)
                                         .map(|(pid, addr)| (*pid, *addr))
                                         .collect();
@@ -54,15 +71,20 @@ pub async fn run_bootnode(bind: SocketAddr) -> Result<(), String> {
 
                                     // notify others if new
                                     if is_new {
-                                        let joined = DiscoveryMessage::PeerJoined { party_id, listen_addr };
+                                        let joined = DiscoveryMessage::PeerJoined {
+                                            party_id,
+                                            listen_addr,
+                                        };
                                         let _ = send_ctrl(&*conn, &joined).await;
                                     }
                                 }
                                 DiscoveryMessage::RequestPeers => {
                                     let st = state.lock().await;
-                                    let peers: Vec<(PartyId, SocketAddr)> = st.iter()
-                                        .map(|(pid, addr)| (*pid, *addr)).collect();
-                                    let _ = send_ctrl(&*conn, &DiscoveryMessage::PeerList { peers }).await;
+                                    let peers: Vec<(PartyId, SocketAddr)> =
+                                        st.iter().map(|(pid, addr)| (*pid, *addr)).collect();
+                                    let _ =
+                                        send_ctrl(&*conn, &DiscoveryMessage::PeerList { peers })
+                                            .await;
                                 }
                                 DiscoveryMessage::Heartbeat => {
                                     // Ignored in this minimal version
@@ -88,7 +110,8 @@ pub async fn run_bootnode(bind: SocketAddr) -> Result<(), String> {
                             }
                         } else if let Ok(sess) = bincode::deserialize::<SessionMessage>(&buf) {
                             match sess {
-                                SessionMessage::SessionAnnounce(_) => { /* not expected from clients */ }
+                                SessionMessage::SessionAnnounce(_) => { /* not expected from clients */
+                                }
                                 SessionMessage::SessionAck { .. } => { /* optional: track */ }
                             }
                         }
@@ -113,19 +136,27 @@ pub async fn bootstrap_with_bootnode(
     let bn_conn = net.connect(bootnode).await?;
 
     // Register
-    send_ctrl(&*bn_conn, &DiscoveryMessage::Register {
-        party_id: my_party_id,
-        listen_addr: my_listen,
-    }).await?;
+    send_ctrl(
+        &*bn_conn,
+        &DiscoveryMessage::Register {
+            party_id: my_party_id,
+            listen_addr: my_listen,
+        },
+    )
+    .await?;
 
     // Request peers
     send_ctrl(&*bn_conn, &DiscoveryMessage::RequestPeers).await?;
 
     // Receive initial list and connect
     if let Ok(buf) = bn_conn.receive().await {
-        if let Ok(DiscoveryMessage::PeerList { peers }) = bincode::deserialize::<DiscoveryMessage>(&buf) {
+        if let Ok(DiscoveryMessage::PeerList { peers }) =
+            bincode::deserialize::<DiscoveryMessage>(&buf)
+        {
             for (pid, addr) in peers {
-                if pid == my_party_id { continue; }
+                if pid == my_party_id {
+                    continue;
+                }
                 // Track node and connect best-effort
                 add_node_and_connect(net, pid, addr).await;
             }
@@ -146,14 +177,22 @@ async fn send_ctrl(conn: &dyn PeerConnection, msg: &DiscoveryMessage) -> Result<
 }
 
 /// Wait until at least n parties are in the QuicNetworkManager.parties() view (including self).
-pub async fn wait_until_min_parties(net: &QuicNetworkManager, n: usize, timeout: Duration) -> Result<(), String> {
+pub async fn wait_until_min_parties(
+    net: &QuicNetworkManager,
+    n: usize,
+    timeout: Duration,
+) -> Result<(), String> {
     let start = tokio::time::Instant::now();
     loop {
         if net.parties().len() >= n {
             return Ok(());
         }
         if start.elapsed() > timeout {
-            return Err(format!("timeout waiting for {} parties, have {}", n, net.parties().len()));
+            return Err(format!(
+                "timeout waiting for {} parties, have {}",
+                n,
+                net.parties().len()
+            ));
         }
         sleep(Duration::from_millis(50)).await;
     }

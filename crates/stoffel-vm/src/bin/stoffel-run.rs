@@ -1,19 +1,22 @@
 use std::env;
-use std::process::exit;
 use std::net::SocketAddr;
+use std::process::exit;
 
-use stoffel_vm::core_vm::VirtualMachine;
-use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
-use stoffel_vm_types::compiled_binary::{CompiledBinary};
+use rand::RngCore;
 use std::fs::File;
 use std::io::Read;
-use stoffel_vm::net::{run_bootnode, wait_until_min_parties, agree_and_sync_program, program_id_from_bytes, bootstrap_with_bootnode};
-use stoffelnet::network_utils::Network;
 use std::sync::Arc;
 use std::time::Duration;
-use stoffel_vm::net::session::{agree_session_with_bootnode};
+use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
-use rand::RngCore;
+use stoffel_vm::net::session::agree_session_with_bootnode;
+use stoffel_vm::net::{
+    agree_and_sync_program, bootstrap_with_bootnode, program_id_from_bytes, run_bootnode,
+    wait_until_min_parties,
+};
+use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
+use stoffel_vm_types::compiled_binary::CompiledBinary;
+use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 
 // Use a Tokio runtime for async operations
@@ -100,10 +103,14 @@ async fn main() {
                 }
             }
             "--n-parties" => {
-                if let Some(v) = args_iter.next() { n_parties = Some(v.parse().expect("Invalid --n-parties")); }
+                if let Some(v) = args_iter.next() {
+                    n_parties = Some(v.parse().expect("Invalid --n-parties"));
+                }
             }
             "--threshold" => {
-                if let Some(v) = args_iter.next() { threshold = Some(v.parse().expect("Invalid --threshold")); }
+                if let Some(v) = args_iter.next() {
+                    threshold = Some(v.parse().expect("Invalid --threshold"));
+                }
             }
             _ => {}
         }
@@ -114,7 +121,9 @@ async fn main() {
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:9000".parse().unwrap());
         eprintln!("Starting bootnode on {}", bind);
         // Install crypto provider for quinn/rustls
-        rustls::crypto::ring::default_provider().install_default().expect("install rustls crypto");
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("install rustls crypto");
         if let Err(e) = run_bootnode(bind).await {
             eprintln!("Bootnode error: {}", e);
             exit(10);
@@ -122,8 +131,16 @@ async fn main() {
         return;
     }
 
-    path_opt = if !positional.is_empty() { Some(positional.remove(0)) } else { None };
-    entry = if !positional.is_empty() { positional.remove(0) } else { entry };
+    path_opt = if !positional.is_empty() {
+        Some(positional.remove(0))
+    } else {
+        None
+    };
+    entry = if !positional.is_empty() {
+        positional.remove(0)
+    } else {
+        entry
+    };
 
     // Optional: bring up networking in party mode if bootstrap provided
     let mut net_opt: Option<Arc<QuicNetworkManager>> = None;
@@ -133,7 +150,9 @@ async fn main() {
     if let Some(bootnode) = bootstrap_addr {
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
         let my_id = party_id.unwrap_or(0usize);
-        rustls::crypto::ring::default_provider().install_default().expect("install rustls crypto");
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("install rustls crypto");
         // Prepare QUIC manager
         let mut mgr = QuicNetworkManager::new();
         // Listen so peers can connect back directly
@@ -159,7 +178,10 @@ async fn main() {
             program_id = program_id_from_bytes(&bytes);
             program_bytes = Some(bytes);
         }
-        let (pid, _sz, agreed_entry_s) = agree_and_sync_program(&*bn_conn, my_id, &entry, program_bytes.clone()).await.expect("program agree/sync");
+        let (pid, _sz, agreed_entry_s) =
+            agree_and_sync_program(&*bn_conn, my_id, &entry, program_bytes.clone())
+                .await
+                .expect("program agree/sync");
         program_id = pid;
         agreed_entry = agreed_entry_s;
         let net = Arc::new(mgr);
@@ -175,7 +197,7 @@ async fn main() {
         }
     }
 
-        // Load compiled binary from a file path
+    // Load compiled binary from a file path
     let load_path: String = if let Some(p) = path_opt.clone() {
         p
     } else {
@@ -186,7 +208,10 @@ async fn main() {
     let mut f = File::open(&load_path).expect("open binary file");
     let binary = CompiledBinary::deserialize(&mut f).expect("deserialize compiled binary");
     let functions = binary.to_vm_functions();
-    if functions.is_empty() { eprintln!("Error: compiled program contains no functions"); exit(3); }
+    if functions.is_empty() {
+        eprintln!("Error: compiled program contains no functions");
+        exit(3);
+    }
 
     // Initialize VM
     let mut vm = VirtualMachine::new();
@@ -201,23 +226,42 @@ async fn main() {
     // Register debugging hooks based on flags
     if trace_instr {
         vm.register_hook(
-            |event| matches!(event, HookEvent::BeforeInstructionExecute(_) | HookEvent::AfterInstructionExecute(_)),
-            |event, ctx: &HookContext| {
-                match event {
-                    HookEvent::BeforeInstructionExecute(instr) => {
-                        let fn_name = ctx.get_function_name().unwrap_or_else(|| "<unknown>".to_string());
-                        let pc = ctx.get_current_instruction();
-                        eprintln!("[instr][depth {}][{}][pc {}] BEFORE {:?}", ctx.get_call_depth(), fn_name, pc, instr);
-                        Ok(())
-                    }
-                    HookEvent::AfterInstructionExecute(instr) => {
-                        let fn_name = ctx.get_function_name().unwrap_or_else(|| "<unknown>".to_string());
-                        let pc = ctx.get_current_instruction();
-                        eprintln!("[instr][depth {}][{}][pc {}] AFTER  {:?}", ctx.get_call_depth(), fn_name, pc, instr);
-                        Ok(())
-                    }
-                    _ => Ok(())
+            |event| {
+                matches!(
+                    event,
+                    HookEvent::BeforeInstructionExecute(_) | HookEvent::AfterInstructionExecute(_)
+                )
+            },
+            |event, ctx: &HookContext| match event {
+                HookEvent::BeforeInstructionExecute(instr) => {
+                    let fn_name = ctx
+                        .get_function_name()
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let pc = ctx.get_current_instruction();
+                    eprintln!(
+                        "[instr][depth {}][{}][pc {}] BEFORE {:?}",
+                        ctx.get_call_depth(),
+                        fn_name,
+                        pc,
+                        instr
+                    );
+                    Ok(())
                 }
+                HookEvent::AfterInstructionExecute(instr) => {
+                    let fn_name = ctx
+                        .get_function_name()
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let pc = ctx.get_current_instruction();
+                    eprintln!(
+                        "[instr][depth {}][{}][pc {}] AFTER  {:?}",
+                        ctx.get_call_depth(),
+                        fn_name,
+                        pc,
+                        instr
+                    );
+                    Ok(())
+                }
+                _ => Ok(()),
             },
             0,
         );
@@ -225,21 +269,41 @@ async fn main() {
 
     if trace_regs {
         vm.register_hook(
-            |event| matches!(event, HookEvent::RegisterRead(_, _) | HookEvent::RegisterWrite(_, _, _)),
-            |event, ctx: &HookContext| {
-                match event {
-                    HookEvent::RegisterRead(idx, val) => {
-                        let fn_name = ctx.get_function_name().unwrap_or_else(|| "<unknown>".to_string());
-                        eprintln!("[regs][depth {}][{}] R{} -> {:?}", ctx.get_call_depth(), fn_name, idx, val);
-                        Ok(())
-                    }
-                    HookEvent::RegisterWrite(idx, old, new) => {
-                        let fn_name = ctx.get_function_name().unwrap_or_else(|| "<unknown>".to_string());
-                        eprintln!("[regs][depth {}][{}] R{}: {:?} -> {:?}", ctx.get_call_depth(), fn_name, idx, old, new);
-                        Ok(())
-                    }
-                    _ => Ok(())
+            |event| {
+                matches!(
+                    event,
+                    HookEvent::RegisterRead(_, _) | HookEvent::RegisterWrite(_, _, _)
+                )
+            },
+            |event, ctx: &HookContext| match event {
+                HookEvent::RegisterRead(idx, val) => {
+                    let fn_name = ctx
+                        .get_function_name()
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    eprintln!(
+                        "[regs][depth {}][{}] R{} -> {:?}",
+                        ctx.get_call_depth(),
+                        fn_name,
+                        idx,
+                        val
+                    );
+                    Ok(())
                 }
+                HookEvent::RegisterWrite(idx, old, new) => {
+                    let fn_name = ctx
+                        .get_function_name()
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    eprintln!(
+                        "[regs][depth {}][{}] R{}: {:?} -> {:?}",
+                        ctx.get_call_depth(),
+                        fn_name,
+                        idx,
+                        old,
+                        new
+                    );
+                    Ok(())
+                }
+                _ => Ok(()),
             },
             0,
         );
@@ -247,29 +311,59 @@ async fn main() {
 
     if trace_stack {
         vm.register_hook(
-            |event| matches!(event, HookEvent::BeforeFunctionCall(_, _) | HookEvent::AfterFunctionCall(_, _) | HookEvent::StackPush(_) | HookEvent::StackPop(_)),
-            |event, ctx: &HookContext| {
-                match event {
-                    HookEvent::BeforeFunctionCall(func, args) => {
-                        eprintln!("[stack][depth {}] CALL {:?} with {:?}", ctx.get_call_depth(), func, args);
-                        Ok(())
-                    }
-                    HookEvent::AfterFunctionCall(func, ret) => {
-                        eprintln!("[stack][depth {}] RET  {:?} => {:?}", ctx.get_call_depth(), func, ret);
-                        Ok(())
-                    }
-                    HookEvent::StackPush(v) => {
-                        let fn_name = ctx.get_function_name().unwrap_or_else(|| "<unknown>".to_string());
-                        eprintln!("[stack][depth {}][{}] PUSH {:?}", ctx.get_call_depth(), fn_name, v);
-                        Ok(())
-                    }
-                    HookEvent::StackPop(v) => {
-                        let fn_name = ctx.get_function_name().unwrap_or_else(|| "<unknown>".to_string());
-                        eprintln!("[stack][depth {}][{}] POP  {:?}", ctx.get_call_depth(), fn_name, v);
-                        Ok(())
-                    }
-                    _ => Ok(())
+            |event| {
+                matches!(
+                    event,
+                    HookEvent::BeforeFunctionCall(_, _)
+                        | HookEvent::AfterFunctionCall(_, _)
+                        | HookEvent::StackPush(_)
+                        | HookEvent::StackPop(_)
+                )
+            },
+            |event, ctx: &HookContext| match event {
+                HookEvent::BeforeFunctionCall(func, args) => {
+                    eprintln!(
+                        "[stack][depth {}] CALL {:?} with {:?}",
+                        ctx.get_call_depth(),
+                        func,
+                        args
+                    );
+                    Ok(())
                 }
+                HookEvent::AfterFunctionCall(func, ret) => {
+                    eprintln!(
+                        "[stack][depth {}] RET  {:?} => {:?}",
+                        ctx.get_call_depth(),
+                        func,
+                        ret
+                    );
+                    Ok(())
+                }
+                HookEvent::StackPush(v) => {
+                    let fn_name = ctx
+                        .get_function_name()
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    eprintln!(
+                        "[stack][depth {}][{}] PUSH {:?}",
+                        ctx.get_call_depth(),
+                        fn_name,
+                        v
+                    );
+                    Ok(())
+                }
+                HookEvent::StackPop(v) => {
+                    let fn_name = ctx
+                        .get_function_name()
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    eprintln!(
+                        "[stack][depth {}][{}] POP  {:?}",
+                        ctx.get_call_depth(),
+                        fn_name,
+                        v
+                    );
+                    Ok(())
+                }
+                _ => Ok(()),
             },
             0,
         );
@@ -285,14 +379,7 @@ async fn main() {
         rand::thread_rng().fill_bytes(&mut b);
         let instance_id = u64::from_le_bytes(b);
         // Construct engine
-        let engine = HoneyBadgerMpcEngine::new(
-            instance_id,
-            my_id,
-            n,
-            t,
-            8, 16,
-            net.clone(),
-        );
+        let engine = HoneyBadgerMpcEngine::new(instance_id, my_id, n, t, 8, 16, net.clone());
         let engine = match engine {
             Ok(eng) => eng,
             Err(e) => {

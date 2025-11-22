@@ -69,7 +69,7 @@ impl Array {
             // 0-indexed arrays: only indices >= 0 are valid for the dense part
             Value::I64(idx) if idx >= 0 => {
                 let idx_usize = idx as usize; // 0-based
-                // Update length_hint to the highest occupied numeric index + 1
+                                              // Update length_hint to the highest occupied numeric index + 1
                 self.length_hint = self.length_hint.max(idx_usize + 1);
                 if idx_usize < 32 {
                     // Small array optimization
@@ -140,29 +140,118 @@ impl std::hash::Hash for Closure {
     }
 }
 
+/// Default bit-length used when creating secret integers in the VM.
+pub const DEFAULT_SECRET_INT_BITS: usize = 64;
+/// Bit-length reserved for boolean secrets (0 or 1).
+pub const BOOLEAN_SECRET_INT_BITS: usize = 1;
+/// Default total bits for fixed-point representations.
+pub const DEFAULT_FIXED_POINT_TOTAL_BITS: usize = 64;
+/// Default fractional bits for fixed-point representations.
+pub const DEFAULT_FIXED_POINT_FRACTIONAL_BITS: usize = 16;
+
+/// Lightweight precision descriptor that mirrors `SecretFixedPoint` metadata.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FixedPointConfig {
+    pub total_bits: usize,
+    pub fractional_bits: usize,
+}
+
+impl FixedPointConfig {
+    pub fn new(total_bits: usize, fractional_bits: usize) -> Self {
+        assert!(
+            fractional_bits < total_bits,
+            "fractional bits ({}) must be lower than total bits ({})",
+            fractional_bits,
+            total_bits
+        );
+        Self {
+            total_bits,
+            fractional_bits,
+        }
+    }
+
+    pub fn total_bits(&self) -> usize {
+        self.total_bits
+    }
+
+    pub fn fractional_bits(&self) -> usize {
+        self.fractional_bits
+    }
+}
+
+impl Default for FixedPointConfig {
+    fn default() -> Self {
+        Self {
+            total_bits: DEFAULT_FIXED_POINT_TOTAL_BITS,
+            fractional_bits: DEFAULT_FIXED_POINT_FRACTIONAL_BITS,
+        }
+    }
+}
+
 /// Enum to represent the underlying type of a secret share
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ShareType {
-    /// 64-bit signed integer
-    Int(i64), // TODO: make this i64
-    /// 32-bit signed integer
-    I32(i32),
-    /// 16-bit signed integer
-    I16(i16),
-    /// 8-bit signed integer
-    I8(i8),
-    /// 8-bit unsigned integer
-    U8(u8),
-    /// 16-bit unsigned integer
-    U16(u16),
-    /// 32-bit unsigned integer
-    U32(u32),
-    /// 64-bit unsigned integer
-    U64(u64),
-    /// Fixed-point floating point number (represented as i64 internally for Eq/Hash)
-    Float(i64),
-    /// Boolean value
-    Bool(bool),
+    /// Secure integer shares (mirrors `SecretInt` in mpc-protocols)
+    SecretInt { bit_length: usize },
+    /// Secure fixed-point shares (mirrors `SecretFixedPoint` in mpc-protocols)
+    SecretFixedPoint { precision: FixedPointConfig },
+}
+
+impl ShareType {
+    pub fn secret_int(bit_length: usize) -> Self {
+        assert!(
+            bit_length > 0,
+            "secret integers require a positive bit length"
+        );
+        ShareType::SecretInt { bit_length }
+    }
+
+    pub fn boolean() -> Self {
+        ShareType::SecretInt {
+            bit_length: BOOLEAN_SECRET_INT_BITS,
+        }
+    }
+
+    pub fn default_secret_int() -> Self {
+        ShareType::SecretInt {
+            bit_length: DEFAULT_SECRET_INT_BITS,
+        }
+    }
+
+    pub fn secret_fixed_point_from_bits(total_bits: usize, fractional_bits: usize) -> Self {
+        ShareType::SecretFixedPoint {
+            precision: FixedPointConfig::new(total_bits, fractional_bits),
+        }
+    }
+
+    pub fn default_secret_fixed_point() -> Self {
+        ShareType::SecretFixedPoint {
+            precision: FixedPointConfig::default(),
+        }
+    }
+
+    pub fn bit_length(&self) -> Option<usize> {
+        match self {
+            ShareType::SecretInt { bit_length } => Some(*bit_length),
+            _ => None,
+        }
+    }
+
+    pub fn precision(&self) -> Option<FixedPointConfig> {
+        match self {
+            ShareType::SecretFixedPoint { precision } => Some(*precision),
+            _ => None,
+        }
+    }
+
+    pub fn is_boolean(&self) -> bool {
+        matches!(
+            self,
+            ShareType::SecretInt {
+                bit_length: BOOLEAN_SECRET_INT_BITS
+            }
+        )
+    }
 }
 
 /// Value types supported by the VM
@@ -208,7 +297,7 @@ pub enum Value {
     Closure(Arc<Closure>),
     /// Unit/void/nil value
     Unit,
-    /// Secret shared value (for SMPC) TODO: Change 
+    /// Secret shared value (for SMPC) TODO: Change
     Share(ShareType, Vec<u8>),
 }
 

@@ -16,6 +16,8 @@
 //!
 //! The current implementation uses the Quinn library for QUIC support.
 
+use ark_ff::Field;
+use async_trait::async_trait;
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
@@ -26,10 +28,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use stoffelnet::network_utils::{ClientId, Message, Network, NetworkError, Node, PartyId};
 use tokio::sync::Mutex;
-use ark_ff::Field;
-use async_trait::async_trait;
-use uuid::Uuid;
 use tracing::debug;
+use uuid::Uuid;
 
 /// Represents a connection to a peer (re-export of stoffelnet traits is not used directly here)
 pub trait PeerConnection: Send + Sync {
@@ -631,9 +631,8 @@ impl QuicNetworkManager {
 
         // Convert the certificate and key to DER format
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-        let key_der = PrivateKeyDer::Pkcs8(
-            PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
-        );
+        let key_der =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
 
         // Create a server crypto configuration with the certificate
         let mut server_crypto = rustls::ServerConfig::builder()
@@ -687,7 +686,9 @@ impl NetworkManager for QuicNetworkManager {
             }
 
             // Find the node ID for this address or generate a new one
-            let node_id = self.nodes.iter()
+            let node_id = self
+                .nodes
+                .iter()
                 .find(|node| node.address() == address)
                 .map(|node| node.id())
                 .unwrap_or_else(|| {
@@ -700,7 +701,10 @@ impl NetworkManager for QuicNetworkManager {
 
             // Store a clone of the connection in the connections hashmap
             let mut connections = self.connections.lock().await;
-            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), false)));
+            connections.insert(
+                node_id,
+                Box::new(QuicPeerConnection::new(connection.clone(), false)),
+            );
 
             // Return the original connection
             Ok(Box::new(QuicPeerConnection::new(connection, false)) as Box<dyn PeerConnection>)
@@ -733,7 +737,11 @@ impl NetworkManager for QuicNetworkManager {
             if let Ok((mut _send, mut recv)) = connection.accept_bi().await {
                 let mut buf = vec![0u8; 256];
                 if let Ok(Some(n)) = recv.read(&mut buf).await {
-                    let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+                    let line = String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
                     if let Some(rest) = line.strip_prefix("ROLE:SERVER:") {
                         if let Ok(id) = rest.trim().parse::<usize>() {
                             parsed_id = Some(id);
@@ -748,7 +756,10 @@ impl NetworkManager for QuicNetworkManager {
                 id
             });
             let mut connections = self.connections.lock().await;
-            connections.insert(node_id, Box::new(QuicPeerConnection::new(connection.clone(), true)));
+            connections.insert(
+                node_id,
+                Box::new(QuicPeerConnection::new(connection.clone(), true)),
+            );
 
             // Return the original connection
             Ok(Box::new(QuicPeerConnection::new(connection, true)) as Box<dyn PeerConnection>)
@@ -793,7 +804,14 @@ impl Network for QuicNetworkManager {
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect();
-        debug!("[MSG:SEND] from node {} to node {} ({} bytes, hex[0..{}]={})", self.node_id, recipient, message.len(), preview_len, hex_preview);
+        debug!(
+            "[MSG:SEND] from node {} to node {} ({} bytes, hex[0..{}]={})",
+            self.node_id,
+            recipient,
+            message.len(),
+            preview_len,
+            hex_preview
+        );
 
         // Get a mutable reference to the connection
         let connection = connections.get_mut(&recipient).unwrap();
@@ -801,11 +819,19 @@ impl Network for QuicNetworkManager {
         // Send the message
         match connection.send(message).await {
             Ok(_) => {
-                debug!("[MSG:SENT] from node {} to node {} ({} bytes)", self.node_id, recipient, message.len());
+                debug!(
+                    "[MSG:SENT] from node {} to node {} ({} bytes)",
+                    self.node_id,
+                    recipient,
+                    message.len()
+                );
                 Ok(message.len())
-            },
+            }
             Err(e) => {
-                debug!("[MSG:SEND-FAIL] from node {} to node {}: {}", self.node_id, recipient, e);
+                debug!(
+                    "[MSG:SEND-FAIL] from node {} to node {}: {}",
+                    self.node_id, recipient, e
+                );
                 Err(NetworkError::SendError)
             }
         }
@@ -823,8 +849,13 @@ impl Network for QuicNetworkManager {
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect();
-        debug!("[MSG:BROADCAST] from node {} to all ({} bytes, hex[0..{}]={})",
-               self.node_id, message.len(), preview_len, hex_preview);
+        debug!(
+            "[MSG:BROADCAST] from node {} to all ({} bytes, hex[0..{}]={})",
+            self.node_id,
+            message.len(),
+            preview_len,
+            hex_preview
+        );
 
         // Send the message to all nodes except self
         for node in &self.nodes {
@@ -837,17 +868,31 @@ impl Network for QuicNetworkManager {
                     // Send the message
                     match connection.send(message).await {
                         Ok(_) => {
-                            debug!("[MSG:BROADCAST-SENT] from node {} -> node {} ({} bytes)", self.node_id, node.id(), message.len());
+                            debug!(
+                                "[MSG:BROADCAST-SENT] from node {} -> node {} ({} bytes)",
+                                self.node_id,
+                                node.id(),
+                                message.len()
+                            );
                             total_bytes += message.len();
-                        },
+                        }
                         Err(e) => {
-                            debug!("[MSG:BROADCAST-FAIL] from node {} -> node {}: {}", self.node_id, node.id(), e);
+                            debug!(
+                                "[MSG:BROADCAST-FAIL] from node {} -> node {}: {}",
+                                self.node_id,
+                                node.id(),
+                                e
+                            );
                             // Continue with other nodes even if one fails
                         }
                     }
                 } else {
                     // Log a warning that we couldn't send the message to this node
-                    debug!("[MSG:BROADCAST-SKIP] from node {} -> node {}: no connection", self.node_id, node.id());
+                    debug!(
+                        "[MSG:BROADCAST-SKIP] from node {} -> node {}: no connection",
+                        self.node_id,
+                        node.id()
+                    );
                 }
             }
         }
@@ -880,7 +925,11 @@ impl Network for QuicNetworkManager {
         self.nodes.iter_mut().find(|node| node.id() == id)
     }
 
-    async fn send_to_client(&self, client: ClientId, message: &[u8]) -> Result<usize, NetworkError> {
+    async fn send_to_client(
+        &self,
+        client: ClientId,
+        message: &[u8],
+    ) -> Result<usize, NetworkError> {
         // Not used in current VM path
         Err(NetworkError::ClientNotFound(client))
     }

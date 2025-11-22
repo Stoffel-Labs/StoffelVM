@@ -13,14 +13,21 @@
 //! The VM state is the central component that orchestrates all aspects of
 //! program execution, from function calls to object manipulation.
 
-use stoffel_vm_types::activations::{ActivationRecord, ActivationRecordPool};
-use stoffel_vm_types::core_types::{Closure, ForeignObjectStorage, ObjectStore, ShareType, Upvalue, Value};
 use crate::foreign_functions::{ForeignFunctionContext, Function};
-use stoffel_vm_types::instructions::{Instruction, ResolvedInstruction};
+use crate::net::client_store::ClientInputStore;
 use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
+use ark_bls12_381::Fr;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
 use std::sync::Arc;
+use stoffel_vm_types::activations::{ActivationRecord, ActivationRecordPool};
+use stoffel_vm_types::core_types::{
+    Closure, ForeignObjectStorage, ObjectStore, ShareType, Upvalue, Value, BOOLEAN_SECRET_INT_BITS,
+};
+use stoffel_vm_types::instructions::{Instruction, ResolvedInstruction};
+use stoffelnet::network_utils::ClientId;
+use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 
 /// Runtime state of the virtual machine
 ///
@@ -49,6 +56,8 @@ pub struct VMState {
     pub hook_manager: HookManager,
     /// Optional MPC engine used to drive secret-sharing protocols
     pub mpc_engine: Option<Arc<dyn crate::net::mpc_engine::MpcEngine>>,
+    /// Per-VM client store used for loading MPC inputs
+    client_store: Arc<ClientInputStore>,
 }
 
 impl Default for VMState {
@@ -78,6 +87,7 @@ impl VMState {
             foreign_objects: ForeignObjectStorage::new(),
             hook_manager: HookManager::new(),
             mpc_engine: None,
+            client_store: Arc::new(ClientInputStore::new()),
         }
     }
 
@@ -278,11 +288,12 @@ impl VMState {
                 let current_record = self.activation_records.last().unwrap();
                 current_record.resolved_instructions.is_none()
             };
-            
+
             // If we need to resolve instructions, do it now
             if needs_resolving {
                 // Get the function and resolve its instructions if needed
-                if let Some(Function::VM(mut vm_func)) = self.functions.get(&function_name).cloned() {
+                if let Some(Function::VM(mut vm_func)) = self.functions.get(&function_name).cloned()
+                {
                     vm_func.resolve_instructions();
                     // Now update the activation record
                     let current_record = self.activation_records.last_mut().unwrap();
@@ -496,7 +507,11 @@ impl VMState {
 
                         // Only trigger hook if needed
                         if let Some(old) = old_value {
-                            let event = HookEvent::RegisterWrite(dest_reg, old, current_record.registers[dest_reg].clone());
+                            let event = HookEvent::RegisterWrite(
+                                dest_reg,
+                                old,
+                                current_record.registers[dest_reg].clone(),
+                            );
                             self.trigger_hook_with_snapshot(&event)?;
                         }
                     }
@@ -518,88 +533,97 @@ impl VMState {
 
                         // Only trigger hook if needed
                         if let Some(old) = old_value {
-                            let event = HookEvent::RegisterWrite(dest_reg, old, current_record.registers[dest_reg].clone());
+                            let event = HookEvent::RegisterWrite(
+                                dest_reg,
+                                old,
+                                current_record.registers[dest_reg].clone(),
+                            );
                             self.trigger_hook_with_snapshot(&event)?;
                         }
                     }
                 }
                 Instruction::MOV(dest_reg, src_reg) => {
                     // Get value from source register and prepare result value
-                    let result_value;
-                    {
+                    let result_value = {
                         let current_record = self.activation_records.last().unwrap();
                         let src_value = &current_record.registers[src_reg];
 
-                        // MOV with optional secret/clear conversion when MPC feature is enabled
-                        {
-                            result_value = if dest_reg >= 16 && src_reg < 16 {
-                                // Clear -> Secret
+                        if dest_reg >= 16 && src_reg < 16 {
+                            if matches!(src_value, Value::Share(_, _)) {
+                                src_value.clone()
+                            } else {
                                 let engine = {
-                                    let e = self
-                                        .mpc_engine()
-                                        .as_ref()
-                                        .cloned()
-                                        .ok_or_else(|| "MPC engine not configured".to_string())?;
+                                    let e =
+                                        self.mpc_engine().as_ref().cloned().ok_or_else(|| {
+                                            "MPC engine not configured".to_string()
+                                        })?;
                                     if !e.is_ready() {
-                                        return Err("MPC engine configured but not ready".to_string());
+                                        return Err(
+                                            "MPC engine configured but not ready".to_string()
+                                        );
                                     }
                                     e
                                 };
                                 match src_value {
                                     Value::I64(_) => {
-                                        let ty = ShareType::Int(0);
+                                        let ty = ShareType::default_secret_int();
                                         let bytes = engine
-                                            .input_share(ty.clone(), src_value)
+                                            .input_share(ty, src_value)
                                             .map_err(|e| format!("MPC input_share failed: {}", e))?;
                                         Value::Share(ty, bytes)
                                     }
                                     Value::Float(_) => {
-                                        let ty = ShareType::Float(0);
+                                        let ty = ShareType::default_secret_fixed_point();
                                         let bytes = engine
-                                            .input_share(ty.clone(), src_value)
+                                            .input_share(ty, src_value)
                                             .map_err(|e| format!("MPC input_share failed: {}", e))?;
                                         Value::Share(ty, bytes)
                                     }
                                     Value::Bool(_) => {
-                                        let ty = ShareType::Bool(false);
+                                        let ty = ShareType::boolean();
                                         let bytes = engine
-                                            .input_share(ty.clone(), src_value)
+                                            .input_share(ty, src_value)
                                             .map_err(|e| format!("MPC input_share failed: {}", e))?;
                                         Value::Share(ty, bytes)
                                     }
-                                    _ => return Err("Only primitive types (Int, Float, Bool) can be converted to shares".to_string()),
-                                }
-                            } else if dest_reg < 16 && src_reg >= 16 {
-                                // Secret -> Clear
-                                let engine = {
-                                    let e = self
-                                        .mpc_engine()
-                                        .as_ref()
-                                        .cloned()
-                                        .ok_or_else(|| "MPC engine not configured".to_string())?;
-                                    if !e.is_ready() {
-                                        return Err("MPC engine configured but not ready".to_string());
+                                    _ => {
+                                        return Err(
+                                            "Only primitive types (Int, Float, Bool) can be converted to shares"
+                                                .to_string(),
+                                        )
                                     }
-                                    e
-                                };
-                                match src_value {
-                                    Value::Share(ty @ ShareType::Int(_), data) => engine
-                                        .open_share(ty.clone(), data)
-                                        .map_err(|e| format!("MPC open_share failed: {}", e))?,
-                                    Value::Share(ty @ ShareType::Float(_), data) => engine
-                                        .open_share(ty.clone(), data)
-                                        .map_err(|e| format!("MPC open_share failed: {}", e))?,
-                                    Value::Share(ty @ ShareType::Bool(_), data) => engine
-                                        .open_share(ty.clone(), data)
-                                        .map_err(|e| format!("MPC open_share failed: {}", e))?,
-                                    _ => return Err("Invalid share type for conversion to clear value".to_string()),
                                 }
-                            } else {
-                                // Regular MOV
-                                src_value.clone()
+                            }
+                        } else if dest_reg < 16 && src_reg >= 16 {
+                            let engine = {
+                                let e = self
+                                    .mpc_engine()
+                                    .as_ref()
+                                    .cloned()
+                                    .ok_or_else(|| "MPC engine not configured".to_string())?;
+                                if !e.is_ready() {
+                                    return Err("MPC engine configured but not ready".to_string());
+                                }
+                                e
                             };
+                            match src_value {
+                                Value::Share(ty @ ShareType::SecretInt { .. }, data) => engine
+                                    .open_share(*ty, data)
+                                    .map_err(|e| format!("MPC open_share failed: {}", e))?,
+                                Value::Share(ty @ ShareType::SecretFixedPoint { .. }, data) => {
+                                    engine
+                                        .open_share(*ty, data)
+                                        .map_err(|e| format!("MPC open_share failed: {}", e))?
+                                }
+                                _ => {
+                                    return Err("Invalid share type for conversion to clear value"
+                                        .to_string())
+                                }
+                            }
+                        } else {
+                            src_value.clone()
                         }
-                    }
+                    };
 
                     // Update destination register
                     {
@@ -617,7 +641,8 @@ impl VMState {
                             let read_event = HookEvent::RegisterRead(src_reg, src_value);
                             self.trigger_hook_with_snapshot(&read_event)?;
 
-                            let write_event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
+                            let write_event =
+                                HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.trigger_hook_with_snapshot(&write_event)?;
                         } else {
                             // Just update the register without hooks
@@ -647,10 +672,14 @@ impl VMState {
 
                             // Only trigger hook if needed
                             if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
                                 self.hook_manager.trigger(&event, self)?;
                             }
-                        },
+                        }
                         (Value::I32(a), Value::I32(b)) => {
                             // Create result directly
                             let result = *a + *b;
@@ -667,10 +696,14 @@ impl VMState {
 
                             // Only trigger hook if needed
                             if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
                                 self.hook_manager.trigger(&event, self)?;
                             }
-                        },
+                        }
                         (Value::I16(a), Value::I16(b)) => {
                             // Create result directly
                             let result = *a + *b;
@@ -687,10 +720,14 @@ impl VMState {
 
                             // Only trigger hook if needed
                             if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
                                 self.hook_manager.trigger(&event, self)?;
                             }
-                        },
+                        }
                         (Value::I8(a), Value::I8(b)) => {
                             // Create result directly
                             let result = *a + *b;
@@ -707,10 +744,14 @@ impl VMState {
 
                             // Only trigger hook if needed
                             if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
                                 self.hook_manager.trigger(&event, self)?;
                             }
-                        },
+                        }
                         (Value::U8(a), Value::U8(b)) => {
                             // Create result directly
                             let result = *a + *b;
@@ -727,10 +768,14 @@ impl VMState {
 
                             // Only trigger hook if needed
                             if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
                                 self.hook_manager.trigger(&event, self)?;
                             }
-                        },
+                        }
                         (Value::U16(a), Value::U16(b)) => {
                             // Create result directly
                             let result = *a + *b;
@@ -747,10 +792,14 @@ impl VMState {
 
                             // Only trigger hook if needed
                             if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
                                 self.hook_manager.trigger(&event, self)?;
                             }
-                        },
+                        }
                         (Value::U32(a), Value::U32(b)) => {
                             // Create result directly
                             let result = *a + *b;
@@ -767,10 +816,14 @@ impl VMState {
 
                             // Only trigger hook if needed
                             if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
                                 self.hook_manager.trigger(&event, self)?;
                             }
-                        },
+                        }
                         (Value::U64(a), Value::U64(b)) => {
                             // Create result directly
                             let result = *a + *b;
@@ -787,14 +840,88 @@ impl VMState {
 
                             // Only trigger hook if needed
                             if let Some(old) = old_value {
-                                let event = HookEvent::RegisterWrite(dest_reg, old, record.registers[dest_reg].clone());
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
                                 self.hook_manager.trigger(&event, self)?;
                             }
-                        },
+                        }
                         // Share + Share (offline addition)
-                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
+                        (
+                            Value::Share(ty @ ShareType::SecretInt { .. }, data1),
+                            Value::Share(ShareType::SecretInt { .. }, data2),
+                        ) => {
+                            let bytes = Self::add_serialized_shares(data1, data2)?;
+                            let old_value = if hooks_enabled {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+                            record.registers[dest_reg] = Value::Share(ty.clone(), bytes);
+
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                        }
+                        (
+                            Value::Share(ty @ ShareType::SecretFixedPoint { .. }, data1),
+                            Value::Share(ShareType::SecretFixedPoint { .. }, data2),
+                        ) => {
+                            let bytes = Self::add_serialized_shares(data1, data2)?;
+                            let old_value = if hooks_enabled {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+                            record.registers[dest_reg] = Value::Share(ty.clone(), bytes);
+
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                        }
+                        (
+                            Value::Share(
+                                ty @ ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data1,
+                            ),
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data2,
+                            ),
+                        ) => {
+                            let bytes = Self::add_serialized_shares(data1, data2)?;
+                            let old_value = if hooks_enabled {
+                                Some(record.registers[dest_reg].clone())
+                            } else {
+                                None
+                            };
+                            record.registers[dest_reg] = Value::Share(ty.clone(), bytes);
+
+                            if let Some(old) = old_value {
+                                let event = HookEvent::RegisterWrite(
+                                    dest_reg,
+                                    old,
+                                    record.registers[dest_reg].clone(),
+                                );
+                                self.hook_manager.trigger(&event, self)?;
+                            }
+                        }
                         _ => return Err("Type error in ADD operation".to_string()),
                     }
                 }
@@ -811,7 +938,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::I32(a), Value::I32(b)) => {
                             let result_value = Value::I32(a - b);
                             let old_value = record.registers[dest_reg].clone();
@@ -819,7 +946,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::I16(a), Value::I16(b)) => {
                             let result_value = Value::I16(a - b);
                             let old_value = record.registers[dest_reg].clone();
@@ -827,7 +954,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::I8(a), Value::I8(b)) => {
                             let result_value = Value::I8(a - b);
                             let old_value = record.registers[dest_reg].clone();
@@ -835,7 +962,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U8(a), Value::U8(b)) => {
                             let result_value = Value::U8(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
                             let old_value = record.registers[dest_reg].clone();
@@ -843,7 +970,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U16(a), Value::U16(b)) => {
                             let result_value = Value::U16(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
                             let old_value = record.registers[dest_reg].clone();
@@ -851,7 +978,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U32(a), Value::U32(b)) => {
                             let result_value = Value::U32(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
                             let old_value = record.registers[dest_reg].clone();
@@ -859,7 +986,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U64(a), Value::U64(b)) => {
                             let result_value = Value::U64(a.saturating_sub(*b)); // Use saturating_sub to avoid underflow
                             let old_value = record.registers[dest_reg].clone();
@@ -867,11 +994,30 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         // Share - Share (offline subtraction)
-                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
+                        (
+                            Value::Share(ShareType::SecretInt { .. }, data1),
+                            Value::Share(ShareType::SecretInt { .. }, data2),
+                        ) => todo!(),
+                        (
+                            Value::Share(ShareType::SecretFixedPoint { .. }, data1),
+                            Value::Share(ShareType::SecretFixedPoint { .. }, data2),
+                        ) => todo!(),
+                        (
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data1,
+                            ),
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data2,
+                            ),
+                        ) => todo!(),
                         _ => return Err("Type error in SUB operation".to_string()),
                     }
                 }
@@ -880,7 +1026,10 @@ impl VMState {
                     // while holding a mutable borrow of the activation record.
                     let (left, right) = {
                         let record = self.activation_records.last().unwrap();
-                        (record.registers[src1_reg].clone(), record.registers[src2_reg].clone())
+                        (
+                            record.registers[src1_reg].clone(),
+                            record.registers[src2_reg].clone(),
+                        )
                     };
 
                     // Compute the result value without holding a mutable borrow of the record
@@ -894,7 +1043,10 @@ impl VMState {
                         (Value::U32(a), Value::U32(b)) => Value::U32(a * *b),
                         (Value::U64(a), Value::U64(b)) => Value::U64(a * *b),
                         // Share * Share (online multiplication)
-                        (Value::Share(ty1 @ ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => {
+                        (
+                            Value::Share(ty1 @ ShareType::SecretInt { .. }, data1),
+                            Value::Share(ShareType::SecretInt { .. }, data2),
+                        ) => {
                             let engine = self
                                 .mpc_engine()
                                 .as_ref()
@@ -908,7 +1060,10 @@ impl VMState {
                                 .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
                             Value::Share(ty1.clone(), product)
                         }
-                        (Value::Share(ty1 @ ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => {
+                        (
+                            Value::Share(ty1 @ ShareType::SecretFixedPoint { .. }, data1),
+                            Value::Share(ShareType::SecretFixedPoint { .. }, data2),
+                        ) => {
                             let engine = self
                                 .mpc_engine()
                                 .as_ref()
@@ -922,7 +1077,20 @@ impl VMState {
                                 .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
                             Value::Share(ty1.clone(), product)
                         }
-                        (Value::Share(ty1 @ ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => {
+                        (
+                            Value::Share(
+                                ty1 @ ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data1,
+                            ),
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data2,
+                            ),
+                        ) => {
                             let engine = self
                                 .mpc_engine()
                                 .as_ref()
@@ -932,9 +1100,9 @@ impl VMState {
                                 return Err("MPC engine configured but not ready".to_string());
                             }
                             let product = engine
-                                .multiply_share(ty1.clone(), data1, data2)
+                                .multiply_share(*ty1, data1, data2)
                                 .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
-                            Value::Share(ty1.clone(), product)
+                            Value::Share(*ty1, product)
                         }
                         _ => return Err("Type error in MUL operation".to_string()),
                     };
@@ -963,7 +1131,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::I32(a), Value::I32(b)) => {
                             if *b == 0 {
                                 return Err("Division by zero".to_string());
@@ -974,7 +1142,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::I16(a), Value::I16(b)) => {
                             if *b == 0 {
                                 return Err("Division by zero".to_string());
@@ -985,7 +1153,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::I8(a), Value::I8(b)) => {
                             if *b == 0 {
                                 return Err("Division by zero".to_string());
@@ -996,7 +1164,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U8(a), Value::U8(b)) => {
                             if *b == 0 {
                                 return Err("Division by zero".to_string());
@@ -1007,7 +1175,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U16(a), Value::U16(b)) => {
                             if *b == 0 {
                                 return Err("Division by zero".to_string());
@@ -1018,7 +1186,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U32(a), Value::U32(b)) => {
                             if *b == 0 {
                                 return Err("Division by zero".to_string());
@@ -1029,7 +1197,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U64(a), Value::U64(b)) => {
                             if *b == 0 {
                                 return Err("Division by zero".to_string());
@@ -1040,10 +1208,16 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         // Share / Share (online division)
-                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
+                        (
+                            Value::Share(ShareType::SecretInt { .. }, data1),
+                            Value::Share(ShareType::SecretInt { .. }, data2),
+                        ) => todo!(),
+                        (
+                            Value::Share(ShareType::SecretFixedPoint { .. }, data1),
+                            Value::Share(ShareType::SecretFixedPoint { .. }, data2),
+                        ) => todo!(),
                         _ => return Err("Type error in DIV operation".to_string()),
                     }
                 }
@@ -1063,7 +1237,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::I32(a), Value::I32(b)) => {
                             if *b == 0 {
                                 return Err("Modulo by zero".to_string());
@@ -1074,7 +1248,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::I16(a), Value::I16(b)) => {
                             if *b == 0 {
                                 return Err("Modulo by zero".to_string());
@@ -1085,7 +1259,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::I8(a), Value::I8(b)) => {
                             if *b == 0 {
                                 return Err("Modulo by zero".to_string());
@@ -1096,7 +1270,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U8(a), Value::U8(b)) => {
                             if *b == 0 {
                                 return Err("Modulo by zero".to_string());
@@ -1107,7 +1281,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U16(a), Value::U16(b)) => {
                             if *b == 0 {
                                 return Err("Modulo by zero".to_string());
@@ -1118,7 +1292,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U32(a), Value::U32(b)) => {
                             if *b == 0 {
                                 return Err("Modulo by zero".to_string());
@@ -1129,7 +1303,7 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         (Value::U64(a), Value::U64(b)) => {
                             if *b == 0 {
                                 return Err("Modulo by zero".to_string());
@@ -1140,10 +1314,16 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         // Share % Share (online modulo)
-                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => todo!(),
+                        (
+                            Value::Share(ShareType::SecretInt { .. }, data1),
+                            Value::Share(ShareType::SecretInt { .. }, data2),
+                        ) => todo!(),
+                        (
+                            Value::Share(ShareType::SecretFixedPoint { .. }, data1),
+                            Value::Share(ShareType::SecretFixedPoint { .. }, data2),
+                        ) => todo!(),
                         // Modulo is not defined for boolean shares in GF(2)
                         _ => return Err("Type error in MOD operation".to_string()),
                     }
@@ -1157,8 +1337,24 @@ impl VMState {
                         (Value::I64(a), Value::I64(b)) => Value::I64(a & b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
                         // Share & Share (bitwise AND for shares)
-                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
+                        (
+                            Value::Share(ShareType::SecretInt { .. }, data1),
+                            Value::Share(ShareType::SecretInt { .. }, data2),
+                        ) => todo!(),
+                        (
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data1,
+                            ),
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data2,
+                            ),
+                        ) => todo!(),
                         _ => return Err("Type error in AND operation".to_string()),
                     };
 
@@ -1177,8 +1373,24 @@ impl VMState {
                         (Value::I64(a), Value::I64(b)) => Value::I64(a | b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
                         // Share | Share (bitwise OR for shares)
-                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
+                        (
+                            Value::Share(ShareType::SecretInt { .. }, data1),
+                            Value::Share(ShareType::SecretInt { .. }, data2),
+                        ) => todo!(),
+                        (
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data1,
+                            ),
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data2,
+                            ),
+                        ) => todo!(),
                         _ => return Err("Type error in OR operation".to_string()),
                     };
 
@@ -1197,8 +1409,24 @@ impl VMState {
                         (Value::I64(a), Value::I64(b)) => Value::I64(a ^ b),
                         (Value::Bool(a), Value::Bool(b)) => Value::Bool(a ^ b),
                         // Share ^ Share (bitwise XOR for shares)
-                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => todo!(),
-                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => todo!(),
+                        (
+                            Value::Share(ShareType::SecretInt { .. }, data1),
+                            Value::Share(ShareType::SecretInt { .. }, data2),
+                        ) => todo!(),
+                        (
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data1,
+                            ),
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data2,
+                            ),
+                        ) => todo!(),
                         _ => return Err("Type error in XOR operation".to_string()),
                     };
 
@@ -1216,8 +1444,13 @@ impl VMState {
                         Value::I64(a) => Value::I64(!a),
                         Value::Bool(a) => Value::Bool(!a),
                         // ~Share (bitwise NOT for shares)
-                        Value::Share(ShareType::Int(_), data) => todo!(),
-                        Value::Share(ShareType::Bool(_), data) => todo!(),
+                        Value::Share(ShareType::SecretInt { .. }, data) => todo!(),
+                        Value::Share(
+                            ShareType::SecretInt {
+                                bit_length: BOOLEAN_SECRET_INT_BITS,
+                            },
+                            data,
+                        ) => todo!(),
                         _ => return Err("Type error in NOT operation".to_string()),
                     };
 
@@ -1240,9 +1473,9 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         // Share << Int (shift left for shares)
-                        (Value::Share(ShareType::Int(_), data), Value::I64(b)) => todo!(),
+                        (Value::Share(ShareType::SecretInt { .. }, data), Value::I64(b)) => todo!(),
                         // Share << Share is not supported (amount must be a clear value)
                         _ => return Err("Type error in SHL operation".to_string()),
                     }
@@ -1260,9 +1493,9 @@ impl VMState {
 
                             let event = HookEvent::RegisterWrite(dest_reg, old_value, result_value);
                             self.hook_manager.trigger(&event, self)?;
-                        },
+                        }
                         // Share >> Int (shift right for shares)
-                        (Value::Share(ShareType::Int(_), data), Value::I64(b)) => todo!(),
+                        (Value::Share(ShareType::SecretInt { .. }, data), Value::I64(b)) => todo!(),
                         // Share >> Share is not supported (amount must be a clear value)
                         _ => return Err("Type error in SHR operation".to_string()),
                     }
@@ -1719,7 +1952,7 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         (Value::I32(a), Value::I32(b)) => {
                             if a < b {
                                 -1
@@ -1728,7 +1961,7 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         (Value::I16(a), Value::I16(b)) => {
                             if a < b {
                                 -1
@@ -1737,7 +1970,7 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         (Value::I8(a), Value::I8(b)) => {
                             if a < b {
                                 -1
@@ -1746,7 +1979,7 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         (Value::U8(a), Value::U8(b)) => {
                             if a < b {
                                 -1
@@ -1755,7 +1988,7 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         (Value::U16(a), Value::U16(b)) => {
                             if a < b {
                                 -1
@@ -1764,7 +1997,7 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         (Value::U32(a), Value::U32(b)) => {
                             if a < b {
                                 -1
@@ -1773,7 +2006,7 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         (Value::U64(a), Value::U64(b)) => {
                             if a < b {
                                 -1
@@ -1782,7 +2015,7 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         (Value::String(a), Value::String(b)) => {
                             if a < b {
                                 -1
@@ -1791,14 +2024,17 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         (Value::Bool(a), Value::Bool(b)) => match (a, b) {
                             (false, true) => -1,
                             (true, false) => 1,
                             _ => 0,
                         },
                         // Share comparison (Int)
-                        (Value::Share(ShareType::Int(_), data1), Value::Share(ShareType::Int(_), data2)) => {
+                        (
+                            Value::Share(ShareType::SecretInt { .. }, data1),
+                            Value::Share(ShareType::SecretInt { .. }, data2),
+                        ) => {
                             // TODO: implement this
                             let mut bytes1 = [0u8; 8];
                             let mut bytes2 = [0u8; 8];
@@ -1815,9 +2051,12 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         // Share comparison (Float)
-                        (Value::Share(ShareType::Float(_), data1), Value::Share(ShareType::Float(_), data2)) => {
+                        (
+                            Value::Share(ShareType::SecretFixedPoint { .. }, data1),
+                            Value::Share(ShareType::SecretFixedPoint { .. }, data2),
+                        ) => {
                             // For fixed-point values
                             let mut bytes1 = [0u8; 8];
                             let mut bytes2 = [0u8; 8];
@@ -1834,9 +2073,22 @@ impl VMState {
                             } else {
                                 0
                             }
-                        },
+                        }
                         // Share comparison (Bool)
-                        (Value::Share(ShareType::Bool(_), data1), Value::Share(ShareType::Bool(_), data2)) => {
+                        (
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data1,
+                            ),
+                            Value::Share(
+                                ShareType::SecretInt {
+                                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                                },
+                                data2,
+                            ),
+                        ) => {
                             // For boolean values
                             let bit1 = data1[0] != 0;
                             let bit2 = data2[0] != 0;
@@ -1846,7 +2098,7 @@ impl VMState {
                                 (true, false) => 1,
                                 _ => 0,
                             }
-                        },
+                        }
                         _ => return Err(format!("Cannot compare {:?} and {:?}", val1, val2)),
                     };
 
@@ -1898,14 +2150,10 @@ impl VMState {
     }
 }
 
-
 // --- MPC engine integration helpers ---
 impl VMState {
     /// Attach an MPC engine to the VM state. Call `engine.start()` externally before use.
-    pub fn set_mpc_engine(
-        &mut self,
-        engine: Arc<dyn crate::net::mpc_engine::MpcEngine>,
-    ) {
+    pub fn set_mpc_engine(&mut self, engine: Arc<dyn crate::net::mpc_engine::MpcEngine>) {
         self.mpc_engine = Some(engine);
     }
 
@@ -1923,6 +2171,26 @@ impl VMState {
         }
     }
 
+    /// Get the number of clients that have provided inputs.
+    pub fn client_store_len(&self) -> usize {
+        self.client_store.len()
+    }
+
+    /// Get a sorted list of client IDs.
+    pub fn client_ids(&self) -> Vec<ClientId> {
+        self.client_store.client_ids()
+    }
+
+    /// Get a client ID by index (sorted order).
+    pub fn client_id_at_index(&self, index: usize) -> Option<ClientId> {
+        self.client_store.client_id_at(index)
+    }
+
+    /// Access the underlying client store.
+    pub fn client_store(&self) -> Arc<ClientInputStore> {
+        self.client_store.clone()
+    }
+
     /// Load a client's input share from the global client store
     ///
     /// # Arguments
@@ -1931,12 +2199,9 @@ impl VMState {
     ///
     /// # Returns
     /// A `Value::Share` containing the serialized share, or an error if not found
-    pub fn load_client_share(&self, client_id: stoffelnet::network_utils::ClientId, index: usize) -> Result<Value, String> {
-        use ark_serialize::CanonicalSerialize;
-        use crate::net::client_store::get_global_store;
-
-        let store = get_global_store();
-        let share = store
+    pub fn load_client_share(&self, client_id: ClientId, index: usize) -> Result<Value, String> {
+        let share = self
+            .client_store
             .get_client_share(client_id, index)
             .ok_or_else(|| format!("No share found for client {} at index {}", client_id, index))?;
 
@@ -1946,7 +2211,7 @@ impl VMState {
             .serialize_compressed(&mut share_bytes)
             .map_err(|e| format!("Failed to serialize share: {}", e))?;
 
-        Ok(Value::Share(ShareType::Int(64), share_bytes))
+        Ok(Value::Share(ShareType::secret_int(64), share_bytes))
     }
 
     /// Load all of a client's input shares from the global client store
@@ -1956,12 +2221,9 @@ impl VMState {
     ///
     /// # Returns
     /// A vector of `Value::Share` containing all shares for this client
-    pub fn load_client_inputs(&self, client_id: stoffelnet::network_utils::ClientId) -> Result<Vec<Value>, String> {
-        use ark_serialize::CanonicalSerialize;
-        use crate::net::client_store::get_global_store;
-
-        let store = get_global_store();
-        let shares = store
+    pub fn load_client_inputs(&self, client_id: ClientId) -> Result<Vec<Value>, String> {
+        let shares = self
+            .client_store
             .get_client_input(client_id)
             .ok_or_else(|| format!("No inputs found for client {}", client_id))?;
 
@@ -1971,23 +2233,47 @@ impl VMState {
             share
                 .serialize_compressed(&mut share_bytes)
                 .map_err(|e| format!("Failed to serialize share: {}", e))?;
-            values.push(Value::Share(ShareType::Int(64), share_bytes));
+            values.push(Value::Share(ShareType::secret_int(64), share_bytes));
         }
 
         Ok(values)
     }
 
+    fn decode_share_bytes(bytes: &[u8]) -> Result<RobustShare<Fr>, String> {
+        RobustShare::<Fr>::deserialize_compressed(bytes)
+            .map_err(|e| format!("Failed to decode share bytes: {}", e))
+    }
+
+    fn encode_share_bytes(share: &RobustShare<Fr>) -> Result<Vec<u8>, String> {
+        let mut encoded = Vec::new();
+        share
+            .serialize_compressed(&mut encoded)
+            .map_err(|e| format!("Failed to encode share bytes: {}", e))?;
+        Ok(encoded)
+    }
+
+    fn add_serialized_shares(left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
+        let mut lhs = Self::decode_share_bytes(left)?;
+        let rhs = Self::decode_share_bytes(right)?;
+
+        if lhs.id != rhs.id {
+            return Err("Cannot add shares with different party identifiers".to_string());
+        }
+        if lhs.degree != rhs.degree {
+            return Err("Cannot add shares with different polynomial degrees".to_string());
+        }
+
+        lhs.share[0] += rhs.share[0];
+        Self::encode_share_bytes(&lhs)
+    }
+
     /// Check if a client has provided inputs in the global store
-    pub fn has_client_input(&self, client_id: stoffelnet::network_utils::ClientId) -> bool {
-        use crate::net::client_store::get_global_store;
-        let store = get_global_store();
-        store.has_client_input(client_id)
+    pub fn has_client_input(&self, client_id: ClientId) -> bool {
+        self.client_store.has_client_input(client_id)
     }
 
     /// Get the number of shares a client has provided
-    pub fn get_client_input_count(&self, client_id: stoffelnet::network_utils::ClientId) -> usize {
-        use crate::net::client_store::get_global_store;
-        let store = get_global_store();
-        store.get_client_input_count(client_id)
+    pub fn get_client_input_count(&self, client_id: ClientId) -> usize {
+        self.client_store.get_client_input_count(client_id)
     }
 }

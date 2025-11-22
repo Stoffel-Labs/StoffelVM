@@ -1,9 +1,9 @@
+use std::collections::HashMap;
 use std::time::Instant;
 use stoffel_vm::core_vm::VirtualMachine;
+use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
-use stoffel_vm_types::core_types::Value;
-use std::collections::HashMap;
 
 fn main() {
     println!("Running StoffelVM performance benchmark...");
@@ -14,7 +14,7 @@ fn main() {
     // Create a benchmark function that performs a lot of arithmetic operations
     let mut labels = HashMap::new();
     labels.insert("loop_start".to_string(), 1);
-    labels.insert("loop_end".to_string(), 7);
+    labels.insert("loop_end".to_string(), 8);
 
     let benchmark_function = VMFunction::new(
         "benchmark".to_string(),
@@ -62,7 +62,10 @@ fn main() {
         println!("Benchmark with {} iterations:", iter_count);
         println!("  Result: {:?}", result);
         println!("  Time: {:?}", duration);
-        println!("  Instructions per second: {:.2}", iter_count as f64 / duration.as_secs_f64());
+        println!(
+            "  Instructions per second: {:.2}",
+            iter_count as f64 / duration.as_secs_f64()
+        );
         println!();
     }
 
@@ -86,7 +89,10 @@ fn main() {
         println!("Benchmark with {} iterations:", iter_count);
         println!("  Result: {:?}", result);
         println!("  Time: {:?}", duration);
-        println!("  Instructions per second: {:.2}", iter_count as f64 / duration.as_secs_f64());
+        println!(
+            "  Instructions per second: {:.2}",
+            iter_count as f64 / duration.as_secs_f64()
+        );
         println!();
     }
 }
