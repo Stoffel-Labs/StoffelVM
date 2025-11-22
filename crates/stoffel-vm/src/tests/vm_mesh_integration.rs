@@ -637,40 +637,41 @@ fn build_average_salary_program() -> (Vec<Instruction>, HashMap<String, usize>) 
     instructions.push(Instruction::MOV(1, 0));
 
     instructions.push(Instruction::LDI(0, Value::I64(0)));
+    instructions.push(Instruction::MOV(2, 0));
     instructions.push(Instruction::MOV(16, 0));
-    instructions.push(Instruction::LDI(0, Value::I64(0)));
     instructions.push(Instruction::MOV(17, 0));
+    instructions.push(Instruction::LDI(3, Value::I64(1))); // constant 1 for increments
 
-    for idx in 0..MAX_AVG_CLIENTS {
-        let process_label = format!("avg_process_{}", idx);
-        let skip_label = format!("avg_skip_{}", idx);
+    let loop_label = "avg_loop_start".to_string();
+    let process_label = "avg_process".to_string();
+    let done_label = "avg_done".to_string();
 
-        instructions.push(Instruction::LDI(0, Value::I64(idx as i64)));
-        instructions.push(Instruction::CMP(0, 1));
-        instructions.push(Instruction::JMPLT(process_label.clone()));
-        instructions.push(Instruction::JMP(skip_label.clone()));
+    labels.insert(loop_label.clone(), instructions.len());
+    instructions.push(Instruction::CMP(2, 1));
+    instructions.push(Instruction::JMPLT(process_label.clone()));
+    instructions.push(Instruction::JMP(done_label.clone()));
 
-        labels.insert(process_label.clone(), instructions.len());
+    labels.insert(process_label.clone(), instructions.len());
+    instructions.push(Instruction::MOV(0, 2));
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.push(Instruction::LDI(1, Value::I64(0)));
+    instructions.push(Instruction::PUSHARG(1));
+    instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
+    instructions.push(Instruction::MOV(18, 0));
 
-        instructions.push(Instruction::LDI(0, Value::I64(idx as i64)));
-        instructions.push(Instruction::PUSHARG(0));
-        instructions.push(Instruction::LDI(1, Value::I64(0)));
-        instructions.push(Instruction::PUSHARG(1));
-        instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
-        instructions.push(Instruction::MOV(18, 0));
+    instructions.push(Instruction::MOV(0, 2));
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.push(Instruction::LDI(1, Value::I64(1)));
+    instructions.push(Instruction::PUSHARG(1));
+    instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
+    instructions.push(Instruction::MOV(19, 0));
 
-        instructions.push(Instruction::LDI(0, Value::I64(idx as i64)));
-        instructions.push(Instruction::PUSHARG(0));
-        instructions.push(Instruction::LDI(1, Value::I64(1)));
-        instructions.push(Instruction::PUSHARG(1));
-        instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
-        instructions.push(Instruction::MOV(19, 0));
+    instructions.push(Instruction::ADD(16, 16, 18));
+    instructions.push(Instruction::ADD(17, 17, 19));
+    instructions.push(Instruction::ADD(2, 2, 3));
+    instructions.push(Instruction::JMP(loop_label.clone()));
 
-        instructions.push(Instruction::ADD(16, 16, 18));
-        instructions.push(Instruction::ADD(17, 17, 19));
-
-        labels.insert(skip_label.clone(), instructions.len());
-    }
+    labels.insert(done_label.clone(), instructions.len());
 
     instructions.push(Instruction::MOV(2, 16));
     instructions.push(Instruction::MOV(3, 17));
