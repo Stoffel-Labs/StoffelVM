@@ -1,14 +1,14 @@
 // tests/p2p_integration.rs
 //! Integration tests for QUIC-based peer-to-peer networking.
 
+use crate::net::{NetworkManager, PeerConnection, QuicNetworkManager};
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::net::{NetworkManager, PeerConnection, QuicNetworkManager};
-use tokio::time::{sleep, timeout, Duration};
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use std::sync::Arc;
+use tokio::time::{sleep, timeout, Duration};
 
 static INIT: Once = Once::new();
 
@@ -179,7 +179,10 @@ async fn test_ping_pong_three_servers() {
     // Verify results
     for (client_id, server_results) in latency_results.iter().enumerate() {
         for (server_id, latencies) in server_results.iter().enumerate() {
-            println!("Client {} to Server {} latencies: {:?}", client_id, server_id, latencies);
+            println!(
+                "Client {} to Server {} latencies: {:?}",
+                client_id, server_id, latencies
+            );
 
             // Verify we have 3 latency measurements per server
             assert_eq!(latencies.len(), 3, "Should have 3 latency measurements");
@@ -198,7 +201,9 @@ async fn test_ping_pong_three_servers() {
 }
 
 /// Start three ping-pong servers
-async fn start_ping_pong_servers(server_addrs: &[SocketAddr; 3]) -> Vec<tokio::task::JoinHandle<()>> {
+async fn start_ping_pong_servers(
+    server_addrs: &[SocketAddr; 3],
+) -> Vec<tokio::task::JoinHandle<()>> {
     let mut server_handles = Vec::new();
 
     for (i, &addr) in server_addrs.iter().enumerate() {
@@ -272,10 +277,10 @@ async fn perform_ping_pong_exchanges(server_addrs: &[SocketAddr; 3]) -> Vec<Vec<
     for (client_id, client) in clients.iter_mut().enumerate() {
         for (server_id, &server_addr) in server_addrs.iter().enumerate() {
             // Connect to server
-            let mut connection = client
-                .connect(server_addr)
-                .await
-                .expect(&format!("Client {} should connect to server {}", client_id, server_id));
+            let mut connection = client.connect(server_addr).await.expect(&format!(
+                "Client {} should connect to server {}",
+                client_id, server_id
+            ));
 
             // Perform 3 ping-pong exchanges
             for seq in 0..3 {
@@ -286,8 +291,7 @@ async fn perform_ping_pong_exchanges(server_addrs: &[SocketAddr; 3]) -> Vec<Vec<
                 };
 
                 // Serialize and send ping
-                let ping_data = bincode::serialize(&ping)
-                    .expect("Should serialize ping message");
+                let ping_data = bincode::serialize(&ping).expect("Should serialize ping message");
 
                 connection
                     .send(&ping_data)
@@ -303,14 +307,15 @@ async fn perform_ping_pong_exchanges(server_addrs: &[SocketAddr; 3]) -> Vec<Vec<
                 let pong_received_time = current_time_ms();
 
                 // Deserialize pong
-                let pong: PongMessage = bincode::deserialize(&pong_data)
-                    .expect("Should deserialize pong message");
+                let pong: PongMessage =
+                    bincode::deserialize(&pong_data).expect("Should deserialize pong message");
 
                 // Calculate server processing time (time between receiving ping and sending pong)
                 let server_processing_time = pong.sent_at - pong.received_at;
 
                 // Calculate latency
-                let latency = calculate_latency(ping.sent_at, pong_received_time, server_processing_time);
+                let latency =
+                    calculate_latency(ping.sent_at, pong_received_time, server_processing_time);
 
                 // Store latency result
                 latency_results[client_id][server_id].push(latency);

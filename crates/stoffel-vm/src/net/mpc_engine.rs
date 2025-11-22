@@ -13,5 +13,7 @@ pub trait MpcEngine: Send + Sync {
     fn input_share(&self, ty: ShareType, clear: &Value) -> Result<Vec<u8>, String>;
     fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String>;
     fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String>;
-    fn shutdown(&self) -> () { () }
+    fn shutdown(&self) -> () {
+        ()
+    }
 }

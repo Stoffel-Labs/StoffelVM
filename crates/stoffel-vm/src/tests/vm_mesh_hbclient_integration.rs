@@ -83,7 +83,11 @@ async fn test_vm_mesh_hbclient_integration() {
 
     // Prepare server addresses for clients
     let server_addresses: Vec<SocketAddr> = (0..n_parties)
-        .map(|i| format!("127.0.0.1:{}", base_port + i as u16).parse().unwrap())
+        .map(|i| {
+            format!("127.0.0.1:{}", base_port + i as u16)
+                .parse()
+                .unwrap()
+        })
         .collect();
 
     // Step 2: Start servers and spawn message processors
@@ -159,7 +163,10 @@ async fn test_vm_mesh_hbclient_integration() {
                 match res {
                     Ok(Ok(())) => Ok::<(), String>(()),
                     Ok(Err(e)) => Err(format!("Preprocessing error: {e:?}")),
-                    Err(_) => Err(format!("Preprocessing timeout after {:?}", preprocessing_timeout)),
+                    Err(_) => Err(format!(
+                        "Preprocessing timeout after {:?}",
+                        preprocessing_timeout
+                    )),
                 }
             })
         })
@@ -194,7 +201,10 @@ async fn test_vm_mesh_hbclient_integration() {
             .init(input_client, local_shares, 2, server.network.clone())
             .await
             .expect("input.init failed");
-        info!("✓ Server {} initialized inputs for client {}", i, input_client);
+        info!(
+            "✓ Server {} initialized inputs for client {}",
+            i, input_client
+        );
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -247,8 +257,8 @@ async fn test_vm_mesh_hbclient_integration() {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::Share(ShareType::Int(64), sx)),
-                Instruction::LDI(1, Value::Share(ShareType::Int(64), sy)),
+                Instruction::LDI(0, Value::Share(ShareType::secret_int(64), sx)),
+                Instruction::LDI(1, Value::Share(ShareType::secret_int(64), sy)),
                 Instruction::MUL(2, 0, 1),
                 Instruction::RET(2),
             ],
@@ -303,15 +313,17 @@ async fn test_vm_mesh_hbclient_integration() {
         };
 
         match val {
-            Value::Share(ShareType::Int(_), bytes) => match engine.open_share(ShareType::Int(64), bytes) {
-                Ok(clear) => {
-                    revealed = Some(clear);
-                    break;
+            Value::Share(ShareType::SecretInt { .. }, bytes) => {
+                match engine.open_share(ShareType::secret_int(64), bytes) {
+                    Ok(clear) => {
+                        revealed = Some(clear);
+                        break;
+                    }
+                    Err(e) => {
+                        info!("open_share at party {} pending/err: {}", pid, e);
+                    }
                 }
-                Err(e) => {
-                    info!("open_share at party {} pending/err: {}", pid, e);
-                }
-            },
+            }
             other => panic!("Unexpected VM return value: {:?}", other),
         }
     }

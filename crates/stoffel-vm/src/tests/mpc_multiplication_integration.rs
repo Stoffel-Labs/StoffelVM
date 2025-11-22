@@ -1,18 +1,22 @@
 // honeybadger_quic.rs
 //! Integration module for HoneyBadger MPC with QUIC networking
-use ark_ff::FftField;
+use ark_ff::{FftField, PrimeField};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCClient, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts, WrappedMessage};
+use stoffelmpc_mpc::honeybadger::{
+    HoneyBadgerError, HoneyBadgerMPCClient, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts,
+    WrappedMessage,
+};
 use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId};
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
-use tokio::sync::Mutex;
+use crate::net::mpc::honeybadger_node_opts;
 
 /// Configuration for HoneyBadger MPC over QUIC
 #[derive(Debug, Clone)]
@@ -38,7 +42,7 @@ impl Default for HoneyBadgerQuicConfig {
 }
 
 /// A HoneyBadger MPC server node using QUIC networking
-pub struct HoneyBadgerQuicServer<F: FftField> {
+pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     /// The underlying MPC node
     pub node: HoneyBadgerMPCNode<F, Avid>,
     /// Actor-like manager usage: Arc for send/broadcast, owned clones for accept/connect
@@ -57,7 +61,7 @@ pub struct HoneyBadgerQuicServer<F: FftField> {
     pub channels: Sender<Vec<u8>>,
 }
 
-impl<F: FftField + 'static> HoneyBadgerQuicServer<F> {
+impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
     /// Creates a new HoneyBadger QUIC server
     pub async fn new(
         node_id: PartyId,
@@ -375,9 +379,8 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
 
         // Spawn the actor task
         let network_clone = network.clone();
-        let actor_task = tokio::spawn(async move {
-            Self::run_actor(mpc_client, actor_rx, network_clone).await
-        });
+        let actor_task =
+            tokio::spawn(async move { Self::run_actor(mpc_client, actor_rx, network_clone).await });
 
         info!("Created HoneyBadger QUIC client {}", client_id);
 
@@ -404,7 +407,11 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
         while let Some(msg) = rx.recv().await {
             match msg {
                 ClientActorMessage::ProcessData(data) => {
-                    info!("[HB-QUIC] Client {} received {} bytes", client_id, data.len());
+                    info!(
+                        "[HB-QUIC] Client {} received {} bytes",
+                        client_id,
+                        data.len()
+                    );
                     let preview_len = data.len().min(64);
                     let hex_preview: String = data[..preview_len]
                         .iter()
@@ -412,7 +419,10 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                         .collect();
                     debug!(
                         "[MSG:RECV] client {} handling {} bytes (hex[0..{}]={})",
-                        client_id, data.len(), preview_len, hex_preview
+                        client_id,
+                        data.len(),
+                        preview_len,
+                        hex_preview
                     );
 
                     use crate::net::mpc::NetEnvelope;
@@ -428,10 +438,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
 
                     let network_guard = network.lock().await;
                     if let Err(e) = client.process(data, Arc::new(network_guard.clone())).await {
-                        error!(
-                                    "Client {} failed to process message: {:?}",
-                                    client_id, e
-                                );
+                        error!("Client {} failed to process message: {:?}", client_id, e);
                     }
 
                     // // Try envelope first, fallback to raw HB bytes
@@ -490,9 +497,16 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
 
     /// Connects to all configured servers
     pub async fn connect_to_servers(&mut self) -> Result<(), HoneyBadgerError> {
-        info!("Client {} connecting to {} servers", self.client_id, self.server_addresses.len());
+        info!(
+            "Client {} connecting to {} servers",
+            self.client_id,
+            self.server_addresses.len()
+        );
         for (idx, addr) in self.server_addresses.iter().enumerate() {
-            info!("[HB-QUIC] Client {} will connect to [{}] {}", self.client_id, idx, addr);
+            info!(
+                "[HB-QUIC] Client {} will connect to [{}] {}",
+                self.client_id, idx, addr
+            );
         }
 
         let mut dialer = self.network.clone();
@@ -500,8 +514,13 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
             let mut retry_count = 0;
 
             loop {
-                info!("[HB-QUIC] Client {} dial attempt {} to {}", self.client_id, retry_count + 1, address);
-                
+                info!(
+                    "[HB-QUIC] Client {} dial attempt {} to {}",
+                    self.client_id,
+                    retry_count + 1,
+                    address
+                );
+
                 let connection_result = {
                     let mut dialer = self.network.lock().await;
                     dialer.connect_as_client(address, self.client_id).await
@@ -509,8 +528,10 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
 
                 match connection_result {
                     Ok(connection) => {
-                        info!("Client {} successfully connected to server {} at {}",
-                             self.client_id, i, address);
+                        info!(
+                            "Client {} successfully connected to server {} at {}",
+                            self.client_id, i, address
+                        );
 
                         // Spawn message handler for this connection
                         let actor_tx = self.actor_tx.clone();
@@ -524,12 +545,18 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                                             .send(ClientActorMessage::ProcessData(data))
                                             .await
                                         {
-                                            error!("Client {} failed to send to actor: {:?}", client_id, e);
+                                            error!(
+                                                "Client {} failed to send to actor: {:?}",
+                                                client_id, e
+                                            );
                                             break;
                                         }
                                     }
                                     Err(e) => {
-                                        info!("Client {} connection to server closed: {}", client_id, e);
+                                        info!(
+                                            "Client {} connection to server closed: {}",
+                                            client_id, e
+                                        );
                                         break;
                                     }
                                 }
@@ -547,8 +574,10 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                             return Err(HoneyBadgerError::NetworkError(NetworkError::Timeout));
                         }
 
-                        info!("Client {} connection attempt {} to server {} failed: {}",
-                              self.client_id, retry_count, i, e);
+                        info!(
+                            "Client {} connection attempt {} to server {} failed: {}",
+                            self.client_id, retry_count, i, e
+                        );
                         tokio::time::sleep(self.config.connection_retry_delay).await;
                     }
                 }
@@ -557,7 +586,6 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
 
         Ok(())
     }
-
 
     /// Stops the client and closes all connections, returning the MPC client
     pub async fn stop(mut self) -> Result<HoneyBadgerMPCClient<F, Avid>, HoneyBadgerError> {
@@ -587,7 +615,6 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
         Ok(client)
     }
 }
-
 
 impl<F: FftField + 'static> Drop for HoneyBadgerQuicClient<F> {
     fn drop(&mut self) {
@@ -620,7 +647,11 @@ pub async fn setup_honeybadger_quic_clients<F: FftField + 'static>(
     info!("Setting up {} HoneyBadger QUIC clients", client_ids.len());
 
     for (i, &client_id) in client_ids.iter().enumerate() {
-        let client_inputs = inputs.get(i).cloned().unwrap_or_default();
+        let client_inputs = inputs
+            .get(i)
+            .cloned()
+            .or_else(|| inputs.last().cloned())
+            .unwrap_or_default();
 
         let mut client = HoneyBadgerQuicClient::new(
             client_id,
@@ -630,7 +661,8 @@ pub async fn setup_honeybadger_quic_clients<F: FftField + 'static>(
             client_inputs,
             input_len,
             config.clone(),
-        ).await?;
+        )
+        .await?;
 
         // Add all servers
         for &address in &server_addresses {
@@ -647,7 +679,7 @@ pub async fn setup_honeybadger_quic_clients<F: FftField + 'static>(
 /// Helper functions for setting up HoneyBadger MPC over QUIC
 
 /// Sets up a complete HoneyBadger MPC network with QUIC
-pub async fn setup_honeybadger_quic_network<F: FftField + 'static>(
+pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     n_parties: usize,
     threshold: usize,
     n_triples: usize,
@@ -676,13 +708,8 @@ pub async fn setup_honeybadger_quic_network<F: FftField + 'static>(
     }
 
     // Create MPC options
-    let mpc_opts = HoneyBadgerMPCNodeOpts::new(
-        n_parties,
-        threshold,
-        n_triples,
-        n_random_shares,
-        instance_id,
-    );
+    let mpc_opts =
+        honeybadger_node_opts(n_parties, threshold, n_triples, n_random_shares, instance_id);
 
     // Create all servers
     let mut recv = Vec::new();
@@ -760,13 +787,17 @@ mod tests {
             base_port,
             config.clone(),
         )
-            .await
-            .expect("Failed to create servers");
+        .await
+        .expect("Failed to create servers");
         info!("✓ Created {} servers", servers.len());
 
         // Get server addresses
         let server_addresses: Vec<SocketAddr> = (0..n_parties)
-            .map(|i| format!("127.0.0.1:{}", base_port + i as u16).parse().unwrap())
+            .map(|i| {
+                format!("127.0.0.1:{}", base_port + i as u16)
+                    .parse()
+                    .unwrap()
+            })
             .collect();
 
         info!("Server addresses:");
@@ -784,8 +815,8 @@ mod tests {
             2,
             config.clone(),
         )
-            .await
-            .expect("Failed to create clients");
+        .await
+        .expect("Failed to create clients");
 
         // Step 2: Start all servers
         info!("Step 2: Starting servers...");
@@ -818,12 +849,14 @@ mod tests {
             info!("✓ Server {} connected to peers", server.node_id);
         }
 
-
         // Step 4: Connect clients to servers
         info!("Step 4: Connecting clients to servers...");
         for client in &mut clients {
             info!("Connecting client {} to servers...", client.client_id);
-            client.connect_to_servers().await.expect("Failed to connect client to servers");
+            client
+                .connect_to_servers()
+                .await
+                .expect("Failed to connect client to servers");
             info!("✓ Client {} connected to servers", client.client_id);
         }
         info!("✓ All clients connected to servers");
@@ -834,8 +867,15 @@ mod tests {
         info!("Step 5: Verifying client connectivity...");
         for (i, client) in clients.iter().enumerate() {
             let connected_servers = client.network.lock().await.parties().len();
-            info!("Client {} sees {} servers in network map", i, connected_servers);
-            assert_eq!(connected_servers, n_parties, "Client {} only sees {} servers but expected {}", i, connected_servers, n_parties);
+            info!(
+                "Client {} sees {} servers in network map",
+                i, connected_servers
+            );
+            assert_eq!(
+                connected_servers, n_parties,
+                "Client {} only sees {} servers but expected {}",
+                i, connected_servers, n_parties
+            );
         }
         info!("✓ Client connectivity verified");
 
@@ -895,7 +935,7 @@ mod tests {
                             .run_preprocessing(network_clone.clone(), &mut rng)
                             .await
                     })
-                        .await;
+                    .await;
 
                     match result {
                         Ok(Ok(())) => {
@@ -923,13 +963,15 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         for (_, server) in servers.iter_mut().enumerate() {
-            let local_shares = server.node
+            let local_shares = server
+                .node
                 .preprocessing_material
                 .lock()
                 .await
                 .take_random_shares(2)
                 .unwrap();
-            match server.node
+            match server
+                .node
                 .preprocess
                 .input
                 .init(clientid[0], local_shares, 2, server.network.clone())
@@ -988,7 +1030,8 @@ mod tests {
                 }
                 let shares_mult_for_node: Vec<RobustShare<Fr>> = storage.protocol_output.clone();
                 assert_eq!(shares_mult_for_node.len(), no_of_multiplications);
-                match server.node
+                match server
+                    .node
                     .output
                     .init(
                         output_clientid,
@@ -1008,7 +1051,6 @@ mod tests {
                 );
             }
         }
-
     }
 
     #[tokio::test]
@@ -1043,13 +1085,17 @@ mod tests {
             base_port,
             config.clone(),
         )
-            .await
-            .expect("Failed to create servers");
+        .await
+        .expect("Failed to create servers");
         info!("✓ Created {} servers", servers.len());
 
         // Get server addresses
         let server_addresses: Vec<SocketAddr> = (0..n_parties)
-            .map(|i| format!("127.0.0.1:{}", base_port + i as u16).parse().unwrap())
+            .map(|i| {
+                format!("127.0.0.1:{}", base_port + i as u16)
+                    .parse()
+                    .unwrap()
+            })
             .collect();
 
         info!("Server addresses:");
@@ -1067,8 +1113,8 @@ mod tests {
             2,
             config.clone(),
         )
-            .await
-            .expect("Failed to create clients");
+        .await
+        .expect("Failed to create clients");
 
         // Step 2: Start all servers
         info!("Step 2: Starting servers...");
@@ -1105,7 +1151,10 @@ mod tests {
         info!("Step 4: Connecting clients to servers...");
         for client in &mut clients {
             info!("Connecting client {} to servers...", client.client_id);
-            client.connect_to_servers().await.expect("Failed to connect client to servers");
+            client
+                .connect_to_servers()
+                .await
+                .expect("Failed to connect client to servers");
             info!("✓ Client {} connected to servers", client.client_id);
         }
         info!("✓ All clients connected to servers");
@@ -1116,11 +1165,17 @@ mod tests {
         info!("Step 5: Verifying client connectivity...");
         for (i, client) in clients.iter().enumerate() {
             let connected_servers = client.network.lock().await.parties().len();
-            info!("Client {} sees {} servers in network map", i, connected_servers);
-            assert_eq!(connected_servers, n_parties, "Client {} only sees {} servers but expected {}", i, connected_servers, n_parties);
+            info!(
+                "Client {} sees {} servers in network map",
+                i, connected_servers
+            );
+            assert_eq!(
+                connected_servers, n_parties,
+                "Client {} only sees {} servers but expected {}",
+                i, connected_servers, n_parties
+            );
         }
         info!("✓ Client connectivity verified");
-
 
         // Step 4: Verify network connectivity with a simple ping-pong test
         info!("Step 4: Verifying network connectivity...");
@@ -1178,7 +1233,7 @@ mod tests {
                             .run_preprocessing(network_clone.clone(), &mut rng)
                             .await
                     })
-                        .await;
+                    .await;
 
                     match result {
                         Ok(Ok(())) => {
@@ -1205,13 +1260,15 @@ mod tests {
         let results = futures::future::join_all(preprocessing_handles).await;
 
         for (_, server) in servers.iter_mut().enumerate() {
-            let local_shares = server.node
+            let local_shares = server
+                .node
                 .preprocessing_material
                 .lock()
                 .await
                 .take_random_shares(2)
                 .unwrap();
-            match server.node
+            match server
+                .node
                 .preprocess
                 .input
                 .init(clientid[0], local_shares, 2, server.network.clone())
@@ -1223,8 +1280,6 @@ mod tests {
                 }
             }
         }
-
-
     }
 
     #[tokio::test]
@@ -1257,8 +1312,8 @@ mod tests {
             base_port,
             config,
         )
-            .await
-            .expect("Failed to create servers");
+        .await
+        .expect("Failed to create servers");
         info!("✓ Created {} servers", servers.len());
 
         // Step 2: Start all servers
@@ -1349,7 +1404,7 @@ mod tests {
                             .run_preprocessing(network_clone.clone(), &mut rng)
                             .await
                     })
-                        .await;
+                    .await;
 
                     match result {
                         Ok(Ok(())) => {
@@ -1400,7 +1455,8 @@ mod tests {
                 //let node = server.node.lock().await;
                 let preproc = server.node.preprocessing_material.lock().await;
 
-                let (triples_count, random_shares_count) = preproc.len();
+                let (triples_count, random_shares_count, _prandbit_count, _prandint_count) =
+                    preproc.len();
 
                 info!(
                     "Server {} has {} triples and {} random shares",
