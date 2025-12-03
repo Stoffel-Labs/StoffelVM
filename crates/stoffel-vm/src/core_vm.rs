@@ -166,8 +166,8 @@ impl VirtualMachine {
                     if let Some(arr) = ctx.vm_state.object_store.get_array_mut(*id) {
                         let start = arr.length();
                         for (offset, value) in ctx.args[1..].iter().enumerate() {
-                            // Lua-inspired 1-based arrays: next index is start + 1
-                            let idx = Value::I64((start + 1 + offset) as i64);
+                            // 0-indexed arrays: next index is current length + offset
+                            let idx = Value::I64((start + offset) as i64);
                             arr.set(idx, value.clone());
                         }
                         Ok(Value::I64(arr.length() as i64))
@@ -1153,9 +1153,9 @@ mod tests {
                 Instruction::LDI(2, Value::I64(42)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("array_push".to_string()),
-                // Get element at index 1
+                // Get element at index 0 (0-indexed array)
                 Instruction::PUSHARG(1),
-                Instruction::LDI(3, Value::I64(1)),
+                Instruction::LDI(3, Value::I64(0)),
                 Instruction::PUSHARG(3),
                 Instruction::CALL("get_field".to_string()),
                 Instruction::RET(0),
