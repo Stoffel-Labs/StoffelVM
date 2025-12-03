@@ -3,10 +3,10 @@
 //! Use the MpcEngine abstraction (net::mpc_engine) to attach an engine to VMState for VM usage.
 
 use serde::{Deserialize, Serialize};
-use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNodeOpts;
 use stoffel_vm_types::core_types::{
     DEFAULT_FIXED_POINT_FRACTIONAL_BITS, DEFAULT_FIXED_POINT_TOTAL_BITS,
 };
+use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNodeOpts;
 
 const DEFAULT_MIN_PARTIES: usize = 5;
 const DEFAULT_THRESHOLD: usize = 1;
@@ -44,8 +44,8 @@ pub fn honeybadger_node_opts(
     n_random_shares: usize,
     instance_id: u64,
 ) -> HoneyBadgerMPCNodeOpts {
-    let n_prandbit = derive_prandbit_count(n_random_shares);
-    let n_prandint = derive_prandint_count(n_triples, n_random_shares);
+    let n_prandbit = 0;
+    let n_prandint = 0;
     let l = DEFAULT_FIXED_POINT_TOTAL_BITS;
     let k = DEFAULT_SECURITY_PARAMETER_K;
 

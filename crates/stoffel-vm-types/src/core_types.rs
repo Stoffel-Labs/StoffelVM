@@ -17,7 +17,119 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::any::Any;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use stoffelmpc_mpc::common::types::fixed::FixedPointPrecision;
+
+/// A wrapper around f64 that implements Eq and Hash using bit representation.
+/// This allows f64 values to be used in contexts requiring these traits.
+/// NaN values are handled by treating all NaNs as equal.
+#[derive(Clone, Copy, Default)]
+pub struct F64(pub f64);
+
+impl F64 {
+    /// Create a new F64 wrapper
+    pub fn new(value: f64) -> Self {
+        F64(value)
+    }
+
+    /// Get the inner f64 value
+    pub fn value(&self) -> f64 {
+        self.0
+    }
+
+    /// Convert to bits for comparison, normalizing NaN values
+    fn to_bits_normalized(&self) -> u64 {
+        if self.0.is_nan() {
+            // All NaN values map to the same bit pattern
+            f64::NAN.to_bits()
+        } else if self.0 == 0.0 {
+            // Treat -0.0 and 0.0 as equal
+            0u64
+        } else {
+            self.0.to_bits()
+        }
+    }
+}
+
+impl PartialEq for F64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_bits_normalized() == other.to_bits_normalized()
+    }
+}
+
+impl Eq for F64 {}
+
+impl Hash for F64 {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.to_bits_normalized().hash(state);
+    }
+}
+
+impl fmt::Debug for F64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for F64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<f64> for F64 {
+    fn from(value: f64) -> Self {
+        F64(value)
+    }
+}
+
+impl From<F64> for f64 {
+    fn from(value: F64) -> Self {
+        value.0
+    }
+}
+
+impl std::ops::Add for F64 {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output {
+        F64(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::Sub for F64 {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self::Output {
+        F64(self.0 - rhs.0)
+    }
+}
+
+impl std::ops::Mul for F64 {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self::Output {
+        F64(self.0 * rhs.0)
+    }
+}
+
+impl std::ops::Div for F64 {
+    type Output = Self;
+    fn div(self, rhs: Self) -> Self::Output {
+        F64(self.0 / rhs.0)
+    }
+}
+
+impl std::ops::Neg for F64 {
+    type Output = Self;
+    fn neg(self) -> Self::Output {
+        F64(-self.0)
+    }
+}
+
+impl PartialOrd for F64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
 
 /// Represents an array in the VM
 ///
@@ -69,7 +181,7 @@ impl Array {
             // 0-indexed arrays: only indices >= 0 are valid for the dense part
             Value::I64(idx) if idx >= 0 => {
                 let idx_usize = idx as usize; // 0-based
-                                              // Update length_hint to the highest occupied numeric index + 1
+                // Update length_hint to the highest occupied numeric index + 1
                 self.length_hint = self.length_hint.max(idx_usize + 1);
                 if idx_usize < 32 {
                     // Small array optimization
@@ -149,52 +261,20 @@ pub const DEFAULT_FIXED_POINT_TOTAL_BITS: usize = 64;
 /// Default fractional bits for fixed-point representations.
 pub const DEFAULT_FIXED_POINT_FRACTIONAL_BITS: usize = 16;
 
-/// Lightweight precision descriptor that mirrors `SecretFixedPoint` metadata.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct FixedPointConfig {
-    pub total_bits: usize,
-    pub fractional_bits: usize,
-}
-
-impl FixedPointConfig {
-    pub fn new(total_bits: usize, fractional_bits: usize) -> Self {
-        assert!(
-            fractional_bits < total_bits,
-            "fractional bits ({}) must be lower than total bits ({})",
-            fractional_bits,
-            total_bits
-        );
-        Self {
-            total_bits,
-            fractional_bits,
-        }
-    }
-
-    pub fn total_bits(&self) -> usize {
-        self.total_bits
-    }
-
-    pub fn fractional_bits(&self) -> usize {
-        self.fractional_bits
-    }
-}
-
-impl Default for FixedPointConfig {
-    fn default() -> Self {
-        Self {
-            total_bits: DEFAULT_FIXED_POINT_TOTAL_BITS,
-            fractional_bits: DEFAULT_FIXED_POINT_FRACTIONAL_BITS,
-        }
-    }
+fn default_fixed_point_precision() -> FixedPointPrecision {
+    FixedPointPrecision::new(
+        DEFAULT_FIXED_POINT_TOTAL_BITS,
+        DEFAULT_FIXED_POINT_FRACTIONAL_BITS,
+    )
 }
 
 /// Enum to represent the underlying type of a secret share
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ShareType {
     /// Secure integer shares (mirrors `SecretInt` in mpc-protocols)
     SecretInt { bit_length: usize },
     /// Secure fixed-point shares (mirrors `SecretFixedPoint` in mpc-protocols)
-    SecretFixedPoint { precision: FixedPointConfig },
+    SecretFixedPoint { precision: FixedPointPrecision },
 }
 
 impl ShareType {
@@ -220,13 +300,13 @@ impl ShareType {
 
     pub fn secret_fixed_point_from_bits(total_bits: usize, fractional_bits: usize) -> Self {
         ShareType::SecretFixedPoint {
-            precision: FixedPointConfig::new(total_bits, fractional_bits),
+            precision: FixedPointPrecision::new(total_bits, fractional_bits),
         }
     }
 
     pub fn default_secret_fixed_point() -> Self {
         ShareType::SecretFixedPoint {
-            precision: FixedPointConfig::default(),
+            precision: default_fixed_point_precision(),
         }
     }
 
@@ -237,7 +317,7 @@ impl ShareType {
         }
     }
 
-    pub fn precision(&self) -> Option<FixedPointConfig> {
+    pub fn precision(&self) -> Option<FixedPointPrecision> {
         match self {
             ShareType::SecretFixedPoint { precision } => Some(*precision),
             _ => None,
@@ -251,6 +331,24 @@ impl ShareType {
                 bit_length: BOOLEAN_SECRET_INT_BITS
             }
         )
+    }
+}
+
+impl Eq for ShareType {}
+
+impl Hash for ShareType {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            ShareType::SecretInt { bit_length } => {
+                0u8.hash(state);
+                bit_length.hash(state);
+            }
+            ShareType::SecretFixedPoint { precision } => {
+                1u8.hash(state);
+                precision.k().hash(state);
+                precision.f().hash(state);
+            }
+        }
     }
 }
 
@@ -281,8 +379,8 @@ pub enum Value {
     U32(u32),
     /// 64-bit unsigned integer
     U64(u64),
-    /// Fixed-point floating point number (represented as i64 internally for Eq/Hash)
-    Float(i64),
+    /// 64-bit floating point number (uses F64 wrapper for Eq/Hash)
+    Float(F64),
     /// Boolean value
     Bool(bool),
     /// String value
@@ -313,8 +411,7 @@ impl fmt::Debug for Value {
             Value::U32(i) => write!(f, "{}u32", i),
             Value::U64(i) => write!(f, "{}u64", i),
             Value::Float(fp) => {
-                let float_val = *fp as f64 / 1000.0;
-                write!(f, "{}", float_val)
+                write!(f, "{}f64", fp.0)
             }
             Value::Bool(b) => write!(f, "{}", b),
             Value::String(s) => write!(f, "\"{}\"", s),

@@ -211,6 +211,68 @@ impl VirtualMachine {
             ctx.vm_state.load_client_share(client_id, share_index)
         });
 
+        // Fixed-point version of take_share
+        // Usage: ClientStore.take_share_fixed(client_index, share_index)
+        // Returns a Value::Share with SecretFixedPoint type
+        self.register_foreign_function("ClientStore.take_share_fixed", |ctx| {
+            if ctx.args.len() != 2 {
+                return Err(
+                    "ClientStore.take_share_fixed expects 2 arguments: client_index, share_index"
+                        .to_string(),
+                );
+            }
+
+            fn parse_index(value: &Value, name: &str) -> Result<usize, String> {
+                match value {
+                    Value::I64(v) if *v >= 0 => Ok(*v as usize),
+                    Value::U64(v) => Ok(*v as usize),
+                    _ => Err(format!("{name} must be a non-negative integer")),
+                }
+            }
+
+            let client_index = parse_index(&ctx.args[0], "client_index")?;
+            let share_index = parse_index(&ctx.args[1], "share_index")?;
+
+            let client_id = ctx
+                .vm_state
+                .client_id_at_index(client_index)
+                .ok_or_else(|| format!("No client at index {}", client_index))?;
+
+            ctx.vm_state.load_client_share_fixed(client_id, share_index)
+        });
+
+        // MPC Output protocol: send secret share(s) to a specific client for private reconstruction
+        // Usage: MpcOutput.send_to_client(client_id, share_value)
+        // - client_id: The ID of the client to receive the output
+        // - share_value: A Value::Share containing the secret share data
+        // Returns: Value::Bool(true) on success
+        self.register_foreign_function("MpcOutput.send_to_client", |ctx| {
+            if ctx.args.len() != 2 {
+                return Err(
+                    "MpcOutput.send_to_client expects 2 arguments: client_id, share_value"
+                        .to_string(),
+                );
+            }
+
+            // Parse client_id (ClientId is usize)
+            let client_id: usize = match &ctx.args[0] {
+                Value::I64(v) if *v >= 0 => *v as usize,
+                Value::U64(v) => *v as usize,
+                _ => return Err("client_id must be a non-negative integer".to_string()),
+            };
+
+            // Get the share bytes from the share value
+            let (share_bytes, input_len) = match &ctx.args[1] {
+                Value::Share(_, data) => (data.clone(), 1usize),
+                _ => return Err("share_value must be a Value::Share".to_string()),
+            };
+
+            // Send via MPC engine
+            ctx.vm_state.send_output_to_client(client_id, &share_bytes, input_len)?;
+
+            Ok(Value::Bool(true))
+        });
+
         self.register_foreign_function("create_closure", |ctx| {
             if ctx.args.len() < 1 {
                 return Err("create_closure expects at least 1 argument: function_name".to_string());
@@ -729,6 +791,51 @@ impl VirtualMachine {
     pub fn execute_until_return(&mut self) -> Result<Value, String> {
         // Directly delegate to VMState without locking
         self.state.execute_until_return()
+    }
+
+    /// Execute the VM with a given main function using async MPC operations
+    ///
+    /// This version uses the async-native execution which only awaits when
+    /// MPC operations (like share multiplication) are needed.
+    pub async fn execute_async<E: crate::net::mpc_engine::AsyncMpcEngine>(
+        &mut self,
+        main_function: &str,
+        async_engine: &E,
+    ) -> Result<Value, String> {
+        let vm_func = match self.state.functions.get(main_function) {
+            Some(Function::VM(func)) => func.clone(),
+            Some(Function::Foreign(_)) => {
+                return Err(format!(
+                    "Cannot execute foreign function {} as main",
+                    main_function
+                ));
+            }
+            None => return Err(format!("Function {} not found", main_function)),
+        };
+
+        // Ensure instructions are cached and resolved
+        let mut vm_func = vm_func.clone();
+        if vm_func.resolved_instructions.is_none() {
+            vm_func.resolve_instructions();
+        }
+
+        let mut initial_record = self.activation_pool.get();
+        initial_record.function_name = main_function.to_string();
+        initial_record.resolved_instructions = vm_func.resolved_instructions.clone();
+        initial_record.constant_values = vm_func.constant_values.clone();
+
+        // Initialize registers with the appropriate size and default values
+        initial_record.registers = SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]);
+
+        // Clone the record and drop the Reusable to avoid borrowing conflicts
+        let cloned_record = (*initial_record).clone();
+        drop(initial_record);
+
+        // Add the activation record directly to the state
+        self.state.activation_records.push(cloned_record);
+
+        // Execute with async MPC
+        self.state.execute_until_return_async(async_engine).await
     }
 
     /// Execute a function specifically for benchmarking purposes.

@@ -13,7 +13,7 @@
 //! This module is designed to be portable and can be copied directly to the compiler
 //! codebase without modification.
 
-use crate::core_types::Value;
+use crate::core_types::{Value, F64};
 use crate::functions::VMFunction;
 use crate::instructions::{Instruction, ReducedOpcode};
 use std::collections::HashMap;
@@ -441,7 +441,7 @@ impl CompiledBinary {
             }
             Value::Float(f) => {
                 writer.write_all(&[9u8])?; // Type tag for Float
-                writer.write_all(&f.to_le_bytes())?;
+                writer.write_all(&f.0.to_le_bytes())?;
             }
             Value::Bool(b) => {
                 writer.write_all(&[10u8])?; // Type tag for Bool
@@ -810,7 +810,7 @@ impl CompiledBinary {
             9 => {
                 let mut bytes = [0u8; 8];
                 reader.read_exact(&mut bytes)?;
-                Ok(Value::Float(i64::from_le_bytes(bytes)))
+                Ok(Value::Float(F64(f64::from_le_bytes(bytes))))
             }
             10 => {
                 let mut byte = [0u8; 1];

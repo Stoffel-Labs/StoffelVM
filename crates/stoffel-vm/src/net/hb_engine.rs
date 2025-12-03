@@ -1,18 +1,19 @@
+use crate::net::client_store::ClientInputStore;
 use crate::net::mpc::honeybadger_node_opts;
-use crate::net::mpc_engine::MpcEngine;
+use crate::net::mpc_engine::{MpcEngine, MpcEngineClientOps};
 use ark_bls12_381::Fr;
 use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS};
+use stoffel_vm_types::core_types::{BOOLEAN_SECRET_INT_BITS, F64, ShareType, Value};
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode, ProtocolType, SessionId};
+use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode, SessionId};
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
@@ -229,6 +230,80 @@ impl HoneyBadgerMpcEngine {
         Ok(shares)
     }
 
+    /// Get all client IDs that have submitted inputs to this HB node
+    pub async fn get_client_ids(&self) -> Vec<ClientId> {
+        let node = self.node.lock().await;
+        let input_store = node.preprocess.input.input_shares.lock().await;
+        input_store.keys().copied().collect()
+    }
+
+    /// Get all client inputs from the HB node's input store
+    /// Returns a map of client_id -> shares
+    pub async fn get_all_client_inputs(
+        &self,
+    ) -> Result<Vec<(ClientId, Vec<RobustShare<Fr>>)>, String> {
+        let node = self.node.lock().await;
+        let input_store = node.preprocess.input.input_shares.lock().await;
+        Ok(input_store
+            .iter()
+            .map(|(client_id, shares)| (*client_id, shares.clone()))
+            .collect())
+    }
+
+    /// Hydrate a ClientInputStore with all client inputs from the HB node
+    ///
+    /// This copies all client input shares from the HoneyBadger node's internal
+    /// input store to the provided ClientInputStore, making them available
+    /// to the VM for execution.
+    ///
+    /// # Arguments
+    /// * `store` - The ClientInputStore to populate with client inputs
+    ///
+    /// # Returns
+    /// The number of clients whose inputs were hydrated
+    pub async fn hydrate_client_inputs(&self, store: &ClientInputStore) -> Result<usize, String> {
+        let all_inputs = self.get_all_client_inputs().await?;
+        let count = all_inputs.len();
+
+        for (client_id, shares) in all_inputs {
+            store.store_client_input(client_id, shares);
+        }
+
+        Ok(count)
+    }
+
+    /// Hydrate a ClientInputStore with inputs from specific clients
+    ///
+    /// # Arguments
+    /// * `store` - The ClientInputStore to populate
+    /// * `client_ids` - The client IDs to hydrate inputs for
+    ///
+    /// # Returns
+    /// The number of clients successfully hydrated
+    pub async fn hydrate_client_inputs_for(
+        &self,
+        store: &ClientInputStore,
+        client_ids: &[ClientId],
+    ) -> Result<usize, String> {
+        let mut count = 0;
+        for &client_id in client_ids {
+            match self.get_client_shares(client_id).await {
+                Ok(shares) => {
+                    store.store_client_input(client_id, shares);
+                    count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to get shares for client {}: {}",
+                        client_id,
+                        e
+                    );
+                }
+            }
+        }
+        Ok(count)
+    }
+
     pub fn new(
         instance_id: u64,
         party_id: usize,
@@ -307,6 +382,47 @@ impl HoneyBadgerMpcEngine {
         RobustShare::<Fr>::deserialize_compressed(bytes)
             .map_err(|e| format!("deserialize share: {}", e))
     }
+
+    /// Send output share(s) to a specific client using the OutputServer protocol
+    ///
+    /// This is used for private output where only the designated client can
+    /// reconstruct the result by collecting shares from all parties.
+    pub async fn send_output_to_client_async_impl(
+        &self,
+        client_id: ClientId,
+        shares_bytes: &[u8],
+        input_len: usize,
+    ) -> Result<(), String> {
+        // Deserialize shares from bytes
+        // If input_len == 1, try to deserialize as a single RobustShare first
+        // (Value::Share stores a single share's bytes)
+        let shares: Vec<RobustShare<Fr>> = if input_len == 1 {
+            // Try to deserialize as a single share
+            let single_share: RobustShare<Fr> =
+                CanonicalDeserialize::deserialize_compressed(shares_bytes)
+                    .map_err(|e| format!("Failed to deserialize single share: {:?}", e))?;
+            vec![single_share]
+        } else {
+            // Multiple shares - deserialize as Vec
+            CanonicalDeserialize::deserialize_compressed(shares_bytes)
+                .map_err(|e| format!("Failed to deserialize shares: {:?}", e))?
+        };
+
+        if shares.len() != input_len {
+            return Err(format!(
+                "Share count mismatch: got {}, expected {}",
+                shares.len(),
+                input_len
+            ));
+        }
+
+        // Use the OutputServer from the node to send shares to the client
+        let node = self.node.lock().await;
+        node.output
+            .init(client_id as usize, shares, input_len, self.net.clone())
+            .await
+            .map_err(|e| format!("OutputServer.init failed: {:?}", e))
+    }
 }
 
 impl MpcEngine for HoneyBadgerMpcEngine {
@@ -350,9 +466,19 @@ impl MpcEngine for HoneyBadgerMpcEngine {
                 let my = &shares[self.party_id];
                 Self::encode_share(my)
             }
-            (ShareType::SecretFixedPoint { .. }, Value::Float(fp)) => {
-                // Basic fixed-point: assume input already scaled as i64; map to field via u64 cast.
-                let secret = Fr::from(*fp as u64);
+            (ShareType::SecretFixedPoint { precision }, Value::Float(fp)) => {
+                // Convert f64 to fixed-point scaled integer
+                // Scale factor = 2^f (fractional bits)
+                let f = precision.f();
+                let scale = (1u64 << f) as f64;
+                let scaled_value = (fp.0 * scale) as i64;
+                // Map to field (handle negative values by wrapping)
+                let secret = if scaled_value >= 0 {
+                    Fr::from(scaled_value as u64)
+                } else {
+                    // For negative values, use field modular arithmetic
+                    -Fr::from((-scaled_value) as u64)
+                };
                 let mut rng = ark_std::test_rng();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
@@ -406,54 +532,91 @@ impl MpcEngine for HoneyBadgerMpcEngine {
 
     fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
         // In-process aggregator using a global registry of shares; reconstruct when 2t+1 are present.
+        // Each open operation gets a unique session ID to prevent different values being mixed together.
+        //
+        // CRITICAL: All parties must agree on which accumulator to use for each open operation.
+        // We achieve this by having each party find the first accumulator (by sequence number)
+        // that they haven't contributed to yet. Since all parties execute the same bytecode
+        // in the same order, they will all converge on the same accumulator for each open.
         #[derive(Default, Clone)]
         struct OpenAccumulator {
             shares: Vec<Vec<u8>>,
+            party_ids: Vec<usize>, // Track which parties have contributed
             result: Option<Value>,
         }
 
+        // Registry: maps (instance_id, sequence, type_string) to accumulator
         static REGISTRY: once_cell::sync::Lazy<
-            parking_lot::Mutex<std::collections::HashMap<(u64, String), OpenAccumulator>>,
-        > = once_cell::sync::Lazy::new(
-            || parking_lot::Mutex::new(std::collections::HashMap::new()),
-        );
+            parking_lot::Mutex<std::collections::HashMap<(u64, usize, String), OpenAccumulator>>,
+        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-        let key = (
-            self.instance_id,
-            match ty {
-                ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
-                ShareType::SecretFixedPoint { precision } => format!(
-                    "fixed-{}-{}",
-                    precision.total_bits(),
-                    precision.fractional_bits()
-                ),
-            },
-        );
+        let type_key = match ty {
+            ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
+            ShareType::SecretFixedPoint { precision } => {
+                format!("fixed-{}-{}", precision.k(), precision.f())
+            }
+        };
 
         let required = 2 * self.t + 1;
-        let mut pushed = false;
+        let mut my_sequence: Option<usize> = None;
 
         loop {
             let mut reg = REGISTRY.lock();
-            let entry = reg
-                .entry(key.clone())
-                .or_insert_with(OpenAccumulator::default);
 
+            // If we haven't contributed yet, find the right accumulator
+            if my_sequence.is_none() {
+                // Find the first sequence number where this party hasn't contributed
+                let mut seq = 0;
+                loop {
+                    let key = (self.instance_id, seq, type_key.clone());
+                    let entry = reg.entry(key).or_insert_with(OpenAccumulator::default);
+
+                    if !entry.party_ids.contains(&self.party_id) {
+                        // This party hasn't contributed here yet - use this accumulator
+                        entry.shares.push(share_bytes.to_vec());
+                        entry.party_ids.push(self.party_id);
+                        my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.unwrap();
+            let key = (self.instance_id, seq, type_key.clone());
+            let entry = reg.get_mut(&key).unwrap();
+
+            // Check if result is ready
             if let Some(result) = entry.result.clone() {
                 return Ok(result);
             }
 
-            if !pushed {
-                entry.shares.push(share_bytes.to_vec());
-                pushed = true;
-            }
-
+            // Check if we have enough shares to reconstruct
             if entry.shares.len() >= required {
                 let collected: Vec<_> = entry.shares.iter().take(required).cloned().collect();
                 let mut shares: Vec<RobustShare<Fr>> = Vec::with_capacity(collected.len());
                 for bytes in &collected {
                     shares.push(Self::decode_share(bytes)?);
                 }
+
+                // Debug: log share IDs, degrees, and values being used for reconstruction
+                tracing::info!(
+                    "open_share reconstruction: n={}, t={}, required={}, shares.len()={}",
+                    self.n, self.t, required, shares.len()
+                );
+
+                // Sort shares by ID for interpolation debugging
+                let mut sorted_shares = shares.clone();
+                sorted_shares.sort_by_key(|s| s.id);
+
+                for (i, share) in sorted_shares.iter().enumerate() {
+                    tracing::info!(
+                        "  sorted_share[{}]: id={}, degree={}, value={:?}",
+                        i, share.id, share.degree,
+                        share.share[0].into_bigint().0 // All limbs of the share value
+                    );
+                }
+
                 let (_deg, secret) = RobustShare::recover_secret(&shares, self.n)
                     .map_err(|e| format!("recover_secret: {:?}", e))?;
                 let value = match ty {
@@ -465,9 +628,14 @@ impl MpcEngine for HoneyBadgerMpcEngine {
                         let limbs: [u64; 4] = secret.into_bigint().0;
                         Value::I64(limbs[0] as i64)
                     }
-                    ShareType::SecretFixedPoint { .. } => {
+                    ShareType::SecretFixedPoint { precision } => {
                         let limbs: [u64; 4] = secret.into_bigint().0;
-                        Value::Float(limbs[0] as i64)
+                        let scaled_value = limbs[0] as i64;
+                        // Convert from fixed-point scaled integer back to f64
+                        let f = precision.f();
+                        let scale = (1u64 << f) as f64;
+                        let float_value = scaled_value as f64 / scale;
+                        Value::Float(F64(float_value))
                     }
                 };
                 entry.result = Some(value.clone());
@@ -481,5 +649,166 @@ impl MpcEngine for HoneyBadgerMpcEngine {
 
     fn shutdown(&self) {
         self.ready.store(false, Ordering::SeqCst);
+    }
+
+    fn party_id(&self) -> usize {
+        self.party_id
+    }
+
+    fn n_parties(&self) -> usize {
+        self.n
+    }
+
+    fn threshold(&self) -> usize {
+        self.t
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn send_output_to_client(
+        &self,
+        client_id: ClientId,
+        shares: &[u8],
+        input_len: usize,
+    ) -> Result<(), String> {
+        // Execute the async version, handling runtime context appropriately
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                #[allow(deprecated)]
+                match handle.runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(self.send_output_to_client_async_impl(
+                                client_id, shares, input_len,
+                            ))
+                        })
+                    }
+                    tokio::runtime::RuntimeFlavor::CurrentThread => {
+                        Err("send_output_to_client called from a single-thread Tokio runtime; synchronous waiting is unsupported".to_string())
+                    }
+                    _ => {
+                        Err("send_output_to_client called from an unsupported Tokio runtime flavor".to_string())
+                    }
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
+                rt.block_on(self.send_output_to_client_async_impl(client_id, shares, input_len))
+            }
+        }
+    }
+}
+
+use crate::net::mpc_engine::AsyncMpcEngine;
+
+#[async_trait::async_trait]
+impl AsyncMpcEngine for HoneyBadgerMpcEngine {
+    async fn multiply_share_async(
+        &self,
+        ty: ShareType,
+        left: &[u8],
+        right: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.multiply_share_async(ty, left, right).await
+    }
+
+    async fn open_share_async(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
+        self.open_share_async(ty, share_bytes).await
+    }
+
+    async fn send_output_to_client_async(
+        &self,
+        client_id: ClientId,
+        shares: &[u8],
+        input_len: usize,
+    ) -> Result<(), String> {
+        self.send_output_to_client_async_impl(client_id, shares, input_len)
+            .await
+    }
+}
+
+impl MpcEngineClientOps for HoneyBadgerMpcEngine {
+    fn get_client_ids_sync(&self) -> Vec<ClientId> {
+        // Use the async/sync bridging pattern
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                #[allow(deprecated)]
+                match handle.runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(|| handle.block_on(self.get_client_ids()))
+                    }
+                    _ => Vec::new(), // Cannot block on single-thread runtime
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok();
+                rt.map(|rt| rt.block_on(self.get_client_ids()))
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    fn hydrate_client_inputs_sync(&self, store: &ClientInputStore) -> Result<usize, String> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                #[allow(deprecated)]
+                match handle.runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(self.hydrate_client_inputs(store))
+                        })
+                    }
+                    tokio::runtime::RuntimeFlavor::CurrentThread => {
+                        Err("Cannot hydrate client inputs from single-thread Tokio runtime".to_string())
+                    }
+                    _ => Err("Unsupported Tokio runtime flavor".to_string()),
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
+                rt.block_on(self.hydrate_client_inputs(store))
+            }
+        }
+    }
+
+    fn hydrate_client_inputs_for_sync(
+        &self,
+        store: &ClientInputStore,
+        client_ids: &[ClientId],
+    ) -> Result<usize, String> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                #[allow(deprecated)]
+                match handle.runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(self.hydrate_client_inputs_for(store, client_ids))
+                        })
+                    }
+                    tokio::runtime::RuntimeFlavor::CurrentThread => {
+                        Err("Cannot hydrate client inputs from single-thread Tokio runtime".to_string())
+                    }
+                    _ => Err("Unsupported Tokio runtime flavor".to_string()),
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
+                rt.block_on(self.hydrate_client_inputs_for(store, client_ids))
+            }
+        }
     }
 }

@@ -95,8 +95,11 @@ async fn test_vm_mpc_multiplication_integration() {
     // Step 2: Start all servers
     info!("Step 2: Starting servers...");
     for (i, server) in servers.iter_mut().enumerate() {
+        // Must call start() first to create the network Arc
+        server.start().await.expect("Failed to start server");
+
         let mut node = server.node.clone();
-        let network = server.network.clone();
+        let network = server.network.clone().expect("network should be set after start()");
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some(raw_msg) = rx.recv().await {
@@ -106,7 +109,6 @@ async fn test_vm_mpc_multiplication_integration() {
             }
             tracing::info!("Receiver task for node {i} ended");
         });
-        server.start().await.expect("Failed to start server");
         info!("✓ Started server {}", server.node_id);
     }
 
@@ -130,7 +132,7 @@ async fn test_vm_mpc_multiplication_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server.network.clone();
+            let network = server.network.clone().expect("network should be set after start()");
 
             tokio::spawn(async move {
                 info!("[Server {}] Starting preprocessing...", i);
@@ -193,7 +195,7 @@ async fn test_vm_mpc_multiplication_integration() {
     let mut multiplication_handles = Vec::new();
     for (pid, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let net = server.network.clone();
+        let net = server.network.clone().expect("network should be set");
 
         let handle = tokio::spawn(async move {
             // Get input shares for this party

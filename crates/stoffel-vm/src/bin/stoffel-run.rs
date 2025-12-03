@@ -2,17 +2,14 @@ use std::env;
 use std::net::SocketAddr;
 use std::process::exit;
 
-use rand::RngCore;
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
-use stoffel_vm::net::session::agree_session_with_bootnode;
 use stoffel_vm::net::{
-    agree_and_sync_program, bootstrap_with_bootnode, program_id_from_bytes, run_bootnode,
-    wait_until_min_parties,
+    program_id_from_bytes, register_and_wait_for_session_with_program, run_bootnode_with_config,
 };
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 use stoffel_vm_types::compiled_binary::CompiledBinary;
@@ -36,10 +33,10 @@ async fn main() {
     let mut trace_regs = false;
     let mut trace_stack = false;
     let mut as_bootnode = false;
+    let mut as_leader = false;
     let mut bind_addr: Option<SocketAddr> = None;
     let mut party_id: Option<usize> = None;
     let mut bootstrap_addr: Option<SocketAddr> = None;
-    let mut min_parties: Option<usize> = None;
     let mut n_parties: Option<usize> = None;
     let mut threshold: Option<usize> = None;
 
@@ -54,12 +51,13 @@ async fn main() {
             trace_stack = true;
         } else if arg == "--bootnode" {
             as_bootnode = true;
+        } else if arg == "--leader" {
+            as_leader = true;
         } else if let Some(_rest) = arg.strip_prefix("--bind") {
             // support "--bind" and "--bind=.."
             // actual value parsed later from positional with key
         } else if let Some(_rest) = arg.strip_prefix("--party-id") {
         } else if let Some(_rest) = arg.strip_prefix("--bootstrap") {
-        } else if let Some(_rest) = arg.strip_prefix("--min-parties") {
         } else if let Some(_rest) = arg.strip_prefix("--n-parties") {
         } else if let Some(_rest) = arg.strip_prefix("--threshold") {
         }
@@ -97,11 +95,6 @@ async fn main() {
                     bootstrap_addr = Some(v.parse().expect("Invalid --bootstrap addr"));
                 }
             }
-            "--min-parties" => {
-                if let Some(v) = args_iter.next() {
-                    min_parties = Some(v.parse().expect("Invalid --min-parties"));
-                }
-            }
             "--n-parties" => {
                 if let Some(v) = args_iter.next() {
                     n_parties = Some(v.parse().expect("Invalid --n-parties"));
@@ -116,15 +109,16 @@ async fn main() {
         }
     }
 
-    // Bootnode mode
-    if as_bootnode {
+    // Bootnode-only mode (no program execution)
+    if as_bootnode && !as_leader {
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:9000".parse().unwrap());
         eprintln!("Starting bootnode on {}", bind);
         // Install crypto provider for quinn/rustls
         rustls::crypto::ring::default_provider()
             .install_default()
             .expect("install rustls crypto");
-        if let Err(e) = run_bootnode(bind).await {
+        // Pass expected parties if specified, so bootnode waits for all before announcing session
+        if let Err(e) = run_bootnode_with_config(bind, n_parties).await {
             eprintln!("Bootnode error: {}", e);
             exit(10);
         }
@@ -142,17 +136,133 @@ async fn main() {
         entry
     };
 
-    // Optional: bring up networking in party mode if bootstrap provided
+    // Optional: bring up networking in party mode if bootstrap provided or if leader
     let mut net_opt: Option<Arc<QuicNetworkManager>> = None;
-    let mut program_bytes: Option<Vec<u8>> = None;
     let mut program_id: [u8; 32] = [0u8; 32];
     let mut agreed_entry = entry.clone();
-    if let Some(bootnode) = bootstrap_addr {
+    let mut session_instance_id: Option<u64> = None;
+    let mut session_n_parties: Option<usize> = None;
+    let mut session_threshold: Option<usize> = None;
+
+    // Leader mode: this party also runs the bootnode
+    if as_leader {
+        let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:9000".parse().unwrap());
+        let my_id = party_id.unwrap_or(0usize);
+
+        // Install crypto provider for quinn/rustls
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("install rustls crypto");
+
+        // Must have program path
+        if path_opt.is_none() {
+            eprintln!("Error: leader mode requires a program path");
+            exit(2);
+        }
+        let program_path = path_opt.as_ref().unwrap();
+        let bytes = std::fs::read(program_path).expect("read program");
+        program_id = program_id_from_bytes(&bytes);
+
+        // Get MPC parameters (required for session)
+        let n = n_parties.unwrap_or_else(|| {
+            eprintln!("Error: --n-parties is required for leader mode");
+            exit(2);
+        });
+        let t = threshold.unwrap_or(1);
+
+        eprintln!(
+            "[leader/party {}] Starting bootnode on {} and participating in session (n={}, t={})",
+            my_id, bind, n, t
+        );
+
+        // Spawn bootnode in background
+        let bootnode_bind = bind;
+        let bootnode_n = n;
+        tokio::spawn(async move {
+            if let Err(e) = run_bootnode_with_config(bootnode_bind, Some(bootnode_n)).await {
+                eprintln!("Bootnode error: {}", e);
+            }
+        });
+
+        // Give bootnode a moment to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now connect to ourselves as the bootnode
+        let mut mgr = QuicNetworkManager::new();
+        // Listen on a different port for peer connections
+        let party_bind: SocketAddr = format!("{}:{}", bind.ip(), bind.port() + 1000)
+            .parse()
+            .unwrap();
+        if let Err(e) = mgr.listen(party_bind).await {
+            eprintln!("Failed to listen on {}: {}", party_bind, e);
+            exit(11);
+        }
+
+        eprintln!(
+            "[leader/party {}] Party listening on {}, registering with bootnode {}",
+            my_id, party_bind, bind
+        );
+
+        // Register with our own bootnode and wait for session
+        // Leader uploads program bytes so other parties can fetch them
+        let session_info = match register_and_wait_for_session_with_program(
+            &mut mgr,
+            bind, // bootnode is on our bind address
+            my_id,
+            party_bind,
+            program_id,
+            &entry,
+            n,
+            t,
+            Duration::from_secs(120), // 2 minute timeout for all parties to join
+            Some(bytes),              // Leader uploads program bytes
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                eprintln!("Session registration failed: {}", e);
+                exit(12);
+            }
+        };
+
+        // Use session parameters
+        agreed_entry = session_info.entry.clone();
+        session_instance_id = Some(session_info.instance_id);
+        session_n_parties = Some(session_info.n_parties);
+        session_threshold = Some(session_info.threshold);
+
+        eprintln!(
+            "[leader/party {}] Session started: instance_id={}, n={}, t={}, entry={}",
+            my_id, session_info.instance_id, session_info.n_parties, session_info.threshold, agreed_entry
+        );
+
+        let net = Arc::new(mgr);
+        net_opt = Some(net.clone());
+    } else if let Some(bootnode) = bootstrap_addr {
+        // Regular party mode: connect to external bootnode
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
         let my_id = party_id.unwrap_or(0usize);
         rustls::crypto::ring::default_provider()
             .install_default()
             .expect("install rustls crypto");
+
+        // Must have program path in party mode
+        if path_opt.is_none() {
+            eprintln!("Error: party mode requires a program path");
+            exit(2);
+        }
+        let program_path = path_opt.as_ref().unwrap();
+        let bytes = std::fs::read(program_path).expect("read program");
+        program_id = program_id_from_bytes(&bytes);
+
+        // Get MPC parameters (required for session)
+        let n = n_parties.unwrap_or_else(|| {
+            eprintln!("Error: --n-parties is required for party mode");
+            exit(2);
+        });
+        let t = threshold.unwrap_or(1);
+
         // Prepare QUIC manager
         let mut mgr = QuicNetworkManager::new();
         // Listen so peers can connect back directly
@@ -160,39 +270,59 @@ async fn main() {
             eprintln!("Failed to listen on {}: {}", bind, e);
             exit(11);
         }
-        if let Err(e) = bootstrap_with_bootnode(&mut mgr, bootnode, my_id, bind).await {
-            eprintln!("bootstrap failed: {}", e);
-            exit(12);
-        }
-        if let Some(n) = min_parties {
-            if let Err(e) = wait_until_min_parties(&mgr, n, Duration::from_secs(10)).await {
-                eprintln!("waiting for parties failed: {}", e);
-                exit(13);
+
+        // Note: if using port 0, the OS assigns a port. For now we use the bind address.
+        // In a real deployment, you should use specific ports, not port 0.
+        let actual_listen = bind;
+        eprintln!(
+            "[party {}] Listening on {}, connecting to bootnode {}",
+            my_id, actual_listen, bootnode
+        );
+
+        // Register with bootnode and wait for session to be announced
+        // This blocks until all n parties have registered
+        // Upload program bytes so bootnode can distribute to parties that don't have it
+        let session_info = match register_and_wait_for_session_with_program(
+            &mut mgr,
+            bootnode,
+            my_id,
+            actual_listen,
+            program_id,
+            &entry,
+            n,
+            t,
+            Duration::from_secs(120), // 2 minute timeout for all parties to join
+            Some(bytes),              // Upload program bytes
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                eprintln!("Session registration failed: {}", e);
+                exit(12);
             }
-        }
-        // program agreement + sync
-        let bn_conn = mgr.connect(bootnode).await.expect("connect bootnode");
-        // local bytes if provided
-        if let Some(p) = &path_opt {
-            let bytes = std::fs::read(p).expect("read program");
-            program_id = program_id_from_bytes(&bytes);
-            program_bytes = Some(bytes);
-        }
-        let (pid, _sz, agreed_entry_s) =
-            agree_and_sync_program(&*bn_conn, my_id, &entry, program_bytes.clone())
-                .await
-                .expect("program agree/sync");
-        program_id = pid;
-        agreed_entry = agreed_entry_s;
+        };
+
+        // Use session parameters
+        agreed_entry = session_info.entry.clone();
+        session_instance_id = Some(session_info.instance_id);
+        session_n_parties = Some(session_info.n_parties);
+        session_threshold = Some(session_info.threshold);
+
+        eprintln!(
+            "[party {}] Session started: instance_id={}, n={}, t={}, entry={}",
+            my_id, session_info.instance_id, session_info.n_parties, session_info.threshold, agreed_entry
+        );
+
         let net = Arc::new(mgr);
         net_opt = Some(net.clone());
     } else {
         // local run: must have path
         if let Some(p) = &path_opt {
-            program_bytes = Some(std::fs::read(p).expect("read program"));
-            program_id = program_id_from_bytes(program_bytes.as_ref().unwrap());
+            let bytes = std::fs::read(p).expect("read program");
+            program_id = program_id_from_bytes(&bytes);
         } else {
-            eprintln!("Error: local run requires a program path unless --bootnode");
+            eprintln!("Error: local run requires a program path unless --bootnode or --leader");
             exit(2);
         }
     }
@@ -372,13 +502,18 @@ async fn main() {
     // If in party mode, configure async HoneyBadger engine and preprocess
     if let Some(net) = net_opt.clone() {
         let my_id = party_id.unwrap_or(0usize);
-        let n = n_parties.unwrap_or_else(|| net.parties().len());
-        let t = threshold.unwrap_or(1);
-        // Generate a random instance ID locally for this run
-        let mut b = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut b);
-        let instance_id = u64::from_le_bytes(b);
-        // Construct engine
+        // Use session parameters (already agreed upon with bootnode)
+        let n = session_n_parties.unwrap_or_else(|| net.parties().len());
+        let t = session_threshold.unwrap_or(1);
+        // Use the session instance_id (agreed with all parties via bootnode)
+        let instance_id = session_instance_id.expect("session instance_id should be set in party mode");
+
+        eprintln!(
+            "[party {}] Creating MPC engine: instance_id={}, n={}, t={}",
+            my_id, instance_id, n, t
+        );
+
+        // Construct engine with the agreed instance_id
         let engine = HoneyBadgerMpcEngine::new(instance_id, my_id, n, t, 8, 16, net.clone());
         let engine = match engine {
             Ok(eng) => eng,
@@ -388,10 +523,12 @@ async fn main() {
             }
         };
         // Fully async preprocessing
+        eprintln!("[party {}] Starting MPC preprocessing...", my_id);
         if let Err(e) = engine.start_async().await {
             eprintln!("MPC preprocessing failed: {}", e);
             exit(14);
         }
+        eprintln!("[party {}] MPC preprocessing complete", my_id);
         vm.state.set_mpc_engine(engine);
     }
 
@@ -409,7 +546,57 @@ async fn main() {
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Stoffel VM Runner\n\nUsage:\n  stoffel-run <path-to-compiled-binary> [entry_function] [flags]\n\nFlags:\n  --trace-instr   Trace instructions before/after execution\n  --trace-regs    Trace register reads/writes\n  --trace-stack   Trace function calls and stack push/pop\n  --bootnode              Run as bootnode only\n  --bind <addr:port>      Bind address for bootnode or party listen\n  --party-id <usize>      Party id (party mode)\n  --bootstrap <addr:port> Bootnode address (party mode)\n  --min-parties <usize>   Wait until this many parties discovered before VM run\n  --n-parties <usize>     Expected parties for MPC engine (default: discovered)\n  --threshold <usize>     Threshold t for HoneyBadger (default: 1)\n  -h, --help      Show this help\n\nExamples:\n  stoffel-run program.stfbin\n  stoffel-run program.stfbin main --trace-instr --trace-regs\n  stoffel-run --bootnode --bind 127.0.0.1:9000\n  stoffel-run program.stfbin main --bind 127.0.0.1:9001 --party-id 1 --bootstrap 127.0.0.1:9000 --min-parties 3 --n-parties 5 --threshold 1\n"
+        r#"Stoffel VM Runner
+
+Usage:
+  stoffel-run <path-to-compiled-binary> [entry_function] [flags]
+
+Flags:
+  --trace-instr           Trace instructions before/after execution
+  --trace-regs            Trace register reads/writes
+  --trace-stack           Trace function calls and stack push/pop
+  --bootnode              Run as bootnode only (coordinates party discovery)
+  --leader                Run as leader: bootnode + party 0 in one process
+  --bind <addr:port>      Bind address for bootnode or party listen
+  --party-id <usize>      Party id (party mode, 0-indexed)
+  --bootstrap <addr:port> Bootnode address (party mode)
+  --n-parties <usize>     Number of parties for MPC (required in party/leader mode)
+  --threshold <usize>     Threshold t for HoneyBadger (default: 1)
+  -h, --help              Show this help
+
+Multi-Party Execution:
+  In party mode, all parties register with the bootnode and wait until
+  all n-parties have joined. The bootnode then broadcasts a session with
+  a shared instance_id to all parties, ensuring they all use the same
+  MPC configuration.
+
+  Use --leader on one party to have it also run the bootnode. This reduces
+  the number of processes needed by one.
+
+Examples:
+  # Local execution (no MPC)
+  stoffel-run program.stfbin
+  stoffel-run program.stfbin main --trace-instr
+
+  # Multi-party execution (5 parties, threshold 1) - Leader mode (recommended)
+  # Terminal 1: Leader (bootnode + party 0)
+  stoffel-run program.stfbin main --leader --bind 127.0.0.1:9000 --n-parties 5 --threshold 1
+
+  # Terminals 2-5: Other parties
+  stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --threshold 1
+  stoffel-run program.stfbin main --party-id 2 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9003 --n-parties 5 --threshold 1
+  stoffel-run program.stfbin main --party-id 3 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9004 --n-parties 5 --threshold 1
+  stoffel-run program.stfbin main --party-id 4 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9005 --n-parties 5 --threshold 1
+
+  # Alternative: Separate bootnode (6 processes total)
+  # Terminal 1: Bootnode only
+  stoffel-run --bootnode --bind 127.0.0.1:9000 --n-parties 5
+
+  # Terminals 2-6: All parties
+  stoffel-run program.stfbin main --party-id 0 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9001 --n-parties 5 --threshold 1
+  stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --threshold 1
+  # ... etc
+"#
     );
     exit(1);
 }

@@ -1,5 +1,6 @@
 // honeybadger_quic.rs
 //! Integration module for HoneyBadger MPC with QUIC networking
+use crate::net::mpc::honeybadger_node_opts;
 use ark_ff::{FftField, PrimeField};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
@@ -16,7 +17,6 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
-use crate::net::mpc::honeybadger_node_opts;
 
 /// Configuration for HoneyBadger MPC over QUIC
 #[derive(Debug, Clone)]
@@ -45,8 +45,10 @@ impl Default for HoneyBadgerQuicConfig {
 pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     /// The underlying MPC node
     pub node: HoneyBadgerMPCNode<F, Avid>,
-    /// Actor-like manager usage: Arc for send/broadcast, owned clones for accept/connect
-    pub network: Arc<QuicNetworkManager>,
+    /// Network manager builder - used during setup before start() is called
+    network_builder: Option<QuicNetworkManager>,
+    /// Network manager Arc - created when start() is called, shared with all tasks
+    pub network: Option<Arc<QuicNetworkManager>>,
     /// Message processing task handle
     message_task: Option<tokio::task::JoinHandle<()>>,
     /// Connection handling task handle
@@ -103,10 +105,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         // Ensure the local party is registered in the party map to avoid PartyNotFound(self)
         base_manager.add_node_with_party_id(node_id, bind_address);
 
-        // Arc for read-only ops; actor loops will use owned clones when mutability across await is needed
-        let network = Arc::new(base_manager);
-
-        let initial_parties = network.parties().len();
+        let initial_parties = base_manager.parties().len();
         info!(
             "Created HoneyBadger QUIC server for node {} on {} (initial peers: {})",
             node_id, bind_address, initial_parties
@@ -114,7 +113,8 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
 
         Ok(Self {
             node: mpc_node,
-            network,
+            network_builder: Some(base_manager),
+            network: None,
             message_task: None,
             connection_task: None,
             config,
@@ -124,16 +124,20 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         })
     }
 
-    /// Adds a peer node to connect to
+    /// Adds a peer node to connect to. Must be called before start().
     pub async fn add_peer(&mut self, peer_id: PartyId, address: SocketAddr) {
-        // Work on a local owned clone, then swap back to update self
-        let mut manager = self.network.as_ref().clone();
-        manager.add_node_with_party_id(peer_id, address);
-        self.network = Arc::new(manager);
-        info!(
-            "Added peer {} at {} to node {}",
-            peer_id, address, self.node_id
-        );
+        if let Some(ref mut builder) = self.network_builder {
+            builder.add_node_with_party_id(peer_id, address);
+            info!(
+                "Added peer {} at {} to node {}",
+                peer_id, address, self.node_id
+            );
+        } else {
+            panic!(
+                "Cannot add peer after start() has been called on node {}",
+                self.node_id
+            );
+        }
     }
 
     /// Starts the server and begins accepting connections
@@ -143,13 +147,25 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             return Ok(());
         }
 
+        // Convert builder to Arc - this freezes the peer list
+        let network = Arc::new(
+            self.network_builder
+                .take()
+                .expect("start() called but network_builder is None"),
+        );
+        self.network = Some(network.clone());
+
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         self.shutdown_tx = Some(shutdown_tx);
 
         info!("Starting HoneyBadger QUIC server on node {}", self.node_id);
 
-        // Start connection acceptance task with an owned clone (no locks held across await)
-        let mut acceptor = self.network.as_ref().clone();
+        // Start connection acceptance task with an owned clone
+        // NOTE: This clones the QuicNetworkManager, which means connections
+        // accepted here are stored in this clone, not the shared Arc.
+        // This is a known limitation - MPC operations must use connections
+        // established via connect_to_peers, not accepted connections.
+        let mut acceptor = (*network).clone();
         // let network_for_handlers = self.network.clone();
         // let node_for_handlers = self.node.clone();
         let node_id = self.node_id;
@@ -208,14 +224,22 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         Ok(())
     }
 
-    /// Connects to all configured peer nodes
+    /// Connects to all configured peer nodes. Must be called after start().
     pub async fn connect_to_peers(&self) -> Result<(), HoneyBadgerError> {
-        let peers: Vec<(PartyId, SocketAddr)> = self
+        let network = self
             .network
+            .as_ref()
+            .expect("connect_to_peers() called before start()");
+
+        let peers: Vec<(PartyId, SocketAddr)> = network
             .parties()
             .iter()
             .map(|p| (p.id(), p.address()))
             .collect();
+
+        // Clone the network manager to get mutable access for establishing connections
+        // NOTE: Connections are stored in this clone, not in the shared Arc
+        let mut dialer = (**network).clone();
         info!(
             "[HB-QUIC] Node {} discovered {} peers (including self)",
             self.node_id,
@@ -227,9 +251,6 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                 self.node_id, pid, addr
             );
         }
-
-        // Use a local owned clone for dialing without any external locks
-        let mut dialer = self.network.as_ref().clone();
         for (peer_id, peer_addr) in peers {
             // Connect to all peers including self to ensure a loopback entry exists in the
             // network connections map. Some protocols send to self, and the transport
@@ -708,8 +729,13 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     }
 
     // Create MPC options
-    let mpc_opts =
-        honeybadger_node_opts(n_parties, threshold, n_triples, n_random_shares, instance_id);
+    let mpc_opts = honeybadger_node_opts(
+        n_parties,
+        threshold,
+        n_triples,
+        n_random_shares,
+        instance_id,
+    );
 
     // Create all servers
     let mut recv = Vec::new();
@@ -821,9 +847,12 @@ mod tests {
         // Step 2: Start all servers
         info!("Step 2: Starting servers...");
         for (i, server) in servers.iter_mut().enumerate() {
-            //Reciever for each node
+            // Must call start() first to create the network Arc
+            server.start().await.expect("Failed to start server");
+
+            //Receiver for each node
             let mut node = server.node.clone();
-            let network = server.network.clone();
+            let network = server.network.clone().expect("network should be set after start()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some(raw_msg) = rx.recv().await {
@@ -833,7 +862,6 @@ mod tests {
                 }
                 tracing::info!("Receiver task for node {i} ended");
             });
-            server.start().await.expect("Failed to start server");
             info!("✓ Started server {}", server.node_id);
         }
         // tokio::time::sleep(Duration::from_millis(100)).await;
@@ -882,7 +910,8 @@ mod tests {
         // Step 5: Verify network connectivity with a simple ping-pong test
         info!("Step 4: Verifying network connectivity...");
         for (i, server) in servers.iter().enumerate() {
-            let parties = server.network.parties();
+            let network = server.network.as_ref().expect("network should be set");
+            let parties = network.parties();
             info!("Server {} sees {} parties in network map", i, parties.len());
             for party in parties {
                 info!("  - Party {} at {}", party.id(), party.address());
@@ -890,7 +919,7 @@ mod tests {
 
             // Verify each server can resolve all other parties
             for peer_id in 0..n_parties {
-                match server.network.node(peer_id) {
+                match network.node(peer_id) {
                     Some(node) => {
                         info!(
                             "✓ Server {} can resolve peer {} at {}",
@@ -925,7 +954,7 @@ mod tests {
             .enumerate()
             .map(|(i, server)| {
                 let mut node_arc = server.node.clone();
-                let network_clone = server.network.clone();
+                let network_clone = server.network.clone().expect("network should be set after start()");
 
                 tokio::spawn(async move {
                     info!("[Server {}] Starting preprocessing...", i);
@@ -974,7 +1003,7 @@ mod tests {
                 .node
                 .preprocess
                 .input
-                .init(clientid[0], local_shares, 2, server.network.clone())
+                .init(clientid[0], local_shares, 2, server.network.clone().expect("network should be set"))
                 .await
             {
                 Ok(_) => {}
@@ -990,7 +1019,7 @@ mod tests {
         let mut handles = Vec::new();
         for pid in 0..n_parties {
             let mut node = servers[pid].node.clone();
-            let net = servers[pid].network.clone();
+            let net = servers[pid].network.clone().expect("network should be set");
 
             let (x_shares, y_shares) = {
                 let input_store = node.preprocess.input.input_shares.lock().await;
@@ -1020,7 +1049,7 @@ mod tests {
         let output_clientid: ClientId = 200;
         // Each server sends its output shares
         for (i, server) in servers.iter().enumerate() {
-            let net = server.network.clone();
+            let net = server.network.clone().expect("network should be set");
             let storage_map = server.node.operations.mul.mult_storage.lock().await;
             if let Some(storage_mutex) = storage_map.get(&session_id) {
                 let storage = storage_mutex.lock().await;
@@ -1119,9 +1148,12 @@ mod tests {
         // Step 2: Start all servers
         info!("Step 2: Starting servers...");
         for (i, server) in servers.iter_mut().enumerate() {
-            //Reciever for each node
+            // Must call start() first to create the network Arc
+            server.start().await.expect("Failed to start server");
+
+            //Receiver for each node
             let mut node = server.node.clone();
-            let network = server.network.clone();
+            let network = server.network.clone().expect("network should be set after start()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some(raw_msg) = rx.recv().await {
@@ -1131,7 +1163,6 @@ mod tests {
                 }
                 tracing::info!("Receiver task for node {i} ended");
             });
-            server.start().await.expect("Failed to start server");
             info!("✓ Started server {}", server.node_id);
         }
         // tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1180,7 +1211,8 @@ mod tests {
         // Step 4: Verify network connectivity with a simple ping-pong test
         info!("Step 4: Verifying network connectivity...");
         for (i, server) in servers.iter().enumerate() {
-            let parties = server.network.parties();
+            let network = server.network.as_ref().expect("network should be set");
+            let parties = network.parties();
             info!("Server {} sees {} parties in network map", i, parties.len());
             for party in parties {
                 info!("  - Party {} at {}", party.id(), party.address());
@@ -1188,7 +1220,7 @@ mod tests {
 
             // Verify each server can resolve all other parties
             for peer_id in 0..n_parties {
-                match server.network.node(peer_id) {
+                match network.node(peer_id) {
                     Some(node) => {
                         info!(
                             "✓ Server {} can resolve peer {} at {}",
@@ -1223,7 +1255,7 @@ mod tests {
             .enumerate()
             .map(|(i, server)| {
                 let mut node_arc = server.node.clone();
-                let network_clone = server.network.clone();
+                let network_clone = server.network.clone().expect("network should be set after start()");
 
                 tokio::spawn(async move {
                     info!("[Server {}] Starting preprocessing...", i);
@@ -1271,7 +1303,7 @@ mod tests {
                 .node
                 .preprocess
                 .input
-                .init(clientid[0], local_shares, 2, server.network.clone())
+                .init(clientid[0], local_shares, 2, server.network.clone().expect("network should be set"))
                 .await
             {
                 Ok(_) => {}
@@ -1319,9 +1351,12 @@ mod tests {
         // Step 2: Start all servers
         info!("Step 2: Starting servers...");
         for (i, server) in servers.iter_mut().enumerate() {
-            //Reciever for each node
+            // Must call start() first to create the network Arc
+            server.start().await.expect("Failed to start server");
+
+            //Receiver for each node
             let mut node = server.node.clone();
-            let network = server.network.clone();
+            let network = server.network.clone().expect("network should be set after start()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some(raw_msg) = rx.recv().await {
@@ -1331,7 +1366,6 @@ mod tests {
                 }
                 tracing::info!("Receiver task for node {i} ended");
             });
-            server.start().await.expect("Failed to start server");
             info!("✓ Started server {}", server.node_id);
         }
         // tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1351,7 +1385,8 @@ mod tests {
         // Step 4: Verify network connectivity with a simple ping-pong test
         info!("Step 4: Verifying network connectivity...");
         for (i, server) in servers.iter().enumerate() {
-            let parties = server.network.parties();
+            let network = server.network.as_ref().expect("network should be set");
+            let parties = network.parties();
             info!("Server {} sees {} parties in network map", i, parties.len());
             for party in parties {
                 info!("  - Party {} at {}", party.id(), party.address());
@@ -1359,7 +1394,7 @@ mod tests {
 
             // Verify each server can resolve all other parties
             for peer_id in 0..n_parties {
-                match server.network.node(peer_id) {
+                match network.node(peer_id) {
                     Some(node) => {
                         info!(
                             "✓ Server {} can resolve peer {} at {}",
@@ -1394,7 +1429,7 @@ mod tests {
             .enumerate()
             .map(|(i, server)| {
                 let mut node_arc = server.node.clone();
-                let network_clone = server.network.clone();
+                let network_clone = server.network.clone().expect("network should be set after start()");
 
                 tokio::spawn(async move {
                     info!("[Server {}] Starting preprocessing...", i);
