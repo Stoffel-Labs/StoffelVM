@@ -52,9 +52,9 @@ use std::ffi::{c_char, CStr, CString};
 use std::os::raw::{c_int, c_void};
 use std::sync::{Arc, Mutex};
 
-use crate::core_types::Value;
+use stoffel_vm_types::core_types::Value;
 use crate::core_vm::VirtualMachine;
-use crate::functions::ForeignFunctionContext;
+use crate::foreign_functions::ForeignFunctionContext;
 
 /// Opaque pointer type for the VM
 pub type VMHandle = *mut c_void;
@@ -478,7 +478,7 @@ fn value_to_stoffel_value(value: &Value) -> StoffelValue {
             value_type: StoffelValueType::Unit,
             data: StoffelValueData { int_val: 0 },
         },
-        Value::Int(n) => StoffelValue {
+        Value::I64(n) => StoffelValue {
             value_type: StoffelValueType::Int,
             data: StoffelValueData { int_val: *n },
         },
@@ -532,7 +532,7 @@ fn value_to_stoffel_value(value: &Value) -> StoffelValue {
 fn stoffel_value_to_value(value: &StoffelValue) -> Result<Value, String> {
     match value.value_type {
         StoffelValueType::Unit => Ok(Value::Unit),
-        StoffelValueType::Int => unsafe { Ok(Value::Int(value.data.int_val)) },
+        StoffelValueType::Int => unsafe { Ok(Value::I64(value.data.int_val)) },
         StoffelValueType::Float => unsafe { Ok(Value::Float(value.data.float_val as i64)) },
         StoffelValueType::Bool => unsafe { Ok(Value::Bool(value.data.bool_val)) },
         StoffelValueType::String => unsafe {
