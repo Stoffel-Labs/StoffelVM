@@ -1,20 +1,19 @@
-use stoffel_vm_types::activations::{ActivationRecord, ActivationRecordPool};
 use crate::foreign_functions::{ForeignFunction, ForeignFunctionContext, Function};
-use stoffel_vm_types::functions::VMFunction;
 use crate::runtime_hooks::{HookContext, HookEvent};
-use stoffel_vm_types::core_types::{Closure, Upvalue, Value};
 use crate::vm_state::VMState;
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
 use std::sync::Arc;
-use rustc_hash::FxHashMap;
+use stoffel_vm_types::activations::{ActivationRecord, ActivationRecordPool};
+use stoffel_vm_types::core_types::{Closure, Upvalue, Value};
+use stoffel_vm_types::functions::VMFunction;
 
 /// The register-based virtual machine
 pub struct VirtualMachine {
     pub state: VMState,
     activation_pool: ActivationRecordPool,
 }
-
 
 impl Default for VirtualMachine {
     fn default() -> Self {
@@ -167,8 +166,8 @@ impl VirtualMachine {
                     if let Some(arr) = ctx.vm_state.object_store.get_array_mut(*id) {
                         let start = arr.length();
                         for (offset, value) in ctx.args[1..].iter().enumerate() {
-                            // Lua-inspired 1-based arrays: next index is start + 1
-                            let idx = Value::I64((start + 1 + offset) as i64);
+                            // 0-indexed arrays: next index is current length + offset
+                            let idx = Value::I64((start + offset) as i64);
                             arr.set(idx, value.clone());
                         }
                         Ok(Value::I64(arr.length() as i64))
@@ -178,6 +177,100 @@ impl VirtualMachine {
                 }
                 _ => Err("First argument must be an array".to_string()),
             }
+        });
+
+        self.register_foreign_function("ClientStore.get_number_clients", |ctx| {
+            let count = ctx.vm_state.client_store_len();
+            Ok(Value::I64(count as i64))
+        });
+
+        self.register_foreign_function("ClientStore.take_share", |ctx| {
+            if ctx.args.len() != 2 {
+                return Err(
+                    "ClientStore.take_share expects 2 arguments: client_index, share_index"
+                        .to_string(),
+                );
+            }
+
+            fn parse_index(value: &Value, name: &str) -> Result<usize, String> {
+                match value {
+                    Value::I64(v) if *v >= 0 => Ok(*v as usize),
+                    Value::U64(v) => Ok(*v as usize),
+                    _ => Err(format!("{name} must be a non-negative integer")),
+                }
+            }
+
+            let client_index = parse_index(&ctx.args[0], "client_index")?;
+            let share_index = parse_index(&ctx.args[1], "share_index")?;
+
+            let client_id = ctx
+                .vm_state
+                .client_id_at_index(client_index)
+                .ok_or_else(|| format!("No client at index {}", client_index))?;
+
+            ctx.vm_state.load_client_share(client_id, share_index)
+        });
+
+        // Fixed-point version of take_share
+        // Usage: ClientStore.take_share_fixed(client_index, share_index)
+        // Returns a Value::Share with SecretFixedPoint type
+        self.register_foreign_function("ClientStore.take_share_fixed", |ctx| {
+            if ctx.args.len() != 2 {
+                return Err(
+                    "ClientStore.take_share_fixed expects 2 arguments: client_index, share_index"
+                        .to_string(),
+                );
+            }
+
+            fn parse_index(value: &Value, name: &str) -> Result<usize, String> {
+                match value {
+                    Value::I64(v) if *v >= 0 => Ok(*v as usize),
+                    Value::U64(v) => Ok(*v as usize),
+                    _ => Err(format!("{name} must be a non-negative integer")),
+                }
+            }
+
+            let client_index = parse_index(&ctx.args[0], "client_index")?;
+            let share_index = parse_index(&ctx.args[1], "share_index")?;
+
+            let client_id = ctx
+                .vm_state
+                .client_id_at_index(client_index)
+                .ok_or_else(|| format!("No client at index {}", client_index))?;
+
+            ctx.vm_state.load_client_share_fixed(client_id, share_index)
+        });
+
+        // MPC Output protocol: send secret share(s) to a specific client for private reconstruction
+        // Usage: MpcOutput.send_to_client(client_id, share_value)
+        // - client_id: The ID of the client to receive the output
+        // - share_value: A Value::Share containing the secret share data
+        // Returns: Value::Bool(true) on success
+        self.register_foreign_function("MpcOutput.send_to_client", |ctx| {
+            if ctx.args.len() != 2 {
+                return Err(
+                    "MpcOutput.send_to_client expects 2 arguments: client_id, share_value"
+                        .to_string(),
+                );
+            }
+
+            // Parse client_id (ClientId is usize)
+            let client_id: usize = match &ctx.args[0] {
+                Value::I64(v) if *v >= 0 => *v as usize,
+                Value::U64(v) => *v as usize,
+                _ => return Err("client_id must be a non-negative integer".to_string()),
+            };
+
+            // Get the share bytes from the share value
+            let (share_bytes, input_len) = match &ctx.args[1] {
+                Value::Share(_, data) => (data.clone(), 1usize),
+                _ => return Err("share_value must be a Value::Share".to_string()),
+            };
+
+            // Send via MPC engine
+            ctx.vm_state.send_output_to_client(client_id, &share_bytes, input_len)?;
+
+            Ok(Value::Bool(true))
         });
 
         self.register_foreign_function("create_closure", |ctx| {
@@ -270,7 +363,8 @@ impl VirtualMachine {
                     }
 
                     // Trigger BeforeFunctionCall hook
-                    let event = HookEvent::BeforeFunctionCall(ctx.args[0].clone(), call_args.to_vec());
+                    let event =
+                        HookEvent::BeforeFunctionCall(ctx.args[0].clone(), call_args.to_vec());
                     ctx.vm_state.hook_manager.trigger(&event, ctx.vm_state)?;
 
                     // Setup the new activation record with the provided upvalues
@@ -295,7 +389,9 @@ impl VirtualMachine {
                     // Set up parameters in registers and locals
                     for (i, param_name) in vm_func.parameters.iter().enumerate() {
                         record.registers[i] = call_args[i].clone();
-                        record.locals.insert(param_name.clone(), call_args[i].clone());
+                        record
+                            .locals
+                            .insert(param_name.clone(), call_args[i].clone());
                     }
 
                     // Push to the activation record stack
@@ -407,7 +503,10 @@ impl VirtualMachine {
                         old_value = upvalue.value.clone();
                         upvalue.value = new_value.clone();
                         found = true;
-                        println!("Updated upvalue {} in current record: {:?} -> {:?}", name, old_value, new_value);
+                        println!(
+                            "Updated upvalue {} in current record: {:?} -> {:?}",
+                            name, old_value, new_value
+                        );
                         break;
                     }
                 }
@@ -583,7 +682,11 @@ impl VirtualMachine {
         self.state.hook_manager.disable_hook(hook_id)
     }
 
-    pub fn execute_with_args(&mut self, function_name: &str, args: &[Value]) -> Result<Value, String> {
+    pub fn execute_with_args(
+        &mut self,
+        function_name: &str,
+        args: &[Value],
+    ) -> Result<Value, String> {
         // First check if the function exists and what type it is
         let function = match self.state.functions.get(function_name) {
             Some(f) => f.clone(),
@@ -598,7 +701,7 @@ impl VirtualMachine {
                     vm_state: &mut self.state,
                 })?;
                 return Ok(result);
-            },
+            }
             Function::VM(vm_func) => {
                 if args.len() != vm_func.parameters.len() {
                     return Err(format!(
@@ -618,7 +721,7 @@ impl VirtualMachine {
                 // Clone the needed data before setting up the activation record to avoid borrow conflicts
                 let function_name = function_name.to_string();
                 let parameters = vm_func.parameters.clone();
-                let args = args.to_vec();  // Clone the arguments to avoid reference issues
+                let args = args.to_vec(); // Clone the arguments to avoid reference issues
 
                 let mut initial_record = self.activation_pool.get();
                 initial_record.function_name = function_name;
@@ -626,11 +729,14 @@ impl VirtualMachine {
                 initial_record.constant_values = vm_func.constant_values.clone();
 
                 // Initialize registers with the appropriate size and default values
-                initial_record.registers = SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]);
+                initial_record.registers =
+                    SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]);
 
                 for (i, (param_name, arg_value)) in parameters.iter().zip(args.iter()).enumerate() {
                     initial_record.registers[i] = arg_value.clone();
-                    initial_record.locals.insert(param_name.clone(), arg_value.clone());
+                    initial_record
+                        .locals
+                        .insert(param_name.clone(), arg_value.clone());
                 }
 
                 // Clone the record and drop the Reusable to avoid borrowing conflicts
@@ -687,6 +793,51 @@ impl VirtualMachine {
         self.state.execute_until_return()
     }
 
+    /// Execute the VM with a given main function using async MPC operations
+    ///
+    /// This version uses the async-native execution which only awaits when
+    /// MPC operations (like share multiplication) are needed.
+    pub async fn execute_async<E: crate::net::mpc_engine::AsyncMpcEngine>(
+        &mut self,
+        main_function: &str,
+        async_engine: &E,
+    ) -> Result<Value, String> {
+        let vm_func = match self.state.functions.get(main_function) {
+            Some(Function::VM(func)) => func.clone(),
+            Some(Function::Foreign(_)) => {
+                return Err(format!(
+                    "Cannot execute foreign function {} as main",
+                    main_function
+                ));
+            }
+            None => return Err(format!("Function {} not found", main_function)),
+        };
+
+        // Ensure instructions are cached and resolved
+        let mut vm_func = vm_func.clone();
+        if vm_func.resolved_instructions.is_none() {
+            vm_func.resolve_instructions();
+        }
+
+        let mut initial_record = self.activation_pool.get();
+        initial_record.function_name = main_function.to_string();
+        initial_record.resolved_instructions = vm_func.resolved_instructions.clone();
+        initial_record.constant_values = vm_func.constant_values.clone();
+
+        // Initialize registers with the appropriate size and default values
+        initial_record.registers = SmallVec::from_vec(vec![Value::Unit; vm_func.register_count]);
+
+        // Clone the record and drop the Reusable to avoid borrowing conflicts
+        let cloned_record = (*initial_record).clone();
+        drop(initial_record);
+
+        // Add the activation record directly to the state
+        self.state.activation_records.push(cloned_record);
+
+        // Execute with async MPC
+        self.state.execute_until_return_async(async_engine).await
+    }
+
     /// Execute a function specifically for benchmarking purposes.
     /// This method assumes the function has already been registered and executed at least once,
     /// so that all instructions are cached and resolved.
@@ -737,23 +888,22 @@ impl VirtualMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mutex_helpers::lock_mutex_as_result;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Instant;
     use stoffel_vm_types::activations::ActivationRecord;
     use stoffel_vm_types::functions::VMFunction;
     use stoffel_vm_types::instructions::Instruction;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use parking_lot::Mutex;
-    use std::time::Instant;
-    use crate::mutex_helpers::lock_mutex_as_result;
 
     // Helper function to create a test VM
     // Each test gets its own VM instance to allow parallel test execution
     fn setup_vm() -> VirtualMachine {
         // Create a new VM with its own independent state
         // Use a static VM instance as the base for all test VMs
-        static BASE_VM: once_cell::sync::Lazy<VirtualMachine> = once_cell::sync::Lazy::new(|| {
-            VirtualMachine::new()
-        });
+        static BASE_VM: once_cell::sync::Lazy<VirtualMachine> =
+            once_cell::sync::Lazy::new(|| VirtualMachine::new());
 
         // Clone the base VM with its own independent state
         // This allows tests to run in parallel without locking each other
@@ -802,14 +952,14 @@ mod tests {
             None,
             3,
             vec![
-                Instruction::LDI(0, Value::I64(5)),  // r0 = 5
-                Instruction::LDI(1, Value::I64(10)), // r1 = 10
-                Instruction::CMP(0, 1),              // Compare r0 < r1 (sets flag to -1)
+                Instruction::LDI(0, Value::I64(5)),          // r0 = 5
+                Instruction::LDI(1, Value::I64(10)),         // r1 = 10
+                Instruction::CMP(0, 1),                      // Compare r0 < r1 (sets flag to -1)
                 Instruction::JMPLT("less_than".to_string()), // Jump if less than
-                Instruction::LDI(2, Value::I64(0)),  // Should be skipped
+                Instruction::LDI(2, Value::I64(0)),          // Should be skipped
                 Instruction::JMP("end".to_string()),
                 // less_than:
-                Instruction::LDI(2, Value::I64(1)),  // Set result to 1 if jump taken
+                Instruction::LDI(2, Value::I64(1)), // Set result to 1 if jump taken
                 // end:
                 Instruction::RET(2),
             ],
@@ -838,14 +988,14 @@ mod tests {
             parent: None,
             register_count: 3,
             instructions: vec![
-                Instruction::LDI(0, Value::I64(15)), // r0 = 15
-                Instruction::LDI(1, Value::I64(10)), // r1 = 10
-                Instruction::CMP(0, 1),              // Compare r0 > r1 (sets flag to 1)
+                Instruction::LDI(0, Value::I64(15)),            // r0 = 15
+                Instruction::LDI(1, Value::I64(10)),            // r1 = 10
+                Instruction::CMP(0, 1),                         // Compare r0 > r1 (sets flag to 1)
                 Instruction::JMPGT("greater_than".to_string()), // Jump if greater than
-                Instruction::LDI(2, Value::I64(0)),  // Should be skipped
+                Instruction::LDI(2, Value::I64(0)),             // Should be skipped
                 Instruction::JMP("end".to_string()),
                 // greater_than:
-                Instruction::LDI(2, Value::I64(1)),  // Set result to 1 if jump taken
+                Instruction::LDI(2, Value::I64(1)), // Set result to 1 if jump taken
                 // end:
                 Instruction::RET(2),
             ],
@@ -1003,9 +1153,9 @@ mod tests {
                 Instruction::LDI(2, Value::I64(42)),
                 Instruction::PUSHARG(2),
                 Instruction::CALL("array_push".to_string()),
-                // Get element at index 1
+                // Get element at index 0 (0-indexed array)
                 Instruction::PUSHARG(1),
-                Instruction::LDI(3, Value::I64(1)),
+                Instruction::LDI(3, Value::I64(0)),
                 Instruction::PUSHARG(3),
                 Instruction::CALL("get_field".to_string()),
                 Instruction::RET(0),
@@ -1396,9 +1546,7 @@ mod tests {
 
         // 4. Hook for register operations
         vm.register_hook(
-            |event| {
-                matches!(event, HookEvent::RegisterWrite(_, _, _))
-            },
+            |event| matches!(event, HookEvent::RegisterWrite(_, _, _)),
             move |event, ctx| {
                 if let HookEvent::RegisterWrite(reg, old, new) = event {
                     println!("REGISTER WRITE: r{} = {:?} (was {:?})", reg, new, old);
@@ -1852,7 +2000,8 @@ mod tests {
         vm.register_hook(
             |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
             move |_, _| {
-                if let Ok(mut calls) = crate::mutex_helpers::lock_mutex_as_result(&hook_calls_clone) {
+                if let Ok(mut calls) = crate::mutex_helpers::lock_mutex_as_result(&hook_calls_clone)
+                {
                     *calls += 1;
                 }
                 Ok(())
@@ -1898,7 +2047,9 @@ mod tests {
             move |event, ctx| {
                 // Add the ctx parameter
                 if let HookEvent::RegisterWrite(reg, _, new_value) = event {
-                    if let Ok(mut log) = crate::mutex_helpers::lock_mutex_as_result(&register_writes_clone) {
+                    if let Ok(mut log) =
+                        crate::mutex_helpers::lock_mutex_as_result(&register_writes_clone)
+                    {
                         // Make sure types match here - reg is already usize, keep it that way
                         log.push((*reg, new_value.clone()));
                     }
@@ -1958,7 +2109,10 @@ mod tests {
                         ops.push(("read", name.clone(), value.clone()));
                     }
                     HookEvent::UpvalueWrite(name, old_value, new_value) => {
-                        println!("UpvalueWrite: {} = {:?} -> {:?}", name, old_value, new_value);
+                        println!(
+                            "UpvalueWrite: {} = {:?} -> {:?}",
+                            name, old_value, new_value
+                        );
                         let mut ops = upvalue_ops_clone.lock();
                         ops.push(("write", name.clone(), new_value.clone()));
                     }
@@ -1990,7 +2144,10 @@ mod tests {
             |event| matches!(event, HookEvent::RegisterWrite(_, _, _)),
             move |event, _ctx| {
                 if let HookEvent::RegisterWrite(reg, old_value, new_value) = event {
-                    println!("RegisterWrite: r{} = {:?} -> {:?}", reg, old_value, new_value);
+                    println!(
+                        "RegisterWrite: r{} = {:?} -> {:?}",
+                        reg, old_value, new_value
+                    );
                 }
                 Ok(())
             },
@@ -2071,7 +2228,7 @@ mod tests {
         println!("Test function instructions:");
         for (i, instruction) in test_function.instructions.iter().enumerate() {
             println!("  {}: {:?}", i, instruction);
-        };
+        }
 
         vm.register_function(create_counter);
         vm.register_function(increment);
@@ -2709,7 +2866,7 @@ mod tests {
         {
             let mut hook_calls_guard = hook_calls.lock();
             assert_eq!(*hook_calls_guard, 4); // 4 instructions executed
-            // Reset counter
+                                              // Reset counter
             *hook_calls_guard = 0;
         } // Explicitly drop the lock
 
@@ -2778,7 +2935,7 @@ mod tests {
         {
             let mut hook_calls_guard = hook_calls.lock();
             assert_eq!(*hook_calls_guard, 4); // 4 instructions executed
-            // Reset counter
+                                              // Reset counter
             *hook_calls_guard = 0;
         } // Explicitly drop the lock
 

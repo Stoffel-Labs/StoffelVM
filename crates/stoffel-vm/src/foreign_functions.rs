@@ -1,8 +1,8 @@
+use crate::vm_state::VMState;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
-use crate::vm_state::VMState;
 
 /// Foreign (native) function type
 ///

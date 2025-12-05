@@ -14,7 +14,7 @@ use ark_std::rand::SeedableRng;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use stoffelmpc_mpc::common::{SecretSharingScheme, MPCProtocol, PreprocessingMPCProtocol};
+use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::ProtocolType;
 use stoffelnet::network_utils::ClientId;
@@ -24,12 +24,12 @@ use tracing::info;
 use crate::core_vm::VirtualMachine;
 use crate::net::hb_engine::HoneyBadgerMpcEngine;
 use crate::tests::mpc_multiplication_integration::{
-    HoneyBadgerQuicConfig, HoneyBadgerQuicServer, setup_honeybadger_quic_network,
+    setup_honeybadger_quic_network, HoneyBadgerQuicConfig, HoneyBadgerQuicServer,
 };
+use std::collections::HashMap;
 use stoffel_vm_types::core_types::{ShareType, Value};
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
-use std::collections::HashMap;
 
 /// Helper to initialize crypto provider
 fn init_crypto_provider() {
@@ -50,16 +50,15 @@ fn setup_test_tracing() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let subscriber = FmtSubscriber::builder()
-            .with_env_filter(
-                EnvFilter::from_default_env().add_directive("info".parse().unwrap()),
-            )
+            .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
             .with_test_writer()
             .finish();
         let _ = tracing::subscriber::set_global_default(subscriber);
     });
 }
 
-#[tokio::test]
+// Use a multi-thread runtime to allow synchronous bridges inside the VM's MPC engine
+#[tokio::test(flavor = "multi_thread")]
 async fn test_vm_mpc_multiplication_integration() {
     init_crypto_provider();
     setup_test_tracing();
@@ -96,8 +95,11 @@ async fn test_vm_mpc_multiplication_integration() {
     // Step 2: Start all servers
     info!("Step 2: Starting servers...");
     for (i, server) in servers.iter_mut().enumerate() {
+        // Must call start() first to create the network Arc
+        server.start().await.expect("Failed to start server");
+
         let mut node = server.node.clone();
-        let network = server.network.clone();
+        let network = server.network.clone().expect("network should be set after start()");
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some(raw_msg) = rx.recv().await {
@@ -107,7 +109,6 @@ async fn test_vm_mpc_multiplication_integration() {
             }
             tracing::info!("Receiver task for node {i} ended");
         });
-        server.start().await.expect("Failed to start server");
         info!("✓ Started server {}", server.node_id);
     }
 
@@ -131,7 +132,7 @@ async fn test_vm_mpc_multiplication_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server.network.clone();
+            let network = server.network.clone().expect("network should be set after start()");
 
             tokio::spawn(async move {
                 info!("[Server {}] Starting preprocessing...", i);
@@ -146,12 +147,8 @@ async fn test_vm_mpc_multiplication_integration() {
                         info!("[Server {}] ✓ Preprocessing completed", i);
                         Ok(())
                     }
-                    Ok(Err(e)) => {
-                        Err(format!("Preprocessing error: {:?}", e))
-                    }
-                    Err(_) => {
-                        Err(format!("Timeout after {:?}", preprocessing_timeout))
-                    }
+                    Ok(Err(e)) => Err(format!("Preprocessing error: {:?}", e)),
+                    Err(_) => Err(format!("Timeout after {:?}", preprocessing_timeout)),
                 }
             })
         })
@@ -198,7 +195,7 @@ async fn test_vm_mpc_multiplication_integration() {
     let mut multiplication_handles = Vec::new();
     for (pid, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let net = server.network.clone();
+        let net = server.network.clone().expect("network should be set");
 
         let handle = tokio::spawn(async move {
             // Get input shares for this party
@@ -229,12 +226,8 @@ async fn test_vm_mpc_multiplication_integration() {
 
     // Get the result share from party 0
     let party_id = 0;
-    let session_id = stoffelmpc_mpc::honeybadger::SessionId::new(
-        ProtocolType::Mul,
-        0,
-        0,
-        instance_id,
-    );
+    let session_id =
+        stoffelmpc_mpc::honeybadger::SessionId::new(ProtocolType::Mul, 0, 0, instance_id);
 
     let result_share = {
         let storage_map = servers[party_id]
@@ -269,7 +262,7 @@ async fn test_vm_mpc_multiplication_integration() {
             // Load the result share into r0
             Instruction::LDI(
                 0,
-                Value::Share(ShareType::Int(64), result_share_bytes.clone()),
+                Value::Share(ShareType::secret_int(64), result_share_bytes.clone()),
             ),
             // Could perform additional operations here (e.g., add constants)
             // For now, just return the share
@@ -294,7 +287,7 @@ async fn test_vm_mpc_multiplication_integration() {
     info!("Step 10: Verifying result...");
 
     match result {
-        Value::Share(ShareType::Int(_), result_bytes) => {
+        Value::Share(ShareType::SecretInt { .. }, result_bytes) => {
             info!("Received result share: {} bytes", result_bytes.len());
 
             // Decode the result share
@@ -306,7 +299,10 @@ async fn test_vm_mpc_multiplication_integration() {
             // Verify the share has the correct degree
             // Note: MPC multiplication includes degree reduction, so output is degree t, not 2t
             assert_eq!(result_share.degree, threshold);
-            info!("✓ Result share has correct degree: {} (after degree reduction)", result_share.degree);
+            info!(
+                "✓ Result share has correct degree: {} (after degree reduction)",
+                result_share.degree
+            );
 
             // Expected result: 10 * 20 = 200
             info!("Expected result: 10 * 20 = 200");
@@ -318,7 +314,10 @@ async fn test_vm_mpc_multiplication_integration() {
     // Step 11: Demonstrate full integration success
     info!("Step 11: Integration test summary...");
     info!("✓ 5-party MPC network with QUIC established");
-    info!("✓ Preprocessing completed (generated {} triples)", n_triples);
+    info!(
+        "✓ Preprocessing completed (generated {} triples)",
+        n_triples
+    );
     info!("✓ Client inputs distributed (10 and 20)");
     info!("✓ Secure multiplication performed (10 × 20 = 200)");
     info!("✓ VM successfully processed MPC result shares");
