@@ -248,18 +248,23 @@ async fn test_vm_mpc_multiplication_integration() {
                 (vec![inputs[0].clone()], vec![inputs[1].clone()])
             };
 
-            // Perform multiplication
-            node.mul(x_shares, y_shares, net.clone())
+            // Perform multiplication - returns the result shares directly
+            let result = node.mul(x_shares, y_shares, net.clone())
                 .await
                 .expect("mul failed");
 
             info!("✓ Party {} completed multiplication", pid);
+            (pid, result)
         });
         multiplication_handles.push(handle);
     }
 
-    // Wait for all multiplications to complete
-    futures::future::join_all(multiplication_handles).await;
+    // Wait for all multiplications to complete and collect results
+    let results: Vec<_> = futures::future::join_all(multiplication_handles)
+        .await
+        .into_iter()
+        .map(|r| r.expect("task panicked"))
+        .collect();
     tokio::time::sleep(Duration::from_millis(300)).await;
     info!("✓ All parties completed multiplication");
 
@@ -267,30 +272,18 @@ async fn test_vm_mpc_multiplication_integration() {
     info!("Step 7: Creating VM and loading multiplication results...");
     let mut vm = VirtualMachine::new();
 
-    // Get the result share from party 0
-    let party_id = 0;
-    let session_id =
-        stoffelmpc_mpc::honeybadger::SessionId::new(ProtocolType::Mul, 0, 0, 0, instance_id as u32);
-
-    let result_share = {
-        let storage_map = servers[party_id]
-            .node
-            .operations
-            .mul
-            .mult_storage
-            .lock()
-            .await;
-        let storage_mutex = storage_map.get(&session_id).unwrap();
-        let storage = storage_mutex.lock().await;
-        storage.protocol_output[0].clone()
-    };
+    // Get the result share from party 0 (from the collected results)
+    let result_share = results.iter()
+        .find(|(pid, _)| *pid == 0)
+        .map(|(_, shares)| shares[0].clone())
+        .expect("Party 0 result not found");
 
     let mut result_share_bytes = Vec::new();
     result_share
         .serialize_compressed(&mut result_share_bytes)
         .expect("Failed to serialize result share");
 
-    info!("✓ Loaded result share from party {}", party_id);
+    info!("✓ Loaded result share from party 0");
 
     // Step 8: Register VM function that processes the result share
     info!("Step 8: Creating VM function to process result share...");

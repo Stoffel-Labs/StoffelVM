@@ -13,7 +13,7 @@ use std::time::Duration;
 use stoffel_vm_types::core_types::{BOOLEAN_SECRET_INT_BITS, F64, ShareType, Value};
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode, SessionId};
+use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode};
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
@@ -74,57 +74,18 @@ impl HoneyBadgerMpcEngine {
                 let x_shares = vec![left_share];
                 let y_shares = vec![right_share];
 
-                // Lock node just for the call and initial snapshot
+                // Lock node and perform multiplication
+                // node.mul() returns the result directly (via internal wait_for_result)
                 let mut node = self.node.lock().await;
-                let before_keys: std::collections::HashSet<SessionId> = {
-                    let map = node.operations.mul.mult_storage.lock().await;
-                    map.keys().cloned().collect()
-                };
-
-                node.mul(x_shares, y_shares, self.net.clone())
+                let result_shares = node.mul(x_shares, y_shares, self.net.clone())
                     .await
                     .map_err(|e| format!("MPC multiplication failed: {:?}", e))?;
 
-                // Poll the storage briefly to allow asynchronous propagation
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                loop {
-                    // Identify the newly created session and fetch its output
-                    if let Some((session_id, result_share)) = {
-                        let storage_map = node.operations.mul.mult_storage.lock().await;
-                        // Prefer keys that didn't exist before; if none, take any with output
-                        let mut chosen: Option<(SessionId, RobustShare<Fr>)> = None;
-                        for (sid, storage_mutex) in storage_map.iter() {
-                            if !before_keys.contains(sid) {
-                                let storage = storage_mutex.lock().await;
-                                if let Some(first) = storage.protocol_output.get(0) {
-                                    chosen = Some((*sid, first.clone()));
-                                    break;
-                                }
-                            }
-                        }
-                        if chosen.is_none() {
-                            for (sid, storage_mutex) in storage_map.iter() {
-                                let storage = storage_mutex.lock().await;
-                                if let Some(first) = storage.protocol_output.get(0) {
-                                    chosen = Some((*sid, first.clone()));
-                                    break;
-                                }
-                            }
-                        }
-                        chosen
-                    } {
-                        let _ = session_id; // reserved for tracing if needed
-                        break Self::encode_share(&result_share);
-                    }
+                // Get the first result share
+                let result_share = result_shares.into_iter().next()
+                    .ok_or_else(|| "Multiplication returned no shares".to_string())?;
 
-                    if std::time::Instant::now() >= deadline {
-                        break Err("Multiplication produced no output within timeout".to_string());
-                    }
-                    // Small yield before retry
-                    drop(node); // allow other tasks to progress
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    node = self.node.lock().await;
-                }
+                Self::encode_share(&result_share)
             }
             _ => Err("Unsupported share type for multiply_share".to_string()),
         }

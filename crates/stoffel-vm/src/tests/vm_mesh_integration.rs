@@ -1321,7 +1321,7 @@ async fn test_vm_mesh_output_client_integration() {
     info!("Step 11: Verifying output client reconstruction...");
 
     let client = output_client.lock().await;
-    let reconstructed_value = client.output.clone();
+    let reconstructed_value = client.get_output().and_then(|v| v.into_iter().next());
 
     match reconstructed_value {
         Some(secret) => {

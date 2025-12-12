@@ -1045,52 +1045,49 @@ mod tests {
             };
 
             let handle = tokio::spawn(async move {
-                {
-                    node.mul(x_shares.clone(), y_shares.clone(), net.clone())
-                        .await
-                        .expect("mul failed");
-                }
+                // mul() returns the result directly (via internal wait_for_result)
+                let result = node.mul(x_shares.clone(), y_shares.clone(), net.clone())
+                    .await
+                    .expect("mul failed");
+                (pid, result)
             });
             handles.push(handle);
         }
 
-        // Wait for all mul tasks to finish
-        futures::future::join_all(handles).await;
+        // Wait for all mul tasks to finish and collect results
+        let mul_results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.expect("task panicked"))
+            .collect();
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         //----------------------------------------VALIDATE VALUES----------------------------------------
         // Use the output client ID we defined earlier
-        // Each server sends its output shares
+        // Each server sends its output shares using the results from mul()
         for (i, server) in servers.iter().enumerate() {
             let net = server.network.clone().expect("network should be set");
-            let storage_map = server.node.operations.mul.mult_storage.lock().await;
-            if let Some(storage_mutex) = storage_map.get(&session_id) {
-                let storage = storage_mutex.lock().await;
 
-                if storage.protocol_output.is_empty() {
-                    panic!("protocol_output empty for node {}", i);
-                }
-                let shares_mult_for_node: Vec<RobustShare<Fr>> = storage.protocol_output.clone();
-                assert_eq!(shares_mult_for_node.len(), no_of_multiplications);
-                match server
-                    .node
-                    .output
-                    .init(
-                        output_client_id,
-                        shares_mult_for_node,
-                        no_of_multiplications,
-                        net.clone(),
-                    )
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => eprintln!("Server init error: {e}"),
-                }
-            } else {
-                panic!(
-                    "no mult_storage entry for session {:?} on node {}",
-                    session_id, i
-                );
+            // Find the result for this party from the collected mul results
+            let shares_mult_for_node = mul_results.iter()
+                .find(|(pid, _)| *pid == i)
+                .map(|(_, shares)| shares.clone())
+                .expect(&format!("Result for party {} not found", i));
+
+            assert_eq!(shares_mult_for_node.len(), no_of_multiplications);
+            match server
+                .node
+                .output
+                .init(
+                    output_client_id,
+                    shares_mult_for_node,
+                    no_of_multiplications,
+                    net.clone(),
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => eprintln!("Server init error: {e}"),
             }
         }
     }
