@@ -400,9 +400,66 @@ pub async fn bootstrap_with_bootnode(
     Ok(())
 }
 
+/// Connect to a peer with timeout and retry logic
 async fn add_node_and_connect(net: &mut QuicNetworkManager, party_id: PartyId, addr: SocketAddr) {
     net.add_node_with_party_id(party_id, addr);
-    let _ = net.connect(addr).await;
+
+    // Retry connection with exponential backoff
+    let max_retries = 3;
+    let base_timeout = Duration::from_secs(10);
+
+    for attempt in 0..max_retries {
+        let timeout_duration = base_timeout * (1 << attempt); // Exponential backoff: 10s, 20s, 40s
+
+        eprintln!(
+            "[peer-connect] Attempting to connect to party {} at {} (attempt {}/{}, timeout {:?})",
+            party_id, addr, attempt + 1, max_retries, timeout_duration
+        );
+
+        match tokio::time::timeout(timeout_duration, net.connect(addr)).await {
+            Ok(Ok(_conn)) => {
+                eprintln!(
+                    "[peer-connect] Successfully connected to party {} at {} (attempt {})",
+                    party_id,
+                    addr,
+                    attempt + 1
+                );
+                return;
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[peer-connect] Connection error to party {} at {}: {} (attempt {}/{})",
+                    party_id,
+                    addr,
+                    e,
+                    attempt + 1,
+                    max_retries
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "[peer-connect] Timeout connecting to party {} at {} after {:?} (attempt {}/{})",
+                    party_id,
+                    addr,
+                    timeout_duration,
+                    attempt + 1,
+                    max_retries
+                );
+            }
+        }
+
+        // Longer delay before retry to allow other parties to settle
+        if attempt < max_retries - 1 {
+            let delay = Duration::from_millis(500 * (attempt as u64 + 1));
+            eprintln!("[peer-connect] Waiting {:?} before retry...", delay);
+            sleep(delay).await;
+        }
+    }
+
+    eprintln!(
+        "[peer-connect] WARNING: Could not connect to party {} at {} after {} attempts",
+        party_id, addr, max_retries
+    );
 }
 
 async fn send_ctrl(conn: &dyn PeerConnection, msg: &DiscoveryMessage) -> Result<(), String> {
@@ -545,10 +602,128 @@ pub async fn register_and_wait_for_session_with_program(
                         info.parties.len()
                     );
 
-                    // Connect to all peers in the session
+                    // Add ALL peers to the node list first
                     for (pid, addr) in &info.parties {
                         if *pid != my_party_id {
-                            add_node_and_connect(net, *pid, *addr).await;
+                            net.add_node_with_party_id(*pid, *addr);
+                        }
+                    }
+
+                    // Peer connection strategy:
+                    // - Lower-ID parties CONNECT to higher-ID parties
+                    // - Higher-ID parties ACCEPT from lower-ID parties
+                    // This avoids bidirectional connection races
+                    let higher_peers: Vec<_> = info.parties.iter()
+                        .filter(|(pid, _)| *pid > my_party_id)
+                        .collect();
+                    let n_expected_incoming = info.parties.iter()
+                        .filter(|(pid, _)| *pid < my_party_id)
+                        .count();
+
+                    eprintln!(
+                        "[party {}] Connection plan: {} outgoing (to higher IDs), {} incoming (from lower IDs)",
+                        my_party_id, higher_peers.len(), n_expected_incoming
+                    );
+
+                    // Spawn a background accept loop for incoming connections from lower-ID parties
+                    let mut acceptor = net.clone();
+                    let acceptor_party_id = my_party_id;
+
+                    let accept_handle = tokio::spawn(async move {
+                        if n_expected_incoming == 0 {
+                            eprintln!(
+                                "[party {}] No incoming connections expected (lowest ID party)",
+                                acceptor_party_id
+                            );
+                            return 0;
+                        }
+
+                        let mut accepted = 0;
+                        let accept_timeout = Duration::from_secs(60);
+                        let accept_start = tokio::time::Instant::now();
+
+                        eprintln!(
+                            "[party {}] Accept loop started, expecting {} connections from lower-ID parties",
+                            acceptor_party_id, n_expected_incoming
+                        );
+
+                        while accepted < n_expected_incoming && accept_start.elapsed() < accept_timeout {
+                            match tokio::time::timeout(Duration::from_secs(10), acceptor.accept()).await {
+                                Ok(Ok(conn)) => {
+                                    eprintln!(
+                                        "[party {}] Accepted connection from {} ({}/{})",
+                                        acceptor_party_id, conn.remote_address(), accepted + 1, n_expected_incoming
+                                    );
+                                    accepted += 1;
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!(
+                                        "[party {}] Accept error (will retry): {}",
+                                        acceptor_party_id, e
+                                    );
+                                    sleep(Duration::from_millis(100)).await;
+                                }
+                                Err(_) => {
+                                    // Timeout, continue waiting
+                                    eprintln!(
+                                        "[party {}] Accept timeout, waiting for {} more ({}/{})",
+                                        acceptor_party_id, n_expected_incoming - accepted, accepted, n_expected_incoming
+                                    );
+                                }
+                            }
+                        }
+
+                        eprintln!(
+                            "[party {}] Accept loop finished: accepted {} connections",
+                            acceptor_party_id, accepted
+                        );
+                        accepted
+                    });
+
+                    // Connect to higher-ID peers only
+                    for (pid, addr) in higher_peers {
+                        add_node_and_connect(net, *pid, *addr).await;
+                    }
+
+                    // Wait for accept loop to finish
+                    match tokio::time::timeout(Duration::from_secs(90), accept_handle).await {
+                        Ok(Ok(n)) => {
+                            eprintln!(
+                                "[party {}] Peer mesh established: {} outgoing, {} accepted",
+                                my_party_id, info.parties.len() - 1 - n_expected_incoming, n
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!(
+                                "[party {}] Accept task error: {:?}",
+                                my_party_id, e
+                            );
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[party {}] Accept task timed out",
+                                my_party_id
+                            );
+                        }
+                    }
+
+                    // Create loopback connection to self (required by MPC protocols)
+                    // Some MPC operations send messages to self, requiring a connection entry
+                    let my_addr = info.parties.iter()
+                        .find(|(pid, _)| *pid == my_party_id)
+                        .map(|(_, addr)| *addr);
+                    if let Some(addr) = my_addr {
+                        eprintln!("[party {}] Establishing loopback connection to self at {}", my_party_id, addr);
+                        match tokio::time::timeout(Duration::from_secs(5), net.connect(addr)).await {
+                            Ok(Ok(_)) => {
+                                eprintln!("[party {}] Loopback connection established", my_party_id);
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!("[party {}] Loopback connection failed: {} (non-fatal)", my_party_id, e);
+                            }
+                            Err(_) => {
+                                eprintln!("[party {}] Loopback connection timed out (non-fatal)", my_party_id);
+                            }
                         }
                     }
 

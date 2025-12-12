@@ -71,13 +71,14 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         mpc_opts: HoneyBadgerMPCNodeOpts,
         config: HoneyBadgerQuicConfig,
         channels: Sender<Vec<u8>>,
+        input_ids: Vec<ClientId>,
     ) -> Result<Self, HoneyBadgerError> {
         // Create the MPC node
         let mpc_node = <HoneyBadgerMPCNode<F, Avid> as MPCProtocol<
             F,
             RobustShare<F>,
             QuicNetworkManager,
-        >>::setup(node_id, mpc_opts)?;
+        >>::setup(node_id, mpc_opts, input_ids)?;
         //let node = Arc::new(Mutex::new(mpc_node));
 
         // Create network manager
@@ -387,7 +388,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
             client_id,
             n_parties,
             threshold,
-            instance_id,
+            instance_id as u32,
             inputs,
             input_len,
         )?;
@@ -700,6 +701,9 @@ pub async fn setup_honeybadger_quic_clients<F: FftField + 'static>(
 /// Helper functions for setting up HoneyBadger MPC over QUIC
 
 /// Sets up a complete HoneyBadger MPC network with QUIC
+///
+/// If `input_ids` is provided, the servers will be initialized with those client IDs.
+/// Otherwise, an empty client list is used (clients can still be registered dynamically).
 pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     n_parties: usize,
     threshold: usize,
@@ -708,7 +712,9 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     instance_id: u64,
     base_port: u16,
     config: HoneyBadgerQuicConfig,
+    input_ids: Option<Vec<ClientId>>,
 ) -> Result<(Vec<HoneyBadgerQuicServer<F>>, Vec<Receiver<Vec<u8>>>), HoneyBadgerError> {
+    let input_ids = input_ids.unwrap_or_default();
     let mut servers = Vec::new();
 
     // Create server addresses
@@ -742,7 +748,7 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     for i in 0..n_parties {
         let (tx, rx) = mpsc::channel(1500);
         let mut server =
-            HoneyBadgerQuicServer::new(i, addresses[i], mpc_opts.clone(), config.clone(), tx)
+            HoneyBadgerQuicServer::new(i, addresses[i], mpc_opts.clone(), config.clone(), tx, input_ids.clone())
                 .await?;
         // Add all other servers as peers
         for j in 0..n_parties {
@@ -793,8 +799,12 @@ mod tests {
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
         let instance_id = 99999;
         let base_port = 9200;
-        let session_id = SessionId::new(ProtocolType::Mul, 0, 0, instance_id);
-        let clientid: Vec<ClientId> = vec![100, 200];
+        let session_id = SessionId::new(ProtocolType::Mul, 0, 0, 0, instance_id as u32);
+        // Define client IDs before network setup (client IDs must be registered at setup time)
+        // Client 100 is for input, client 200 is for output only
+        let input_client_id: ClientId = 100;
+        let output_client_id: ClientId = 200;
+        let clientid: Vec<ClientId> = vec![input_client_id]; // Only register input client
         let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
         let no_of_multiplications = input_values.len();
 
@@ -812,6 +822,7 @@ mod tests {
             instance_id,
             base_port,
             config.clone(),
+            Some(clientid.clone()),
         )
         .await
         .expect("Failed to create servers");
@@ -948,7 +959,7 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, instance_id);
+        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
@@ -1003,7 +1014,7 @@ mod tests {
                 .node
                 .preprocess
                 .input
-                .init(clientid[0], local_shares, 2, server.network.clone().expect("network should be set"))
+                .init(input_client_id, local_shares, 2, server.network.clone().expect("network should be set"))
                 .await
             {
                 Ok(_) => {}
@@ -1022,8 +1033,11 @@ mod tests {
             let net = servers[pid].network.clone().expect("network should be set");
 
             let (x_shares, y_shares) = {
-                let input_store = node.preprocess.input.input_shares.lock().await;
-                let inputs = input_store.get(&clientid[0]).unwrap();
+                let input_store = node.preprocess.input
+                    .wait_for_all_inputs(std::time::Duration::from_secs(30))
+                    .await
+                    .expect("Failed to get client inputs");
+                let inputs = input_store.get(&input_client_id).unwrap();
                 (
                     vec![inputs[0].clone(), inputs[1].clone()],
                     vec![inputs[0].clone(), inputs[1].clone()],
@@ -1045,8 +1059,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         //----------------------------------------VALIDATE VALUES----------------------------------------
-
-        let output_clientid: ClientId = 200;
+        // Use the output client ID we defined earlier
         // Each server sends its output shares
         for (i, server) in servers.iter().enumerate() {
             let net = server.network.clone().expect("network should be set");
@@ -1063,7 +1076,7 @@ mod tests {
                     .node
                     .output
                     .init(
-                        output_clientid,
+                        output_client_id,
                         shares_mult_for_node,
                         no_of_multiplications,
                         net.clone(),
@@ -1096,6 +1109,7 @@ mod tests {
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
         let instance_id = 99999;
         let base_port = 9200;
+        // Define client IDs before network setup (client IDs must be registered at setup time)
         let clientid: Vec<ClientId> = vec![100, 200];
         let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
 
@@ -1113,6 +1127,7 @@ mod tests {
             instance_id,
             base_port,
             config.clone(),
+            Some(clientid.clone()),
         )
         .await
         .expect("Failed to create servers");
@@ -1249,7 +1264,7 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, instance_id);
+        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
@@ -1343,6 +1358,7 @@ mod tests {
             instance_id,
             base_port,
             config,
+            None, // Client IDs will be registered later
         )
         .await
         .expect("Failed to create servers");
@@ -1423,7 +1439,7 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, instance_id);
+        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()

@@ -31,6 +31,9 @@ impl VirtualMachine {
         // Register standard library functions
         vm.register_standard_library();
 
+        // Register MPC builtins
+        crate::mpc_builtins::register_mpc_builtins(&mut vm);
+
         vm
     }
 

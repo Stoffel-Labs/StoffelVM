@@ -599,10 +599,18 @@ impl QuicNetworkManager {
                 .map_err(|e| format!("Failed to create QUIC client config: {}", e))?,
         ));
 
-        // Set transport config
+        // Set transport config with reasonable timeouts
         config.transport_config(Arc::new({
             let mut transport = quinn::TransportConfig::default();
             transport.max_concurrent_uni_streams(0u32.into());
+            // Set connection timeout to prevent indefinite hangs
+            transport.max_idle_timeout(Some(
+                std::time::Duration::from_secs(30)
+                    .try_into()
+                    .expect("idle timeout"),
+            ));
+            // Set keep-alive to detect dead connections
+            transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
             transport
         }));
 
@@ -649,9 +657,17 @@ impl QuicNetworkManager {
                 .map_err(|e| format!("Failed to create QUIC server config: {}", e))?,
         ));
 
-        // Configure transport parameters
+        // Configure transport parameters with reasonable timeouts
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
         transport_config.max_concurrent_uni_streams(0u32.into());
+        // Set connection timeout to prevent indefinite hangs
+        transport_config.max_idle_timeout(Some(
+            std::time::Duration::from_secs(30)
+                .try_into()
+                .expect("idle timeout"),
+        ));
+        // Set keep-alive to detect dead connections
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
 
         Ok(server_config)
     }
@@ -663,21 +679,61 @@ impl NetworkManager for QuicNetworkManager {
         address: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
         Box::pin(async move {
-            if self.endpoint.is_none() {
-                // Create client endpoint
-                let client_config = Self::create_insecure_client_config()?;
+            // Create client config for outgoing connections
+            let client_config = Self::create_insecure_client_config()?;
+
+            // Determine which endpoint to use for the connection
+            let connection = if let Some(endpoint) = self.endpoint.as_mut() {
+                // Try to use existing server endpoint with client config
+                endpoint.set_default_client_config(client_config.clone());
+                eprintln!("[quic] Using existing endpoint to connect to {}", address);
+
+                match endpoint.connect(address, "localhost") {
+                    Ok(connecting) => {
+                        eprintln!("[quic] Awaiting connection handshake to {}", address);
+                        connecting
+                            .await
+                            .map_err(|e| format!("Failed to establish connection to {}: {}", address, e))?
+                    }
+                    Err(e) => {
+                        // Server endpoint failed, create a dedicated client endpoint
+                        eprintln!(
+                            "[quic] Server endpoint connect failed ({}), creating client endpoint for {}",
+                            e, address
+                        );
+                        let mut client_endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+                            .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
+                        client_endpoint.set_default_client_config(client_config);
+
+                        let connecting = client_endpoint
+                            .connect(address, "localhost")
+                            .map_err(|e| format!("Failed to initiate connection to {}: {}", address, e))?;
+
+                        eprintln!("[quic] Awaiting connection handshake to {} (client endpoint)", address);
+                        connecting
+                            .await
+                            .map_err(|e| format!("Failed to establish connection to {}: {}", address, e))?
+                    }
+                }
+            } else {
+                // No endpoint exists, create a client endpoint
+                eprintln!("[quic] Creating new client endpoint to connect to {}", address);
                 let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
                     .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
                 endpoint.set_default_client_config(client_config);
                 self.endpoint = Some(endpoint);
-            }
 
-            let endpoint = self.endpoint.as_ref().unwrap();
-            let connection = endpoint
-                .connect(address, "localhost")
-                .map_err(|e| format!("Failed to initiate connection: {}", e))?
-                .await
-                .map_err(|e| format!("Failed to establish connection: {}", e))?;
+                let connecting = self.endpoint.as_ref().unwrap()
+                    .connect(address, "localhost")
+                    .map_err(|e| format!("Failed to initiate connection to {}: {}", address, e))?;
+
+                eprintln!("[quic] Awaiting connection handshake to {}", address);
+                connecting
+                    .await
+                    .map_err(|e| format!("Failed to establish connection to {}: {}", address, e))?
+            };
+
+            eprintln!("[quic] Connection established to {}", address);
 
             // Send identification handshake as SERVER with our node_id for stoffelnet compatibility
             if let Ok((mut send, _recv)) = connection.open_bi().await {

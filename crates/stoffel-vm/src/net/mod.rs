@@ -4,6 +4,7 @@
 pub mod client_store;
 pub mod discovery;
 pub mod hb_engine;
+pub mod hb_server;
 pub mod mpc;
 pub mod mpc_engine;
 pub mod mpc_runner;
@@ -19,6 +20,10 @@ pub use p2p::{
 
 // Re-export MPC helpers and engine unconditionally
 pub use mpc::{default_node_opts, honeybadger_node_opts};
+// Re-export HoneyBadger QUIC server
+pub use hb_server::{
+    spawn_receive_loops, FrHoneyBadgerQuicServer, HoneyBadgerQuicConfig, HoneyBadgerQuicServer,
+};
 // Re-export MpcRunner for convenient VM+MPC orchestration
 pub use mpc_runner::{MpcRunner, MpcRunnerBuilder, MpcRunnerConfig};
 // Re-export discovery helpers

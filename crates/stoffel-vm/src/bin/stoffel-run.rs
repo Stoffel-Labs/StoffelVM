@@ -2,17 +2,23 @@ use std::env;
 use std::net::SocketAddr;
 use std::process::exit;
 
+use ark_bls12_381::Fr;
 use std::fs::File;
-use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
 use stoffel_vm::net::{
-    program_id_from_bytes, register_and_wait_for_session_with_program, run_bootnode_with_config,
+    honeybadger_node_opts, program_id_from_bytes, register_and_wait_for_session_with_program,
+    run_bootnode_with_config, spawn_receive_loops,
 };
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 use stoffel_vm_types::compiled_binary::CompiledBinary;
+use stoffelmpc_mpc::common::rbc::rbc::Avid;
+use stoffelmpc_mpc::common::MPCProtocol;
+use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNode;
+use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 
@@ -34,11 +40,15 @@ async fn main() {
     let mut trace_stack = false;
     let mut as_bootnode = false;
     let mut as_leader = false;
+    let mut as_client = false;
     let mut bind_addr: Option<SocketAddr> = None;
     let mut party_id: Option<usize> = None;
     let mut bootstrap_addr: Option<SocketAddr> = None;
     let mut n_parties: Option<usize> = None;
     let mut threshold: Option<usize> = None;
+    let mut client_id: Option<usize> = None;
+    let mut client_inputs: Option<String> = None;
+    let mut expected_clients: Option<String> = None;
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -53,6 +63,8 @@ async fn main() {
             as_bootnode = true;
         } else if arg == "--leader" {
             as_leader = true;
+        } else if arg == "--client" {
+            as_client = true;
         } else if let Some(_rest) = arg.strip_prefix("--bind") {
             // support "--bind" and "--bind=.."
             // actual value parsed later from positional with key
@@ -60,6 +72,9 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--bootstrap") {
         } else if let Some(_rest) = arg.strip_prefix("--n-parties") {
         } else if let Some(_rest) = arg.strip_prefix("--threshold") {
+        } else if let Some(_rest) = arg.strip_prefix("--client-id") {
+        } else if let Some(_rest) = arg.strip_prefix("--inputs") {
+        } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
         }
     }
 
@@ -105,6 +120,21 @@ async fn main() {
                     threshold = Some(v.parse().expect("Invalid --threshold"));
                 }
             }
+            "--client-id" => {
+                if let Some(v) = args_iter.next() {
+                    client_id = Some(v.parse().expect("Invalid --client-id"));
+                }
+            }
+            "--inputs" => {
+                if let Some(v) = args_iter.next() {
+                    client_inputs = Some(v);
+                }
+            }
+            "--expected-clients" => {
+                if let Some(v) = args_iter.next() {
+                    expected_clients = Some(v);
+                }
+            }
             _ => {}
         }
     }
@@ -123,6 +153,58 @@ async fn main() {
             exit(10);
         }
         return;
+    }
+
+    // Client mode: connect to MPC servers and provide inputs
+    // NOTE: Client mode is currently a placeholder. Full client mode requires:
+    // 1. Server addresses to be provided (not from bootnode - clients are separate)
+    // 2. HoneyBadgerMPCClient to be wrapped in Arc for sharing
+    // For now, client inputs should be provided via a separate client binary or
+    // by using the test harness in mpc_multiplication_integration.rs
+    if as_client {
+        let cid = client_id.unwrap_or_else(|| {
+            eprintln!("Error: --client-id is required in client mode");
+            exit(2);
+        });
+
+        let n = n_parties.unwrap_or_else(|| {
+            eprintln!("Error: --n-parties is required in client mode");
+            exit(2);
+        });
+        let t = threshold.unwrap_or(1);
+
+        // Parse inputs (comma-separated integers or fixed-point values)
+        let inputs_str = client_inputs.unwrap_or_else(|| {
+            eprintln!("Error: --inputs is required in client mode (comma-separated values)");
+            exit(2);
+        });
+        let input_values: Vec<Fr> = inputs_str
+            .split(',')
+            .map(|s| {
+                let s = s.trim();
+                // Support integer and fixed-point (interpret as integer for now)
+                let val: i64 = s.parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid input value: {}", s);
+                    exit(2);
+                });
+                Fr::from(val as u64)
+            })
+            .collect();
+
+        let input_len = input_values.len();
+
+        eprintln!(
+            "[client {}] Client mode (n={}, t={}, {} inputs)",
+            cid, n, t, input_len
+        );
+        eprintln!("NOTE: Client mode is not yet fully implemented.");
+        eprintln!("Currently, client inputs should be provided using the test harness or");
+        eprintln!("by running parties with --expected-clients and waiting for direct connections.");
+        eprintln!("");
+        eprintln!("To provide inputs, parties should use:");
+        eprintln!("  --expected-clients {}", cid);
+        eprintln!("And the program should use secret_input(client_id) to receive them.");
+        exit(0);
     }
 
     path_opt = if !positional.is_empty() {
@@ -188,7 +270,8 @@ async fn main() {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Now connect to ourselves as the bootnode
-        let mut mgr = QuicNetworkManager::new();
+        // Use with_node_id so connections are indexed by party ID (0-4), not random UUIDs
+        let mut mgr = QuicNetworkManager::with_node_id(my_id);
         // Listen on a different port for peer connections
         let party_bind: SocketAddr = format!("{}:{}", bind.ip(), bind.port() + 1000)
             .parse()
@@ -264,7 +347,8 @@ async fn main() {
         let t = threshold.unwrap_or(1);
 
         // Prepare QUIC manager
-        let mut mgr = QuicNetworkManager::new();
+        // Use with_node_id so connections are indexed by party ID (0-4), not random UUIDs
+        let mut mgr = QuicNetworkManager::with_node_id(my_id);
         // Listen so peers can connect back directly
         if let Err(e) = mgr.listen(bind).await {
             eprintln!("Failed to listen on {}: {}", bind, e);
@@ -506,29 +590,164 @@ async fn main() {
         let n = session_n_parties.unwrap_or_else(|| net.parties().len());
         let t = session_threshold.unwrap_or(1);
         // Use the session instance_id (agreed with all parties via bootnode)
-        let instance_id = session_instance_id.expect("session instance_id should be set in party mode");
+        let instance_id =
+            session_instance_id.expect("session instance_id should be set in party mode");
 
         eprintln!(
             "[party {}] Creating MPC engine: instance_id={}, n={}, t={}",
             my_id, instance_id, n, t
         );
 
-        // Construct engine with the agreed instance_id
-        let engine = HoneyBadgerMpcEngine::new(instance_id, my_id, n, t, 8, 16, net.clone());
-        let engine = match engine {
-            Ok(eng) => eng,
+        // Parse expected client IDs (comma-separated)
+        let input_ids: Vec<ClientId> = expected_clients
+            .as_ref()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|id| id.trim().parse::<ClientId>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !input_ids.is_empty() {
+            eprintln!(
+                "[party {}] Expecting inputs from {} clients: {:?}",
+                my_id,
+                input_ids.len(),
+                input_ids
+            );
+        }
+
+        // Debug: print established connections
+        let connections = net.get_all_connections().await;
+        let conn_ids: Vec<_> = connections.iter().map(|(id, _)| *id).collect();
+        eprintln!(
+            "[party {}] Connections before MPC: {:?} ({} total)",
+            my_id,
+            conn_ids,
+            connections.len()
+        );
+
+        // Create HoneyBadger MPC node options
+        let n_triples = 8;
+        let n_random = 16;
+        let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
+
+        // Create the MPC node directly with expected client IDs
+        let mut mpc_node = match <HoneyBadgerMPCNode<Fr, Avid> as MPCProtocol<
+            Fr,
+            RobustShare<Fr>,
+            QuicNetworkManager,
+        >>::setup(my_id, mpc_opts, input_ids.clone())
+        {
+            Ok(node) => node,
             Err(e) => {
-                eprintln!("Failed to create MPC engine: {}", e);
+                eprintln!("Failed to create MPC node: {:?}", e);
                 exit(13);
             }
         };
-        // Fully async preprocessing
+
+        // Spawn receive loops for MPC peer connections only
+        eprintln!("[party {}] Spawning receive loops for {} MPC peers...", my_id, n);
+        let mut msg_rx = spawn_receive_loops(net.clone(), my_id, n).await;
+
+        // Clone node for the message processing task
+        let mut processing_node = mpc_node.clone();
+        let processing_net = net.clone();
+        let processing_party_id = my_id;
+
+        // Spawn message processing task
+        tokio::spawn(async move {
+            eprintln!(
+                "[party {}] Message processing task started",
+                processing_party_id
+            );
+            while let Some(raw_msg) = msg_rx.recv().await {
+                if let Err(e) = processing_node.process(raw_msg, processing_net.clone()).await {
+                    eprintln!(
+                        "[party {}] Failed to process message: {:?}",
+                        processing_party_id, e
+                    );
+                }
+            }
+            eprintln!(
+                "[party {}] Message processing task ended",
+                processing_party_id
+            );
+        });
+
+        // Create engine wrapping the same node (shared via internal Arc state)
+        let engine =
+            HoneyBadgerMpcEngine::from_existing_node(instance_id, my_id, n, t, net.clone(), mpc_node.clone());
+
+        // Run preprocessing
         eprintln!("[party {}] Starting MPC preprocessing...", my_id);
-        if let Err(e) = engine.start_async().await {
+        if let Err(e) = engine.preprocess().await {
             eprintln!("MPC preprocessing failed: {}", e);
             exit(14);
         }
         eprintln!("[party {}] MPC preprocessing complete", my_id);
+
+        // If we have expected clients, initialize InputServer and wait for inputs
+        if !input_ids.is_empty() {
+            eprintln!("[party {}] Initializing InputServer for {} clients...", my_id, input_ids.len());
+
+            // Initialize input server for each expected client
+            // Each client needs random shares for their inputs (assume 1 input per client for now)
+            for &cid in &input_ids {
+                // Take random shares from preprocessing material
+                let local_shares = match mpc_node
+                    .preprocessing_material
+                    .lock()
+                    .await
+                    .take_random_shares(1) // 1 input per client
+                {
+                    Ok(shares) => shares,
+                    Err(e) => {
+                        eprintln!("[party {}] Not enough random shares for client {}: {:?}", my_id, cid, e);
+                        exit(15);
+                    }
+                };
+
+                if let Err(e) = mpc_node
+                    .preprocess
+                    .input
+                    .init(cid, local_shares, 1, net.clone())
+                    .await
+                {
+                    eprintln!("[party {}] Failed to init InputServer for client {}: {:?}", my_id, cid, e);
+                    exit(15);
+                }
+                eprintln!("[party {}] InputServer initialized for client {}", my_id, cid);
+            }
+
+            // Wait for all client inputs with timeout
+            eprintln!("[party {}] Waiting for client inputs (timeout: 60s)...", my_id);
+            let client_inputs = match mpc_node
+                .preprocess
+                .input
+                .wait_for_all_inputs(Duration::from_secs(60))
+                .await
+            {
+                Ok(inputs) => inputs,
+                Err(e) => {
+                    eprintln!("[party {}] Failed to receive client inputs: {:?}", my_id, e);
+                    exit(16);
+                }
+            };
+
+            eprintln!(
+                "[party {}] Received inputs from {} clients",
+                my_id,
+                client_inputs.len()
+            );
+
+            // Store client inputs in the VM's client store
+            for (cid, shares) in client_inputs {
+                vm.state.client_store().store_client_input(cid, shares);
+                eprintln!("[party {}] Stored inputs for client {}", my_id, cid);
+            }
+        }
+
         vm.state.set_mpc_engine(engine);
     }
 
@@ -557,11 +776,15 @@ Flags:
   --trace-stack           Trace function calls and stack push/pop
   --bootnode              Run as bootnode only (coordinates party discovery)
   --leader                Run as leader: bootnode + party 0 in one process
+  --client                Run as client (provide inputs to MPC network)
   --bind <addr:port>      Bind address for bootnode or party listen
   --party-id <usize>      Party id (party mode, 0-indexed)
-  --bootstrap <addr:port> Bootnode address (party mode)
-  --n-parties <usize>     Number of parties for MPC (required in party/leader mode)
+  --bootstrap <addr:port> Bootnode address (party mode or client mode)
+  --n-parties <usize>     Number of parties for MPC (required in party/leader/client mode)
   --threshold <usize>     Threshold t for HoneyBadger (default: 1)
+  --client-id <usize>     Client ID (client mode)
+  --inputs <values>       Comma-separated input values (client mode)
+  --expected-clients <ids> Comma-separated client IDs expected (party/leader mode)
   -h, --help              Show this help
 
 Multi-Party Execution:
@@ -596,6 +819,18 @@ Examples:
   stoffel-run program.stfbin main --party-id 0 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9001 --n-parties 5 --threshold 1
   stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --threshold 1
   # ... etc
+
+  # Multi-party execution with client inputs
+  # Terminal 1: Leader with expected clients
+  stoffel-run program.stfbin main --leader --bind 127.0.0.1:9000 --n-parties 5 --threshold 1 --expected-clients 100,101
+
+  # Terminals 2-5: Other parties (same expected-clients)
+  stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --expected-clients 100,101
+  # ... etc
+
+  # Client mode: provide inputs to the MPC network
+  stoffel-run --client --client-id 100 --inputs 10,20 --bootstrap 127.0.0.1:9000 --n-parties 5
+  stoffel-run --client --client-id 101 --inputs 30,40 --bootstrap 127.0.0.1:9000 --n-parties 5
 "#
     );
     exit(1);

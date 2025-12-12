@@ -1,6 +1,6 @@
 use crate::net::client_store::ClientInputStore;
 use crate::net::mpc::honeybadger_node_opts;
-use crate::net::mpc_engine::{MpcEngine, MpcEngineClientOps};
+use crate::net::mpc_engine::{AsyncMpcEngineConsensus, MpcEngine, MpcEngineClientOps, MpcEngineConsensus};
 use ark_bls12_381::Fr;
 use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -217,37 +217,54 @@ impl HoneyBadgerMpcEngine {
     }
 
     /// Get the shares for a specific client after input initialization
+    ///
+    /// Note: This method waits for all inputs to be received before returning.
+    /// The wait timeout is configurable via DEFAULT_INPUT_WAIT_TIMEOUT.
     pub async fn get_client_shares(
         &self,
         client_id: ClientId,
     ) -> Result<Vec<RobustShare<Fr>>, String> {
-        let node = self.node.lock().await;
-        let input_store = node.preprocess.input.input_shares.lock().await;
-        let shares = input_store
+        let all_inputs = self.wait_for_inputs().await?;
+        all_inputs
             .get(&client_id)
-            .ok_or_else(|| format!("No shares found for client {}", client_id))?
-            .clone();
-        Ok(shares)
+            .cloned()
+            .ok_or_else(|| format!("No shares found for client {}", client_id))
     }
 
     /// Get all client IDs that have submitted inputs to this HB node
+    ///
+    /// Note: This method waits for all inputs to be received before returning.
     pub async fn get_client_ids(&self) -> Vec<ClientId> {
-        let node = self.node.lock().await;
-        let input_store = node.preprocess.input.input_shares.lock().await;
-        input_store.keys().copied().collect()
+        match self.wait_for_inputs().await {
+            Ok(inputs) => inputs.keys().copied().collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Get all client inputs from the HB node's input store
     /// Returns a map of client_id -> shares
+    ///
+    /// Note: This method waits for all inputs to be received before returning.
     pub async fn get_all_client_inputs(
         &self,
     ) -> Result<Vec<(ClientId, Vec<RobustShare<Fr>>)>, String> {
-        let node = self.node.lock().await;
-        let input_store = node.preprocess.input.input_shares.lock().await;
-        Ok(input_store
-            .iter()
-            .map(|(client_id, shares)| (*client_id, shares.clone()))
+        let all_inputs = self.wait_for_inputs().await?;
+        Ok(all_inputs
+            .into_iter()
+            .map(|(client_id, shares)| (client_id, shares))
             .collect())
+    }
+
+    /// Wait for all client inputs to be received
+    ///
+    /// Uses the InputServer's wait_for_all_inputs method with a default timeout.
+    async fn wait_for_inputs(&self) -> Result<std::collections::HashMap<ClientId, Vec<RobustShare<Fr>>>, String> {
+        let mut node = self.node.lock().await;
+        node.preprocess
+            .input
+            .wait_for_all_inputs(Duration::from_secs(30))
+            .await
+            .map_err(|e| format!("Failed to wait for inputs: {:?}", e))
     }
 
     /// Hydrate a ClientInputStore with all client inputs from the HB node
@@ -312,6 +329,7 @@ impl HoneyBadgerMpcEngine {
         n_triples: usize,
         n_random: usize,
         net: Arc<QuicNetworkManager>,
+        input_ids: Vec<ClientId>,
     ) -> Result<Arc<Self>, String> {
         // Create the MPC node options
         let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
@@ -321,7 +339,7 @@ impl HoneyBadgerMpcEngine {
             Fr,
             RobustShare<Fr>,
             QuicNetworkManager,
-        >>::setup(party_id, mpc_opts)
+        >>::setup(party_id, mpc_opts, input_ids)
         .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
 
         Ok(Arc::new(Self {
@@ -810,5 +828,250 @@ impl MpcEngineClientOps for HoneyBadgerMpcEngine {
                 rt.block_on(self.hydrate_client_inputs_for(store, client_ids))
             }
         }
+    }
+}
+
+// ============================================================================
+// MpcEngineConsensus Implementation (RBC and ABA)
+// ============================================================================
+//
+// RBC and ABA use in-process registries for coordination between parties.
+// This mirrors the open_share approach where all parties in the same process
+// coordinate through shared state.
+//
+// For multi-process deployments, these protocols would need to use the
+// actual network-based Avid/ABA implementations from mpc-protocols.
+
+/// Registry for RBC broadcasts - maps (instance_id, session_id) to broadcast data
+#[derive(Default)]
+struct RbcRegistry {
+    /// Maps (instance_id, session_id, from_party) to message bytes
+    messages: std::collections::HashMap<(u64, u64, usize), Vec<u8>>,
+    /// Session counter for generating unique session IDs
+    session_counter: u64,
+}
+
+/// Registry for ABA sessions - maps (instance_id, session_id) to agreement state
+#[derive(Default)]
+struct AbaRegistry {
+    /// Maps (instance_id, session_id, party_id) to proposed value
+    proposals: std::collections::HashMap<(u64, u64, usize), bool>,
+    /// Maps (instance_id, session_id) to agreed result once consensus is reached
+    results: std::collections::HashMap<(u64, u64), bool>,
+    /// Session counter for generating unique session IDs
+    session_counter: u64,
+}
+
+static RBC_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<RbcRegistry>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(RbcRegistry::default()));
+
+static ABA_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<AbaRegistry>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(AbaRegistry::default()));
+
+impl MpcEngineConsensus for HoneyBadgerMpcEngine {
+    fn rbc_broadcast(&self, message: &[u8]) -> Result<u64, String> {
+        let mut registry = RBC_REGISTRY.lock();
+
+        // Generate a unique session ID
+        let session_id = registry.session_counter;
+        registry.session_counter += 1;
+
+        // Store the message for this party's broadcast
+        let key = (self.instance_id, session_id, self.party_id);
+        registry.messages.insert(key, message.to_vec());
+
+        tracing::info!(
+            instance_id = self.instance_id,
+            session_id = session_id,
+            party_id = self.party_id,
+            message_len = message.len(),
+            "RBC broadcast initiated"
+        );
+
+        Ok(session_id)
+    }
+
+    fn rbc_receive(&self, from_party: usize, timeout_ms: u64) -> Result<Vec<u8>, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            {
+                let registry = RBC_REGISTRY.lock();
+
+                // Look for a message from the specified party
+                // We need to find the session where from_party broadcast
+                for ((inst_id, _session_id, party), message) in registry.messages.iter() {
+                    if *inst_id == self.instance_id && *party == from_party {
+                        tracing::info!(
+                            instance_id = self.instance_id,
+                            from_party = from_party,
+                            message_len = message.len(),
+                            "RBC receive found message"
+                        );
+                        return Ok(message.clone());
+                    }
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "RBC receive timeout waiting for message from party {}",
+                    from_party
+                ));
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn rbc_receive_any(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+        // Track which parties we've already received from
+        let mut received_from = std::collections::HashSet::new();
+
+        loop {
+            {
+                let registry = RBC_REGISTRY.lock();
+
+                // Look for any message we haven't received yet
+                for ((inst_id, _session_id, party), message) in registry.messages.iter() {
+                    if *inst_id == self.instance_id
+                        && *party != self.party_id
+                        && !received_from.contains(party)
+                    {
+                        received_from.insert(*party);
+                        tracing::info!(
+                            instance_id = self.instance_id,
+                            from_party = *party,
+                            message_len = message.len(),
+                            "RBC receive_any found message"
+                        );
+                        return Ok((*party, message.clone()));
+                    }
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return Err("RBC receive_any timeout waiting for message from any party".to_string());
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn aba_propose(&self, value: bool) -> Result<u64, String> {
+        let mut registry = ABA_REGISTRY.lock();
+
+        // Generate a unique session ID
+        let session_id = registry.session_counter;
+        registry.session_counter += 1;
+
+        // Store this party's proposal
+        let key = (self.instance_id, session_id, self.party_id);
+        registry.proposals.insert(key, value);
+
+        tracing::info!(
+            instance_id = self.instance_id,
+            session_id = session_id,
+            party_id = self.party_id,
+            value = value,
+            "ABA propose initiated"
+        );
+
+        Ok(session_id)
+    }
+
+    fn aba_result(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let required = 2 * self.t + 1; // Need 2t+1 proposals for agreement
+
+        loop {
+            {
+                let mut registry = ABA_REGISTRY.lock();
+
+                // Check if result is already computed
+                if let Some(&result) = registry.results.get(&(self.instance_id, session_id)) {
+                    return Ok(result);
+                }
+
+                // Count proposals for this session
+                let mut true_count = 0usize;
+                let mut false_count = 0usize;
+
+                for ((inst_id, sess_id, _party), &proposal) in registry.proposals.iter() {
+                    if *inst_id == self.instance_id && *sess_id == session_id {
+                        if proposal {
+                            true_count += 1;
+                        } else {
+                            false_count += 1;
+                        }
+                    }
+                }
+
+                // ABA agreement rule: if 2t+1 parties agree on a value, that's the result
+                if true_count >= required {
+                    registry.results.insert((self.instance_id, session_id), true);
+                    tracing::info!(
+                        instance_id = self.instance_id,
+                        session_id = session_id,
+                        result = true,
+                        true_count = true_count,
+                        "ABA agreement reached"
+                    );
+                    return Ok(true);
+                }
+
+                if false_count >= required {
+                    registry.results.insert((self.instance_id, session_id), false);
+                    tracing::info!(
+                        instance_id = self.instance_id,
+                        session_id = session_id,
+                        result = false,
+                        false_count = false_count,
+                        "ABA agreement reached"
+                    );
+                    return Ok(false);
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "ABA result timeout waiting for agreement on session {}",
+                    session_id
+                ));
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncMpcEngineConsensus for HoneyBadgerMpcEngine {
+    async fn rbc_broadcast_async(&self, message: &[u8]) -> Result<u64, String> {
+        // Use sync version since registry operations are quick
+        self.rbc_broadcast(message)
+    }
+
+    async fn rbc_receive_async(
+        &self,
+        from_party: usize,
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>, String> {
+        // For async, we could use tokio::time::sleep but for now delegate to sync
+        self.rbc_receive(from_party, timeout_ms)
+    }
+
+    async fn rbc_receive_any_async(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String> {
+        self.rbc_receive_any(timeout_ms)
+    }
+
+    async fn aba_propose_async(&self, value: bool) -> Result<u64, String> {
+        self.aba_propose(value)
+    }
+
+    async fn aba_result_async(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
+        self.aba_result(session_id, timeout_ms)
     }
 }

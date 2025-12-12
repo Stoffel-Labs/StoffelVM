@@ -116,6 +116,106 @@ pub trait AsyncMpcEngine: MpcEngine {
     }
 }
 
+/// Extended MPC engine trait for consensus protocols (RBC and ABA)
+///
+/// This trait provides methods for Reliable Broadcast (RBC) and
+/// Asynchronous Binary Agreement (ABA) primitives.
+///
+/// RBC (Reliable Broadcast) ensures that:
+/// - If the broadcaster is honest, all honest parties deliver the same message
+/// - If any honest party delivers a message, all honest parties eventually deliver it
+///
+/// ABA (Asynchronous Binary Agreement) ensures that:
+/// - All honest parties eventually decide on the same binary value
+/// - If all honest parties propose the same value, that value is decided
+pub trait MpcEngineConsensus: MpcEngine {
+    /// Broadcast a message reliably to all parties using RBC
+    ///
+    /// # Arguments
+    /// * `message` - The message to broadcast
+    ///
+    /// # Returns
+    /// A session ID that can be used to track this broadcast
+    fn rbc_broadcast(&self, message: &[u8]) -> Result<u64, String>;
+
+    /// Receive a reliable broadcast from a specific party
+    ///
+    /// # Arguments
+    /// * `from_party` - The party ID of the sender
+    /// * `timeout_ms` - Maximum time to wait in milliseconds
+    ///
+    /// # Returns
+    /// The broadcasted message bytes
+    fn rbc_receive(&self, from_party: usize, timeout_ms: u64) -> Result<Vec<u8>, String>;
+
+    /// Receive a reliable broadcast from any party
+    ///
+    /// # Arguments
+    /// * `timeout_ms` - Maximum time to wait in milliseconds
+    ///
+    /// # Returns
+    /// A tuple of (party_id, message_bytes)
+    fn rbc_receive_any(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String>;
+
+    /// Propose a binary value for Asynchronous Binary Agreement
+    ///
+    /// # Arguments
+    /// * `value` - The binary value (true/false) to propose
+    ///
+    /// # Returns
+    /// A session ID for this ABA instance
+    fn aba_propose(&self, value: bool) -> Result<u64, String>;
+
+    /// Get the agreed-upon result for an ABA session
+    ///
+    /// # Arguments
+    /// * `session_id` - The session ID from aba_propose
+    /// * `timeout_ms` - Maximum time to wait in milliseconds
+    ///
+    /// # Returns
+    /// The agreed-upon binary value
+    fn aba_result(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String>;
+
+    /// Propose a value and wait for agreement (convenience method)
+    ///
+    /// # Arguments
+    /// * `value` - The binary value to propose
+    /// * `timeout_ms` - Maximum time to wait in milliseconds
+    ///
+    /// # Returns
+    /// The agreed-upon binary value
+    fn aba_propose_and_wait(&self, value: bool, timeout_ms: u64) -> Result<bool, String> {
+        let session_id = self.aba_propose(value)?;
+        self.aba_result(session_id, timeout_ms)
+    }
+}
+
+/// Async version of MpcEngineConsensus
+#[async_trait::async_trait]
+pub trait AsyncMpcEngineConsensus: MpcEngineConsensus {
+    /// Broadcast a message reliably to all parties (async)
+    async fn rbc_broadcast_async(&self, message: &[u8]) -> Result<u64, String>;
+
+    /// Receive a reliable broadcast from a specific party (async)
+    async fn rbc_receive_async(&self, from_party: usize, timeout_ms: u64)
+        -> Result<Vec<u8>, String>;
+
+    /// Receive a reliable broadcast from any party (async)
+    async fn rbc_receive_any_async(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String>;
+
+    /// Propose a binary value for ABA (async)
+    async fn aba_propose_async(&self, value: bool) -> Result<u64, String>;
+
+    /// Get the agreed-upon result for an ABA session (async)
+    async fn aba_result_async(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String>;
+
+    /// Propose and wait for agreement (async)
+    async fn aba_propose_and_wait_async(&self, value: bool, timeout_ms: u64) -> Result<bool, String> {
+        let session_id = self.aba_propose_async(value).await?;
+        self.aba_result_async(session_id, timeout_ms).await
+    }
+}
+
 /// Extended MPC engine trait for client input management
 ///
 /// This trait provides methods for managing client inputs in the MPC system.

@@ -3,28 +3,24 @@
 //! This test demonstrates:
 //! 1. Setting up a network of MPC nodes with QUIC
 //! 2. Running preprocessing to generate multiplication triples
-//! 3. Clients sharing input secrets
+//! 3. Clients sharing input secrets via proper MPC protocol
 //! 4. VM executing bytecode that performs MPC multiplication on shares
 //! 5. Opening the results to verify correctness
 
 use ark_bls12_381::Fr;
-use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::ProtocolType;
 use stoffelnet::network_utils::ClientId;
-use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::core_vm::VirtualMachine;
-use crate::net::hb_engine::HoneyBadgerMpcEngine;
 use crate::tests::mpc_multiplication_integration::{
-    setup_honeybadger_quic_network, HoneyBadgerQuicConfig, HoneyBadgerQuicServer,
+    setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
 };
 use std::collections::HashMap;
 use stoffel_vm_types::core_types::{ShareType, Value};
@@ -73,6 +69,9 @@ async fn test_vm_mpc_multiplication_integration() {
     let instance_id = 88888;
     let base_port = 9300;
 
+    // Define client ID before network setup (client IDs must be registered at setup time)
+    let client_id: ClientId = 100;
+
     let mut config = HoneyBadgerQuicConfig::default();
     config.mpc_timeout = Duration::from_secs(10);
     config.connection_retry_delay = Duration::from_millis(100);
@@ -87,6 +86,7 @@ async fn test_vm_mpc_multiplication_integration() {
         instance_id,
         base_port,
         config.clone(),
+        Some(vec![client_id]),
     )
     .await
     .expect("Failed to create servers");
@@ -165,27 +165,67 @@ async fn test_vm_mpc_multiplication_integration() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Step 5: Generate input shares
-    info!("Step 5: Generating input shares...");
-    let client_id: ClientId = 100;
-    let input_a = Fr::from(10u64);
-    let input_b = Fr::from(20u64);
+    // Step 5: Create server addresses and client inputs
+    info!("Step 5: Creating client inputs...");
+    let input_a = 10u64;
+    let input_b = 20u64;
+    let server_addresses: Vec<SocketAddr> = (0..n_parties)
+        .map(|i| {
+            format!("127.0.0.1:{}", base_port + i as u16)
+                .parse()
+                .unwrap()
+        })
+        .collect();
 
-    // Generate shares for both inputs
-    let mut rng = ark_std::test_rng();
-    let shares_a = RobustShare::compute_shares(input_a, n_parties, threshold, None, &mut rng)
-        .expect("Failed to generate shares for input A");
-    let shares_b = RobustShare::compute_shares(input_b, n_parties, threshold, None, &mut rng)
-        .expect("Failed to generate shares for input B");
+    // Step 5a: Create and connect actual MPC clients
+    info!("Step 5a: Creating and connecting MPC clients...");
+    let client_ids: Vec<ClientId> = vec![client_id];
+    let client_inputs: Vec<Vec<Fr>> = vec![vec![Fr::from(input_a), Fr::from(input_b)]];
 
-    // Store shares directly in each server's input storage
-    for (i, server) in servers.iter().enumerate() {
-        let mut input_store = server.node.preprocess.input.input_shares.lock().await;
-        input_store.insert(client_id, vec![shares_a[i].clone(), shares_b[i].clone()]);
-        info!("✓ Server {} stored input shares", i);
+    let mut clients = setup_honeybadger_quic_clients::<Fr>(
+        client_ids.clone(),
+        server_addresses,
+        n_parties,
+        threshold,
+        instance_id,
+        client_inputs,
+        2, // input_len - we have 2 inputs per client
+        config.clone(),
+    )
+    .await
+    .expect("Failed to create clients");
+
+    for client in &mut clients {
+        info!("Connecting client {} to servers...", client.client_id);
+        client
+            .connect_to_servers()
+            .await
+            .expect("Client failed to connect to servers");
+        info!("✓ Client {} connected to all servers", client.client_id);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Step 5b: Initialize input protocol on all servers for the client
+    info!("Step 5b: Initializing client inputs on all servers...");
+    for (i, server) in servers.iter_mut().enumerate() {
+        let local_shares = server
+            .node
+            .preprocessing_material
+            .lock()
+            .await
+            .take_random_shares(2) // 2 inputs
+            .expect("Failed to take random shares for input");
+        server
+            .node
+            .preprocess
+            .input
+            .init(client_id, local_shares, 2, server.network.clone().expect("network should be set"))
+            .await
+            .expect("input.init failed");
+        info!("✓ Server {} initialized input protocol for client {}", i, client_id);
     }
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Step 6: Perform MPC multiplication using the servers directly
     // (The VM will use shares from this multiplication)
@@ -200,7 +240,10 @@ async fn test_vm_mpc_multiplication_integration() {
         let handle = tokio::spawn(async move {
             // Get input shares for this party
             let (x_shares, y_shares) = {
-                let input_store = node.preprocess.input.input_shares.lock().await;
+                let input_store = node.preprocess.input
+                    .wait_for_all_inputs(std::time::Duration::from_secs(30))
+                    .await
+                    .expect("Failed to get client inputs");
                 let inputs = input_store.get(&client_id).unwrap();
                 (vec![inputs[0].clone()], vec![inputs[1].clone()])
             };
@@ -227,7 +270,7 @@ async fn test_vm_mpc_multiplication_integration() {
     // Get the result share from party 0
     let party_id = 0;
     let session_id =
-        stoffelmpc_mpc::honeybadger::SessionId::new(ProtocolType::Mul, 0, 0, instance_id);
+        stoffelmpc_mpc::honeybadger::SessionId::new(ProtocolType::Mul, 0, 0, 0, instance_id as u32);
 
     let result_share = {
         let storage_map = servers[party_id]

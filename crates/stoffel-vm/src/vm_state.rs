@@ -17,7 +17,7 @@ use crate::foreign_functions::{ForeignFunctionContext, Function};
 use crate::net::client_store::ClientInputStore;
 use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
 use ark_bls12_381::Fr;
-use ark_ff::Field;
+use ark_ff::{Field, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rustc_hash::FxHashMap;
 use smallvec::{SmallVec, smallvec};
@@ -29,6 +29,7 @@ use stoffel_vm_types::core_types::{
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::{Instruction, ResolvedInstruction};
 use stoffelmpc_mpc::common::types::{TypeError, fixed::SecretFixedPoint, integer::SecretInt};
+use stoffelmpc_mpc::common::SecretSharingScheme;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelnet::network_utils::ClientId;
 
@@ -1175,31 +1176,6 @@ impl VMState {
                     .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
                 Value::Share(*ty1, product)
             }
-            (
-                Value::Share(
-                    ty1 @ ShareType::SecretInt {
-                        bit_length: BOOLEAN_SECRET_INT_BITS,
-                    },
-                    data1,
-                ),
-                Value::Share(
-                    ShareType::SecretInt {
-                        bit_length: BOOLEAN_SECRET_INT_BITS,
-                    },
-                    data2,
-                ),
-            ) => {
-                let engine = self
-                    .mpc_engine()
-                    .ok_or_else(|| "MPC engine not configured".to_string())?;
-                if !engine.is_ready() {
-                    return Err("MPC engine configured but not ready".to_string());
-                }
-                let product = engine
-                    .multiply_share(*ty1, data1, data2)
-                    .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
-                Value::Share(*ty1, product)
-            }
             // Share * Scalar (offline - local computation, no MPC required)
             (Value::Share(ty @ ShareType::SecretInt { .. }, data), Value::I64(scalar)) => {
                 let bytes = Self::secret_int_mul_scalar(*ty, data, *scalar)?;
@@ -1450,20 +1426,6 @@ impl VMState {
                 Value::Share(ShareType::SecretInt { .. }, _data1),
                 Value::Share(ShareType::SecretInt { .. }, _data2),
             ) => todo!(),
-            (
-                Value::Share(
-                    ShareType::SecretInt {
-                        bit_length: BOOLEAN_SECRET_INT_BITS,
-                    },
-                    _data1,
-                ),
-                Value::Share(
-                    ShareType::SecretInt {
-                        bit_length: BOOLEAN_SECRET_INT_BITS,
-                    },
-                    _data2,
-                ),
-            ) => todo!(),
             _ => return Err("Type error in AND operation".to_string()),
         };
 
@@ -1497,20 +1459,6 @@ impl VMState {
             (
                 Value::Share(ShareType::SecretInt { .. }, _data1),
                 Value::Share(ShareType::SecretInt { .. }, _data2),
-            ) => todo!(),
-            (
-                Value::Share(
-                    ShareType::SecretInt {
-                        bit_length: BOOLEAN_SECRET_INT_BITS,
-                    },
-                    _data1,
-                ),
-                Value::Share(
-                    ShareType::SecretInt {
-                        bit_length: BOOLEAN_SECRET_INT_BITS,
-                    },
-                    _data2,
-                ),
             ) => todo!(),
             _ => return Err("Type error in OR operation".to_string()),
         };
@@ -1546,20 +1494,6 @@ impl VMState {
                 Value::Share(ShareType::SecretInt { .. }, _data1),
                 Value::Share(ShareType::SecretInt { .. }, _data2),
             ) => todo!(),
-            (
-                Value::Share(
-                    ShareType::SecretInt {
-                        bit_length: BOOLEAN_SECRET_INT_BITS,
-                    },
-                    _data1,
-                ),
-                Value::Share(
-                    ShareType::SecretInt {
-                        bit_length: BOOLEAN_SECRET_INT_BITS,
-                    },
-                    _data2,
-                ),
-            ) => todo!(),
             _ => return Err("Type error in XOR operation".to_string()),
         };
 
@@ -1589,12 +1523,6 @@ impl VMState {
             Value::Bool(a) => Value::Bool(!a),
             // ~Share - TODO
             Value::Share(ShareType::SecretInt { .. }, _data) => todo!(),
-            Value::Share(
-                ShareType::SecretInt {
-                    bit_length: BOOLEAN_SECRET_INT_BITS,
-                },
-                _data,
-            ) => todo!(),
             _ => return Err("Type error in NOT operation".to_string()),
         };
 
@@ -2104,29 +2032,6 @@ impl VMState {
                 let val1 = i64::from_le_bytes(bytes1);
                 let val2 = i64::from_le_bytes(bytes2);
                 impl_cmp!(val1, val2)
-            }
-            // Share comparison (Bool)
-            (
-                Value::Share(
-                    ShareType::SecretInt {
-                        bit_length: BOOLEAN_SECRET_INT_BITS,
-                    },
-                    data1,
-                ),
-                Value::Share(
-                    ShareType::SecretInt {
-                        bit_length: BOOLEAN_SECRET_INT_BITS,
-                    },
-                    data2,
-                ),
-            ) => {
-                let bit1 = data1[0] != 0;
-                let bit2 = data2[0] != 0;
-                match (bit1, bit2) {
-                    (false, true) => -1,
-                    (true, false) => 1,
-                    _ => 0,
-                }
             }
             _ => return Err(format!("Cannot compare {:?} and {:?}", val1, val2)),
         };
@@ -2677,5 +2582,153 @@ impl VMState {
         };
         let result = SecretFixedPoint::new_with_precision(new_share, precision);
         Self::secret_fixed_point_to_bytes(result)
+    }
+
+    // ============================================================================
+    // Public Share Arithmetic Methods (for mpc_builtins)
+    // ============================================================================
+
+    /// Add two secret shares (public wrapper for mpc_builtins)
+    pub fn secret_share_add(
+        &self,
+        ty: ShareType,
+        lhs_bytes: &[u8],
+        rhs_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        match ty {
+            ShareType::SecretInt { .. } => {
+                Self::secret_int_binary_op("addition", ty, lhs_bytes, ty, rhs_bytes, |l, r| l + r)
+            }
+            ShareType::SecretFixedPoint { .. } => {
+                Self::secret_fixed_point_binary_op("addition", ty, lhs_bytes, ty, rhs_bytes, |l, r| {
+                    l + r
+                })
+            }
+        }
+    }
+
+    /// Subtract two secret shares (public wrapper for mpc_builtins)
+    pub fn secret_share_sub(
+        &self,
+        ty: ShareType,
+        lhs_bytes: &[u8],
+        rhs_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        match ty {
+            ShareType::SecretInt { .. } => {
+                Self::secret_int_binary_op("subtraction", ty, lhs_bytes, ty, rhs_bytes, |l, r| {
+                    l - r
+                })
+            }
+            ShareType::SecretFixedPoint { .. } => {
+                Self::secret_fixed_point_binary_op(
+                    "subtraction",
+                    ty,
+                    lhs_bytes,
+                    ty,
+                    rhs_bytes,
+                    |l, r| l - r,
+                )
+            }
+        }
+    }
+
+    /// Negate a secret share (public wrapper for mpc_builtins)
+    pub fn secret_share_neg(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Vec<u8>, String> {
+        match ty {
+            ShareType::SecretInt { bit_length } => {
+                let secret = Self::secret_int_from_bytes(ty, share_bytes)?;
+                let share = secret.share();
+                let new_share_value = -share.share[0];
+                let new_share = RobustShare::new(new_share_value, share.id, share.degree);
+                let result = SecretInt::new(new_share, bit_length);
+                Self::secret_int_to_bytes(result)
+            }
+            ShareType::SecretFixedPoint { precision } => {
+                let secret = Self::secret_fixed_point_from_bytes(ty, share_bytes)?;
+                let share = secret.value();
+                let new_share_value = -share.share[0];
+                let new_share = RobustShare::new(new_share_value, share.id, share.degree);
+                let result = SecretFixedPoint::new_with_precision(new_share, precision);
+                Self::secret_fixed_point_to_bytes(result)
+            }
+        }
+    }
+
+    /// Add scalar to a secret share (public wrapper for mpc_builtins)
+    pub fn secret_share_add_scalar(
+        &self,
+        ty: ShareType,
+        share_bytes: &[u8],
+        scalar: i64,
+    ) -> Result<Vec<u8>, String> {
+        match ty {
+            ShareType::SecretInt { .. } => Self::secret_int_add_scalar(ty, share_bytes, scalar),
+            ShareType::SecretFixedPoint { .. } => {
+                Self::secret_fixed_point_add_scalar(ty, share_bytes, scalar)
+            }
+        }
+    }
+
+    /// Multiply secret share by scalar (public wrapper for mpc_builtins)
+    pub fn secret_share_mul_scalar(
+        &self,
+        ty: ShareType,
+        share_bytes: &[u8],
+        scalar: i64,
+    ) -> Result<Vec<u8>, String> {
+        match ty {
+            ShareType::SecretInt { .. } => Self::secret_int_mul_scalar(ty, share_bytes, scalar),
+            ShareType::SecretFixedPoint { .. } => {
+                Self::secret_fixed_point_mul_scalar(ty, share_bytes, scalar)
+            }
+        }
+    }
+
+    /// Local interpolation - reconstruct secret from array of shares (public wrapper for mpc_builtins)
+    pub fn secret_share_interpolate_local(
+        &self,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> Result<Value, String> {
+        if shares.is_empty() {
+            return Err("Cannot interpolate from empty shares array".to_string());
+        }
+
+        // Decode all shares
+        let mut robust_shares: Vec<RobustShare<Fr>> = Vec::with_capacity(shares.len());
+        for (i, share_bytes) in shares.iter().enumerate() {
+            let share = Self::decode_share_bytes(share_bytes)
+                .map_err(|e| format!("Failed to decode share at index {}: {}", i, e))?;
+            robust_shares.push(share);
+        }
+
+        // Get n_parties from MPC engine if available
+        let n_parties = self.mpc_engine().map(|e| e.n_parties()).unwrap_or(shares.len());
+
+        // Recover the secret using Lagrange interpolation
+        let (_degree, secret) = RobustShare::recover_secret(&robust_shares, n_parties)
+            .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
+
+        // Convert field element back to value based on share type
+        match ty {
+            ShareType::SecretInt { bit_length } if bit_length == 1 => {
+                // Boolean
+                use ark_ff::Zero;
+                Ok(Value::Bool(!secret.is_zero()))
+            }
+            ShareType::SecretInt { .. } => {
+                let limbs: [u64; 4] = secret.into_bigint().0;
+                Ok(Value::I64(limbs[0] as i64))
+            }
+            ShareType::SecretFixedPoint { precision } => {
+                let limbs: [u64; 4] = secret.into_bigint().0;
+                let scaled_value = limbs[0] as i64;
+                let f = precision.f();
+                let scale = (1u64 << f) as f64;
+                let float_value = scaled_value as f64 / scale;
+                Ok(Value::Float(F64(float_value)))
+            }
+        }
     }
 }
