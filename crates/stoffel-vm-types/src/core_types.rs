@@ -170,7 +170,13 @@ impl Array {
         match key {
             // 0-indexed arrays: Valid numeric keys are 0..<length
             Value::I64(idx) if *idx >= 0 && (*idx as usize) < self.length_hint => {
-                Some(&self.elements[*idx as usize])
+                let idx_usize = *idx as usize;
+                // Check if in dense part (< 32) or sparse part (extra_fields)
+                if idx_usize < self.elements.len() {
+                    Some(&self.elements[idx_usize])
+                } else {
+                    self.extra_fields.get(key)
+                }
             }
             _ => self.extra_fields.get(key),
         }

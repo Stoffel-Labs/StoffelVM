@@ -2144,19 +2144,18 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         //
         // Simpler: Reset material to empty before each batch, accumulate manually after.
 
-        // Temporarily drain current material from all servers
-        let mut saved_material: Vec<Vec<_>> = Vec::new();
-        for server in servers.iter() {
+        // Temporarily drain current material from all servers (in parallel)
+        let drain_futures: Vec<_> = servers.iter().map(|server| async {
             let mut material = server.node.preprocessing_material.lock().await;
             // Take all existing shares (we'll put them back after)
             let share_count = material.len().1;
-            let existing = if share_count > 0 {
+            if share_count > 0 {
                 material.take_random_shares(share_count).unwrap_or_default()
             } else {
                 Vec::new()
-            };
-            saved_material.push(existing);
-        }
+            }
+        }).collect();
+        let saved_material: Vec<Vec<_>> = futures::future::join_all(drain_futures).await;
 
         // Now all servers have 0 shares, run preprocessing to generate batch_size
         let preprocessing_handles: Vec<_> = servers
@@ -2180,24 +2179,30 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             .collect();
         futures::future::join_all(preprocessing_handles).await;
 
-        // Restore saved material + keep new material (it accumulates)
-        for (server_idx, server) in servers.iter().enumerate() {
-            let mut material = server.node.preprocessing_material.lock().await;
-            // Add back the saved shares
-            if !saved_material[server_idx].is_empty() {
-                material.add(
-                    None,
-                    Some(saved_material[server_idx].clone()),
-                    None,
-                    None,
-                );
-            }
-            let (triples, random_shares, _, _) = material.len();
+        // Restore saved material + keep new material in parallel
+        let restore_futures: Vec<_> = servers.iter().zip(saved_material.into_iter()).enumerate()
+            .map(|(server_idx, (server, saved_shares))| async move {
+                let mut material = server.node.preprocessing_material.lock().await;
+                // Add back the saved shares
+                if !saved_shares.is_empty() {
+                    material.add(
+                        None,
+                        Some(saved_shares),
+                        None,
+                        None,
+                    );
+                }
+                let (triples, random_shares, _, _) = material.len();
+                (server_idx, random_shares, triples)
+            })
+            .collect();
+        let restore_results = futures::future::join_all(restore_futures).await;
+        for (server_idx, random_shares, triples) in restore_results {
             info!("    Server {} now has {} random shares, {} triples", server_idx, random_shares, triples);
         }
 
-        // Brief pause between batches
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Brief pause between batches (reduced from 100ms since operations are now parallel)
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Safety limit to prevent infinite loops
         if batch_idx > 1000 {
@@ -2366,8 +2371,8 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                     .chain((LARGE_MATRIX_SIZE - 10)..LARGE_MATRIX_SIZE)
                     .collect();
                 for &elem_idx in &sample_indices {
-                    // Arrays are 1-indexed in this VM
-                    let idx_val = Value::I64((elem_idx + 1) as i64);
+                    // Arrays are 0-indexed in this VM
+                    let idx_val = Value::I64(elem_idx as i64);
                     if let Some(elem_val) = arr.get(&idx_val) {
                         // Extract the computed average value
                         // SecretFixedPoint now reveals directly to f64 (via F64 wrapper)
@@ -2427,7 +2432,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         let arr = vm.state.object_store.get_array(array_id).expect("array exists");
         sample_indices.iter()
             .map(|&i| {
-                let idx = Value::I64((i + 1) as i64);
+                let idx = Value::I64(i as i64);
                 match arr.get(&idx).expect("element exists") {
                     Value::I64(v) => *v as f64,
                     Value::Float(v) => v.0,
@@ -2445,7 +2450,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         };
         let arr = vm.state.object_store.get_array(array_id).expect("array exists");
         for (sample_idx, (&i, &ref_val)) in sample_indices.iter().zip(reference_vals.iter()).enumerate() {
-            let idx = Value::I64((i + 1) as i64);
+            let idx = Value::I64(i as i64);
             let party_val: f64 = match arr.get(&idx).expect("element exists") {
                 Value::I64(v) => *v as f64,
                 Value::Float(v) => v.0,
@@ -2739,10 +2744,9 @@ fn build_federated_average_program(matrix_size: usize, _num_clients: usize) -> (
     // Divide by num_clients to get average (now operating on clear values)
     instructions.push(Instruction::DIV(7, 7, 1)); // reg7 = sum / num_clients
 
-    // Store the revealed averaged value in the result array
-    instructions.push(Instruction::ADD(8, 5, 3)); // reg8 = element_index + 1 (1-indexed)
+    // Store the revealed averaged value in the result array (0-indexed)
     instructions.push(Instruction::PUSHARG(6)); // result array ref
-    instructions.push(Instruction::PUSHARG(8)); // index (1-based)
+    instructions.push(Instruction::PUSHARG(5)); // index (0-based element_index)
     instructions.push(Instruction::PUSHARG(7)); // value (revealed average)
     instructions.push(Instruction::CALL("set_field".to_string()));
 
@@ -2753,7 +2757,7 @@ fn build_federated_average_program(matrix_size: usize, _num_clients: usize) -> (
     // For now, we store the revealed value - clients will get clear values
     // TODO: To send secret shares, we need to copy the share before revealing
     instructions.push(Instruction::PUSHARG(12)); // shares array ref
-    instructions.push(Instruction::PUSHARG(8)); // index (1-based)
+    instructions.push(Instruction::PUSHARG(5)); // index (0-based element_index)
     instructions.push(Instruction::PUSHARG(7)); // value (revealed average, not secret)
     instructions.push(Instruction::CALL("set_field".to_string()));
 
