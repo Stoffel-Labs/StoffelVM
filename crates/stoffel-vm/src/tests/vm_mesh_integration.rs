@@ -1388,6 +1388,29 @@ const LARGE_MATRIX_SIZE: usize = LARGE_MATRIX_ROWS * LARGE_MATRIX_COLS;
 /// The preprocessing protocol freezes when attempting to generate >511 elements at once
 const MAX_PREPROCESSING_BATCH_SIZE: usize = 500;
 
+// =============================================================================
+// PREPROCESSING PERFORMANCE NOTE
+// =============================================================================
+//
+// The stoffelmpc library's `ensure_random_shares` generates shares sequentially:
+//   batch_size = n_parties - 2*threshold = 5 - 2*1 = 3 shares per network round
+//
+// For large tests (e.g., 128x128 matrix with 4 clients = 65,536 shares):
+//   - Network rounds per 510-share batch: ~170
+//   - Total batches: ~129
+//   - Total sequential network rounds: ~22,000
+//
+// This results in ~20 minute preprocessing times for large matrices.
+//
+// OPTIMIZATION OPPORTUNITY (requires stoffelmpc library changes):
+// The HoneyBadgerMPC protocol supports parallel preprocessing since each
+// ShareGen iteration uses unique SessionIds. Parallelizing the loop in
+// `ensure_random_shares` would significantly reduce preprocessing time.
+//
+// Current workaround: Use smaller matrices for CI tests, keep large tests
+// marked #[ignore] for manual validation runs.
+// =============================================================================
+
 /// Test VM mesh integration with federated matrix average computation
 ///
 /// This test demonstrates:
@@ -1910,6 +1933,11 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     init_crypto_provider();
     setup_test_tracing();
 
+    // Timing tracking for performance analysis
+    let test_start = std::time::Instant::now();
+    let mut step_timings: Vec<(&str, std::time::Duration)> = Vec::new();
+    let mut step_start = std::time::Instant::now();
+
     info!("=== Starting VM Mesh Large Matrix (128x128) Fixed-Point Integration Test ===");
     info!(
         "Matrix dimensions: {}x{} = {} elements per client",
@@ -1989,6 +2017,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     }
     info!("  ... ({} total elements)", LARGE_MATRIX_SIZE);
 
+    step_timings.push(("Data generation", step_start.elapsed()));
+    step_start = std::time::Instant::now();
+
     // Step 1: Create mesh network with initial preprocessing capacity
     info!("Step 1: Creating {} MPC servers...", n_parties);
     let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
@@ -2012,6 +2043,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         })
         .collect();
 
+    step_timings.push(("Step 1: Create MPC servers", step_start.elapsed()));
+    step_start = std::time::Instant::now();
+
     // Step 2: Start servers and spawn message processors
     info!("Step 2: Starting servers...");
     for (i, server) in servers.iter_mut().enumerate() {
@@ -2033,15 +2067,30 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         });
     }
 
-    // Step 3: Connect servers
-    info!("Step 3: Connecting servers in mesh topology...");
-    for server in &servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    step_timings.push(("Step 2: Start servers", step_start.elapsed()));
+    step_start = std::time::Instant::now();
 
-    // Step 4: Create input clients
-    info!("Step 4: Creating {} matrix input clients...", client_count);
+    // Step 3: Connect servers (PARALLELIZED)
+    info!("Step 3: Connecting servers in mesh topology...");
+    let connect_handles: Vec<_> = servers.iter()
+        .map(|server| server.connect_to_peers())
+        .collect();
+    let connect_results = futures::future::join_all(connect_handles).await;
+    for (i, result) in connect_results.into_iter().enumerate() {
+        result.unwrap_or_else(|e| panic!("Server {} failed to connect: {:?}", i, e));
+    }
+    info!("  ✓ All {} servers connected to mesh", n_parties);
+    // Brief pause to ensure all connections are fully established
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    step_timings.push(("Step 3: Connect servers", step_start.elapsed()));
+    step_start = std::time::Instant::now();
+
+    // Step 4: Create input clients (but DON'T connect yet - defer until after preprocessing)
+    // NOTE: We create clients early to register client IDs, but delay connect_to_servers()
+    // until after preprocessing and input.init(). This prevents QUIC connection timeouts
+    // during the potentially long preprocessing phase.
+    info!("Step 4: Creating {} matrix input clients (will connect after preprocessing)...", client_count);
     let mut clients = setup_honeybadger_quic_clients::<Fr>(
         client_ids.clone(),
         server_addresses.clone(),
@@ -2055,109 +2104,60 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     .await
     .expect("Failed to create clients");
 
-    for client in &mut clients {
-        client
-            .connect_to_servers()
-            .await
-            .expect("Client failed to connect");
-        info!("✓ Client {} connected", client.client_id);
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    step_timings.push(("Step 4: Create clients", step_start.elapsed()));
+    step_start = std::time::Instant::now();
 
-    // Step 5: Run BATCHED preprocessing
+    // Step 5: Run BATCHED preprocessing with O(n) accumulation strategy
     // We need enough random shares for all client inputs: client_count * LARGE_MATRIX_SIZE
     // The preprocessing protocol freezes when attempting to generate >511 elements at once.
     //
-    // CRITICAL: The `run_preprocessing` function in stoffelmpc tries to generate
-    // `params.n_random_shares` shares if `available < params.n_random_shares`.
-    // It does NOT generate just the delta - it tries to generate the full amount.
-    // So we MUST keep n_random_shares <= MAX_PREPROCESSING_BATCH_SIZE at all times.
+    // OPTIMIZED STRATEGY: Instead of drain-all/restore-all per batch (O(n²) total),
+    // we accumulate shares externally and only touch batch_size shares per iteration (O(n) total).
     //
-    // Strategy: Run preprocessing multiple times with a small n_random_shares value.
-    // Each run adds to the accumulated material. We loop until we have enough.
+    // 1. Keep preprocessing material empty during batch generation
+    // 2. After each batch, extract the newly generated shares to external accumulator
+    // 3. At the end, add all accumulated shares back to material in one operation
     let total_random_shares_needed = client_count * LARGE_MATRIX_SIZE;
+    // Use batch size closer to the 511 limit for fewer iterations
+    let optimized_batch_size = 510;
+    let total_batches = (total_random_shares_needed + optimized_batch_size - 1) / optimized_batch_size;
 
-    info!("Step 5: Running BATCHED preprocessing (need {} total shares, batch size {})...",
-          total_random_shares_needed, MAX_PREPROCESSING_BATCH_SIZE);
+    info!("Step 5: Running OPTIMIZED batched preprocessing...");
+    info!("  Need {} total shares, batch size {}, ~{} batches expected",
+          total_random_shares_needed, optimized_batch_size, total_batches);
 
+    // External accumulators for each server - avoids O(n²) drain/restore
+    let mut accumulated_shares: Vec<Vec<_>> = (0..n_parties).map(|_| Vec::with_capacity(total_random_shares_needed)).collect();
+    let mut total_accumulated = 0usize;
     let mut batch_idx = 0;
-    loop {
-        // Check current accumulation on server 0 (all servers should have same amount)
-        let current_shares = {
-            let material = servers[0].node.preprocessing_material.lock().await;
-            let (_, random_shares, _, _) = material.len();
-            random_shares
-        };
+    let start_time = std::time::Instant::now();
 
-        if current_shares >= total_random_shares_needed {
-            info!("  ✓ Have {} shares, need {} - done preprocessing", current_shares, total_random_shares_needed);
-            break;
-        }
+    // Only generate triples in the first batch - they're expensive and we only need ~32 total
+    let triples_needed = 32;
+    let mut triples_generated = false;
 
+    while total_accumulated < total_random_shares_needed {
         batch_idx += 1;
-        let remaining = total_random_shares_needed - current_shares;
-        let batch_size = std::cmp::min(MAX_PREPROCESSING_BATCH_SIZE, remaining);
+        let remaining = total_random_shares_needed - total_accumulated;
+        let batch_size = std::cmp::min(optimized_batch_size, remaining);
 
-        info!("  Batch {}: have {} shares, generating {} more (need {} total)...",
-              batch_idx, current_shares, batch_size, total_random_shares_needed);
+        // Log progress every 10 batches to reduce output spam
+        if batch_idx % 10 == 1 || batch_idx == 1 {
+            let elapsed = start_time.elapsed().as_secs_f32();
+            let rate = if elapsed > 0.0 { total_accumulated as f32 / elapsed } else { 0.0 };
+            info!("  Batch {}/{}: accumulated {}/{} shares ({:.0} shares/sec)...",
+                  batch_idx, total_batches, total_accumulated, total_random_shares_needed, rate);
+        }
 
         // Set preprocessing parameters for this batch
-        // IMPORTANT: n_random_shares must be <= MAX_PREPROCESSING_BATCH_SIZE to avoid freeze
+        // OPTIMIZATION: Only generate triples once (first batch) - they're expensive!
         for server in servers.iter_mut() {
             server.node.params.n_random_shares = batch_size;
-            server.node.params.n_triples = std::cmp::min(32, batch_size / 4);
+            server.node.params.n_triples = if !triples_generated { triples_needed } else { 0 };
         }
+        triples_generated = true;
 
-        // Clear the existing preprocessing material counts on all servers
-        // so that run_preprocessing sees "0 available" and generates fresh batch
-        // Actually, we can't clear - we need to accumulate. The trick is that
-        // run_preprocessing will add to existing material via .add() method.
-        // BUT it checks `available >= target` and skips if true.
-        //
-        // The REAL fix: We need n_random_shares to be (current + batch_size),
-        // but that causes freeze. So the only option is to temporarily drain
-        // the material before each batch, run preprocessing, then restore.
-        // This is ugly but necessary given the protocol limitations.
-        //
-        // Alternative: Just set n_random_shares to a value > current.
-        // E.g., current + 1. Then it will try to generate batch_size worth.
-        // Let's try: n_random_shares = current + batch_size (but this freezes...)
-        //
-        // After more analysis: ensure_random_shares generates EXACTLY the amount
-        // passed to it, not the delta. So if we pass batch_size, it generates
-        // batch_size. The freeze happens when batch_size > 511.
-        // Since batch_size <= 500, we should be safe!
-        //
-        // The issue is that run_preprocessing passes `total_random_shares_to_generate`
-        // which equals `no_of_random_shares` (the param) if triples=0.
-        // So if params.n_random_shares = 500 and available = 501, it skips (501 >= 500).
-        // We need params.n_random_shares = 502 to trigger generation.
-        // But then it generates 502 shares, not 1.
-        //
-        // Revised strategy: Set n_random_shares = current_shares + batch_size
-        // This triggers generation of (current_shares + batch_size) shares,
-        // but that would freeze for large values. So we need a different approach.
-        //
-        // FINAL FIX: Directly add material by calling ensure_random_shares ourselves.
-        // But that's internal. So instead, create fresh nodes for each batch.
-        // This is inefficient but ensures each batch starts from 0.
-        //
-        // Simpler: Reset material to empty before each batch, accumulate manually after.
-
-        // Temporarily drain current material from all servers (in parallel)
-        let drain_futures: Vec<_> = servers.iter().map(|server| async {
-            let mut material = server.node.preprocessing_material.lock().await;
-            // Take all existing shares (we'll put them back after)
-            let share_count = material.len().1;
-            if share_count > 0 {
-                material.take_random_shares(share_count).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }).collect();
-        let saved_material: Vec<Vec<_>> = futures::future::join_all(drain_futures).await;
-
-        // Now all servers have 0 shares, run preprocessing to generate batch_size
+        // Run preprocessing on all servers in parallel (material is empty, so it generates batch_size)
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
@@ -2167,87 +2167,181 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                     .network
                     .clone()
                     .expect("network should be set after start()");
-                let batch = batch_idx;
                 tokio::spawn(async move {
                     let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                     node.run_preprocessing(network, &mut rng)
                         .await
-                        .expect("Preprocessing failed");
-                    info!("    ✓ Server {} batch {} complete", i, batch);
+                        .map_err(|e| format!("Server {} preprocessing failed: {:?}", i, e))
                 })
             })
             .collect();
-        futures::future::join_all(preprocessing_handles).await;
 
-        // Restore saved material + keep new material in parallel
-        let restore_futures: Vec<_> = servers.iter().zip(saved_material.into_iter()).enumerate()
-            .map(|(server_idx, (server, saved_shares))| async move {
+        // Wait for all servers to complete this batch
+        let results = futures::future::join_all(preprocessing_handles).await;
+        for result in results {
+            result.expect("Task panicked").expect("Preprocessing failed");
+        }
+
+        // Extract newly generated shares from each server and add to external accumulator
+        let extract_futures: Vec<_> = servers.iter().enumerate()
+            .map(|(server_idx, server)| async move {
                 let mut material = server.node.preprocessing_material.lock().await;
-                // Add back the saved shares
-                if !saved_shares.is_empty() {
-                    material.add(
-                        None,
-                        Some(saved_shares),
-                        None,
-                        None,
-                    );
-                }
-                let (triples, random_shares, _, _) = material.len();
-                (server_idx, random_shares, triples)
+                let share_count = material.len().1;
+                let new_shares = if share_count > 0 {
+                    material.take_random_shares(share_count).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                (server_idx, new_shares)
             })
             .collect();
-        let restore_results = futures::future::join_all(restore_futures).await;
-        for (server_idx, random_shares, triples) in restore_results {
-            info!("    Server {} now has {} random shares, {} triples", server_idx, random_shares, triples);
-        }
 
-        // Brief pause between batches (reduced from 100ms since operations are now parallel)
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let extracted = futures::future::join_all(extract_futures).await;
+        for (server_idx, new_shares) in extracted {
+            let count = new_shares.len();
+            accumulated_shares[server_idx].extend(new_shares);
+            if server_idx == 0 {
+                total_accumulated += count;
+            }
+        }
 
         // Safety limit to prevent infinite loops
-        if batch_idx > 1000 {
-            panic!("Too many preprocessing batches - something is wrong");
+        if batch_idx > 2000 {
+            panic!("Too many preprocessing batches ({}) - something is wrong", batch_idx);
         }
     }
+
+    let elapsed = start_time.elapsed();
+    info!("  ✓ Generated {} shares in {} batches ({:.1}s, {:.0} shares/sec)",
+          total_accumulated, batch_idx, elapsed.as_secs_f32(),
+          total_accumulated as f32 / elapsed.as_secs_f32());
+
+    // Add all accumulated shares back to preprocessing material in one operation
+    info!("  Finalizing: adding accumulated shares to preprocessing material...");
+    let finalize_futures: Vec<_> = servers.iter().zip(accumulated_shares.into_iter())
+        .map(|(server, shares)| async move {
+            let mut material = server.node.preprocessing_material.lock().await;
+            let count = shares.len();
+            material.add(None, Some(shares), None, None);
+            count
+        })
+        .collect();
+    let finalize_results = futures::future::join_all(finalize_futures).await;
+    info!("  ✓ All {} servers now have {} random shares each",
+          n_parties, finalize_results[0]);
 
     info!("✓ All preprocessing complete");
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Step 6: Initialize input protocol for each client
-    // We need to take shares in batches if a single client needs more than available
-    info!("Step 6: Initializing input protocol for {} clients with {} shares each...",
+    step_timings.push(("Step 5: Preprocessing", step_start.elapsed()));
+    step_start = std::time::Instant::now();
+
+    // Step 6: Connect clients and initialize input protocol (PARALLELIZED)
+    // IMPORTANT: Connect clients RIGHT BEFORE input.init() to avoid QUIC connection timeouts.
+    // input.init() sends random shares to clients, so clients must be connected first.
+    info!("Step 6: Connecting clients and initializing input protocol...");
+    info!("  Connecting {} clients to servers (parallel)...", client_count);
+
+    // OPTIMIZATION: Connect all clients in parallel
+    let client_connect_handles: Vec<_> = clients.iter_mut()
+        .map(|client| {
+            let client_id = client.client_id;
+            async move {
+                client.connect_to_servers().await
+                    .map_err(|e| format!("Client {} failed to connect: {:?}", client_id, e))?;
+                Ok::<_, String>(client_id)
+            }
+        })
+        .collect();
+
+    let client_results = futures::future::join_all(client_connect_handles).await;
+    for result in client_results {
+        let client_id = result.expect("Client connection failed");
+        info!("  ✓ Client {} connected", client_id);
+    }
+
+    // Brief pause to ensure connections are stable
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // OPTIMIZATION: Initialize input protocol for all servers in parallel
+    // Each server initializes input protocol for all clients
+    info!("  Initializing input protocol for {} clients with {} shares each (parallel per server)...",
           client_count, LARGE_MATRIX_SIZE);
-    for (idx, server) in servers.iter_mut().enumerate() {
-        for client_id in &client_ids {
-            let local_shares = server
-                .node
-                .preprocessing_material
-                .lock()
-                .await
-                .take_random_shares(LARGE_MATRIX_SIZE)
-                .expect("Failed to take random shares");
-            server
-                .node
-                .preprocess
-                .input
-                .init(
-                    *client_id,
-                    local_shares,
-                    LARGE_MATRIX_SIZE,
-                    server
-                        .network
-                        .clone()
-                        .expect("network should be set"),
-                )
-                .await
-                .expect("input.init failed");
-        }
+
+    let input_init_handles: Vec<_> = servers.iter_mut().enumerate()
+        .map(|(idx, server)| {
+            let client_ids = client_ids.clone();
+            let network = server.network.clone().expect("network should be set");
+            let preprocessing_material = server.node.preprocessing_material.clone();
+            let mut preprocess_input = server.node.preprocess.input.clone();
+
+            async move {
+                for client_id in &client_ids {
+                    let local_shares = preprocessing_material
+                        .lock()
+                        .await
+                        .take_random_shares(LARGE_MATRIX_SIZE)
+                        .expect("Failed to take random shares");
+                    preprocess_input
+                        .init(
+                            *client_id,
+                            local_shares,
+                            LARGE_MATRIX_SIZE,
+                            network.clone(),
+                        )
+                        .await
+                        .expect("input.init failed");
+                }
+                idx
+            }
+        })
+        .collect();
+
+    let init_results = futures::future::join_all(input_init_handles).await;
+    for idx in init_results {
         info!("✓ Server {} initialized input protocol", idx);
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    step_timings.push(("Step 6: Connect clients & init input", step_start.elapsed()));
+    step_start = std::time::Instant::now();
 
     // Step 7: Create VMs and hydrate client stores
     info!("Step 7: Creating VMs and hydrating client stores...");
+
+    // OPTIMIZATION: Wait for all inputs in PARALLEL across all parties
+    // This is critical because the input protocol requires all parties to participate
+    // Using a longer timeout (5 minutes) for 16K elements per client
+    let input_timeout = Duration::from_secs(300);
+    info!("  Waiting for client inputs (timeout: {}s, {} elements per client)...",
+          input_timeout.as_secs(), LARGE_MATRIX_SIZE);
+
+    let wait_handles: Vec<_> = servers.iter().enumerate()
+        .map(|(party_id, server)| {
+            let mut input = server.node.preprocess.input.clone();
+            async move {
+                let input_store = input
+                    .wait_for_all_inputs(input_timeout)
+                    .await
+                    .map_err(|e| format!("Party {} failed to get inputs: {:?}", party_id, e))?;
+                let shares: Vec<(ClientId, Vec<RobustShare<Fr>>)> = input_store
+                    .iter()
+                    .map(|(client, shares)| (*client, shares.clone()))
+                    .collect();
+                Ok::<_, String>((party_id, shares))
+            }
+        })
+        .collect();
+
+    let all_shares = futures::future::join_all(wait_handles).await;
+
+    // Collect shares per party
+    let mut shares_by_party: Vec<Vec<(ClientId, Vec<RobustShare<Fr>>)>> = vec![Vec::new(); n_parties];
+    for result in all_shares {
+        let (party_id, shares) = result.expect("Failed to get client inputs");
+        shares_by_party[party_id] = shares;
+        info!("  ✓ Party {} received {} client inputs", party_id, shares_by_party[party_id].len());
+    }
+
+    // Create VMs and hydrate client stores
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
     for party_id in 0..n_parties {
         let mut vm = VirtualMachine::new();
@@ -2263,50 +2357,42 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             servers[party_id].node.clone(),
         );
         vm.state.set_mpc_engine(engine);
-        vms.push(Arc::new(parking_lot::Mutex::new(vm)));
-    }
 
-    // Hydrate VM client stores
-    for (party_id, vm_arc) in vms.iter().enumerate() {
-        let shares_for_party: Vec<(ClientId, Vec<RobustShare<Fr>>)> = {
-            let input_store = servers[party_id]
-                .node
-                .preprocess
-                .input
-                .wait_for_all_inputs(Duration::from_secs(30))
-                .await
-                .expect("Failed to get client inputs");
-            input_store
-                .iter()
-                .map(|(client, shares)| (*client, shares.clone()))
-                .collect()
-        };
-        let mut vm = vm_arc.lock();
+        // Hydrate client store with pre-fetched shares
         let store = vm.state.client_store();
         store.clear();
-        for (client_id, shares) in shares_for_party {
-            store.store_client_input(client_id, shares);
+        for (client_id, shares) in &shares_by_party[party_id] {
+            store.store_client_input(*client_id, shares.clone());
         }
-        info!("✓ VM {} client store populated", party_id);
+
+        vms.push(Arc::new(parking_lot::Mutex::new(vm)));
+        info!("✓ VM {} created and client store populated", party_id);
     }
 
-    // Step 8: Register federated averaging program
-    // This program computes element-wise averages and sends them back to clients
-    info!("Step 8: Registering federated averaging program...");
-    let (fed_avg_program, fed_avg_labels) = build_federated_average_program(LARGE_MATRIX_SIZE, client_count);
+    step_timings.push(("Step 7: Create VMs & hydrate stores", step_start.elapsed()));
+    step_start = std::time::Instant::now();
+
+    // Step 8: Register federated averaging program using the new batch reveal builtin
+    // This uses FederatedLearning.average_client_shares which is much faster for large matrices
+    // Using fixed-point mode since this test uses scaled fixed-point values
+    info!("Step 8: Registering federated averaging program (using batch reveal builtin with fixed-point)...");
+    let fed_avg_program = build_batch_average_program_with_type(LARGE_MATRIX_SIZE, true);
     for vm_arc in &vms {
         let avg_fn = VMFunction::new(
             "federated_average".to_string(),
             vec![],
             Vec::new(),
             None,
-            MATRIX_AVG_PROGRAM_REGISTERS,
+            8, // Minimal registers needed for builtin call
             fed_avg_program.clone(),
-            fed_avg_labels.clone(),
+            HashMap::new(),
         );
         let mut vm = vm_arc.lock();
         vm.register_function(avg_fn);
     }
+
+    step_timings.push(("Step 8: Register program", step_start.elapsed()));
+    step_start = std::time::Instant::now();
 
     info!("Step 9: Executing federated averaging program on all parties...");
     use futures::FutureExt;
@@ -2339,6 +2425,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         let (pid, val) = res.expect("VM execution task failed");
         results.push((pid, val));
     }
+
+    step_timings.push(("Step 9: Execute program (batch reveal)", step_start.elapsed()));
+    step_start = std::time::Instant::now();
 
     // Step 10: Verify results
     // The VM returns an array of element-wise averages (still in fixed-point scaled format)
@@ -2467,6 +2556,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         info!("  ✓ Party {} results match reference ({} samples)", pid, sample_size);
     }
 
+    step_timings.push(("Step 10: Verify results", step_start.elapsed()));
+    step_start = std::time::Instant::now();
+
     // Cleanup
     info!("Step 11: Cleaning up...");
     for mut server in servers {
@@ -2476,14 +2568,26 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         let _ = client.stop().await;
     }
 
+    step_timings.push(("Step 11: Cleanup", step_start.elapsed()));
+
+    // Print timing breakdown
+    let total_elapsed = test_start.elapsed();
     info!("");
+    info!("=== TIMING BREAKDOWN ===");
+    for (step_name, duration) in &step_timings {
+        let pct = (duration.as_secs_f64() / total_elapsed.as_secs_f64()) * 100.0;
+        info!("  {:40} {:>8.2}s ({:>5.1}%)", step_name, duration.as_secs_f64(), pct);
+    }
+    info!("  {:40} {:>8.2}s (100.0%)", "TOTAL", total_elapsed.as_secs_f64());
+    info!("");
+
     info!("=== VM Mesh Large Matrix (128x128) Federated Averaging Integration Test PASSED ===");
     info!(
         "Successfully computed federated average of {} matrices ({}x{} = {} elements) from {} clients",
         client_count, LARGE_MATRIX_ROWS, LARGE_MATRIX_COLS, LARGE_MATRIX_SIZE, client_count
     );
     info!("All {} parties computed identical element-wise averages", n_parties);
-    info!("Preprocessing was executed in batches of up to {} elements each", MAX_PREPROCESSING_BATCH_SIZE);
+    info!("Using batch reveal builtin (FederatedLearning.average_client_shares)");
 }
 
 /// Build a program that computes the overall average using fixed-point shares
@@ -3320,4 +3424,355 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         "Bytecode processed {} matrices ({}x{}) from {} clients",
         client_count, MATRIX_ROWS, MATRIX_COLS, client_count
     );
+}
+
+/// Test the batch reveal optimization using FederatedLearning.average_client_shares builtin
+///
+/// This test demonstrates the new batch reveal functionality that:
+/// 1. Collects all client shares from the ClientStore
+/// 2. Sums them element-wise (local operation)
+/// 3. Batch reveals all sums in a single efficient operation
+/// 4. Computes the average by dividing by client count
+///
+/// This is significantly more efficient than revealing each element individually
+/// because it uses the batch_open_shares method which processes all shares together.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_vm_mesh_batch_reveal_federated_average() {
+    init_crypto_provider();
+    setup_test_tracing();
+
+    info!("=== Starting Batch Reveal Federated Average Test ===");
+
+    let n_parties = 5;
+    let threshold = 1;
+    let n_triples = 16;
+    let num_elements = 6; // Small matrix for fast test
+    let n_random_shares = 32 + num_elements * 8;
+    let instance_id = 88888;
+    let base_port = 9950;
+
+    let config = HoneyBadgerQuicConfig {
+        mpc_timeout: Duration::from_secs(30),
+        connection_retry_delay: Duration::from_millis(100),
+        ..Default::default()
+    };
+
+    // Generate test client data
+    let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+    let client_count = 3;
+    let mut client_ids = Vec::new();
+    let mut client_inputs = Vec::new();
+    let mut element_sums: Vec<i64> = vec![0; num_elements];
+
+    info!("Generating {} clients with {} elements each...", client_count, num_elements);
+
+    for idx in 0..client_count {
+        let client_id = 900 + idx as ClientId;
+        client_ids.push(client_id);
+
+        let mut values: Vec<Fr> = Vec::new();
+        for elem_idx in 0..num_elements {
+            let value = rng.gen_range(10i64..=100i64);
+            element_sums[elem_idx] += value;
+            values.push(Fr::from(value as u64));
+        }
+        client_inputs.push(values);
+        info!("  Client {}: generated {} values", client_id, num_elements);
+    }
+
+    // Expected averages (integer division)
+    let expected_averages: Vec<i64> = element_sums.iter()
+        .map(|sum| sum / client_count as i64)
+        .collect();
+    info!("Expected averages: {:?}", expected_averages);
+
+    // Step 1: Create mesh network
+    info!("Step 1: Creating {} MPC servers...", n_parties);
+    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
+        n_parties,
+        threshold,
+        n_triples,
+        n_random_shares,
+        instance_id,
+        base_port,
+        config.clone(),
+        Some(client_ids.clone()),
+    )
+    .await
+    .expect("Failed to create servers");
+
+    let server_addresses: Vec<SocketAddr> = (0..n_parties)
+        .map(|i| format!("127.0.0.1:{}", base_port + i as u16).parse().unwrap())
+        .collect();
+
+    // Step 2: Start servers
+    info!("Step 2: Starting servers...");
+    for (i, server) in servers.iter_mut().enumerate() {
+        server.start().await.expect("Failed to start server");
+        let mut node = server.node.clone();
+        let network = server.network.clone().expect("network should be set");
+        let mut rx = recv.remove(0);
+        tokio::spawn(async move {
+            while let Some(raw_msg) = rx.recv().await {
+                if let Err(e) = node.process(raw_msg, network.clone()).await {
+                    tracing::error!("Node {i} failed to process message: {e:?}");
+                }
+            }
+        });
+    }
+
+    // Step 3: Connect servers
+    info!("Step 3: Connecting servers...");
+    for server in &servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 4: Create input clients
+    info!("Step 4: Creating {} input clients...", client_count);
+    let mut clients = setup_honeybadger_quic_clients::<Fr>(
+        client_ids.clone(),
+        server_addresses,
+        n_parties,
+        threshold,
+        instance_id,
+        client_inputs.clone(),
+        num_elements,
+        config.clone(),
+    )
+    .await
+    .expect("Failed to create clients");
+
+    for client in &mut clients {
+        client.connect_to_servers().await.expect("Client failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Step 5: Run preprocessing
+    info!("Step 5: Running preprocessing...");
+    let preprocessing_handles: Vec<_> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, server)| {
+            let mut node = server.node.clone();
+            let network = server.network.clone().expect("network should be set");
+            tokio::spawn(async move {
+                let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+                node.run_preprocessing(network, &mut rng).await.expect("Preprocessing failed");
+                info!("  Server {} preprocessing complete", i);
+            })
+        })
+        .collect();
+    futures::future::join_all(preprocessing_handles).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Step 6: Initialize input protocol
+    info!("Step 6: Initializing input protocol...");
+    for (idx, server) in servers.iter_mut().enumerate() {
+        for client_id in &client_ids {
+            let local_shares = server.node.preprocessing_material.lock().await
+                .take_random_shares(num_elements)
+                .expect("Failed to take random shares");
+            server.node.preprocess.input
+                .init(*client_id, local_shares, num_elements, server.network.clone().expect("network"))
+                .await
+                .expect("input.init failed");
+        }
+        info!("  Server {} initialized input protocol", idx);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 7: Create VMs and hydrate client stores
+    info!("Step 7: Creating VMs...");
+    let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
+    for party_id in 0..n_parties {
+        let mut vm = VirtualMachine::new();
+        let engine = HoneyBadgerMpcEngine::from_existing_node(
+            instance_id,
+            party_id,
+            n_parties,
+            threshold,
+            servers[party_id].network.clone().expect("network"),
+            servers[party_id].node.clone(),
+        );
+        vm.state.set_mpc_engine(engine);
+        vms.push(Arc::new(parking_lot::Mutex::new(vm)));
+    }
+
+    // Hydrate VM client stores
+    for (party_id, vm_arc) in vms.iter().enumerate() {
+        let shares_for_party: Vec<(ClientId, Vec<RobustShare<Fr>>)> = {
+            let input_store = servers[party_id].node.preprocess.input
+                .wait_for_all_inputs(Duration::from_secs(30))
+                .await
+                .expect("Failed to get client inputs");
+            input_store.iter().map(|(c, s)| (*c, s.clone())).collect()
+        };
+        let mut vm = vm_arc.lock();
+        let store = vm.state.client_store();
+        store.clear();
+        for (client_id, shares) in shares_for_party {
+            store.store_client_input(client_id, shares);
+        }
+    }
+
+    // Step 8: Build and register a program that uses FederatedLearning.average_client_shares
+    info!("Step 8: Registering batch average program...");
+    let batch_avg_program = build_batch_average_program(num_elements);
+    for vm_arc in &vms {
+        let avg_fn = VMFunction::new(
+            "batch_average".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            8,
+            batch_avg_program.clone(),
+            HashMap::new(),
+        );
+        let mut vm = vm_arc.lock();
+        vm.register_function(avg_fn);
+    }
+
+    // Step 9: Execute the program on all parties
+    info!("Step 9: Executing batch average program on all parties...");
+    let handles: Vec<_> = vms
+        .iter()
+        .enumerate()
+        .map(|(pid, vm_arc)| {
+            let vm_arc = vm_arc.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut vm = vm_arc.lock();
+                let val = vm.execute("batch_average")
+                    .map_err(|e| format!("VM execution failed at party {}: {}", pid, e))?;
+                Ok::<(usize, Value), String>((pid, val))
+            })
+        })
+        .collect();
+
+    let joined = tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(handles))
+        .await
+        .expect("Timed out waiting for batch average VM executions");
+
+    // Step 10: Verify results
+    info!("Step 10: Verifying results...");
+    let mut party_results: Vec<(usize, usize)> = Vec::new();
+    for res in joined {
+        let inner = res.expect("Task failed");
+        match inner {
+            Ok((pid, Value::Array(arr_id))) => {
+                info!("Party {} returned array {}", pid, arr_id);
+                party_results.push((pid, arr_id as usize));
+            }
+            Ok((pid, val)) => {
+                panic!("Party {} returned unexpected value: {:?}", pid, val);
+            }
+            Err(e) => panic!("VM execution failed: {}", e),
+        }
+    }
+
+    // Extract and verify array values from each party's VM
+    info!("Step 10b: Extracting and verifying array values...");
+    info!("Expected sums: {:?}", element_sums);
+    info!("Expected averages: {:?}", expected_averages);
+
+    for (pid, arr_id) in &party_results {
+        let vm = vms[*pid].lock();
+        let array = vm.state.object_store.get_array(*arr_id)
+            .expect(&format!("Party {} array {} not found", pid, arr_id));
+
+        let mut actual_values: Vec<f64> = Vec::new();
+        for i in 0..num_elements {
+            let idx = Value::I64(i as i64);
+            if let Some(val) = array.get(&idx) {
+                match val {
+                    Value::Float(f) => actual_values.push(f.0),
+                    Value::I64(v) => actual_values.push(*v as f64),
+                    other => panic!("Party {} element {} has unexpected type: {:?}", pid, i, other),
+                }
+            } else {
+                panic!("Party {} missing element at index {}", pid, i);
+            }
+        }
+
+        info!("Party {} actual values: {:?}", pid, actual_values);
+
+        // Verify each element matches expected average (with tolerance for fixed-point)
+        for (i, (actual, expected)) in actual_values.iter().zip(expected_averages.iter()).enumerate() {
+            let expected_f = *expected as f64;
+            let diff = (*actual - expected_f).abs();
+            // Allow tolerance for fixed-point representation errors
+            assert!(
+                diff < 1.0, // Allow up to 1 unit of error due to fixed-point precision
+                "Party {} element {} mismatch: actual={}, expected={}, diff={}",
+                pid, i, actual, expected_f, diff
+            );
+        }
+        info!("Party {} values verified against expected averages ✓", pid);
+    }
+
+    // Verify all parties got the same results (consensus)
+    if party_results.len() >= 2 {
+        let first_vm = vms[party_results[0].0].lock();
+        let first_array = first_vm.state.object_store.get_array(party_results[0].1).unwrap();
+
+        for (pid, arr_id) in party_results.iter().skip(1) {
+            let vm = vms[*pid].lock();
+            let array = vm.state.object_store.get_array(*arr_id).unwrap();
+
+            for i in 0..num_elements {
+                let idx = Value::I64(i as i64);
+                let first_val = first_array.get(&idx).unwrap();
+                let this_val = array.get(&idx).unwrap();
+                assert_eq!(
+                    first_val, this_val,
+                    "Party 0 and party {} disagree on element {}: {:?} vs {:?}",
+                    pid, i, first_val, this_val
+                );
+            }
+        }
+        info!("All parties agree on result values (consensus verified) ✓");
+    }
+
+    // Cleanup
+    info!("Step 11: Cleaning up...");
+    for mut server in servers {
+        server.stop().await;
+    }
+    for client in clients {
+        let _ = client.stop().await;
+    }
+
+    info!("");
+    info!("=== Batch Reveal Federated Average Test PASSED ===");
+    info!("Successfully used FederatedLearning.average_client_shares builtin");
+    info!("Batch revealed {} elements from {} clients", num_elements, client_count);
+}
+
+/// Build a simple program that calls FederatedLearning.average_client_shares
+fn build_batch_average_program(num_elements: usize) -> Vec<Instruction> {
+    build_batch_average_program_with_type(num_elements, false)
+}
+
+/// Build a program that calls FederatedLearning.average_client_shares with optional fixed-point mode
+fn build_batch_average_program_with_type(num_elements: usize, use_fixed_point: bool) -> Vec<Instruction> {
+    let mut instructions = vec![
+        // Load num_elements as first argument
+        Instruction::LDI(0, Value::I64(num_elements as i64)),
+        Instruction::PUSHARG(0),
+    ];
+
+    // If fixed-point mode, add "fixed" as second argument
+    if use_fixed_point {
+        instructions.push(Instruction::LDI(1, Value::String("fixed".to_string())));
+        instructions.push(Instruction::PUSHARG(1));
+    }
+
+    instructions.extend(vec![
+        // Call the batch average builtin
+        Instruction::CALL("FederatedLearning.average_client_shares".to_string()),
+        // Result array is now in reg 0
+        Instruction::RET(0),
+    ]);
+
+    instructions
 }

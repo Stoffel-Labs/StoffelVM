@@ -626,6 +626,138 @@ impl MpcEngine for HoneyBadgerMpcEngine {
         }
     }
 
+    fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
+        if shares.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Batch accumulator: collects shares from all parties for all positions in a batch
+        #[derive(Clone)]
+        struct BatchOpenAccumulator {
+            batch_size: usize,
+            // shares_per_position[pos][contribution_idx] = share_bytes from some party
+            shares_per_position: Vec<Vec<Vec<u8>>>,
+            // Which parties have contributed to this batch
+            party_ids: Vec<usize>,
+            // Cached results once computed
+            results: Option<Vec<Value>>,
+        }
+
+        impl BatchOpenAccumulator {
+            fn new(batch_size: usize) -> Self {
+                Self {
+                    batch_size,
+                    shares_per_position: vec![Vec::new(); batch_size],
+                    party_ids: Vec::new(),
+                    results: None,
+                }
+            }
+        }
+
+        // Registry: maps (instance_id, batch_sequence, type_key, batch_size) to accumulator
+        static BATCH_REGISTRY: once_cell::sync::Lazy<
+            parking_lot::Mutex<std::collections::HashMap<(u64, usize, String, usize), BatchOpenAccumulator>>,
+        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let type_key = match ty {
+            ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
+            ShareType::SecretFixedPoint { precision } => {
+                format!("fixed-{}-{}", precision.k(), precision.f())
+            }
+        };
+
+        let batch_size = shares.len();
+        let required = 2 * self.t + 1;
+        let mut my_sequence: Option<usize> = None;
+
+        loop {
+            let mut reg = BATCH_REGISTRY.lock();
+
+            // If we haven't contributed yet, find the right batch accumulator
+            if my_sequence.is_none() {
+                let mut seq = 0;
+                loop {
+                    let key = (self.instance_id, seq, type_key.clone(), batch_size);
+                    let entry = reg.entry(key).or_insert_with(|| BatchOpenAccumulator::new(batch_size));
+
+                    if !entry.party_ids.contains(&self.party_id) {
+                        // This party hasn't contributed to this batch yet
+                        // Add all shares for all positions
+                        for (pos, share_bytes) in shares.iter().enumerate() {
+                            entry.shares_per_position[pos].push(share_bytes.clone());
+                        }
+                        entry.party_ids.push(self.party_id);
+                        my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.unwrap();
+            let key = (self.instance_id, seq, type_key.clone(), batch_size);
+            let entry = reg.get_mut(&key).unwrap();
+
+            // Check if results are ready
+            if let Some(results) = entry.results.clone() {
+                return Ok(results);
+            }
+
+            // Check if we have enough contributions from parties
+            if entry.party_ids.len() >= required {
+                // Reconstruct all positions in the batch
+                let mut results = Vec::with_capacity(batch_size);
+
+                for pos in 0..batch_size {
+                    let collected: Vec<_> = entry.shares_per_position[pos]
+                        .iter()
+                        .take(required)
+                        .cloned()
+                        .collect();
+
+                    let mut decoded_shares: Vec<RobustShare<Fr>> = Vec::with_capacity(collected.len());
+                    for bytes in &collected {
+                        decoded_shares.push(Self::decode_share(bytes)?);
+                    }
+
+                    let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, self.n)
+                        .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
+
+                    let value = match ty {
+                        ShareType::SecretInt { .. } if ty.is_boolean() => {
+                            use ark_ff::Zero;
+                            Value::Bool(!secret.is_zero())
+                        }
+                        ShareType::SecretInt { .. } => {
+                            let limbs: [u64; 4] = secret.into_bigint().0;
+                            Value::I64(limbs[0] as i64)
+                        }
+                        ShareType::SecretFixedPoint { precision } => {
+                            let limbs: [u64; 4] = secret.into_bigint().0;
+                            let scaled_value = limbs[0] as i64;
+                            let f = precision.f();
+                            let scale = (1u64 << f) as f64;
+                            let float_value = scaled_value as f64 / scale;
+                            Value::Float(F64(float_value))
+                        }
+                    };
+                    results.push(value);
+                }
+
+                tracing::info!(
+                    "batch_open_shares: reconstructed {} values in batch (instance={}, seq={})",
+                    batch_size, self.instance_id, seq
+                );
+
+                entry.results = Some(results.clone());
+                return Ok(results);
+            }
+
+            drop(reg);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn shutdown(&self) {
         self.ready.store(false, Ordering::SeqCst);
     }
@@ -698,6 +830,15 @@ impl AsyncMpcEngine for HoneyBadgerMpcEngine {
 
     async fn open_share_async(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
         self.open_share_async(ty, share_bytes).await
+    }
+
+    async fn batch_open_shares_async(
+        &self,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> Result<Vec<Value>, String> {
+        // Delegate to sync version - the registry operations are quick
+        self.batch_open_shares(ty, shares)
     }
 
     async fn send_output_to_client_async(

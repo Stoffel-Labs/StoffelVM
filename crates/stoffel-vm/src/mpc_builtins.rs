@@ -282,6 +282,7 @@ pub fn register_mpc_builtins(vm: &mut VirtualMachine) {
     register_rbc_builtins(vm);
     register_aba_builtins(vm);
     register_consensus_builtins(vm);
+    register_federated_learning_builtins(vm);
 }
 
 /// Register Share module builtins
@@ -347,6 +348,9 @@ fn register_share_builtins(vm: &mut VirtualMachine) {
 
     // Share.open - Reconstruct secret (network operation)
     vm.register_foreign_function("Share.open", share_open);
+
+    // Share.batch_open - Batch reconstruct array of secrets (network operation, more efficient)
+    vm.register_foreign_function("Share.batch_open", share_batch_open);
 
     // Share.send_to_client - Send share to specific client (network operation)
     vm.register_foreign_function("Share.send_to_client", share_send_to_client);
@@ -997,6 +1001,94 @@ fn share_open(ctx: ForeignFunctionContext) -> Result<Value, String> {
     engine.open_share(ty, &data)
 }
 
+/// Batch open/reveal an array of shares (network operation - more efficient than individual opens)
+///
+/// This function reveals multiple secrets at once, reducing network rounds.
+/// All shares in the array must be of the same type.
+///
+/// # Arguments
+/// * `shares_array` - Array of Share objects to reveal
+///
+/// # Returns
+/// Array of revealed values (I64 for SecretInt, Float for SecretFixedPoint)
+fn share_batch_open(ctx: ForeignFunctionContext) -> Result<Value, String> {
+    if ctx.args.is_empty() {
+        return Err("Share.batch_open expects 1 argument: shares_array".to_string());
+    }
+
+    let engine = ctx
+        .vm_state
+        .mpc_engine()
+        .ok_or_else(|| "MPC engine not configured".to_string())?;
+
+    if !engine.is_ready() {
+        return Err("MPC engine not ready".to_string());
+    }
+
+    // Extract array
+    let array_id = match &ctx.args[0] {
+        Value::Array(id) => *id,
+        _ => return Err("Argument must be an array of shares".to_string()),
+    };
+
+    let array = ctx
+        .vm_state
+        .object_store
+        .get_array(array_id)
+        .ok_or_else(|| "Array not found".to_string())?;
+
+    let len = array.length();
+    if len == 0 {
+        // Return empty array
+        let result_id = ctx.vm_state.object_store.create_array();
+        return Ok(Value::Array(result_id));
+    }
+
+    // Extract all share data from the array
+    let mut share_data: Vec<(ShareType, Vec<u8>)> = Vec::with_capacity(len);
+
+    for i in 0..len {
+        let idx = Value::I64(i as i64);
+        let value = array
+            .get(&idx)
+            .ok_or_else(|| format!("Missing element at index {}", i))?;
+
+        let (ty, data) = share_object::extract_share_data(&ctx.vm_state.object_store, value)?;
+        share_data.push((ty, data));
+    }
+
+    // Verify all shares have the same type
+    let first_ty = share_data[0].0;
+    for (i, (ty, _)) in share_data.iter().enumerate().skip(1) {
+        if *ty != first_ty {
+            return Err(format!(
+                "All shares must have the same type. Element 0 has {:?} but element {} has {:?}",
+                first_ty, i, ty
+            ));
+        }
+    }
+
+    // Collect share bytes for batch reveal
+    let shares: Vec<Vec<u8>> = share_data.iter().map(|(_, d)| d.clone()).collect();
+
+    // Perform batch reveal
+    let revealed = engine.batch_open_shares(first_ty, &shares)?;
+
+    // Create result array
+    let result_id = ctx.vm_state.object_store.create_array_with_capacity(revealed.len());
+    let result_array = ctx
+        .vm_state
+        .object_store
+        .get_array_mut(result_id)
+        .ok_or_else(|| "Failed to create result array".to_string())?;
+
+    for (i, value) in revealed.into_iter().enumerate() {
+        result_array.set(Value::I64(i as i64), value);
+    }
+
+    Ok(Value::Array(result_id))
+}
+
 /// Send share to specific client (network operation)
 fn share_send_to_client(ctx: ForeignFunctionContext) -> Result<Value, String> {
     if ctx.args.len() < 2 {
@@ -1131,6 +1223,252 @@ fn share_get_party_id(ctx: ForeignFunctionContext) -> Result<Value, String> {
         }
         _ => Err("Expected Share object".to_string()),
     }
+}
+
+// ============================================================================
+// Federated Learning Builtins
+// ============================================================================
+
+/// Register federated learning builtins
+fn register_federated_learning_builtins(vm: &mut VirtualMachine) {
+    // FederatedLearning.sum_client_shares - Sum all client shares element-wise and batch reveal
+    vm.register_foreign_function("FederatedLearning.sum_client_shares", fl_sum_client_shares);
+
+    // FederatedLearning.average_client_shares - Sum, batch reveal, then divide by client count
+    vm.register_foreign_function("FederatedLearning.average_client_shares", fl_average_client_shares);
+}
+
+/// Sum all client shares element-wise and batch reveal the results
+///
+/// This function:
+/// 1. Gets all client shares from the ClientStore
+/// 2. Sums them element-wise (each position across all clients)
+/// 3. Batch reveals all sums in a single efficient network operation
+///
+/// # Arguments
+/// * `num_elements` - Number of elements per client (I64)
+/// * `share_type` - Optional: "fixed" for SecretFixedPoint, default is SecretInt
+///
+/// # Returns
+/// Array of revealed sums (I64 for SecretInt, Float for SecretFixedPoint)
+fn fl_sum_client_shares(ctx: ForeignFunctionContext) -> Result<Value, String> {
+    if ctx.args.is_empty() {
+        return Err("FederatedLearning.sum_client_shares expects 1-2 arguments: num_elements, [share_type]".to_string());
+    }
+
+    let num_elements = match &ctx.args[0] {
+        Value::I64(n) if *n > 0 => *n as usize,
+        _ => return Err("num_elements must be a positive integer".to_string()),
+    };
+
+    let use_fixed_point = ctx.args.get(1).map_or(false, |v| {
+        matches!(v, Value::String(s) if s == "fixed")
+    });
+
+    let engine = ctx
+        .vm_state
+        .mpc_engine()
+        .ok_or_else(|| "MPC engine not configured".to_string())?;
+
+    if !engine.is_ready() {
+        return Err("MPC engine not ready".to_string());
+    }
+
+    // Get client store and sum shares
+    let store = ctx.vm_state.client_store();
+    let client_ids = store.client_ids();
+    let num_clients = client_ids.len();
+
+    if num_clients == 0 {
+        return Err("No client inputs available in ClientStore".to_string());
+    }
+
+    // Sum shares element-wise across all clients
+    // Each summed share is still a secret share (local addition)
+    let mut summed_share_bytes: Vec<Vec<u8>> = Vec::with_capacity(num_elements);
+
+    for elem_idx in 0..num_elements {
+        // Get shares from all clients for this element position
+        let mut shares_for_element: Vec<Vec<u8>> = Vec::new();
+
+        for &client_id in &client_ids {
+            if let Some(share) = store.get_client_share(client_id, elem_idx) {
+                // Serialize the share
+                let mut bytes = Vec::new();
+                ark_serialize::CanonicalSerialize::serialize_compressed(&share, &mut bytes)
+                    .map_err(|e| format!("Failed to serialize share: {:?}", e))?;
+                shares_for_element.push(bytes);
+            }
+        }
+
+        if shares_for_element.is_empty() {
+            return Err(format!("No shares found for element index {}", elem_idx));
+        }
+
+        // Sum the shares locally (this is a homomorphic operation on RobustShares)
+        // We need to deserialize, sum, and re-serialize
+        use ark_bls12_381::Fr;
+        use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+
+        let mut sum_share: Option<RobustShare<Fr>> = None;
+        for share_bytes in &shares_for_element {
+            let share: RobustShare<Fr> = ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.as_slice())
+                .map_err(|e| format!("Failed to deserialize share: {:?}", e))?;
+
+            sum_share = Some(match sum_share {
+                None => share,
+                Some(s) => (s + share).map_err(|e| format!("Share addition failed: {:?}", e))?,
+            });
+        }
+
+        let final_sum = sum_share.unwrap();
+        let mut sum_bytes = Vec::new();
+        ark_serialize::CanonicalSerialize::serialize_compressed(&final_sum, &mut sum_bytes)
+            .map_err(|e| format!("Failed to serialize sum share: {:?}", e))?;
+        summed_share_bytes.push(sum_bytes);
+    }
+
+    // Determine share type for batch reveal
+    let ty = if use_fixed_point {
+        ShareType::default_secret_fixed_point()
+    } else {
+        ShareType::default_secret_int()
+    };
+
+    // Batch reveal all sums
+    let revealed = engine.batch_open_shares(ty, &summed_share_bytes)?;
+
+    // Create result array
+    let result_id = ctx.vm_state.object_store.create_array_with_capacity(revealed.len());
+    let result_array = ctx
+        .vm_state
+        .object_store
+        .get_array_mut(result_id)
+        .ok_or_else(|| "Failed to create result array".to_string())?;
+
+    for (i, value) in revealed.into_iter().enumerate() {
+        result_array.set(Value::I64(i as i64), value);
+    }
+
+    Ok(Value::Array(result_id))
+}
+
+/// Sum all client shares element-wise, batch reveal, then compute the average
+///
+/// This function:
+/// 1. Gets all client shares from the ClientStore
+/// 2. Sums them element-wise (each position across all clients)
+/// 3. Batch reveals all sums in a single efficient network operation
+/// 4. Divides each sum by the number of clients to get the average
+///
+/// # Arguments
+/// * `num_elements` - Number of elements per client (I64)
+/// * `share_type` - Optional: "fixed" for SecretFixedPoint, default is SecretInt
+///
+/// # Returns
+/// Array of averaged values (I64 for SecretInt integer division, Float for SecretFixedPoint)
+fn fl_average_client_shares(ctx: ForeignFunctionContext) -> Result<Value, String> {
+    if ctx.args.is_empty() {
+        return Err("FederatedLearning.average_client_shares expects 1-2 arguments: num_elements, [share_type]".to_string());
+    }
+
+    let num_elements = match &ctx.args[0] {
+        Value::I64(n) if *n > 0 => *n as usize,
+        _ => return Err("num_elements must be a positive integer".to_string()),
+    };
+
+    let use_fixed_point = ctx.args.get(1).map_or(false, |v| {
+        matches!(v, Value::String(s) if s == "fixed")
+    });
+
+    let engine = ctx
+        .vm_state
+        .mpc_engine()
+        .ok_or_else(|| "MPC engine not configured".to_string())?;
+
+    if !engine.is_ready() {
+        return Err("MPC engine not ready".to_string());
+    }
+
+    // Get client store and count clients
+    let store = ctx.vm_state.client_store();
+    let client_ids = store.client_ids();
+    let num_clients = client_ids.len();
+
+    if num_clients == 0 {
+        return Err("No client inputs available in ClientStore".to_string());
+    }
+
+    // Sum shares element-wise across all clients
+    let mut summed_share_bytes: Vec<Vec<u8>> = Vec::with_capacity(num_elements);
+
+    for elem_idx in 0..num_elements {
+        let mut shares_for_element: Vec<Vec<u8>> = Vec::new();
+
+        for &client_id in &client_ids {
+            if let Some(share) = store.get_client_share(client_id, elem_idx) {
+                let mut bytes = Vec::new();
+                ark_serialize::CanonicalSerialize::serialize_compressed(&share, &mut bytes)
+                    .map_err(|e| format!("Failed to serialize share: {:?}", e))?;
+                shares_for_element.push(bytes);
+            }
+        }
+
+        if shares_for_element.is_empty() {
+            return Err(format!("No shares found for element index {}", elem_idx));
+        }
+
+        use ark_bls12_381::Fr;
+        use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+
+        let mut sum_share: Option<RobustShare<Fr>> = None;
+        for share_bytes in &shares_for_element {
+            let share: RobustShare<Fr> = ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.as_slice())
+                .map_err(|e| format!("Failed to deserialize share: {:?}", e))?;
+
+            sum_share = Some(match sum_share {
+                None => share,
+                Some(s) => (s + share).map_err(|e| format!("Share addition failed: {:?}", e))?,
+            });
+        }
+
+        let final_sum = sum_share.unwrap();
+        let mut sum_bytes = Vec::new();
+        ark_serialize::CanonicalSerialize::serialize_compressed(&final_sum, &mut sum_bytes)
+            .map_err(|e| format!("Failed to serialize sum share: {:?}", e))?;
+        summed_share_bytes.push(sum_bytes);
+    }
+
+    // Determine share type for batch reveal
+    let ty = if use_fixed_point {
+        ShareType::default_secret_fixed_point()
+    } else {
+        ShareType::default_secret_int()
+    };
+
+    // Batch reveal all sums
+    let revealed_sums = engine.batch_open_shares(ty, &summed_share_bytes)?;
+
+    // Compute averages and create result array
+    let result_id = ctx.vm_state.object_store.create_array_with_capacity(revealed_sums.len());
+    let result_array = ctx
+        .vm_state
+        .object_store
+        .get_array_mut(result_id)
+        .ok_or_else(|| "Failed to create result array".to_string())?;
+
+    for (i, sum_value) in revealed_sums.into_iter().enumerate() {
+        let avg = match sum_value {
+            Value::Float(stoffel_vm_types::core_types::F64(v)) => {
+                Value::Float(stoffel_vm_types::core_types::F64(v / num_clients as f64))
+            }
+            Value::I64(v) => Value::I64(v / num_clients as i64),
+            other => other, // Pass through unchanged if unexpected type
+        };
+        result_array.set(Value::I64(i as i64), avg);
+    }
+
+    Ok(Value::Array(result_id))
 }
 
 #[cfg(test)]

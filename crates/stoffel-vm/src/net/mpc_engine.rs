@@ -33,6 +33,24 @@ pub trait MpcEngine: Send + Sync {
     /// This broadcasts to all parties - all parties learn the secret.
     fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String>;
 
+    /// Batch reconstruct multiple secrets at once (more efficient than individual open_share calls)
+    ///
+    /// This method reveals multiple secrets in batches, reducing network rounds.
+    /// The batch size is typically `t+1` where `t` is the threshold parameter.
+    ///
+    /// # Arguments
+    /// * `ty` - The share type (must be the same for all shares)
+    /// * `shares` - Vector of serialized shares to reveal
+    ///
+    /// # Returns
+    /// Vector of revealed values in the same order as input shares
+    fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
+        // Default implementation: sequential fallback
+        shares.iter()
+            .map(|s| self.open_share(ty, s))
+            .collect()
+    }
+
     /// Send output share(s) to a specific client for private reconstruction
     ///
     /// Unlike `open_share` which reveals to all parties, this sends this party's
@@ -101,6 +119,18 @@ pub trait AsyncMpcEngine: MpcEngine {
 
     /// Reconstruct a secret from shares asynchronously
     async fn open_share_async(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String>;
+
+    /// Batch reconstruct multiple secrets asynchronously
+    ///
+    /// This is the async version of `batch_open_shares`.
+    async fn batch_open_shares_async(
+        &self,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> Result<Vec<Value>, String> {
+        // Default implementation uses the sync version
+        self.batch_open_shares(ty, shares)
+    }
 
     /// Send output share(s) to a specific client asynchronously
     ///
