@@ -1283,50 +1283,43 @@ fn fl_sum_client_shares(ctx: ForeignFunctionContext) -> Result<Value, String> {
         return Err("No client inputs available in ClientStore".to_string());
     }
 
-    // Sum shares element-wise across all clients
-    // Each summed share is still a secret share (local addition)
-    let mut summed_share_bytes: Vec<Vec<u8>> = Vec::with_capacity(num_elements);
+    // OPTIMIZATION: Work directly with RobustShare<Fr> from store - no intermediate serialization
+    // Sum shares element-wise across all clients (local homomorphic addition)
+    use ark_bls12_381::Fr;
+    use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+
+    // Pre-allocate for all element sums
+    let mut summed_shares: Vec<RobustShare<Fr>> = Vec::with_capacity(num_elements);
 
     for elem_idx in 0..num_elements {
-        // Get shares from all clients for this element position
-        let mut shares_for_element: Vec<Vec<u8>> = Vec::new();
+        // Sum shares directly without serialization round-trip
+        let mut sum_share: Option<RobustShare<Fr>> = None;
 
         for &client_id in &client_ids {
             if let Some(share) = store.get_client_share(client_id, elem_idx) {
-                // Serialize the share
-                let mut bytes = Vec::new();
-                ark_serialize::CanonicalSerialize::serialize_compressed(&share, &mut bytes)
-                    .map_err(|e| format!("Failed to serialize share: {:?}", e))?;
-                shares_for_element.push(bytes);
+                sum_share = Some(match sum_share {
+                    None => share,
+                    Some(s) => (s + share).map_err(|e| format!("Share addition failed: {:?}", e))?,
+                });
             }
         }
 
-        if shares_for_element.is_empty() {
-            return Err(format!("No shares found for element index {}", elem_idx));
+        match sum_share {
+            Some(s) => summed_shares.push(s),
+            None => return Err(format!("No shares found for element index {}", elem_idx)),
         }
-
-        // Sum the shares locally (this is a homomorphic operation on RobustShares)
-        // We need to deserialize, sum, and re-serialize
-        use ark_bls12_381::Fr;
-        use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-
-        let mut sum_share: Option<RobustShare<Fr>> = None;
-        for share_bytes in &shares_for_element {
-            let share: RobustShare<Fr> = ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.as_slice())
-                .map_err(|e| format!("Failed to deserialize share: {:?}", e))?;
-
-            sum_share = Some(match sum_share {
-                None => share,
-                Some(s) => (s + share).map_err(|e| format!("Share addition failed: {:?}", e))?,
-            });
-        }
-
-        let final_sum = sum_share.unwrap();
-        let mut sum_bytes = Vec::new();
-        ark_serialize::CanonicalSerialize::serialize_compressed(&final_sum, &mut sum_bytes)
-            .map_err(|e| format!("Failed to serialize sum share: {:?}", e))?;
-        summed_share_bytes.push(sum_bytes);
     }
+
+    // Serialize all sums at once for batch reveal (only serialization needed)
+    let summed_share_bytes: Vec<Vec<u8>> = summed_shares
+        .iter()
+        .map(|share| {
+            let mut bytes = Vec::with_capacity(96); // RobustShare<Fr> is ~96 bytes
+            ark_serialize::CanonicalSerialize::serialize_compressed(share, &mut bytes)
+                .map_err(|e| format!("Failed to serialize sum share: {:?}", e))?;
+            Ok(bytes)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     // Determine share type for batch reveal
     let ty = if use_fixed_point {
@@ -1399,45 +1392,43 @@ fn fl_average_client_shares(ctx: ForeignFunctionContext) -> Result<Value, String
         return Err("No client inputs available in ClientStore".to_string());
     }
 
-    // Sum shares element-wise across all clients
-    let mut summed_share_bytes: Vec<Vec<u8>> = Vec::with_capacity(num_elements);
+    // OPTIMIZATION: Work directly with RobustShare<Fr> from store - no intermediate serialization
+    // Sum shares element-wise across all clients (local homomorphic addition)
+    use ark_bls12_381::Fr;
+    use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+
+    // Pre-allocate for all element sums
+    let mut summed_shares: Vec<RobustShare<Fr>> = Vec::with_capacity(num_elements);
 
     for elem_idx in 0..num_elements {
-        let mut shares_for_element: Vec<Vec<u8>> = Vec::new();
+        // Sum shares directly without serialization round-trip
+        let mut sum_share: Option<RobustShare<Fr>> = None;
 
         for &client_id in &client_ids {
             if let Some(share) = store.get_client_share(client_id, elem_idx) {
-                let mut bytes = Vec::new();
-                ark_serialize::CanonicalSerialize::serialize_compressed(&share, &mut bytes)
-                    .map_err(|e| format!("Failed to serialize share: {:?}", e))?;
-                shares_for_element.push(bytes);
+                sum_share = Some(match sum_share {
+                    None => share,
+                    Some(s) => (s + share).map_err(|e| format!("Share addition failed: {:?}", e))?,
+                });
             }
         }
 
-        if shares_for_element.is_empty() {
-            return Err(format!("No shares found for element index {}", elem_idx));
+        match sum_share {
+            Some(s) => summed_shares.push(s),
+            None => return Err(format!("No shares found for element index {}", elem_idx)),
         }
-
-        use ark_bls12_381::Fr;
-        use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-
-        let mut sum_share: Option<RobustShare<Fr>> = None;
-        for share_bytes in &shares_for_element {
-            let share: RobustShare<Fr> = ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.as_slice())
-                .map_err(|e| format!("Failed to deserialize share: {:?}", e))?;
-
-            sum_share = Some(match sum_share {
-                None => share,
-                Some(s) => (s + share).map_err(|e| format!("Share addition failed: {:?}", e))?,
-            });
-        }
-
-        let final_sum = sum_share.unwrap();
-        let mut sum_bytes = Vec::new();
-        ark_serialize::CanonicalSerialize::serialize_compressed(&final_sum, &mut sum_bytes)
-            .map_err(|e| format!("Failed to serialize sum share: {:?}", e))?;
-        summed_share_bytes.push(sum_bytes);
     }
+
+    // Serialize all sums at once for batch reveal (only serialization needed)
+    let summed_share_bytes: Vec<Vec<u8>> = summed_shares
+        .iter()
+        .map(|share| {
+            let mut bytes = Vec::with_capacity(96); // RobustShare<Fr> is ~96 bytes
+            ark_serialize::CanonicalSerialize::serialize_compressed(share, &mut bytes)
+                .map_err(|e| format!("Failed to serialize sum share: {:?}", e))?;
+            Ok(bytes)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     // Determine share type for batch reveal
     let ty = if use_fixed_point {

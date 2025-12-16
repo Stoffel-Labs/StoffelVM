@@ -37,6 +37,120 @@ type SecretIntShare = SecretInt<Fr, RobustShare<Fr>>;
 type SecretFixedPointShare = SecretFixedPoint<Fr, RobustShare<Fr>>;
 
 // ============================================================================
+// Automatic Reveal Batching
+// ============================================================================
+
+/// Queued reveal operation waiting to be batched
+#[derive(Clone)]
+struct QueuedReveal {
+    /// The share type (SecretInt or SecretFixedPoint)
+    share_type: ShareType,
+    /// Serialized share data
+    share_data: Vec<u8>,
+    /// Destination register for the revealed value
+    dest_reg: usize,
+}
+
+/// Automatic reveal batching for MPC operations
+///
+/// This struct collects reveal operations and executes them in batches
+/// to reduce network round trips. Instead of revealing immediately when
+/// a MOV from secret to clear register occurs, reveals are queued and
+/// executed as a batch when the value is actually needed.
+pub struct RevealBatcher {
+    /// Pending reveals waiting to be flushed
+    pending: Vec<QueuedReveal>,
+    /// Whether auto-batching is enabled
+    pub enabled: bool,
+    /// Maximum pending reveals before forced flush
+    max_pending: usize,
+}
+
+impl Default for RevealBatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RevealBatcher {
+    /// Create a new reveal batcher with default settings
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            enabled: true,
+            max_pending: 1024, // Prevent unbounded growth
+        }
+    }
+
+    /// Queue a reveal operation, returns the queue index for the PendingReveal marker
+    pub fn queue(&mut self, ty: ShareType, data: Vec<u8>, dest_reg: usize) -> usize {
+        let index = self.pending.len();
+        self.pending.push(QueuedReveal {
+            share_type: ty,
+            share_data: data,
+            dest_reg,
+        });
+        index
+    }
+
+    /// Check if we have pending reveals
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Get number of pending reveals
+    #[inline]
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Check if we should auto-flush (reached max pending)
+    #[inline]
+    pub fn should_auto_flush(&self) -> bool {
+        self.pending.len() >= self.max_pending
+    }
+
+    /// Flush all pending reveals, returns (register, value) pairs
+    ///
+    /// This method batch-reveals all pending shares and returns the results
+    /// paired with their destination registers.
+    pub fn flush(
+        &mut self,
+        engine: &dyn crate::net::mpc_engine::MpcEngine,
+    ) -> Result<Vec<(usize, Value)>, String> {
+        if self.pending.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Group by share type - for now assume all same type (typical case)
+        // TODO: Support mixed types by grouping and batching separately
+        let first_type = self.pending[0].share_type;
+
+        let shares: Vec<Vec<u8>> = self.pending.iter().map(|r| r.share_data.clone()).collect();
+
+        // Batch reveal!
+        let revealed = engine.batch_open_shares(first_type, &shares)?;
+
+        // Build results with register destinations
+        let results: Vec<(usize, Value)> = self
+            .pending
+            .iter()
+            .zip(revealed)
+            .map(|(queued, value)| (queued.dest_reg, value))
+            .collect();
+
+        self.pending.clear();
+        Ok(results)
+    }
+
+    /// Clear all pending reveals without executing them
+    pub fn clear(&mut self) {
+        self.pending.clear();
+    }
+}
+
+// ============================================================================
 // Macros for reducing code duplication
 // ============================================================================
 
@@ -83,6 +197,8 @@ pub struct VMState {
     pub mpc_engine: Option<Arc<dyn crate::net::mpc_engine::MpcEngine>>,
     /// Per-VM client store used for loading MPC inputs
     client_store: Arc<ClientInputStore>,
+    /// Automatic reveal batching for MPC operations
+    pub reveal_batcher: RevealBatcher,
 }
 
 impl Default for VMState {
@@ -110,6 +226,7 @@ impl VMState {
             hook_manager: HookManager::new(),
             mpc_engine: None,
             client_store: Arc::new(ClientInputStore::new()),
+            reveal_batcher: RevealBatcher::new(),
         }
     }
 
@@ -850,7 +967,9 @@ impl VMState {
 
     /// Execute MOV instruction - Move between registers (with secret sharing conversion)
     fn execute_mov(&mut self, dest_reg: usize, src_reg: usize, hooks_enabled: bool) -> Result<(), String> {
-        let result_value = {
+        // Determine what kind of conversion is needed and clone necessary data
+        // We do this in a separate block to avoid borrow conflicts with reveal_share
+        let (conversion_type, src_value_clone) = {
             let record = self.activation_records.last().unwrap();
             let src_value = &record.registers[src_reg];
 
@@ -858,16 +977,24 @@ impl VMState {
             if dest_reg >= 16 && src_reg < 16 {
                 // Clear -> Secret conversion
                 if matches!(src_value, Value::Share(_, _)) {
-                    src_value.clone()
+                    (0, src_value.clone()) // Already a share, just clone
                 } else {
-                    self.convert_to_share(src_value)?
+                    (1, src_value.clone()) // Need to convert to share
                 }
             } else if dest_reg < 16 && src_reg >= 16 {
-                // Secret -> Clear conversion (reveal)
-                self.reveal_share(src_value)?
+                // Secret -> Clear conversion (reveal with batching)
+                (2, src_value.clone())
             } else {
-                src_value.clone()
+                // No conversion, just clone
+                (0, src_value.clone())
             }
+        };
+
+        // Perform the conversion (now with mutable self access for reveal_share)
+        let result_value = match conversion_type {
+            1 => self.convert_to_share(&src_value_clone)?,
+            2 => self.reveal_share(&src_value_clone, dest_reg)?,
+            _ => src_value_clone,
         };
 
         let record = self.activation_records.last_mut().unwrap();
@@ -923,9 +1050,9 @@ impl VMState {
         }
     }
 
-    /// Reveal a secret share to a clear value
+    /// Reveal a secret share to a clear value (immediate, no batching)
     #[inline]
-    fn reveal_share(&self, value: &Value) -> Result<Value, String> {
+    fn reveal_share_immediate(&self, value: &Value) -> Result<Value, String> {
         let engine = self
             .mpc_engine()
             .ok_or_else(|| "MPC engine not configured".to_string())?;
@@ -944,6 +1071,101 @@ impl VMState {
         }
     }
 
+    /// Reveal a secret share to a clear value, with optional batching
+    ///
+    /// If batching is enabled, this queues the reveal and returns a PendingReveal marker.
+    /// The actual reveal happens when the value is used (via flush_pending_reveals).
+    fn reveal_share(&mut self, value: &Value, dest_reg: usize) -> Result<Value, String> {
+        // If batching is disabled, reveal immediately
+        if !self.reveal_batcher.enabled {
+            return self.reveal_share_immediate(value);
+        }
+
+        // Check for MPC engine
+        let engine = self
+            .mpc_engine()
+            .ok_or_else(|| "MPC engine not configured".to_string())?;
+        if !engine.is_ready() {
+            return Err("MPC engine configured but not ready".to_string());
+        }
+
+        match value {
+            Value::Share(ty, data) => {
+                // Queue the reveal instead of executing immediately
+                let index = self.reveal_batcher.queue(*ty, data.clone(), dest_reg);
+
+                // Check if we should auto-flush (hit max pending)
+                if self.reveal_batcher.should_auto_flush() {
+                    self.flush_pending_reveals()?;
+                    // Return the actual revealed value (it's now in the register)
+                    let record = self.activation_records.last().unwrap();
+                    Ok(record.registers[dest_reg].clone())
+                } else {
+                    // Return marker - actual reveal deferred
+                    Ok(Value::PendingReveal(index))
+                }
+            }
+            _ => Err("Invalid share type for conversion to clear value".to_string()),
+        }
+    }
+
+    /// Flush all pending reveals and update destination registers
+    ///
+    /// This batch-reveals all queued shares and stores the results in their
+    /// respective destination registers.
+    pub fn flush_pending_reveals(&mut self) -> Result<(), String> {
+        if !self.reveal_batcher.has_pending() {
+            return Ok(());
+        }
+
+        let engine = self
+            .mpc_engine()
+            .ok_or_else(|| "MPC engine not configured".to_string())?;
+
+        let results = self.reveal_batcher.flush(engine.as_ref())?;
+
+        // Update all destination registers with revealed values
+        let record = self.activation_records.last_mut().unwrap();
+        for (reg, value) in results {
+            record.registers[reg] = value;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure a register value is resolved (not a PendingReveal)
+    ///
+    /// If the register contains a PendingReveal marker, this flushes all pending
+    /// reveals and returns the resolved value.
+    #[inline]
+    fn ensure_resolved(&mut self, reg: usize) -> Result<(), String> {
+        let record = self.activation_records.last().unwrap();
+
+        if matches!(record.registers[reg], Value::PendingReveal(_)) {
+            // This register has a pending reveal - flush all pending
+            self.flush_pending_reveals()?;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure multiple registers are resolved
+    #[inline]
+    fn ensure_registers_resolved(&mut self, regs: &[usize]) -> Result<(), String> {
+        let record = self.activation_records.last().unwrap();
+
+        // Check if any register has a pending reveal
+        let needs_flush = regs
+            .iter()
+            .any(|&reg| matches!(record.registers[reg], Value::PendingReveal(_)));
+
+        if needs_flush {
+            self.flush_pending_reveals()?;
+        }
+
+        Ok(())
+    }
+
     /// Execute ADD instruction
     fn execute_add(
         &mut self,
@@ -952,6 +1174,9 @@ impl VMState {
         src2_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[src1_reg, src2_reg])?;
+
         let record = self.activation_records.last_mut().unwrap();
         let src1 = &record.registers[src1_reg];
         let src2 = &record.registers[src2_reg];
@@ -1045,6 +1270,9 @@ impl VMState {
         src2_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[src1_reg, src2_reg])?;
+
         let record = self.activation_records.last_mut().unwrap();
         let src1 = &record.registers[src1_reg];
         let src2 = &record.registers[src2_reg];
@@ -1127,6 +1355,9 @@ impl VMState {
         src2_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[src1_reg, src2_reg])?;
+
         // Clone operands first to avoid borrow issues with MPC engine access
         let (left, right) = {
             let record = self.activation_records.last().unwrap();
@@ -1216,6 +1447,9 @@ impl VMState {
         src2_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[src1_reg, src2_reg])?;
+
         let record = self.activation_records.last_mut().unwrap();
         let src1 = &record.registers[src1_reg];
         let src2 = &record.registers[src2_reg];
@@ -1330,6 +1564,9 @@ impl VMState {
         src2_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[src1_reg, src2_reg])?;
+
         let record = self.activation_records.last_mut().unwrap();
         let src1 = &record.registers[src1_reg];
         let src2 = &record.registers[src2_reg];
@@ -1414,6 +1651,9 @@ impl VMState {
         src2_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[src1_reg, src2_reg])?;
+
         let record = self.activation_records.last_mut().unwrap();
         let src1 = &record.registers[src1_reg];
         let src2 = &record.registers[src2_reg];
@@ -1448,6 +1688,9 @@ impl VMState {
         src2_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[src1_reg, src2_reg])?;
+
         let record = self.activation_records.last_mut().unwrap();
         let src1 = &record.registers[src1_reg];
         let src2 = &record.registers[src2_reg];
@@ -1482,6 +1725,9 @@ impl VMState {
         src2_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[src1_reg, src2_reg])?;
+
         let record = self.activation_records.last_mut().unwrap();
         let src1 = &record.registers[src1_reg];
         let src2 = &record.registers[src2_reg];
@@ -1515,6 +1761,9 @@ impl VMState {
         src_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source register is resolved (flush pending reveals if needed)
+        self.ensure_resolved(src_reg)?;
+
         let record = self.activation_records.last_mut().unwrap();
         let src = &record.registers[src_reg];
 
@@ -1545,6 +1794,9 @@ impl VMState {
         amount_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[src_reg, amount_reg])?;
+
         let record = self.activation_records.last_mut().unwrap();
         let src = &record.registers[src_reg];
         let amount = &record.registers[amount_reg];
@@ -1575,6 +1827,9 @@ impl VMState {
         amount_reg: usize,
         hooks_enabled: bool,
     ) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[src_reg, amount_reg])?;
+
         let record = self.activation_records.last_mut().unwrap();
         let src = &record.registers[src_reg];
         let amount = &record.registers[amount_reg];
@@ -1925,6 +2180,13 @@ impl VMState {
         instruction: &Instruction,
         hooks_enabled: bool,
     ) -> Result<Option<Value>, String> {
+        // Ensure return register is resolved (flush pending reveals if needed)
+        self.ensure_resolved(reg)?;
+
+        // Also flush any remaining pending reveals before returning
+        // This ensures clean state when exiting a function
+        self.flush_pending_reveals()?;
+
         let (return_value, returning_from) = {
             let record = self.activation_records.last().unwrap();
             (record.registers[reg].clone(), record.function_name.clone())
@@ -1976,6 +2238,9 @@ impl VMState {
     /// Execute PUSHARG instruction
     #[inline]
     fn execute_pusharg(&mut self, reg: usize, hooks_enabled: bool) -> Result<(), String> {
+        // Ensure register is resolved (flush pending reveals if needed)
+        self.ensure_resolved(reg)?;
+
         let value = self.activation_records.last().unwrap().registers[reg].clone();
         self.activation_records.last_mut().unwrap().stack.push(value.clone());
 
@@ -1988,6 +2253,9 @@ impl VMState {
 
     /// Execute CMP instruction
     fn execute_cmp(&mut self, reg1: usize, reg2: usize) -> Result<(), String> {
+        // Ensure source registers are resolved (flush pending reveals if needed)
+        self.ensure_registers_resolved(&[reg1, reg2])?;
+
         let record = self.activation_records.last_mut().unwrap();
         let val1 = &record.registers[reg1];
         let val2 = &record.registers[reg2];

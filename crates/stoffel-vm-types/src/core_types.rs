@@ -429,6 +429,9 @@ pub enum Value {
     Unit,
     /// Secret shared value (for SMPC) TODO: Change
     Share(ShareType, Vec<u8>),
+    /// Marker for a deferred reveal operation (auto-batching optimization)
+    /// Contains index into the VM's reveal batcher pending queue
+    PendingReveal(usize),
 }
 
 impl fmt::Debug for Value {
@@ -453,6 +456,7 @@ impl fmt::Debug for Value {
             Value::Closure(c) => write!(f, "Function({})", c.function_id),
             Value::Unit => write!(f, "()"),
             Value::Share(share_type, _) => write!(f, "Share({:?})", share_type),
+            Value::PendingReveal(idx) => write!(f, "PendingReveal({})", idx),
         }
     }
 }
@@ -491,6 +495,7 @@ impl Value {
             Value::Closure(c) => format!("Function({})", c.function_id),
             Value::Foreign(id) => format!("Foreign({})", id),
             Value::Share(share_type, _) => format!("Share({:?})", share_type),
+            Value::PendingReveal(idx) => format!("PendingReveal({})", idx),
             Value::Array(id) => {
                 if let Some(arr) = store.get_array(*id) {
                     arr.format_contents(store, max_depth)

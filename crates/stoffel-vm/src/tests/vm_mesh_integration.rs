@@ -2290,6 +2290,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                         )
                         .await
                         .expect("input.init failed");
+                    // RELEASE MODE FIX: yield to allow client tasks to progress
+                    // This prevents a race condition where clients don't get scheduled
+                    tokio::task::yield_now().await;
                 }
                 idx
             }
@@ -2305,15 +2308,39 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     step_start = std::time::Instant::now();
 
     // Step 7: Create VMs and hydrate client stores
+    // OPTIMIZATION: Create VMs FIRST (fast), then wait for inputs (slow)
+    // This allows VM setup to complete while clients are processing shares
     info!("Step 7: Creating VMs and hydrating client stores...");
 
-    // OPTIMIZATION: Wait for all inputs in PARALLEL across all parties
-    // This is critical because the input protocol requires all parties to participate
-    // Using a longer timeout (5 minutes) for 16K elements per client
+    // Step 7a: Create VMs immediately (fast - no network wait)
+    info!("  Creating {} VMs...", n_parties);
+    let vm_create_start = std::time::Instant::now();
+    let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
+    for party_id in 0..n_parties {
+        let mut vm = VirtualMachine::new();
+        let engine = HoneyBadgerMpcEngine::from_existing_node(
+            instance_id,
+            party_id,
+            n_parties,
+            threshold,
+            servers[party_id]
+                .network
+                .clone()
+                .expect("network should be set"),
+            servers[party_id].node.clone(),
+        );
+        vm.state.set_mpc_engine(engine);
+        vms.push(Arc::new(parking_lot::Mutex::new(vm)));
+    }
+    info!("  ✓ {} VMs created in {:.2}s", n_parties, vm_create_start.elapsed().as_secs_f32());
+
+    // Step 7b: Wait for all inputs in PARALLEL across all parties
+    // This is the slow part - waiting for clients to process 16K shares each
     let input_timeout = Duration::from_secs(300);
     info!("  Waiting for client inputs (timeout: {}s, {} elements per client)...",
           input_timeout.as_secs(), LARGE_MATRIX_SIZE);
 
+    let wait_start = std::time::Instant::now();
     let wait_handles: Vec<_> = servers.iter().enumerate()
         .map(|(party_id, server)| {
             let mut input = server.node.preprocess.input.clone();
@@ -2332,50 +2359,40 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         .collect();
 
     let all_shares = futures::future::join_all(wait_handles).await;
+    info!("  ✓ All inputs received in {:.2}s", wait_start.elapsed().as_secs_f32());
 
-    // Collect shares per party
+    // Step 7c: Hydrate client stores with received shares
+    // OPTIMIZATION: Use drain() to move ownership instead of cloning ~65K shares
+    let hydrate_start = std::time::Instant::now();
     let mut shares_by_party: Vec<Vec<(ClientId, Vec<RobustShare<Fr>>)>> = vec![Vec::new(); n_parties];
     for result in all_shares {
         let (party_id, shares) = result.expect("Failed to get client inputs");
         shares_by_party[party_id] = shares;
-        info!("  ✓ Party {} received {} client inputs", party_id, shares_by_party[party_id].len());
     }
 
-    // Create VMs and hydrate client stores
-    let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
     for party_id in 0..n_parties {
-        let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
-            instance_id,
-            party_id,
-            n_parties,
-            threshold,
-            servers[party_id]
-                .network
-                .clone()
-                .expect("network should be set"),
-            servers[party_id].node.clone(),
-        );
-        vm.state.set_mpc_engine(engine);
-
-        // Hydrate client store with pre-fetched shares
+        let vm_arc = &vms[party_id];
+        let mut vm = vm_arc.lock();
         let store = vm.state.client_store();
         store.clear();
-        for (client_id, shares) in &shares_by_party[party_id] {
-            store.store_client_input(*client_id, shares.clone());
+        for (client_id, shares) in shares_by_party[party_id].drain(..) {
+            store.store_client_input(client_id, shares);
         }
-
-        vms.push(Arc::new(parking_lot::Mutex::new(vm)));
-        info!("✓ VM {} created and client store populated", party_id);
     }
+    info!("  ✓ Client stores hydrated in {:.2}s", hydrate_start.elapsed().as_secs_f32());
 
     step_timings.push(("Step 7: Create VMs & hydrate stores", step_start.elapsed()));
     step_start = std::time::Instant::now();
 
-    // Step 8: Register federated averaging program using the new batch reveal builtin
-    // This uses FederatedLearning.average_client_shares which is much faster for large matrices
+    // Step 8: Register federated averaging program using the batch reveal builtin
+    //
+    // NOTE: We use the builtin here instead of manual loops because the VM's auto-batching
+    // optimization is designed for reveals to DIFFERENT destination registers. In a loop,
+    // all reveals go to the same register, so batch flush overwrites previous values.
+    // The builtin handles batching at the Rust level, calling batch_open_shares directly.
+    //
     // Using fixed-point mode since this test uses scaled fixed-point values
-    info!("Step 8: Registering federated averaging program (using batch reveal builtin with fixed-point)...");
+    info!("Step 8: Registering federated averaging program (using batch reveal builtin)...");
     let fed_avg_program = build_batch_average_program_with_type(LARGE_MATRIX_SIZE, true);
     for vm_arc in &vms {
         let avg_fn = VMFunction::new(
@@ -3616,8 +3633,13 @@ async fn test_vm_mesh_batch_reveal_federated_average() {
         }
     }
 
-    // Step 8: Build and register a program that uses FederatedLearning.average_client_shares
-    info!("Step 8: Registering batch average program...");
+    // Step 8: Build and register a program that uses FederatedLearning.average_client_shares builtin
+    //
+    // NOTE: We use the builtin instead of manual loops because the VM's auto-batching
+    // is designed for reveals to DIFFERENT destination registers. In a loop, all reveals
+    // go to the same register, so batch flush overwrites previous values. The builtin
+    // handles batching at the Rust level by calling batch_open_shares directly.
+    info!("Step 8: Registering batch average program (using builtin)...");
     let batch_avg_program = build_batch_average_program(num_elements);
     for vm_arc in &vms {
         let avg_fn = VMFunction::new(
@@ -3625,7 +3647,7 @@ async fn test_vm_mesh_batch_reveal_federated_average() {
             vec![],
             Vec::new(),
             None,
-            8,
+            8, // Minimal registers for builtin call
             batch_avg_program.clone(),
             HashMap::new(),
         );
@@ -3744,7 +3766,7 @@ async fn test_vm_mesh_batch_reveal_federated_average() {
 
     info!("");
     info!("=== Batch Reveal Federated Average Test PASSED ===");
-    info!("Successfully used FederatedLearning.average_client_shares builtin");
+    info!("Successfully computed federated average using FederatedLearning.average_client_shares builtin");
     info!("Batch revealed {} elements from {} clients", num_elements, client_count);
 }
 
@@ -3775,4 +3797,227 @@ fn build_batch_average_program_with_type(num_elements: usize, use_fixed_point: b
     ]);
 
     instructions
+}
+
+/// Build a program that computes federated average using manual loops (no builtin)
+/// This tests the VM's automatic reveal batching optimization
+///
+/// The program:
+/// 1. Gets number of clients from ClientStore
+/// 2. Creates a result array
+/// 3. For each element position:
+///    - Loads first client's share as accumulator
+///    - Sums shares from remaining clients
+///    - Reveals the sum (MOV from secret to clear triggers batch reveal)
+///    - Divides by num_clients
+///    - Stores in result array
+/// 4. Returns the result array
+fn build_manual_federated_average_program(num_elements: usize) -> (Vec<Instruction>, HashMap<String, usize>) {
+    build_manual_federated_average_program_with_type(num_elements, false)
+}
+
+/// Build a program that computes federated average using manual loops with optional fixed-point mode
+///
+/// **WARNING**: This program does NOT benefit from auto-batching due to a fundamental design
+/// limitation: the VM's auto-batching tracks reveals by destination register, but in a loop
+/// all reveals go to the same register. When batch flush happens, each result writes to its
+/// destination register, but with the same dest_reg for all reveals, only the last value survives.
+///
+/// For efficient batch reveals of arrays, use the `FederatedLearning.average_client_shares`
+/// builtin which handles batching at the Rust level.
+///
+/// This function is kept for reference and testing single-element reveals.
+fn build_manual_federated_average_program_with_type(num_elements: usize, use_fixed_point: bool) -> (Vec<Instruction>, HashMap<String, usize>) {
+    let mut instructions = Vec::new();
+    let mut labels = HashMap::new();
+
+    // Choose the appropriate ClientStore function based on mode
+    let take_share_fn = if use_fixed_point {
+        "ClientStore.take_share_fixed"
+    } else {
+        "ClientStore.take_share"
+    };
+
+    // Register allocation:
+    // reg0 = general purpose / return value / function results
+    // reg1 = num_clients
+    // reg2 = client index (inner loop counter)
+    // reg3 = constant 1
+    // reg4 = num_elements constant
+    // reg5 = element index (loop counter)
+    // reg6 = result array reference (final averages)
+    // reg7 = scratch / revealed value
+    // reg8 = secret_sums array reference
+    // reg9 = revealed_sums array reference
+    // reg16 = secret accumulator (sum of shares)
+    // reg17 = scratch for loading shares
+
+    // ==========================================
+    // INITIALIZATION
+    // ==========================================
+
+    // Get number of clients
+    instructions.push(Instruction::CALL("ClientStore.get_number_clients".to_string()));
+    instructions.push(Instruction::MOV(1, 0)); // reg1 = num_clients
+
+    // Initialize constants
+    instructions.push(Instruction::LDI(3, Value::I64(1))); // reg3 = 1
+    instructions.push(Instruction::LDI(4, Value::I64(num_elements as i64))); // reg4 = num_elements
+
+    // Create secret_sums array to store intermediate secret sums
+    instructions.push(Instruction::LDI(0, Value::I64(num_elements as i64)));
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.push(Instruction::CALL("create_array".to_string()));
+    instructions.push(Instruction::MOV(8, 0)); // reg8 = secret_sums array
+
+    // Create revealed_sums array to store revealed (but not yet divided) values
+    instructions.push(Instruction::LDI(0, Value::I64(num_elements as i64)));
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.push(Instruction::CALL("create_array".to_string()));
+    instructions.push(Instruction::MOV(9, 0)); // reg9 = revealed_sums array
+
+    // Create result array for final averages
+    instructions.push(Instruction::LDI(0, Value::I64(num_elements as i64)));
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.push(Instruction::CALL("create_array".to_string()));
+    instructions.push(Instruction::MOV(6, 0)); // reg6 = result array
+
+    // ==========================================
+    // PHASE 1: Compute all secret sums
+    // ==========================================
+
+    let phase1_loop = "phase1_loop".to_string();
+    let phase1_process = "phase1_process".to_string();
+    let phase1_done = "phase1_done".to_string();
+    let client_loop = "client_loop".to_string();
+    let client_process = "client_process".to_string();
+    let client_done = "client_done".to_string();
+
+    instructions.push(Instruction::LDI(5, Value::I64(0))); // reg5 = 0 (element index)
+
+    labels.insert(phase1_loop.clone(), instructions.len());
+    instructions.push(Instruction::CMP(5, 4));
+    instructions.push(Instruction::JMPLT(phase1_process.clone()));
+    instructions.push(Instruction::JMP(phase1_done.clone()));
+
+    labels.insert(phase1_process.clone(), instructions.len());
+
+    // Load first client's share as initial accumulator
+    instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.push(Instruction::PUSHARG(5)); // element_index
+    instructions.push(Instruction::CALL(take_share_fn.to_string()));
+    instructions.push(Instruction::MOV(16, 0)); // reg16 = first share (accumulator)
+
+    // Sum remaining clients
+    instructions.push(Instruction::LDI(2, Value::I64(1))); // reg2 = 1 (start from client 1)
+
+    labels.insert(client_loop.clone(), instructions.len());
+    instructions.push(Instruction::CMP(2, 1));
+    instructions.push(Instruction::JMPLT(client_process.clone()));
+    instructions.push(Instruction::JMP(client_done.clone()));
+
+    labels.insert(client_process.clone(), instructions.len());
+    instructions.push(Instruction::PUSHARG(2)); // client_index
+    instructions.push(Instruction::PUSHARG(5)); // element_index
+    instructions.push(Instruction::CALL(take_share_fn.to_string()));
+    instructions.push(Instruction::MOV(17, 0)); // reg17 = share
+    instructions.push(Instruction::ADD(16, 16, 17)); // accumulate
+    instructions.push(Instruction::ADD(2, 2, 3)); // reg2++
+    instructions.push(Instruction::JMP(client_loop.clone()));
+
+    labels.insert(client_done.clone(), instructions.len());
+
+    // Store secret sum in secret_sums array (NO REVEAL YET)
+    instructions.push(Instruction::PUSHARG(8)); // secret_sums array
+    instructions.push(Instruction::PUSHARG(5)); // index
+    instructions.push(Instruction::PUSHARG(16)); // secret sum (still secret!)
+    instructions.push(Instruction::CALL("set_field".to_string()));
+
+    instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
+    instructions.push(Instruction::JMP(phase1_loop.clone()));
+
+    labels.insert(phase1_done.clone(), instructions.len());
+
+    // ==========================================
+    // PHASE 2: Reveal all sums (batch queue)
+    // ==========================================
+
+    let phase2_loop = "phase2_loop".to_string();
+    let phase2_process = "phase2_process".to_string();
+    let phase2_done = "phase2_done".to_string();
+
+    instructions.push(Instruction::LDI(5, Value::I64(0))); // reset element index
+
+    labels.insert(phase2_loop.clone(), instructions.len());
+    instructions.push(Instruction::CMP(5, 4));
+    instructions.push(Instruction::JMPLT(phase2_process.clone()));
+    instructions.push(Instruction::JMP(phase2_done.clone()));
+
+    labels.insert(phase2_process.clone(), instructions.len());
+
+    // Load secret sum from array
+    instructions.push(Instruction::PUSHARG(8)); // secret_sums array
+    instructions.push(Instruction::PUSHARG(5)); // index
+    instructions.push(Instruction::CALL("get_field".to_string()));
+    instructions.push(Instruction::MOV(16, 0)); // reg16 = secret sum
+
+    // Reveal: MOV from secret (reg16) to clear (reg7)
+    // With auto-batching, this QUEUES the reveal (returns PendingReveal marker)
+    instructions.push(Instruction::MOV(7, 16)); // reg7 = PendingReveal or revealed value
+
+    // Store in revealed_sums array (stores PendingReveal marker, not actual value yet)
+    instructions.push(Instruction::PUSHARG(9)); // revealed_sums array
+    instructions.push(Instruction::PUSHARG(5)); // index
+    instructions.push(Instruction::PUSHARG(7)); // PendingReveal marker
+    instructions.push(Instruction::CALL("set_field".to_string()));
+
+    instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
+    instructions.push(Instruction::JMP(phase2_loop.clone()));
+
+    labels.insert(phase2_done.clone(), instructions.len());
+
+    // ==========================================
+    // PHASE 3: Divide and store results
+    // The first get_field will trigger batch flush!
+    // ==========================================
+
+    let phase3_loop = "phase3_loop".to_string();
+    let phase3_process = "phase3_process".to_string();
+    let phase3_done = "phase3_done".to_string();
+
+    instructions.push(Instruction::LDI(5, Value::I64(0))); // reset element index
+
+    labels.insert(phase3_loop.clone(), instructions.len());
+    instructions.push(Instruction::CMP(5, 4));
+    instructions.push(Instruction::JMPLT(phase3_process.clone()));
+    instructions.push(Instruction::JMP(phase3_done.clone()));
+
+    labels.insert(phase3_process.clone(), instructions.len());
+
+    // Load revealed sum - first iteration triggers BATCH FLUSH of all pending reveals!
+    instructions.push(Instruction::PUSHARG(9)); // revealed_sums array
+    instructions.push(Instruction::PUSHARG(5)); // index
+    instructions.push(Instruction::CALL("get_field".to_string()));
+    instructions.push(Instruction::MOV(7, 0)); // reg7 = revealed sum
+
+    // Divide by num_clients to get average
+    instructions.push(Instruction::DIV(7, 7, 1)); // reg7 = sum / num_clients
+
+    // Store in result array
+    instructions.push(Instruction::PUSHARG(6)); // result array
+    instructions.push(Instruction::PUSHARG(5)); // index
+    instructions.push(Instruction::PUSHARG(7)); // average value
+    instructions.push(Instruction::CALL("set_field".to_string()));
+
+    instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
+    instructions.push(Instruction::JMP(phase3_loop.clone()));
+
+    labels.insert(phase3_done.clone(), instructions.len());
+
+    // Return the result array
+    instructions.push(Instruction::MOV(0, 6)); // reg0 = result array
+    instructions.push(Instruction::RET(0));
+
+    (instructions, labels)
 }

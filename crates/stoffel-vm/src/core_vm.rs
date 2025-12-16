@@ -616,6 +616,7 @@ impl VirtualMachine {
                 Value::U32(_) => "uint32",
                 Value::U64(_) => "uint64",
                 Value::Share(_, _) => "share",
+                Value::PendingReveal(_) => "pending_reveal",
             };
 
             Ok(Value::String(type_name.to_string()))

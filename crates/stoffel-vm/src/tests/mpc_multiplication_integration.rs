@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Configuration for HoneyBadger MPC over QUIC
 #[derive(Debug, Clone)]
@@ -203,7 +203,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                                 }
                                             }
                                             Err(e) => {
-                                                info!("Connection closed: {}", e);
+                                                trace!("Connection closed: {}", e);
                                                 break;
                                             }
                                         }
@@ -458,8 +458,15 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                         continue;
                     }
 
-                    let network_guard = network.lock().await;
-                    if let Err(e) = client.process(data, Arc::new(network_guard.clone())).await {
+                    // RELEASE MODE FIX: Clone network and release lock BEFORE processing.
+                    // This prevents holding the mutex during RBC broadcast which can cause
+                    // blocking under fast execution in release mode.
+                    let network_clone = {
+                        let guard = network.lock().await;
+                        guard.clone()
+                    }; // guard dropped here, mutex released
+
+                    if let Err(e) = client.process(data, Arc::new(network_clone)).await {
                         error!("Client {} failed to process message: {:?}", client_id, e);
                     }
 
@@ -1105,7 +1112,7 @@ mod tests {
         let n_triples = 2 * threshold + 1; // Minimal number of triples
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
         let instance_id = 99999;
-        let base_port = 9200;
+        let base_port = 9220; // Unique port range for test_client_input_only
         // Define client IDs before network setup (client IDs must be registered at setup time)
         let clientid: Vec<ClientId> = vec![100, 200];
         let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
@@ -1339,7 +1346,7 @@ mod tests {
         let n_triples = 3; // Minimal number of triples
         let n_random_shares = 6; // Minimal random shares
         let instance_id = 99999;
-        let base_port = 9200;
+        let base_port = 9230; // Unique port range for test_preprocessing_only
 
         let mut config = HoneyBadgerQuicConfig::default();
         config.mpc_timeout = Duration::from_secs(10);
