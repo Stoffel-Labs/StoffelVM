@@ -49,8 +49,11 @@
 //! ```
 
 use std::ffi::{c_char, CStr, CString};
+use std::io::Cursor;
 use std::os::raw::{c_int, c_void};
 use std::sync::{Arc, Mutex};
+
+use stoffel_vm_types::compiled_binary::CompiledBinary;
 
 use stoffel_vm_types::core_types::Value;
 use crate::core_vm::VirtualMachine;
@@ -569,4 +572,54 @@ pub extern "C" fn stoffel_free_string(str: *mut c_char) {
             let _ = CString::from_raw(str);
         }
     }
+}
+
+/// Loads bytecode into the VM
+///
+/// # Arguments
+///
+/// * `handle` - Handle to the VM instance
+/// * `bytecode` - Pointer to bytecode data
+/// * `bytecode_len` - Length of bytecode data in bytes
+///
+/// # Returns
+///
+/// 0 on success, non-zero on error:
+/// - -1: Null handle or bytecode pointer
+/// - -2: Bytecode deserialization failed
+/// - -3: Function registration failed
+///
+/// # Safety
+///
+/// The bytecode pointer must be valid and point to at least `bytecode_len` bytes.
+#[no_mangle]
+pub extern "C" fn stoffel_load_bytecode(
+    handle: VMHandle,
+    bytecode: *const u8,
+    bytecode_len: usize,
+) -> c_int {
+    if handle.is_null() || bytecode.is_null() {
+        return -1;
+    }
+
+    let vm = unsafe { &mut *(handle as *mut VirtualMachine) };
+
+    // Create a byte slice from the raw pointer
+    let bytes = unsafe { std::slice::from_raw_parts(bytecode, bytecode_len) };
+
+    // Deserialize the compiled binary
+    let mut cursor = Cursor::new(bytes);
+    let compiled_binary = match CompiledBinary::deserialize(&mut cursor) {
+        Ok(binary) => binary,
+        Err(_) => return -2,
+    };
+
+    // Convert to VM functions and register them
+    let vm_functions = compiled_binary.to_vm_functions();
+
+    for function in vm_functions {
+        vm.register_function(function);
+    }
+
+    0
 }
