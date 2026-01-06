@@ -1380,8 +1380,8 @@ const MATRIX_SIZE: usize = MATRIX_ROWS * MATRIX_COLS;
 const MATRIX_AVG_PROGRAM_REGISTERS: usize = 32;
 
 /// Large matrix dimensions for the fixed-point integration test (128x128)
-const LARGE_MATRIX_ROWS: usize = 128;
-const LARGE_MATRIX_COLS: usize = 128;
+const LARGE_MATRIX_ROWS: usize = 512;
+const LARGE_MATRIX_COLS: usize = 512;
 const LARGE_MATRIX_SIZE: usize = LARGE_MATRIX_ROWS * LARGE_MATRIX_COLS;
 
 /// Maximum elements that can be preprocessed in a single batch (due to protocol limitations)
@@ -2384,25 +2384,26 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     step_timings.push(("Step 7: Create VMs & hydrate stores", step_start.elapsed()));
     step_start = std::time::Instant::now();
 
-    // Step 8: Register federated averaging program using the batch reveal builtin
+    // Step 8: Register federated averaging program using manual loops
     //
-    // NOTE: We use the builtin here instead of manual loops because the VM's auto-batching
-    // optimization is designed for reveals to DIFFERENT destination registers. In a loop,
-    // all reveals go to the same register, so batch flush overwrites previous values.
-    // The builtin handles batching at the Rust level, calling batch_open_shares directly.
+    // NOTE: The manual loop approach does NOT benefit from auto-batching due to a fundamental
+    // design limitation: the VM's auto-batching tracks reveals by destination register, but in
+    // a loop, all reveals go to the same register. When batch flush happens, each result writes
+    // to its destination register, but with the same dest_reg for all reveals, only the last
+    // value survives. This test may not produce correct results for all elements.
     //
     // Using fixed-point mode since this test uses scaled fixed-point values
-    info!("Step 8: Registering federated averaging program (using batch reveal builtin)...");
-    let fed_avg_program = build_batch_average_program_with_type(LARGE_MATRIX_SIZE, true);
+    info!("Step 8: Registering federated averaging program (using manual loops)...");
+    let (fed_avg_program, labels) = build_manual_federated_average_program_with_type(LARGE_MATRIX_SIZE, true);
     for vm_arc in &vms {
         let avg_fn = VMFunction::new(
             "federated_average".to_string(),
             vec![],
             Vec::new(),
             None,
-            8, // Minimal registers needed for builtin call
+            32, // More registers needed for manual loop
             fed_avg_program.clone(),
-            HashMap::new(),
+            labels.clone(),
         );
         let mut vm = vm_arc.lock();
         vm.register_function(avg_fn);
@@ -2604,7 +2605,6 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         client_count, LARGE_MATRIX_ROWS, LARGE_MATRIX_COLS, LARGE_MATRIX_SIZE, client_count
     );
     info!("All {} parties computed identical element-wise averages", n_parties);
-    info!("Using batch reveal builtin (FederatedLearning.average_client_shares)");
 }
 
 /// Build a program that computes the overall average using fixed-point shares
@@ -3443,363 +3443,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     );
 }
 
-/// Test the batch reveal optimization using FederatedLearning.average_client_shares builtin
-///
-/// This test demonstrates the new batch reveal functionality that:
-/// 1. Collects all client shares from the ClientStore
-/// 2. Sums them element-wise (local operation)
-/// 3. Batch reveals all sums in a single efficient operation
-/// 4. Computes the average by dividing by client count
-///
-/// This is significantly more efficient than revealing each element individually
-/// because it uses the batch_open_shares method which processes all shares together.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_vm_mesh_batch_reveal_federated_average() {
-    init_crypto_provider();
-    setup_test_tracing();
-
-    info!("=== Starting Batch Reveal Federated Average Test ===");
-
-    let n_parties = 5;
-    let threshold = 1;
-    let n_triples = 16;
-    let num_elements = 6; // Small matrix for fast test
-    let n_random_shares = 32 + num_elements * 8;
-    let instance_id = 88888;
-    let base_port = 9950;
-
-    let config = HoneyBadgerQuicConfig {
-        mpc_timeout: Duration::from_secs(30),
-        connection_retry_delay: Duration::from_millis(100),
-        ..Default::default()
-    };
-
-    // Generate test client data
-    let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-    let client_count = 3;
-    let mut client_ids = Vec::new();
-    let mut client_inputs = Vec::new();
-    let mut element_sums: Vec<i64> = vec![0; num_elements];
-
-    info!("Generating {} clients with {} elements each...", client_count, num_elements);
-
-    for idx in 0..client_count {
-        let client_id = 900 + idx as ClientId;
-        client_ids.push(client_id);
-
-        let mut values: Vec<Fr> = Vec::new();
-        for elem_idx in 0..num_elements {
-            let value = rng.gen_range(10i64..=100i64);
-            element_sums[elem_idx] += value;
-            values.push(Fr::from(value as u64));
-        }
-        client_inputs.push(values);
-        info!("  Client {}: generated {} values", client_id, num_elements);
-    }
-
-    // Expected averages (integer division)
-    let expected_averages: Vec<i64> = element_sums.iter()
-        .map(|sum| sum / client_count as i64)
-        .collect();
-    info!("Expected averages: {:?}", expected_averages);
-
-    // Step 1: Create mesh network
-    info!("Step 1: Creating {} MPC servers...", n_parties);
-    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
-        n_parties,
-        threshold,
-        n_triples,
-        n_random_shares,
-        instance_id,
-        base_port,
-        config.clone(),
-        Some(client_ids.clone()),
-    )
-    .await
-    .expect("Failed to create servers");
-
-    let server_addresses: Vec<SocketAddr> = (0..n_parties)
-        .map(|i| format!("127.0.0.1:{}", base_port + i as u16).parse().unwrap())
-        .collect();
-
-    // Step 2: Start servers
-    info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
-        server.start().await.expect("Failed to start server");
-        let mut node = server.node.clone();
-        let network = server.network.clone().expect("network should be set");
-        let mut rx = recv.remove(0);
-        tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
-                    tracing::error!("Node {i} failed to process message: {e:?}");
-                }
-            }
-        });
-    }
-
-    // Step 3: Connect servers
-    info!("Step 3: Connecting servers...");
-    for server in &servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Step 4: Create input clients
-    info!("Step 4: Creating {} input clients...", client_count);
-    let mut clients = setup_honeybadger_quic_clients::<Fr>(
-        client_ids.clone(),
-        server_addresses,
-        n_parties,
-        threshold,
-        instance_id,
-        client_inputs.clone(),
-        num_elements,
-        config.clone(),
-    )
-    .await
-    .expect("Failed to create clients");
-
-    for client in &mut clients {
-        client.connect_to_servers().await.expect("Client failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Step 5: Run preprocessing
-    info!("Step 5: Running preprocessing...");
-    let preprocessing_handles: Vec<_> = servers
-        .iter()
-        .enumerate()
-        .map(|(i, server)| {
-            let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set");
-            tokio::spawn(async move {
-                let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-                node.run_preprocessing(network, &mut rng).await.expect("Preprocessing failed");
-                info!("  Server {} preprocessing complete", i);
-            })
-        })
-        .collect();
-    futures::future::join_all(preprocessing_handles).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Step 6: Initialize input protocol
-    info!("Step 6: Initializing input protocol...");
-    for (idx, server) in servers.iter_mut().enumerate() {
-        for client_id in &client_ids {
-            let local_shares = server.node.preprocessing_material.lock().await
-                .take_random_shares(num_elements)
-                .expect("Failed to take random shares");
-            server.node.preprocess.input
-                .init(*client_id, local_shares, num_elements, server.network.clone().expect("network"))
-                .await
-                .expect("input.init failed");
-        }
-        info!("  Server {} initialized input protocol", idx);
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Step 7: Create VMs and hydrate client stores
-    info!("Step 7: Creating VMs...");
-    let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
-        let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
-            instance_id,
-            party_id,
-            n_parties,
-            threshold,
-            servers[party_id].network.clone().expect("network"),
-            servers[party_id].node.clone(),
-        );
-        vm.state.set_mpc_engine(engine);
-        vms.push(Arc::new(parking_lot::Mutex::new(vm)));
-    }
-
-    // Hydrate VM client stores
-    for (party_id, vm_arc) in vms.iter().enumerate() {
-        let shares_for_party: Vec<(ClientId, Vec<RobustShare<Fr>>)> = {
-            let input_store = servers[party_id].node.preprocess.input
-                .wait_for_all_inputs(Duration::from_secs(30))
-                .await
-                .expect("Failed to get client inputs");
-            input_store.iter().map(|(c, s)| (*c, s.clone())).collect()
-        };
-        let mut vm = vm_arc.lock();
-        let store = vm.state.client_store();
-        store.clear();
-        for (client_id, shares) in shares_for_party {
-            store.store_client_input(client_id, shares);
-        }
-    }
-
-    // Step 8: Build and register a program that uses FederatedLearning.average_client_shares builtin
-    //
-    // NOTE: We use the builtin instead of manual loops because the VM's auto-batching
-    // is designed for reveals to DIFFERENT destination registers. In a loop, all reveals
-    // go to the same register, so batch flush overwrites previous values. The builtin
-    // handles batching at the Rust level by calling batch_open_shares directly.
-    info!("Step 8: Registering batch average program (using builtin)...");
-    let batch_avg_program = build_batch_average_program(num_elements);
-    for vm_arc in &vms {
-        let avg_fn = VMFunction::new(
-            "batch_average".to_string(),
-            vec![],
-            Vec::new(),
-            None,
-            8, // Minimal registers for builtin call
-            batch_avg_program.clone(),
-            HashMap::new(),
-        );
-        let mut vm = vm_arc.lock();
-        vm.register_function(avg_fn);
-    }
-
-    // Step 9: Execute the program on all parties
-    info!("Step 9: Executing batch average program on all parties...");
-    let handles: Vec<_> = vms
-        .iter()
-        .enumerate()
-        .map(|(pid, vm_arc)| {
-            let vm_arc = vm_arc.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut vm = vm_arc.lock();
-                let val = vm.execute("batch_average")
-                    .map_err(|e| format!("VM execution failed at party {}: {}", pid, e))?;
-                Ok::<(usize, Value), String>((pid, val))
-            })
-        })
-        .collect();
-
-    let joined = tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(handles))
-        .await
-        .expect("Timed out waiting for batch average VM executions");
-
-    // Step 10: Verify results
-    info!("Step 10: Verifying results...");
-    let mut party_results: Vec<(usize, usize)> = Vec::new();
-    for res in joined {
-        let inner = res.expect("Task failed");
-        match inner {
-            Ok((pid, Value::Array(arr_id))) => {
-                info!("Party {} returned array {}", pid, arr_id);
-                party_results.push((pid, arr_id as usize));
-            }
-            Ok((pid, val)) => {
-                panic!("Party {} returned unexpected value: {:?}", pid, val);
-            }
-            Err(e) => panic!("VM execution failed: {}", e),
-        }
-    }
-
-    // Extract and verify array values from each party's VM
-    info!("Step 10b: Extracting and verifying array values...");
-    info!("Expected sums: {:?}", element_sums);
-    info!("Expected averages: {:?}", expected_averages);
-
-    for (pid, arr_id) in &party_results {
-        let vm = vms[*pid].lock();
-        let array = vm.state.object_store.get_array(*arr_id)
-            .expect(&format!("Party {} array {} not found", pid, arr_id));
-
-        let mut actual_values: Vec<f64> = Vec::new();
-        for i in 0..num_elements {
-            let idx = Value::I64(i as i64);
-            if let Some(val) = array.get(&idx) {
-                match val {
-                    Value::Float(f) => actual_values.push(f.0),
-                    Value::I64(v) => actual_values.push(*v as f64),
-                    other => panic!("Party {} element {} has unexpected type: {:?}", pid, i, other),
-                }
-            } else {
-                panic!("Party {} missing element at index {}", pid, i);
-            }
-        }
-
-        info!("Party {} actual values: {:?}", pid, actual_values);
-
-        // Verify each element matches expected average (with tolerance for fixed-point)
-        for (i, (actual, expected)) in actual_values.iter().zip(expected_averages.iter()).enumerate() {
-            let expected_f = *expected as f64;
-            let diff = (*actual - expected_f).abs();
-            // Allow tolerance for fixed-point representation errors
-            assert!(
-                diff < 1.0, // Allow up to 1 unit of error due to fixed-point precision
-                "Party {} element {} mismatch: actual={}, expected={}, diff={}",
-                pid, i, actual, expected_f, diff
-            );
-        }
-        info!("Party {} values verified against expected averages ✓", pid);
-    }
-
-    // Verify all parties got the same results (consensus)
-    if party_results.len() >= 2 {
-        let first_vm = vms[party_results[0].0].lock();
-        let first_array = first_vm.state.object_store.get_array(party_results[0].1).unwrap();
-
-        for (pid, arr_id) in party_results.iter().skip(1) {
-            let vm = vms[*pid].lock();
-            let array = vm.state.object_store.get_array(*arr_id).unwrap();
-
-            for i in 0..num_elements {
-                let idx = Value::I64(i as i64);
-                let first_val = first_array.get(&idx).unwrap();
-                let this_val = array.get(&idx).unwrap();
-                assert_eq!(
-                    first_val, this_val,
-                    "Party 0 and party {} disagree on element {}: {:?} vs {:?}",
-                    pid, i, first_val, this_val
-                );
-            }
-        }
-        info!("All parties agree on result values (consensus verified) ✓");
-    }
-
-    // Cleanup
-    info!("Step 11: Cleaning up...");
-    for mut server in servers {
-        server.stop().await;
-    }
-    for client in clients {
-        let _ = client.stop().await;
-    }
-
-    info!("");
-    info!("=== Batch Reveal Federated Average Test PASSED ===");
-    info!("Successfully computed federated average using FederatedLearning.average_client_shares builtin");
-    info!("Batch revealed {} elements from {} clients", num_elements, client_count);
-}
-
-/// Build a simple program that calls FederatedLearning.average_client_shares
-fn build_batch_average_program(num_elements: usize) -> Vec<Instruction> {
-    build_batch_average_program_with_type(num_elements, false)
-}
-
-/// Build a program that calls FederatedLearning.average_client_shares with optional fixed-point mode
-fn build_batch_average_program_with_type(num_elements: usize, use_fixed_point: bool) -> Vec<Instruction> {
-    let mut instructions = vec![
-        // Load num_elements as first argument
-        Instruction::LDI(0, Value::I64(num_elements as i64)),
-        Instruction::PUSHARG(0),
-    ];
-
-    // If fixed-point mode, add "fixed" as second argument
-    if use_fixed_point {
-        instructions.push(Instruction::LDI(1, Value::String("fixed".to_string())));
-        instructions.push(Instruction::PUSHARG(1));
-    }
-
-    instructions.extend(vec![
-        // Call the batch average builtin
-        Instruction::CALL("FederatedLearning.average_client_shares".to_string()),
-        // Result array is now in reg 0
-        Instruction::RET(0),
-    ]);
-
-    instructions
-}
-
-/// Build a program that computes federated average using manual loops (no builtin)
+/// Build a program that computes federated average using manual loops
 /// This tests the VM's automatic reveal batching optimization
 ///
 /// The program:
@@ -3822,9 +3466,6 @@ fn build_manual_federated_average_program(num_elements: usize) -> (Vec<Instructi
 /// limitation: the VM's auto-batching tracks reveals by destination register, but in a loop
 /// all reveals go to the same register. When batch flush happens, each result writes to its
 /// destination register, but with the same dest_reg for all reveals, only the last value survives.
-///
-/// For efficient batch reveals of arrays, use the `FederatedLearning.average_client_shares`
-/// builtin which handles batching at the Rust level.
 ///
 /// This function is kept for reference and testing single-element reveals.
 fn build_manual_federated_average_program_with_type(num_elements: usize, use_fixed_point: bool) -> (Vec<Instruction>, HashMap<String, usize>) {

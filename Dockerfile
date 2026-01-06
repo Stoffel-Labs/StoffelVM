@@ -1,10 +1,19 @@
 # Multi-stage Dockerfile for StoffelVM
 # Builds the stoffel-run binary and packages it for distributed MPC execution
+#
+# Build arguments:
+#   ENABLE_NAT - Set to "true" to enable NAT traversal features (requires hole-punching branch)
+#
+# Example:
+#   docker build --build-arg ENABLE_NAT=true -t stoffelvm:nat .
 
 # ============================================================================
 # Stage 1: Builder
 # ============================================================================
 FROM rustlang/rust:nightly-bookworm AS builder
+
+# Build argument to enable NAT traversal feature
+ARG ENABLE_NAT=false
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -26,7 +35,15 @@ RUN mkdir -p ~/.ssh && \
 
 # Build the release binary
 # Note: If using private repos with SSH, run with: docker build --ssh default .
-RUN --mount=type=ssh cargo build --release --package stoffel-vm --bin stoffel-run
+# If ENABLE_NAT is true, build with the nat feature
+RUN --mount=type=ssh \
+    if [ "$ENABLE_NAT" = "true" ]; then \
+        echo "Building with NAT traversal support..."; \
+        cargo build --release --package stoffel-vm --bin stoffel-run --features nat; \
+    else \
+        echo "Building without NAT traversal support..."; \
+        cargo build --release --package stoffel-vm --bin stoffel-run; \
+    fi
 
 # ============================================================================
 # Stage 2: Runtime
@@ -63,6 +80,9 @@ ENV STOFFEL_ENTRY="main"
 ENV STOFFEL_ROLE="party"
 ENV STOFFEL_PARTY_ID="0"
 ENV STOFFEL_BOOTSTRAP_ADDR=""
+# NAT traversal settings (only effective if built with --features nat)
+ENV STOFFEL_ENABLE_NAT="false"
+ENV STOFFEL_STUN_SERVERS=""
 
 # Expose ports for bootnode and party communication
 # Port 9000: bootnode coordination

@@ -7,11 +7,16 @@
 #   docker-compose build
 #   docker-compose up
 #
+# To build with NAT traversal support:
+#   docker-compose build --build-arg ENABLE_NAT=true
+#
 # To view logs from a specific party:
 #   docker-compose logs -f party0
 #
 # To run with a different program:
 #   STOFFEL_PROGRAM=/app/programs/your_program.stflb docker-compose up
+#
+# For cross-internet NAT traversal, see docker-compose.nat.yml
 
 services:
   # Party 0 - Leader node (runs bootnode + party 0)
@@ -19,6 +24,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party0
     hostname: party0
     environment:
@@ -51,6 +58,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party1
     hostname: party1
     environment:
@@ -79,6 +88,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party2
     hostname: party2
     environment:
@@ -107,6 +118,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party3
     hostname: party3
     environment:
@@ -135,6 +148,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party4
     hostname: party4
     environment:

@@ -15,6 +15,8 @@ echo "Threshold: ${STOFFEL_THRESHOLD}"
 echo "Program: ${STOFFEL_PROGRAM}"
 echo "Entry: ${STOFFEL_ENTRY}"
 echo "Bootstrap: ${STOFFEL_BOOTSTRAP_ADDR:-N/A}"
+echo "NAT Enabled: ${STOFFEL_ENABLE_NAT:-false}"
+echo "STUN Servers: ${STOFFEL_STUN_SERVERS:-N/A}"
 echo "=========================================="
 
 # Wait for a host:port to be available (UDP check for QUIC)
@@ -88,6 +90,14 @@ build_command() {
     fi
     if [ "${STOFFEL_TRACE_STACK}" = "true" ]; then
         cmd="${cmd} --trace-stack"
+    fi
+
+    # Add NAT traversal flags if enabled
+    if [ "${STOFFEL_ENABLE_NAT}" = "true" ]; then
+        cmd="${cmd} --nat"
+        if [ -n "${STOFFEL_STUN_SERVERS}" ]; then
+            cmd="${cmd} --stun-servers ${STOFFEL_STUN_SERVERS}"
+        fi
     fi
 
     echo "$cmd"

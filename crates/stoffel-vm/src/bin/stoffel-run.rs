@@ -20,7 +20,7 @@ use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustS
 use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNode;
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
-use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
+use stoffelnet::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
 
 // Use a Tokio runtime for async operations
 #[tokio::main]
@@ -49,6 +49,8 @@ async fn main() {
     let mut client_id: Option<usize> = None;
     let mut client_inputs: Option<String> = None;
     let mut expected_clients: Option<String> = None;
+    let mut enable_nat: bool = false;
+    let mut stun_servers: Vec<SocketAddr> = Vec::new();
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -65,6 +67,8 @@ async fn main() {
             as_leader = true;
         } else if arg == "--client" {
             as_client = true;
+        } else if arg == "--nat" {
+            enable_nat = true;
         } else if let Some(_rest) = arg.strip_prefix("--bind") {
             // support "--bind" and "--bind=.."
             // actual value parsed later from positional with key
@@ -75,6 +79,7 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--client-id") {
         } else if let Some(_rest) = arg.strip_prefix("--inputs") {
         } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
+        } else if let Some(_rest) = arg.strip_prefix("--stun-servers") {
         }
     }
 
@@ -133,6 +138,20 @@ async fn main() {
             "--expected-clients" => {
                 if let Some(v) = args_iter.next() {
                     expected_clients = Some(v);
+                }
+            }
+            "--stun-servers" => {
+                if let Some(v) = args_iter.next() {
+                    stun_servers = v
+                        .split(',')
+                        .filter_map(|s| {
+                            let s = s.trim();
+                            s.parse::<SocketAddr>().ok().or_else(|| {
+                                eprintln!("Warning: Invalid STUN server address '{}', skipping", s);
+                                None
+                            })
+                        })
+                        .collect();
                 }
             }
             _ => {}

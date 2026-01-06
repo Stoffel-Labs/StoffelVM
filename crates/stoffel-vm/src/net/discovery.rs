@@ -1,5 +1,5 @@
-//! Simple bootnode-based discovery for StoffelVM over QUIC.
-//! Assumes nodes are directly reachable (no NAT traversal).
+//! Bootnode-based discovery for StoffelVM over QUIC.
+//! Supports both direct connections and NAT traversal via ICE hole punching.
 use super::program_sync::{
     send_ctrl as send_prog_ctrl, send_program_bytes, ProgramSyncMessage,
 };
@@ -9,8 +9,51 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use stoffelnet::network_utils::{Network, PartyId};
 use stoffelnet::transports::quic::{NetworkManager, PeerConnection, QuicNetworkManager};
+
+// NAT traversal types - use real types when feature is enabled, stubs otherwise
+#[cfg(feature = "nat")]
+use stoffelnet::transports::ice::{CandidateType, IceCandidate, LocalCandidates};
+
+#[cfg(not(feature = "nat"))]
+mod nat_stubs {
+    use serde::{Deserialize, Serialize};
+    use std::net::SocketAddr;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub enum CandidateType {
+        Host,
+        ServerReflexive,
+        PeerReflexive,
+        Relay,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct IceCandidate {
+        pub foundation: String,
+        pub priority: u32,
+        pub address: SocketAddr,
+        pub candidate_type: CandidateType,
+        pub related_address: Option<SocketAddr>,
+        pub stun_server: Option<SocketAddr>,
+    }
+
+    pub struct LocalCandidates {
+        pub candidates: Vec<IceCandidate>,
+        pub ufrag: String,
+        pub pwd: String,
+    }
+
+    impl LocalCandidates {
+        pub fn len(&self) -> usize {
+            self.candidates.len()
+        }
+    }
+}
+
+#[cfg(not(feature = "nat"))]
+use nat_stubs::{CandidateType, IceCandidate, LocalCandidates};
 use tokio::{
-    sync::{watch, Mutex},
+    sync::{broadcast, watch, Mutex},
     time::sleep,
 };
 
@@ -52,6 +95,19 @@ pub enum DiscoveryMessage {
         party_id: PartyId,
     },
     Heartbeat,
+    /// ICE candidates for NAT traversal - sent via bootnode as signaling relay
+    IceCandidates {
+        from_party_id: PartyId,
+        to_party_id: PartyId,
+        ufrag: String,
+        pwd: String,
+        candidates: Vec<IceCandidate>,
+    },
+    /// Request ICE candidate exchange with a peer
+    IceExchangeRequest {
+        from_party_id: PartyId,
+        to_party_id: PartyId,
+    },
 }
 
 /// Pending session state at bootnode
@@ -93,6 +149,10 @@ pub async fn run_bootnode_with_config(
     // Watch channel for session ready notification
     let (session_tx, _session_rx) = watch::channel::<Option<SessionInfo>>(None);
     let session_tx = Arc::new(session_tx);
+    // Broadcast channel for ICE candidate relay (NAT traversal)
+    // Each connection task subscribes and forwards ICE messages to their party
+    let (ice_tx, _ice_rx) = broadcast::channel::<DiscoveryMessage>(256);
+    let ice_tx = Arc::new(ice_tx);
 
     eprintln!("[bootnode] Listening on {}", bind);
 
@@ -105,10 +165,14 @@ pub async fn run_bootnode_with_config(
         let expected_parties = expected_parties.clone();
         let session_tx = session_tx.clone();
         let mut session_rx = session_tx.subscribe();
+        let ice_tx = ice_tx.clone();
+        let mut ice_rx = ice_tx.subscribe();
 
         tokio::spawn(async move {
             // Track if this connection registered for a session
             let mut waiting_for_session = false;
+            // Track this connection's party_id for ICE relay
+            let mut my_party_id: Option<PartyId> = None;
 
             loop {
                 // If waiting for session, check if it's ready
@@ -124,6 +188,28 @@ pub async fn run_bootnode_with_config(
                     }
                 }
 
+                // Check for ICE messages to relay to this party
+                if let Some(pid) = my_party_id {
+                    // Non-blocking check for ICE messages
+                    while let Ok(ice_msg) = ice_rx.try_recv() {
+                        match &ice_msg {
+                            DiscoveryMessage::IceCandidates { to_party_id, .. } => {
+                                if *to_party_id == pid {
+                                    // Forward this ICE message to our party
+                                    let _ = send_ctrl(&*conn, &ice_msg).await;
+                                }
+                            }
+                            DiscoveryMessage::IceExchangeRequest { to_party_id, .. } => {
+                                if *to_party_id == pid {
+                                    // Forward this ICE exchange request to our party
+                                    let _ = send_ctrl(&*conn, &ice_msg).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 // Use a short timeout to allow checking session state
                 match tokio::time::timeout(Duration::from_millis(50), conn.receive()).await {
                     Ok(Ok(buf)) => {
@@ -133,6 +219,9 @@ pub async fn run_bootnode_with_config(
                                     party_id,
                                     listen_addr,
                                 } => {
+                                    // Track this connection's party_id for ICE relay
+                                    my_party_id = Some(party_id);
+
                                     let mut st = state.lock().await;
                                     let is_new = !st.contains_key(&party_id);
                                     st.insert(party_id, listen_addr);
@@ -164,6 +253,9 @@ pub async fn run_bootnode_with_config(
                                     threshold,
                                     program_bytes,
                                 } => {
+                                    // Track this connection's party_id for ICE relay
+                                    my_party_id = Some(party_id);
+
                                     eprintln!(
                                         "[bootnode] Party {} registering for session (program: {}, n={}, t={}, has_bytes={})",
                                         party_id,
@@ -313,6 +405,47 @@ pub async fn run_bootnode_with_config(
                                         );
                                     }
                                 }
+                                DiscoveryMessage::IceCandidates {
+                                    from_party_id,
+                                    to_party_id,
+                                    ref ufrag,
+                                    ref pwd,
+                                    ref candidates,
+                                } => {
+                                    // Relay ICE candidates to the target party via broadcast
+                                    eprintln!(
+                                        "[bootnode] Relaying {} ICE candidates from party {} to party {}",
+                                        candidates.len(),
+                                        from_party_id,
+                                        to_party_id
+                                    );
+                                    // Broadcast - the target party's task will pick it up
+                                    let ice_msg = DiscoveryMessage::IceCandidates {
+                                        from_party_id,
+                                        to_party_id,
+                                        ufrag: ufrag.clone(),
+                                        pwd: pwd.clone(),
+                                        candidates: candidates.clone(),
+                                    };
+                                    let _ = ice_tx.send(ice_msg);
+                                }
+                                DiscoveryMessage::IceExchangeRequest {
+                                    from_party_id,
+                                    to_party_id,
+                                } => {
+                                    // Log and relay the exchange request
+                                    eprintln!(
+                                        "[bootnode] ICE exchange request from party {} to party {}",
+                                        from_party_id,
+                                        to_party_id
+                                    );
+                                    // Broadcast - the target party's task will handle it
+                                    let req_msg = DiscoveryMessage::IceExchangeRequest {
+                                        from_party_id,
+                                        to_party_id,
+                                    };
+                                    let _ = ice_tx.send(req_msg);
+                                }
                                 _ => {}
                             }
                         } else if let Ok(ps) = bincode::deserialize::<ProgramSyncMessage>(&buf) {
@@ -400,7 +533,7 @@ pub async fn bootstrap_with_bootnode(
     Ok(())
 }
 
-/// Connect to a peer with timeout and retry logic
+/// Connect to a peer with timeout and retry logic (direct connection)
 async fn add_node_and_connect(net: &mut QuicNetworkManager, party_id: PartyId, addr: SocketAddr) {
     net.add_node_with_party_id(party_id, addr);
 
@@ -459,6 +592,223 @@ async fn add_node_and_connect(net: &mut QuicNetworkManager, party_id: PartyId, a
     eprintln!(
         "[peer-connect] WARNING: Could not connect to party {} at {} after {} attempts",
         party_id, addr, max_retries
+    );
+}
+
+/// Connect to a peer using NAT traversal (ICE hole punching via bootnode signaling)
+#[cfg(feature = "nat")]
+async fn add_node_and_connect_nat(
+    net: &mut QuicNetworkManager,
+    my_party_id: PartyId,
+    target_party_id: PartyId,
+    target_addr: SocketAddr,
+    bn_conn: &dyn PeerConnection,
+) {
+    net.add_node_with_party_id(target_party_id, target_addr);
+
+    if !net.is_nat_traversal_enabled() {
+        // Fall back to direct connection if NAT traversal is not enabled
+        eprintln!(
+            "[NAT] NAT traversal not enabled, using direct connection to party {}",
+            target_party_id
+        );
+        add_node_and_connect_direct(net, target_party_id, target_addr).await;
+        return;
+    }
+
+    eprintln!(
+        "[NAT] Starting NAT traversal to party {} (gathering ICE candidates)",
+        target_party_id
+    );
+
+    // Step 1: Gather local ICE candidates
+    let local_candidates = match net.gather_ice_candidates().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[NAT] Failed to gather ICE candidates: {}", e);
+            // Fall back to direct connection
+            add_node_and_connect_direct(net, target_party_id, target_addr).await;
+            return;
+        }
+    };
+
+    eprintln!(
+        "[NAT] Gathered {} local candidates, sending to party {} via bootnode",
+        local_candidates.len(),
+        target_party_id
+    );
+
+    // Step 2: Send our ICE candidates to the target party via bootnode
+    let ice_msg = DiscoveryMessage::IceCandidates {
+        from_party_id: my_party_id,
+        to_party_id: target_party_id,
+        ufrag: local_candidates.ufrag.clone(),
+        pwd: local_candidates.pwd.clone(),
+        candidates: local_candidates.candidates.clone(),
+    };
+
+    if let Err(e) = send_ctrl(bn_conn, &ice_msg).await {
+        eprintln!("[NAT] Failed to send ICE candidates: {}", e);
+        add_node_and_connect_direct(net, target_party_id, target_addr).await;
+        return;
+    }
+
+    // Step 3: Wait for remote ICE candidates from the target party
+    eprintln!("[NAT] Waiting for ICE candidates from party {}...", target_party_id);
+
+    let ice_timeout = Duration::from_secs(30);
+    let start = tokio::time::Instant::now();
+
+    loop {
+        if start.elapsed() > ice_timeout {
+            eprintln!("[NAT] Timeout waiting for ICE candidates from party {}", target_party_id);
+            add_node_and_connect_direct(net, target_party_id, target_addr).await;
+            return;
+        }
+
+        match tokio::time::timeout(Duration::from_millis(100), bn_conn.receive()).await {
+            Ok(Ok(buf)) => {
+                if let Ok(DiscoveryMessage::IceCandidates {
+                    from_party_id,
+                    to_party_id: _,
+                    ufrag: remote_ufrag,
+                    pwd: remote_pwd,
+                    candidates: remote_candidates,
+                }) = bincode::deserialize::<DiscoveryMessage>(&buf)
+                {
+                    if from_party_id == target_party_id {
+                        eprintln!(
+                            "[NAT] Received {} ICE candidates from party {}",
+                            remote_candidates.len(),
+                            target_party_id
+                        );
+
+                        // Step 4: Try to connect using remote candidate addresses
+                        // Prefer server reflexive (STUN-discovered) addresses
+                        let mut connected = false;
+
+                        // Sort candidates: prefer ServerReflexive, then Host
+                        let mut sorted_candidates = remote_candidates.clone();
+                        sorted_candidates.sort_by_key(|c| match c.candidate_type {
+                            CandidateType::ServerReflexive => 0,
+                            CandidateType::Host => 1,
+                            CandidateType::PeerReflexive => 2,
+                            CandidateType::Relay => 3,
+                        });
+
+                        for candidate in &sorted_candidates {
+                            eprintln!(
+                                "[NAT] Trying {:?} candidate {} for party {}",
+                                candidate.candidate_type, candidate.address, target_party_id
+                            );
+
+                            match tokio::time::timeout(
+                                Duration::from_secs(5),
+                                net.connect(candidate.address),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => {
+                                    eprintln!(
+                                        "[NAT] Successfully connected to party {} via {:?} at {}",
+                                        target_party_id, candidate.candidate_type, candidate.address
+                                    );
+                                    connected = true;
+                                    break;
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!(
+                                        "[NAT] Connection to {} failed: {}",
+                                        candidate.address, e
+                                    );
+                                }
+                                Err(_) => {
+                                    eprintln!(
+                                        "[NAT] Connection to {} timed out",
+                                        candidate.address
+                                    );
+                                }
+                            }
+                        }
+
+                        if connected {
+                            return;
+                        }
+
+                        eprintln!(
+                            "[NAT] All ICE candidates failed for party {}, trying direct",
+                            target_party_id
+                        );
+                        add_node_and_connect_direct(net, target_party_id, target_addr).await;
+                        return;
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("[NAT] Error receiving from bootnode: {}", e);
+                break;
+            }
+            Err(_) => {
+                // Timeout, continue waiting
+                continue;
+            }
+        }
+    }
+
+    // Fall back to direct connection
+    add_node_and_connect_direct(net, target_party_id, target_addr).await;
+}
+
+/// Direct connection helper (used when NAT traversal fails or is disabled)
+async fn add_node_and_connect_direct(
+    net: &mut QuicNetworkManager,
+    party_id: PartyId,
+    addr: SocketAddr,
+) {
+    // Retry connection with exponential backoff
+    let max_retries = 3;
+    let base_timeout = Duration::from_secs(10);
+
+    for attempt in 0..max_retries {
+        let timeout_duration = base_timeout * (1 << attempt);
+
+        eprintln!(
+            "[peer-connect] Direct connect to party {} at {} (attempt {}/{}, timeout {:?})",
+            party_id, addr, attempt + 1, max_retries, timeout_duration
+        );
+
+        match tokio::time::timeout(timeout_duration, net.connect(addr)).await {
+            Ok(Ok(_conn)) => {
+                eprintln!(
+                    "[peer-connect] Direct connection established to party {} (attempt {})",
+                    party_id,
+                    attempt + 1
+                );
+                return;
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[peer-connect] Direct connection error to party {}: {} (attempt {}/{})",
+                    party_id, e, attempt + 1, max_retries
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "[peer-connect] Direct connection timeout to party {} (attempt {}/{})",
+                    party_id, attempt + 1, max_retries
+                );
+            }
+        }
+
+        if attempt < max_retries - 1 {
+            let delay = Duration::from_millis(500 * (attempt as u64 + 1));
+            sleep(delay).await;
+        }
+    }
+
+    eprintln!(
+        "[peer-connect] WARNING: Could not connect to party {} after {} attempts",
+        party_id, max_retries
     );
 }
 
@@ -681,8 +1031,28 @@ pub async fn register_and_wait_for_session_with_program(
                     });
 
                     // Connect to higher-ID peers only
-                    for (pid, addr) in higher_peers {
-                        add_node_and_connect(net, *pid, *addr).await;
+                    #[cfg(feature = "nat")]
+                    {
+                        // Use NAT-aware connection if NAT traversal is enabled
+                        let use_nat = net.is_nat_traversal_enabled();
+                        if use_nat {
+                            eprintln!("[party {}] Using NAT traversal for peer connections", my_party_id);
+                        }
+
+                        for (pid, addr) in &higher_peers {
+                            if use_nat {
+                                add_node_and_connect_nat(net, my_party_id, **pid, **addr, &*bn_conn).await;
+                            } else {
+                                add_node_and_connect(net, **pid, **addr).await;
+                            }
+                        }
+                    }
+
+                    #[cfg(not(feature = "nat"))]
+                    {
+                        for (pid, addr) in higher_peers {
+                            add_node_and_connect(net, *pid, *addr).await;
+                        }
                     }
 
                     // Wait for accept loop to finish

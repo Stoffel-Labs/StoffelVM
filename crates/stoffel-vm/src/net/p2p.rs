@@ -477,7 +477,8 @@ pub struct QuicNetworkManager {
     /// Network configuration
     network_config: QuicNetworkConfig,
     /// Active connections to other server nodes and clients are handled in stoffelnet impl.
-    connections: Arc<Mutex<HashMap<PartyId, Box<dyn PeerConnection>>>>,
+    /// Each connection has its own lock to avoid holding the HashMap lock across await points.
+    connections: Arc<Mutex<HashMap<PartyId, Arc<Mutex<Box<dyn PeerConnection>>>>>>,
 }
 
 impl Default for QuicNetworkManager {
@@ -759,7 +760,7 @@ impl NetworkManager for QuicNetworkManager {
             let mut connections = self.connections.lock().await;
             connections.insert(
                 node_id,
-                Box::new(QuicPeerConnection::new(connection.clone(), false)),
+                Arc::new(Mutex::new(Box::new(QuicPeerConnection::new(connection.clone(), false)) as Box<dyn PeerConnection>)),
             );
 
             // Return the original connection
@@ -814,7 +815,7 @@ impl NetworkManager for QuicNetworkManager {
             let mut connections = self.connections.lock().await;
             connections.insert(
                 node_id,
-                Box::new(QuicPeerConnection::new(connection.clone(), true)),
+                Arc::new(Mutex::new(Box::new(QuicPeerConnection::new(connection.clone(), true)) as Box<dyn PeerConnection>)),
             );
 
             // Return the original connection
@@ -846,13 +847,14 @@ impl Network for QuicNetworkManager {
     type NetworkConfig = QuicNetworkConfig;
 
     async fn send(&self, recipient: PartyId, message: &[u8]) -> Result<usize, NetworkError> {
-        // Acquire the lock on the connections hashmap
-        let mut connections = self.connections.lock().await;
+        // Get the connection Arc while holding the HashMap lock briefly
+        let connection_arc = {
+            let connections = self.connections.lock().await;
+            connections.get(&recipient).cloned()
+        };
+        // HashMap lock is now released
 
-        // Check if the connection exists
-        if !connections.contains_key(&recipient) {
-            return Err(NetworkError::PartyNotFound(recipient));
-        }
+        let connection_arc = connection_arc.ok_or(NetworkError::PartyNotFound(recipient))?;
 
         // Log debug info about the outgoing message
         let preview_len = message.len().min(64);
@@ -869,10 +871,8 @@ impl Network for QuicNetworkManager {
             hex_preview
         );
 
-        // Get a mutable reference to the connection
-        let connection = connections.get_mut(&recipient).unwrap();
-
-        // Send the message
+        // Lock the individual connection and send (HashMap lock not held)
+        let mut connection = connection_arc.lock().await;
         match connection.send(message).await {
             Ok(_) => {
                 debug!(
@@ -896,9 +896,6 @@ impl Network for QuicNetworkManager {
     async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
         let mut total_bytes = 0;
 
-        // Acquire the lock on the connections hashmap
-        let mut connections = self.connections.lock().await;
-
         // Prepare a hex preview
         let preview_len = message.len().min(64);
         let hex_preview: String = message[..preview_len]
@@ -913,42 +910,51 @@ impl Network for QuicNetworkManager {
             hex_preview
         );
 
-        // Send the message to all nodes except self
-        for node in &self.nodes {
-            if node.id() != self.node_id {
-                // Check if we have a connection to this node
-                if connections.contains_key(&node.id()) {
-                    // Get a mutable reference to the connection
-                    let connection = connections.get_mut(&node.id()).unwrap();
+        // Collect connection Arcs while holding the HashMap lock briefly
+        let targets: Vec<(PartyId, Arc<Mutex<Box<dyn PeerConnection>>>)> = {
+            let connections = self.connections.lock().await;
+            self.nodes
+                .iter()
+                .filter(|node| node.id() != self.node_id)
+                .filter_map(|node| {
+                    connections.get(&node.id()).map(|conn| (node.id(), conn.clone()))
+                })
+                .collect()
+        };
+        // HashMap lock is now released
 
-                    // Send the message
-                    match connection.send(message).await {
-                        Ok(_) => {
-                            debug!(
-                                "[MSG:BROADCAST-SENT] from node {} -> node {} ({} bytes)",
-                                self.node_id,
-                                node.id(),
-                                message.len()
-                            );
-                            total_bytes += message.len();
-                        }
-                        Err(e) => {
-                            debug!(
-                                "[MSG:BROADCAST-FAIL] from node {} -> node {}: {}",
-                                self.node_id,
-                                node.id(),
-                                e
-                            );
-                            // Continue with other nodes even if one fails
-                        }
-                    }
-                } else {
-                    // Log a warning that we couldn't send the message to this node
+        // Log skipped nodes
+        for node in &self.nodes {
+            if node.id() != self.node_id && !targets.iter().any(|(id, _)| *id == node.id()) {
+                debug!(
+                    "[MSG:BROADCAST-SKIP] from node {} -> node {}: no connection",
+                    self.node_id,
+                    node.id()
+                );
+            }
+        }
+
+        // Send to each target without holding the HashMap lock
+        for (node_id, connection_arc) in targets {
+            let mut connection = connection_arc.lock().await;
+            match connection.send(message).await {
+                Ok(_) => {
                     debug!(
-                        "[MSG:BROADCAST-SKIP] from node {} -> node {}: no connection",
+                        "[MSG:BROADCAST-SENT] from node {} -> node {} ({} bytes)",
                         self.node_id,
-                        node.id()
+                        node_id,
+                        message.len()
                     );
+                    total_bytes += message.len();
+                }
+                Err(e) => {
+                    debug!(
+                        "[MSG:BROADCAST-FAIL] from node {} -> node {}: {}",
+                        self.node_id,
+                        node_id,
+                        e
+                    );
+                    // Continue with other nodes even if one fails
                 }
             }
         }
