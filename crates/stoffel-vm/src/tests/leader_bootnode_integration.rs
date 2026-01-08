@@ -257,29 +257,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         program_bytes.len()
     );
 
-    // Step 1: Create mesh network
-    info!("Step 1: Creating {} MPC servers...", n_parties);
-    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
-        n_parties,
-        threshold,
-        n_triples,
-        n_random_shares,
-        instance_id,
-        base_port,
-        config.clone(),
-    )
-    .await
-    .expect("Failed to create servers");
-
-    let server_addresses: Vec<SocketAddr> = (0..n_parties)
-        .map(|i| {
-            format!("127.0.0.1:{}", base_port + i as u16)
-                .parse()
-                .unwrap()
-        })
-        .collect();
-
-    // Generate test client data (matrices with fixed-point scaled values)
+    // Generate test client data before network setup (client IDs must be registered at setup time)
     let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
     let client_count = 3;
     let mut client_ids = Vec::new();
@@ -316,6 +294,29 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             client_id, MATRIX_ROWS, MATRIX_COLS, client_sum
         );
     }
+
+    // Step 1: Create mesh network
+    info!("Step 1: Creating {} MPC servers...", n_parties);
+    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
+        n_parties,
+        threshold,
+        n_triples,
+        n_random_shares,
+        instance_id,
+        base_port,
+        config.clone(),
+        Some(client_ids.clone()),
+    )
+    .await
+    .expect("Failed to create servers");
+
+    let server_addresses: Vec<SocketAddr> = (0..n_parties)
+        .map(|i| {
+            format!("127.0.0.1:{}", base_port + i as u16)
+                .parse()
+                .unwrap()
+        })
+        .collect();
 
     // Calculate expected element-wise averages
     let expected_averages: Vec<f64> = element_sums.iter()
@@ -462,9 +463,9 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                 .node
                 .preprocess
                 .input
-                .input_shares
-                .lock()
-                .await;
+                .wait_for_all_inputs(Duration::from_secs(30))
+                .await
+                .expect("Failed to get client inputs");
             input_store
                 .iter()
                 .map(|(client, shares)| (*client, shares.clone()))

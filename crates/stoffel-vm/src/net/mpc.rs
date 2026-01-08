@@ -54,7 +54,7 @@ pub fn honeybadger_node_opts(
         threshold,
         n_triples,
         n_random_shares,
-        instance_id,
+        instance_id as u32,
         n_prandbit,
         n_prandint,
         l,

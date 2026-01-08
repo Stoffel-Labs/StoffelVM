@@ -1,0 +1,40 @@
+# Build artifacts
+target/
+*.pdb
+
+# IDE/Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation (not needed for build)
+*.md
+!README.md
+
+# Test artifacts
+*.log
+*.tmp
+
+# Local development files
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Junie/AI files
+.junie/
+
+# C FFI examples (not needed for Docker build)
+c_ffi_example/
+
+# Other unnecessary files
+dont\ look\ pls/
