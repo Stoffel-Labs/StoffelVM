@@ -149,6 +149,10 @@ impl HoneyBadgerMpcEngine {
 
     /// Initialize input shares from a client. This must be called after preprocessing.
     /// The client provides shares for all parties, and each party stores its own share.
+    ///
+    /// For direct share distribution (client computes shares locally), this stores
+    /// the received shares directly in the input store without running the full
+    /// INPUT PROTOCOL (which requires async mask exchange with the client).
     pub async fn init_client_input(
         &self,
         client_id: ClientId,
@@ -158,20 +162,18 @@ impl HoneyBadgerMpcEngine {
             return Err("MPC engine not ready".into());
         }
 
-        // Take random shares from preprocessing material for the input protocol
+        // Store the received shares directly in the input store
+        // This is for direct share distribution where clients compute shares locally
         let num_shares = shares.len();
-        let local_shares = self
-            .reserve_random_shares(num_shares)
-            .await
-            .map_err(|e| format!("Failed to take random shares: {}", e))?;
+        let node = self.node.lock().await;
+        let mut input_store = node.preprocess.input.input_shares.lock().await;
+        input_store.insert(client_id, shares);
 
-        // Initialize the input protocol with the client's shares
-        let mut node = self.node.lock().await;
-        node.preprocess
-            .input
-            .init(client_id, local_shares, num_shares, self.net.clone())
-            .await
-            .map_err(|e| format!("Failed to initialize client input: {:?}", e))?;
+        tracing::info!(
+            "Stored {} input shares for client {}",
+            num_shares,
+            client_id
+        );
 
         Ok(())
     }
