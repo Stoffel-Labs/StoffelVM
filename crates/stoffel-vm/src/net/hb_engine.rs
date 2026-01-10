@@ -14,6 +14,7 @@ use stoffel_vm_types::core_types::{BOOLEAN_SECRET_INT_BITS, F64, ShareType, Valu
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode, SessionId};
+use stoffelmpc_mpc::honeybadger::mul::MultProtocolState;
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
@@ -34,6 +35,8 @@ pub struct HoneyBadgerMpcEngine {
     ready: AtomicBool,
     /// Session counter for multiplication operations
     mul_session_counter: Arc<Mutex<usize>>,
+    /// Local storage for client input shares
+    client_input_store: ClientInputStore,
 }
 
 impl HoneyBadgerMpcEngine {
@@ -96,18 +99,23 @@ impl HoneyBadgerMpcEngine {
                         for (sid, storage_mutex) in storage_map.iter() {
                             if !before_keys.contains(sid) {
                                 let storage = storage_mutex.lock().await;
-                                if let Some(first) = storage.protocol_output.get(0) {
-                                    chosen = Some((*sid, first.clone()));
-                                    break;
+                                // Check if protocol is finished and get output from share_mult_from_triple
+                                if storage.protocol_state == MultProtocolState::Finished {
+                                    if let Some(first) = storage.share_mult_from_triple.first() {
+                                        chosen = Some((*sid, first.clone()));
+                                        break;
+                                    }
                                 }
                             }
                         }
                         if chosen.is_none() {
                             for (sid, storage_mutex) in storage_map.iter() {
                                 let storage = storage_mutex.lock().await;
-                                if let Some(first) = storage.protocol_output.get(0) {
-                                    chosen = Some((*sid, first.clone()));
-                                    break;
+                                if storage.protocol_state == MultProtocolState::Finished {
+                                    if let Some(first) = storage.share_mult_from_triple.first() {
+                                        chosen = Some((*sid, first.clone()));
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -173,6 +181,9 @@ impl HoneyBadgerMpcEngine {
             .await
             .map_err(|e| format!("Failed to initialize client input: {:?}", e))?;
 
+        // Store the shares in our local client input store
+        self.client_input_store.store_client_input(client_id, shares);
+
         Ok(())
     }
 
@@ -221,20 +232,14 @@ impl HoneyBadgerMpcEngine {
         &self,
         client_id: ClientId,
     ) -> Result<Vec<RobustShare<Fr>>, String> {
-        let node = self.node.lock().await;
-        let input_store = node.preprocess.input.input_shares.lock().await;
-        let shares = input_store
-            .get(&client_id)
-            .ok_or_else(|| format!("No shares found for client {}", client_id))?
-            .clone();
-        Ok(shares)
+        self.client_input_store
+            .get_client_input(client_id)
+            .ok_or_else(|| format!("No shares found for client {}", client_id))
     }
 
     /// Get all client IDs that have submitted inputs to this HB node
     pub async fn get_client_ids(&self) -> Vec<ClientId> {
-        let node = self.node.lock().await;
-        let input_store = node.preprocess.input.input_shares.lock().await;
-        input_store.keys().copied().collect()
+        self.client_input_store.list_clients()
     }
 
     /// Get all client inputs from the HB node's input store
@@ -242,12 +247,14 @@ impl HoneyBadgerMpcEngine {
     pub async fn get_all_client_inputs(
         &self,
     ) -> Result<Vec<(ClientId, Vec<RobustShare<Fr>>)>, String> {
-        let node = self.node.lock().await;
-        let input_store = node.preprocess.input.input_shares.lock().await;
-        Ok(input_store
-            .iter()
-            .map(|(client_id, shares)| (*client_id, shares.clone()))
-            .collect())
+        let client_ids = self.client_input_store.list_clients();
+        let mut result = Vec::with_capacity(client_ids.len());
+        for client_id in client_ids {
+            if let Some(shares) = self.client_input_store.get_client_input(client_id) {
+                result.push((client_id, shares));
+            }
+        }
+        Ok(result)
     }
 
     /// Hydrate a ClientInputStore with all client inputs from the HB node
@@ -316,12 +323,12 @@ impl HoneyBadgerMpcEngine {
         // Create the MPC node options
         let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
 
-        // Create the MPC node
+        // Create the MPC node with empty initial input_ids (clients will be added later)
         let node = <HoneyBadgerMPCNode<Fr, RBCImpl> as MPCProtocol<
             Fr,
             RobustShare<Fr>,
             QuicNetworkManager,
-        >>::setup(party_id, mpc_opts)
+        >>::setup(party_id, mpc_opts, Vec::new())
         .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
 
         Ok(Arc::new(Self {
@@ -333,6 +340,7 @@ impl HoneyBadgerMpcEngine {
             node: Arc::new(Mutex::new(node)),
             ready: AtomicBool::new(false),
             mul_session_counter: Arc::new(Mutex::new(0)),
+            client_input_store: ClientInputStore::new(),
         }))
     }
 
@@ -362,6 +370,7 @@ impl HoneyBadgerMpcEngine {
             // Assume the provided node has been preprocessed already in tests; callers can override via start()/preprocess().
             ready: AtomicBool::new(true),
             mul_session_counter: Arc::new(Mutex::new(0)),
+            client_input_store: ClientInputStore::new(),
         })
     }
 
