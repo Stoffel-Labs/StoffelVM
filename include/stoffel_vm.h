@@ -400,6 +400,22 @@ void hb_network_free(HBNetworkOpaque* network_ptr);
  */
 void hb_free_bytes(uint8_t* ptr, size_t len);
 
+/**
+ * Hydrate VM's ClientInputStore from engine's input store
+ *
+ * After calling hb_engine_init_client_input() to store client shares in the engine,
+ * call this function to copy those shares to the VM's ClientInputStore where the
+ * ClientStore.take_share instruction can access them during execution.
+ *
+ * @param engine_ptr Engine handle
+ * @param vm_handle VM handle
+ * @return HBEngineSuccess on success, error code on failure
+ */
+HBEngineErrorCode hb_engine_hydrate_to_vm(
+    HBEngineOpaque* engine_ptr,
+    VMHandle vm_handle
+);
+
 #ifdef __cplusplus
 }
 #endif
