@@ -58,15 +58,23 @@ Stoffel VM supports the following instructions:
 
 Stoffel VM supports the following value types:
 
-- `Value::Int(i64)`: Integer value
-- `Value::Float(i64)`: Fixed-point float value
+- `Value::I64(i64)`: 64-bit signed integer
+- `Value::I32(i32)`: 32-bit signed integer
+- `Value::I16(i16)`: 16-bit signed integer
+- `Value::I8(i8)`: 8-bit signed integer
+- `Value::U8(u8)`: 8-bit unsigned integer
+- `Value::U16(u16)`: 16-bit unsigned integer
+- `Value::U32(u32)`: 32-bit unsigned integer
+- `Value::U64(u64)`: 64-bit unsigned integer
+- `Value::Float(F64)`: 64-bit floating point (F64 wrapper for Eq/Hash)
 - `Value::Bool(bool)`: Boolean value
 - `Value::String(String)`: String value
-- `Value::Object(usize)`: Object reference
+- `Value::Object(usize)`: Object reference (key-value map)
 - `Value::Array(usize)`: Array reference
-- `Value::Foreign(usize)`: Foreign object reference
-- `Value::Closure(Arc<Closure>)`: Function closure
-- `Value::Unit`: Unit/void value
+- `Value::Foreign(usize)`: Foreign object reference (Rust objects exposed to VM)
+- `Value::Closure(Arc<Closure>)`: Function closure with captured environment
+- `Value::Unit`: Unit/void/nil value
+- `Value::Share(ShareType, Vec<u8>)`: Secret shared value for MPC
 
 ### Standard Library Builtins!
 
