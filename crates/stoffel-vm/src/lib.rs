@@ -1,3 +1,4 @@
+pub mod cffi;
 pub mod core_vm;
 pub mod foreign_functions;
 pub mod mutex_helpers;
