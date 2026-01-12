@@ -1,7 +1,7 @@
-# StoffelVM 5-Node MPC Test Environment
+# StoffelVM 5-Node MPC Test Environment with Clients
 # This docker-compose file sets up a 5-node MPC network with threshold 1
-# to test distributed VM execution including program sync, leader node,
-# and client input provision.
+# and 2 clients that provide secret inputs to test distributed VM execution
+# including program sync, leader node, and client input provision.
 #
 # Usage:
 #   docker-compose build
@@ -34,8 +34,9 @@ services:
       - STOFFEL_BIND_ADDR=172.28.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
-      - STOFFEL_PROGRAM=/app/programs/matrix_average_fixed_point.stflb
+      - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
+      - STOFFEL_EXPECTED_CLIENTS=0,1
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -69,8 +70,9 @@ services:
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
-      - STOFFEL_PROGRAM=/app/programs/matrix_average_fixed_point.stflb
+      - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
+      - STOFFEL_EXPECTED_CLIENTS=0,1
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -99,8 +101,9 @@ services:
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
-      - STOFFEL_PROGRAM=/app/programs/matrix_average_fixed_point.stflb
+      - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
+      - STOFFEL_EXPECTED_CLIENTS=0,1
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -129,8 +132,9 @@ services:
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
-      - STOFFEL_PROGRAM=/app/programs/matrix_average_fixed_point.stflb
+      - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
+      - STOFFEL_EXPECTED_CLIENTS=0,1
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -159,8 +163,9 @@ services:
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
-      - STOFFEL_PROGRAM=/app/programs/matrix_average_fixed_point.stflb
+      - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
+      - STOFFEL_EXPECTED_CLIENTS=0,1
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -172,6 +177,74 @@ services:
     ports:
       - "9004:9004/tcp"
       - "9004:9004/udp"
+
+  # Client 0 - Provides first input (value: 15)
+  client0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENABLE_NAT: ${ENABLE_NAT:-false}
+    container_name: stoffel-client0
+    hostname: client0
+    environment:
+      - STOFFEL_ROLE=client
+      - STOFFEL_CLIENT_ID=0
+      - STOFFEL_INPUTS=15
+      - STOFFEL_SERVERS=172.28.0.10:10000,172.28.0.11:9001,172.28.0.12:9002,172.28.0.13:9003,172.28.0.14:9004
+      - STOFFEL_N_PARTIES=5
+      - STOFFEL_THRESHOLD=1
+      - STOFFEL_CLIENT_DELAY=15
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    networks:
+      stoffel-net:
+        ipv4_address: 172.28.0.100
+    depends_on:
+      party0:
+        condition: service_healthy
+      party1:
+        condition: service_started
+      party2:
+        condition: service_started
+      party3:
+        condition: service_started
+      party4:
+        condition: service_started
+
+  # Client 1 - Provides second input (value: 25)
+  client1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENABLE_NAT: ${ENABLE_NAT:-false}
+    container_name: stoffel-client1
+    hostname: client1
+    environment:
+      - STOFFEL_ROLE=client
+      - STOFFEL_CLIENT_ID=1
+      - STOFFEL_INPUTS=25
+      - STOFFEL_SERVERS=172.28.0.10:10000,172.28.0.11:9001,172.28.0.12:9002,172.28.0.13:9003,172.28.0.14:9004
+      - STOFFEL_N_PARTIES=5
+      - STOFFEL_THRESHOLD=1
+      - STOFFEL_CLIENT_DELAY=15
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    networks:
+      stoffel-net:
+        ipv4_address: 172.28.0.101
+    depends_on:
+      party0:
+        condition: service_healthy
+      party1:
+        condition: service_started
+      party2:
+        condition: service_started
+      party3:
+        condition: service_started
+      party4:
+        condition: service_started
 
 networks:
   stoffel-net:

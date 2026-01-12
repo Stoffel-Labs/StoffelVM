@@ -64,8 +64,9 @@ WORKDIR /app
 # Copy the binary from builder
 COPY --from=builder /build/target/release/stoffel-run /app/stoffel-run
 
-# Copy the test bytecode file
+# Copy the test bytecode files
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/matrix_average_fixed_point.stflb /app/programs/matrix_average_fixed_point.stflb
+COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/client_mul.stflb /app/programs/client_mul.stflb
 
 # Copy the entrypoint script
 COPY docker/entrypoint.sh /app/entrypoint.sh
