@@ -9,4 +9,3 @@ smallvec = "1.11"
 parking_lot = "0.12"
 object-pool = "0.6.0"
 stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "main" }
-#stoffelmpc-mpc = { version = "0.1.0", path = "/Users/gabriel/RustroverProjects/mpc-protocols/mpc" }
