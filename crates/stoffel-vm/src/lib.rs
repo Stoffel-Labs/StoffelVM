@@ -8,3 +8,6 @@ pub mod storage;
 mod tests;
 pub mod vm_function_helper;
 pub mod vm_state;
+
+// Re-export types from stoffel_vm_types for convenient API
+pub use stoffel_vm_types::{core_types, functions, instructions};
