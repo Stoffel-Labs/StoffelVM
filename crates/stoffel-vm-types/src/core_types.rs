@@ -170,7 +170,13 @@ impl Array {
         match key {
             // 0-indexed arrays: Valid numeric keys are 0..<length
             Value::I64(idx) if *idx >= 0 && (*idx as usize) < self.length_hint => {
-                Some(&self.elements[*idx as usize])
+                let idx_usize = *idx as usize;
+                // Check if in dense part (< 32) or sparse part (extra_fields)
+                if idx_usize < self.elements.len() {
+                    Some(&self.elements[idx_usize])
+                } else {
+                    self.extra_fields.get(key)
+                }
             }
             _ => self.extra_fields.get(key),
         }
@@ -201,6 +207,32 @@ impl Array {
 
     pub fn length(&self) -> usize {
         self.length_hint
+    }
+
+    /// Format the array contents for display with a depth limit to prevent infinite recursion.
+    /// Returns a string like `[1, 2, 3]` for simple arrays.
+    pub fn format_contents(&self, store: &ObjectStore, max_depth: usize) -> String {
+        if max_depth == 0 {
+            return format!("[...{} elements]", self.length_hint);
+        }
+
+        let mut parts = Vec::with_capacity(self.length_hint.min(10));
+        let truncated = self.length_hint > 10;
+        let display_count = self.length_hint.min(10);
+
+        for i in 0..display_count {
+            if let Some(val) = self.get(&Value::I64(i as i64)) {
+                parts.push(val.format_with_store(store, max_depth - 1));
+            } else {
+                parts.push("()".to_string());
+            }
+        }
+
+        if truncated {
+            format!("[{}, ...({} more)]", parts.join(", "), self.length_hint - 10)
+        } else {
+            format!("[{}]", parts.join(", "))
+        }
     }
 }
 
@@ -397,6 +429,9 @@ pub enum Value {
     Unit,
     /// Secret shared value (for SMPC) TODO: Change
     Share(ShareType, Vec<u8>),
+    /// Marker for a deferred reveal operation (auto-batching optimization)
+    /// Contains index into the VM's reveal batcher pending queue
+    PendingReveal(usize),
 }
 
 impl fmt::Debug for Value {
@@ -421,7 +456,67 @@ impl fmt::Debug for Value {
             Value::Closure(c) => write!(f, "Function({})", c.function_id),
             Value::Unit => write!(f, "()"),
             Value::Share(share_type, _) => write!(f, "Share({:?})", share_type),
+            Value::PendingReveal(idx) => write!(f, "PendingReveal({})", idx),
         }
+    }
+}
+
+impl Value {
+    /// Format the value with rich information using an ObjectStore to resolve references.
+    ///
+    /// This method displays the actual contents of arrays and objects rather than just
+    /// their IDs. The `max_depth` parameter controls how deeply nested structures are
+    /// expanded to prevent infinite recursion and overly verbose output.
+    ///
+    /// # Arguments
+    /// * `store` - The ObjectStore containing array and object data
+    /// * `max_depth` - Maximum depth for nested structure expansion (0 = no expansion)
+    ///
+    /// # Examples
+    /// ```text
+    /// Value::I64(42).format_with_store(&store, 2)       // "42"
+    /// Value::Array(1).format_with_store(&store, 2)     // "[1, 2, 3]"
+    /// Value::Object(1).format_with_store(&store, 2)    // "{name: \"test\", count: 5}"
+    /// ```
+    pub fn format_with_store(&self, store: &ObjectStore, max_depth: usize) -> String {
+        match self {
+            Value::I64(i) => format!("{}", i),
+            Value::I32(i) => format!("{}i32", i),
+            Value::I16(i) => format!("{}i16", i),
+            Value::I8(i) => format!("{}i8", i),
+            Value::U8(i) => format!("{}u8", i),
+            Value::U16(i) => format!("{}u16", i),
+            Value::U32(i) => format!("{}u32", i),
+            Value::U64(i) => format!("{}u64", i),
+            Value::Float(fp) => format!("{}f64", fp.0),
+            Value::Bool(b) => format!("{}", b),
+            Value::String(s) => format!("\"{}\"", s),
+            Value::Unit => "()".to_string(),
+            Value::Closure(c) => format!("Function({})", c.function_id),
+            Value::Foreign(id) => format!("Foreign({})", id),
+            Value::Share(share_type, _) => format!("Share({:?})", share_type),
+            Value::PendingReveal(idx) => format!("PendingReveal({})", idx),
+            Value::Array(id) => {
+                if let Some(arr) = store.get_array(*id) {
+                    arr.format_contents(store, max_depth)
+                } else {
+                    format!("Array({}) <not found>", id)
+                }
+            }
+            Value::Object(id) => {
+                if let Some(obj) = store.get_object(*id) {
+                    obj.format_contents(store, max_depth)
+                } else {
+                    format!("Object({}) <not found>", id)
+                }
+            }
+        }
+    }
+
+    /// Format the value with rich information, using a default depth of 3.
+    /// Convenience method for typical logging use cases.
+    pub fn format_rich(&self, store: &ObjectStore) -> String {
+        self.format_with_store(store, 3)
     }
 }
 
@@ -435,6 +530,31 @@ impl fmt::Debug for Value {
 pub struct Object {
     /// Map of field names to values
     pub fields: FxHashMap<Value, Value>,
+}
+
+impl Object {
+    /// Format the object contents for display with a depth limit to prevent infinite recursion.
+    /// Returns a string like `{a: 1, b: 2}` for simple objects.
+    pub fn format_contents(&self, store: &ObjectStore, max_depth: usize) -> String {
+        if max_depth == 0 {
+            return format!("{{...{} fields}}", self.fields.len());
+        }
+
+        let mut parts: Vec<String> = Vec::with_capacity(self.fields.len().min(10));
+        let truncated = self.fields.len() > 10;
+
+        for (key, val) in self.fields.iter().take(10) {
+            let key_str = key.format_with_store(store, 0); // Keys formatted without depth
+            let val_str = val.format_with_store(store, max_depth - 1);
+            parts.push(format!("{}: {}", key_str, val_str));
+        }
+
+        if truncated {
+            format!("{{{}, ...({} more)}}", parts.join(", "), self.fields.len() - 10)
+        } else {
+            format!("{{{}}}", parts.join(", "))
+        }
+    }
 }
 
 /// Combined storage system for objects and arrays

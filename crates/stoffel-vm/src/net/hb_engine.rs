@@ -1,6 +1,6 @@
 use crate::net::client_store::ClientInputStore;
 use crate::net::mpc::honeybadger_node_opts;
-use crate::net::mpc_engine::{MpcEngine, MpcEngineClientOps};
+use crate::net::mpc_engine::{AsyncMpcEngineConsensus, MpcEngine, MpcEngineClientOps, MpcEngineConsensus};
 use ark_bls12_381::Fr;
 use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -13,8 +13,7 @@ use std::time::Duration;
 use stoffel_vm_types::core_types::{BOOLEAN_SECRET_INT_BITS, F64, ShareType, Value};
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode, SessionId};
-use stoffelmpc_mpc::honeybadger::mul::MultProtocolState;
+use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode};
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
@@ -35,8 +34,6 @@ pub struct HoneyBadgerMpcEngine {
     ready: AtomicBool,
     /// Session counter for multiplication operations
     mul_session_counter: Arc<Mutex<usize>>,
-    /// Local storage for client input shares
-    client_input_store: ClientInputStore,
 }
 
 impl HoneyBadgerMpcEngine {
@@ -77,62 +74,18 @@ impl HoneyBadgerMpcEngine {
                 let x_shares = vec![left_share];
                 let y_shares = vec![right_share];
 
-                // Lock node just for the call and initial snapshot
+                // Lock node and perform multiplication
+                // node.mul() returns the result directly (via internal wait_for_result)
                 let mut node = self.node.lock().await;
-                let before_keys: std::collections::HashSet<SessionId> = {
-                    let map = node.operations.mul.mult_storage.lock().await;
-                    map.keys().cloned().collect()
-                };
-
-                node.mul(x_shares, y_shares, self.net.clone())
+                let result_shares = node.mul(x_shares, y_shares, self.net.clone())
                     .await
                     .map_err(|e| format!("MPC multiplication failed: {:?}", e))?;
 
-                // Poll the storage briefly to allow asynchronous propagation
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                loop {
-                    // Identify the newly created session and fetch its output
-                    if let Some((session_id, result_share)) = {
-                        let storage_map = node.operations.mul.mult_storage.lock().await;
-                        // Prefer keys that didn't exist before; if none, take any with output
-                        let mut chosen: Option<(SessionId, RobustShare<Fr>)> = None;
-                        for (sid, storage_mutex) in storage_map.iter() {
-                            if !before_keys.contains(sid) {
-                                let storage = storage_mutex.lock().await;
-                                // Check if protocol is finished and get output from share_mult_from_triple
-                                if storage.protocol_state == MultProtocolState::Finished {
-                                    if let Some(first) = storage.share_mult_from_triple.first() {
-                                        chosen = Some((*sid, first.clone()));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if chosen.is_none() {
-                            for (sid, storage_mutex) in storage_map.iter() {
-                                let storage = storage_mutex.lock().await;
-                                if storage.protocol_state == MultProtocolState::Finished {
-                                    if let Some(first) = storage.share_mult_from_triple.first() {
-                                        chosen = Some((*sid, first.clone()));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        chosen
-                    } {
-                        let _ = session_id; // reserved for tracing if needed
-                        break Self::encode_share(&result_share);
-                    }
+                // Get the first result share
+                let result_share = result_shares.into_iter().next()
+                    .ok_or_else(|| "Multiplication returned no shares".to_string())?;
 
-                    if std::time::Instant::now() >= deadline {
-                        break Err("Multiplication produced no output within timeout".to_string());
-                    }
-                    // Small yield before retry
-                    drop(node); // allow other tasks to progress
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    node = self.node.lock().await;
-                }
+                Self::encode_share(&result_share)
             }
             _ => Err("Unsupported share type for multiply_share".to_string()),
         }
@@ -181,9 +134,6 @@ impl HoneyBadgerMpcEngine {
             .await
             .map_err(|e| format!("Failed to initialize client input: {:?}", e))?;
 
-        // Store the shares in our local client input store
-        self.client_input_store.store_client_input(client_id, shares);
-
         Ok(())
     }
 
@@ -228,33 +178,54 @@ impl HoneyBadgerMpcEngine {
     }
 
     /// Get the shares for a specific client after input initialization
+    ///
+    /// Note: This method waits for all inputs to be received before returning.
+    /// The wait timeout is configurable via DEFAULT_INPUT_WAIT_TIMEOUT.
     pub async fn get_client_shares(
         &self,
         client_id: ClientId,
     ) -> Result<Vec<RobustShare<Fr>>, String> {
-        self.client_input_store
-            .get_client_input(client_id)
+        let all_inputs = self.wait_for_inputs().await?;
+        all_inputs
+            .get(&client_id)
+            .cloned()
             .ok_or_else(|| format!("No shares found for client {}", client_id))
     }
 
     /// Get all client IDs that have submitted inputs to this HB node
+    ///
+    /// Note: This method waits for all inputs to be received before returning.
     pub async fn get_client_ids(&self) -> Vec<ClientId> {
-        self.client_input_store.list_clients()
+        match self.wait_for_inputs().await {
+            Ok(inputs) => inputs.keys().copied().collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Get all client inputs from the HB node's input store
     /// Returns a map of client_id -> shares
+    ///
+    /// Note: This method waits for all inputs to be received before returning.
     pub async fn get_all_client_inputs(
         &self,
     ) -> Result<Vec<(ClientId, Vec<RobustShare<Fr>>)>, String> {
-        let client_ids = self.client_input_store.list_clients();
-        let mut result = Vec::with_capacity(client_ids.len());
-        for client_id in client_ids {
-            if let Some(shares) = self.client_input_store.get_client_input(client_id) {
-                result.push((client_id, shares));
-            }
-        }
-        Ok(result)
+        let all_inputs = self.wait_for_inputs().await?;
+        Ok(all_inputs
+            .into_iter()
+            .map(|(client_id, shares)| (client_id, shares))
+            .collect())
+    }
+
+    /// Wait for all client inputs to be received
+    ///
+    /// Uses the InputServer's wait_for_all_inputs method with a default timeout.
+    async fn wait_for_inputs(&self) -> Result<std::collections::HashMap<ClientId, Vec<RobustShare<Fr>>>, String> {
+        let mut node = self.node.lock().await;
+        node.preprocess
+            .input
+            .wait_for_all_inputs(Duration::from_secs(30))
+            .await
+            .map_err(|e| format!("Failed to wait for inputs: {:?}", e))
     }
 
     /// Hydrate a ClientInputStore with all client inputs from the HB node
@@ -319,16 +290,17 @@ impl HoneyBadgerMpcEngine {
         n_triples: usize,
         n_random: usize,
         net: Arc<QuicNetworkManager>,
+        input_ids: Vec<ClientId>,
     ) -> Result<Arc<Self>, String> {
         // Create the MPC node options
         let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
 
-        // Create the MPC node with empty initial input_ids (clients will be added later)
+        // Create the MPC node
         let node = <HoneyBadgerMPCNode<Fr, RBCImpl> as MPCProtocol<
             Fr,
             RobustShare<Fr>,
             QuicNetworkManager,
-        >>::setup(party_id, mpc_opts, Vec::new())
+        >>::setup(party_id, mpc_opts, input_ids)
         .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
 
         Ok(Arc::new(Self {
@@ -340,7 +312,6 @@ impl HoneyBadgerMpcEngine {
             node: Arc::new(Mutex::new(node)),
             ready: AtomicBool::new(false),
             mul_session_counter: Arc::new(Mutex::new(0)),
-            client_input_store: ClientInputStore::new(),
         }))
     }
 
@@ -370,7 +341,6 @@ impl HoneyBadgerMpcEngine {
             // Assume the provided node has been preprocessed already in tests; callers can override via start()/preprocess().
             ready: AtomicBool::new(true),
             mul_session_counter: Arc::new(Mutex::new(0)),
-            client_input_store: ClientInputStore::new(),
         })
     }
 
@@ -656,6 +626,138 @@ impl MpcEngine for HoneyBadgerMpcEngine {
         }
     }
 
+    fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
+        if shares.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Batch accumulator: collects shares from all parties for all positions in a batch
+        #[derive(Clone)]
+        struct BatchOpenAccumulator {
+            batch_size: usize,
+            // shares_per_position[pos][contribution_idx] = share_bytes from some party
+            shares_per_position: Vec<Vec<Vec<u8>>>,
+            // Which parties have contributed to this batch
+            party_ids: Vec<usize>,
+            // Cached results once computed
+            results: Option<Vec<Value>>,
+        }
+
+        impl BatchOpenAccumulator {
+            fn new(batch_size: usize) -> Self {
+                Self {
+                    batch_size,
+                    shares_per_position: vec![Vec::new(); batch_size],
+                    party_ids: Vec::new(),
+                    results: None,
+                }
+            }
+        }
+
+        // Registry: maps (instance_id, batch_sequence, type_key, batch_size) to accumulator
+        static BATCH_REGISTRY: once_cell::sync::Lazy<
+            parking_lot::Mutex<std::collections::HashMap<(u64, usize, String, usize), BatchOpenAccumulator>>,
+        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let type_key = match ty {
+            ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
+            ShareType::SecretFixedPoint { precision } => {
+                format!("fixed-{}-{}", precision.k(), precision.f())
+            }
+        };
+
+        let batch_size = shares.len();
+        let required = 2 * self.t + 1;
+        let mut my_sequence: Option<usize> = None;
+
+        loop {
+            let mut reg = BATCH_REGISTRY.lock();
+
+            // If we haven't contributed yet, find the right batch accumulator
+            if my_sequence.is_none() {
+                let mut seq = 0;
+                loop {
+                    let key = (self.instance_id, seq, type_key.clone(), batch_size);
+                    let entry = reg.entry(key).or_insert_with(|| BatchOpenAccumulator::new(batch_size));
+
+                    if !entry.party_ids.contains(&self.party_id) {
+                        // This party hasn't contributed to this batch yet
+                        // Add all shares for all positions
+                        for (pos, share_bytes) in shares.iter().enumerate() {
+                            entry.shares_per_position[pos].push(share_bytes.clone());
+                        }
+                        entry.party_ids.push(self.party_id);
+                        my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.unwrap();
+            let key = (self.instance_id, seq, type_key.clone(), batch_size);
+            let entry = reg.get_mut(&key).unwrap();
+
+            // Check if results are ready
+            if let Some(results) = entry.results.clone() {
+                return Ok(results);
+            }
+
+            // Check if we have enough contributions from parties
+            if entry.party_ids.len() >= required {
+                // Reconstruct all positions in the batch
+                let mut results = Vec::with_capacity(batch_size);
+
+                for pos in 0..batch_size {
+                    let collected: Vec<_> = entry.shares_per_position[pos]
+                        .iter()
+                        .take(required)
+                        .cloned()
+                        .collect();
+
+                    let mut decoded_shares: Vec<RobustShare<Fr>> = Vec::with_capacity(collected.len());
+                    for bytes in &collected {
+                        decoded_shares.push(Self::decode_share(bytes)?);
+                    }
+
+                    let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, self.n)
+                        .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
+
+                    let value = match ty {
+                        ShareType::SecretInt { .. } if ty.is_boolean() => {
+                            use ark_ff::Zero;
+                            Value::Bool(!secret.is_zero())
+                        }
+                        ShareType::SecretInt { .. } => {
+                            let limbs: [u64; 4] = secret.into_bigint().0;
+                            Value::I64(limbs[0] as i64)
+                        }
+                        ShareType::SecretFixedPoint { precision } => {
+                            let limbs: [u64; 4] = secret.into_bigint().0;
+                            let scaled_value = limbs[0] as i64;
+                            let f = precision.f();
+                            let scale = (1u64 << f) as f64;
+                            let float_value = scaled_value as f64 / scale;
+                            Value::Float(F64(float_value))
+                        }
+                    };
+                    results.push(value);
+                }
+
+                tracing::info!(
+                    "batch_open_shares: reconstructed {} values in batch (instance={}, seq={})",
+                    batch_size, self.instance_id, seq
+                );
+
+                entry.results = Some(results.clone());
+                return Ok(results);
+            }
+
+            drop(reg);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn shutdown(&self) {
         self.ready.store(false, Ordering::SeqCst);
     }
@@ -728,6 +830,15 @@ impl AsyncMpcEngine for HoneyBadgerMpcEngine {
 
     async fn open_share_async(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
         self.open_share_async(ty, share_bytes).await
+    }
+
+    async fn batch_open_shares_async(
+        &self,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> Result<Vec<Value>, String> {
+        // Delegate to sync version - the registry operations are quick
+        self.batch_open_shares(ty, shares)
     }
 
     async fn send_output_to_client_async(
@@ -819,5 +930,250 @@ impl MpcEngineClientOps for HoneyBadgerMpcEngine {
                 rt.block_on(self.hydrate_client_inputs_for(store, client_ids))
             }
         }
+    }
+}
+
+// ============================================================================
+// MpcEngineConsensus Implementation (RBC and ABA)
+// ============================================================================
+//
+// RBC and ABA use in-process registries for coordination between parties.
+// This mirrors the open_share approach where all parties in the same process
+// coordinate through shared state.
+//
+// For multi-process deployments, these protocols would need to use the
+// actual network-based Avid/ABA implementations from mpc-protocols.
+
+/// Registry for RBC broadcasts - maps (instance_id, session_id) to broadcast data
+#[derive(Default)]
+struct RbcRegistry {
+    /// Maps (instance_id, session_id, from_party) to message bytes
+    messages: std::collections::HashMap<(u64, u64, usize), Vec<u8>>,
+    /// Session counter for generating unique session IDs
+    session_counter: u64,
+}
+
+/// Registry for ABA sessions - maps (instance_id, session_id) to agreement state
+#[derive(Default)]
+struct AbaRegistry {
+    /// Maps (instance_id, session_id, party_id) to proposed value
+    proposals: std::collections::HashMap<(u64, u64, usize), bool>,
+    /// Maps (instance_id, session_id) to agreed result once consensus is reached
+    results: std::collections::HashMap<(u64, u64), bool>,
+    /// Session counter for generating unique session IDs
+    session_counter: u64,
+}
+
+static RBC_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<RbcRegistry>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(RbcRegistry::default()));
+
+static ABA_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<AbaRegistry>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(AbaRegistry::default()));
+
+impl MpcEngineConsensus for HoneyBadgerMpcEngine {
+    fn rbc_broadcast(&self, message: &[u8]) -> Result<u64, String> {
+        let mut registry = RBC_REGISTRY.lock();
+
+        // Generate a unique session ID
+        let session_id = registry.session_counter;
+        registry.session_counter += 1;
+
+        // Store the message for this party's broadcast
+        let key = (self.instance_id, session_id, self.party_id);
+        registry.messages.insert(key, message.to_vec());
+
+        tracing::info!(
+            instance_id = self.instance_id,
+            session_id = session_id,
+            party_id = self.party_id,
+            message_len = message.len(),
+            "RBC broadcast initiated"
+        );
+
+        Ok(session_id)
+    }
+
+    fn rbc_receive(&self, from_party: usize, timeout_ms: u64) -> Result<Vec<u8>, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            {
+                let registry = RBC_REGISTRY.lock();
+
+                // Look for a message from the specified party
+                // We need to find the session where from_party broadcast
+                for ((inst_id, _session_id, party), message) in registry.messages.iter() {
+                    if *inst_id == self.instance_id && *party == from_party {
+                        tracing::info!(
+                            instance_id = self.instance_id,
+                            from_party = from_party,
+                            message_len = message.len(),
+                            "RBC receive found message"
+                        );
+                        return Ok(message.clone());
+                    }
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "RBC receive timeout waiting for message from party {}",
+                    from_party
+                ));
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn rbc_receive_any(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+        // Track which parties we've already received from
+        let mut received_from = std::collections::HashSet::new();
+
+        loop {
+            {
+                let registry = RBC_REGISTRY.lock();
+
+                // Look for any message we haven't received yet
+                for ((inst_id, _session_id, party), message) in registry.messages.iter() {
+                    if *inst_id == self.instance_id
+                        && *party != self.party_id
+                        && !received_from.contains(party)
+                    {
+                        received_from.insert(*party);
+                        tracing::info!(
+                            instance_id = self.instance_id,
+                            from_party = *party,
+                            message_len = message.len(),
+                            "RBC receive_any found message"
+                        );
+                        return Ok((*party, message.clone()));
+                    }
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return Err("RBC receive_any timeout waiting for message from any party".to_string());
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn aba_propose(&self, value: bool) -> Result<u64, String> {
+        let mut registry = ABA_REGISTRY.lock();
+
+        // Generate a unique session ID
+        let session_id = registry.session_counter;
+        registry.session_counter += 1;
+
+        // Store this party's proposal
+        let key = (self.instance_id, session_id, self.party_id);
+        registry.proposals.insert(key, value);
+
+        tracing::info!(
+            instance_id = self.instance_id,
+            session_id = session_id,
+            party_id = self.party_id,
+            value = value,
+            "ABA propose initiated"
+        );
+
+        Ok(session_id)
+    }
+
+    fn aba_result(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let required = 2 * self.t + 1; // Need 2t+1 proposals for agreement
+
+        loop {
+            {
+                let mut registry = ABA_REGISTRY.lock();
+
+                // Check if result is already computed
+                if let Some(&result) = registry.results.get(&(self.instance_id, session_id)) {
+                    return Ok(result);
+                }
+
+                // Count proposals for this session
+                let mut true_count = 0usize;
+                let mut false_count = 0usize;
+
+                for ((inst_id, sess_id, _party), &proposal) in registry.proposals.iter() {
+                    if *inst_id == self.instance_id && *sess_id == session_id {
+                        if proposal {
+                            true_count += 1;
+                        } else {
+                            false_count += 1;
+                        }
+                    }
+                }
+
+                // ABA agreement rule: if 2t+1 parties agree on a value, that's the result
+                if true_count >= required {
+                    registry.results.insert((self.instance_id, session_id), true);
+                    tracing::info!(
+                        instance_id = self.instance_id,
+                        session_id = session_id,
+                        result = true,
+                        true_count = true_count,
+                        "ABA agreement reached"
+                    );
+                    return Ok(true);
+                }
+
+                if false_count >= required {
+                    registry.results.insert((self.instance_id, session_id), false);
+                    tracing::info!(
+                        instance_id = self.instance_id,
+                        session_id = session_id,
+                        result = false,
+                        false_count = false_count,
+                        "ABA agreement reached"
+                    );
+                    return Ok(false);
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "ABA result timeout waiting for agreement on session {}",
+                    session_id
+                ));
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncMpcEngineConsensus for HoneyBadgerMpcEngine {
+    async fn rbc_broadcast_async(&self, message: &[u8]) -> Result<u64, String> {
+        // Use sync version since registry operations are quick
+        self.rbc_broadcast(message)
+    }
+
+    async fn rbc_receive_async(
+        &self,
+        from_party: usize,
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>, String> {
+        // For async, we could use tokio::time::sleep but for now delegate to sync
+        self.rbc_receive(from_party, timeout_ms)
+    }
+
+    async fn rbc_receive_any_async(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String> {
+        self.rbc_receive_any(timeout_ms)
+    }
+
+    async fn aba_propose_async(&self, value: bool) -> Result<u64, String> {
+        self.aba_propose(value)
+    }
+
+    async fn aba_result_async(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
+        self.aba_result(session_id, timeout_ms)
     }
 }

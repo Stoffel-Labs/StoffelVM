@@ -477,7 +477,8 @@ pub struct QuicNetworkManager {
     /// Network configuration
     network_config: QuicNetworkConfig,
     /// Active connections to other server nodes and clients are handled in stoffelnet impl.
-    connections: Arc<Mutex<HashMap<PartyId, Box<dyn PeerConnection>>>>,
+    /// Each connection has its own lock to avoid holding the HashMap lock across await points.
+    connections: Arc<Mutex<HashMap<PartyId, Arc<Mutex<Box<dyn PeerConnection>>>>>>,
 }
 
 impl Default for QuicNetworkManager {
@@ -599,10 +600,18 @@ impl QuicNetworkManager {
                 .map_err(|e| format!("Failed to create QUIC client config: {}", e))?,
         ));
 
-        // Set transport config
+        // Set transport config with reasonable timeouts
         config.transport_config(Arc::new({
             let mut transport = quinn::TransportConfig::default();
             transport.max_concurrent_uni_streams(0u32.into());
+            // Set connection timeout to prevent indefinite hangs
+            transport.max_idle_timeout(Some(
+                std::time::Duration::from_secs(30)
+                    .try_into()
+                    .expect("idle timeout"),
+            ));
+            // Set keep-alive to detect dead connections
+            transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
             transport
         }));
 
@@ -649,9 +658,17 @@ impl QuicNetworkManager {
                 .map_err(|e| format!("Failed to create QUIC server config: {}", e))?,
         ));
 
-        // Configure transport parameters
+        // Configure transport parameters with reasonable timeouts
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
         transport_config.max_concurrent_uni_streams(0u32.into());
+        // Set connection timeout to prevent indefinite hangs
+        transport_config.max_idle_timeout(Some(
+            std::time::Duration::from_secs(30)
+                .try_into()
+                .expect("idle timeout"),
+        ));
+        // Set keep-alive to detect dead connections
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
 
         Ok(server_config)
     }
@@ -663,21 +680,61 @@ impl NetworkManager for QuicNetworkManager {
         address: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
         Box::pin(async move {
-            if self.endpoint.is_none() {
-                // Create client endpoint
-                let client_config = Self::create_insecure_client_config()?;
+            // Create client config for outgoing connections
+            let client_config = Self::create_insecure_client_config()?;
+
+            // Determine which endpoint to use for the connection
+            let connection = if let Some(endpoint) = self.endpoint.as_mut() {
+                // Try to use existing server endpoint with client config
+                endpoint.set_default_client_config(client_config.clone());
+                eprintln!("[quic] Using existing endpoint to connect to {}", address);
+
+                match endpoint.connect(address, "localhost") {
+                    Ok(connecting) => {
+                        eprintln!("[quic] Awaiting connection handshake to {}", address);
+                        connecting
+                            .await
+                            .map_err(|e| format!("Failed to establish connection to {}: {}", address, e))?
+                    }
+                    Err(e) => {
+                        // Server endpoint failed, create a dedicated client endpoint
+                        eprintln!(
+                            "[quic] Server endpoint connect failed ({}), creating client endpoint for {}",
+                            e, address
+                        );
+                        let mut client_endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+                            .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
+                        client_endpoint.set_default_client_config(client_config);
+
+                        let connecting = client_endpoint
+                            .connect(address, "localhost")
+                            .map_err(|e| format!("Failed to initiate connection to {}: {}", address, e))?;
+
+                        eprintln!("[quic] Awaiting connection handshake to {} (client endpoint)", address);
+                        connecting
+                            .await
+                            .map_err(|e| format!("Failed to establish connection to {}: {}", address, e))?
+                    }
+                }
+            } else {
+                // No endpoint exists, create a client endpoint
+                eprintln!("[quic] Creating new client endpoint to connect to {}", address);
                 let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
                     .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
                 endpoint.set_default_client_config(client_config);
                 self.endpoint = Some(endpoint);
-            }
 
-            let endpoint = self.endpoint.as_ref().unwrap();
-            let connection = endpoint
-                .connect(address, "localhost")
-                .map_err(|e| format!("Failed to initiate connection: {}", e))?
-                .await
-                .map_err(|e| format!("Failed to establish connection: {}", e))?;
+                let connecting = self.endpoint.as_ref().unwrap()
+                    .connect(address, "localhost")
+                    .map_err(|e| format!("Failed to initiate connection to {}: {}", address, e))?;
+
+                eprintln!("[quic] Awaiting connection handshake to {}", address);
+                connecting
+                    .await
+                    .map_err(|e| format!("Failed to establish connection to {}: {}", address, e))?
+            };
+
+            eprintln!("[quic] Connection established to {}", address);
 
             // Send identification handshake as SERVER with our node_id for stoffelnet compatibility
             if let Ok((mut send, _recv)) = connection.open_bi().await {
@@ -703,7 +760,7 @@ impl NetworkManager for QuicNetworkManager {
             let mut connections = self.connections.lock().await;
             connections.insert(
                 node_id,
-                Box::new(QuicPeerConnection::new(connection.clone(), false)),
+                Arc::new(Mutex::new(Box::new(QuicPeerConnection::new(connection.clone(), false)) as Box<dyn PeerConnection>)),
             );
 
             // Return the original connection
@@ -758,7 +815,7 @@ impl NetworkManager for QuicNetworkManager {
             let mut connections = self.connections.lock().await;
             connections.insert(
                 node_id,
-                Box::new(QuicPeerConnection::new(connection.clone(), true)),
+                Arc::new(Mutex::new(Box::new(QuicPeerConnection::new(connection.clone(), true)) as Box<dyn PeerConnection>)),
             );
 
             // Return the original connection
@@ -790,13 +847,14 @@ impl Network for QuicNetworkManager {
     type NetworkConfig = QuicNetworkConfig;
 
     async fn send(&self, recipient: PartyId, message: &[u8]) -> Result<usize, NetworkError> {
-        // Acquire the lock on the connections hashmap
-        let mut connections = self.connections.lock().await;
+        // Get the connection Arc while holding the HashMap lock briefly
+        let connection_arc = {
+            let connections = self.connections.lock().await;
+            connections.get(&recipient).cloned()
+        };
+        // HashMap lock is now released
 
-        // Check if the connection exists
-        if !connections.contains_key(&recipient) {
-            return Err(NetworkError::PartyNotFound(recipient));
-        }
+        let connection_arc = connection_arc.ok_or(NetworkError::PartyNotFound(recipient))?;
 
         // Log debug info about the outgoing message
         let preview_len = message.len().min(64);
@@ -813,10 +871,8 @@ impl Network for QuicNetworkManager {
             hex_preview
         );
 
-        // Get a mutable reference to the connection
-        let connection = connections.get_mut(&recipient).unwrap();
-
-        // Send the message
+        // Lock the individual connection and send (HashMap lock not held)
+        let mut connection = connection_arc.lock().await;
         match connection.send(message).await {
             Ok(_) => {
                 debug!(
@@ -840,9 +896,6 @@ impl Network for QuicNetworkManager {
     async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
         let mut total_bytes = 0;
 
-        // Acquire the lock on the connections hashmap
-        let mut connections = self.connections.lock().await;
-
         // Prepare a hex preview
         let preview_len = message.len().min(64);
         let hex_preview: String = message[..preview_len]
@@ -857,42 +910,51 @@ impl Network for QuicNetworkManager {
             hex_preview
         );
 
-        // Send the message to all nodes except self
-        for node in &self.nodes {
-            if node.id() != self.node_id {
-                // Check if we have a connection to this node
-                if connections.contains_key(&node.id()) {
-                    // Get a mutable reference to the connection
-                    let connection = connections.get_mut(&node.id()).unwrap();
+        // Collect connection Arcs while holding the HashMap lock briefly
+        let targets: Vec<(PartyId, Arc<Mutex<Box<dyn PeerConnection>>>)> = {
+            let connections = self.connections.lock().await;
+            self.nodes
+                .iter()
+                .filter(|node| node.id() != self.node_id)
+                .filter_map(|node| {
+                    connections.get(&node.id()).map(|conn| (node.id(), conn.clone()))
+                })
+                .collect()
+        };
+        // HashMap lock is now released
 
-                    // Send the message
-                    match connection.send(message).await {
-                        Ok(_) => {
-                            debug!(
-                                "[MSG:BROADCAST-SENT] from node {} -> node {} ({} bytes)",
-                                self.node_id,
-                                node.id(),
-                                message.len()
-                            );
-                            total_bytes += message.len();
-                        }
-                        Err(e) => {
-                            debug!(
-                                "[MSG:BROADCAST-FAIL] from node {} -> node {}: {}",
-                                self.node_id,
-                                node.id(),
-                                e
-                            );
-                            // Continue with other nodes even if one fails
-                        }
-                    }
-                } else {
-                    // Log a warning that we couldn't send the message to this node
+        // Log skipped nodes
+        for node in &self.nodes {
+            if node.id() != self.node_id && !targets.iter().any(|(id, _)| *id == node.id()) {
+                debug!(
+                    "[MSG:BROADCAST-SKIP] from node {} -> node {}: no connection",
+                    self.node_id,
+                    node.id()
+                );
+            }
+        }
+
+        // Send to each target without holding the HashMap lock
+        for (node_id, connection_arc) in targets {
+            let mut connection = connection_arc.lock().await;
+            match connection.send(message).await {
+                Ok(_) => {
                     debug!(
-                        "[MSG:BROADCAST-SKIP] from node {} -> node {}: no connection",
+                        "[MSG:BROADCAST-SENT] from node {} -> node {} ({} bytes)",
                         self.node_id,
-                        node.id()
+                        node_id,
+                        message.len()
                     );
+                    total_bytes += message.len();
+                }
+                Err(e) => {
+                    debug!(
+                        "[MSG:BROADCAST-FAIL] from node {} -> node {}: {}",
+                        self.node_id,
+                        node_id,
+                        e
+                    );
+                    // Continue with other nodes even if one fails
                 }
             }
         }
