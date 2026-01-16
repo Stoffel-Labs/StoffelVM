@@ -1121,6 +1121,41 @@ pub extern "C" fn hb_free_bytes(ptr: *mut u8, len: usize) {
     }
 }
 
+/// Hydrate VM's ClientInputStore from engine's input store
+///
+/// After calling `hb_engine_init_client_input()` to store client shares in the engine,
+/// call this function to copy those shares to the VM's ClientInputStore where the
+/// `ClientStore.take_share` instruction can access them during execution.
+///
+/// Returns:
+/// - HBEngineSuccess on success
+/// - HBEngineNullPointer if either pointer is null
+/// - HBEngineClientInputFailed if hydration fails
+#[no_mangle]
+pub extern "C" fn hb_engine_hydrate_to_vm(
+    engine_ptr: *mut HBEngineOpaque,
+    vm_handle: VMHandle,
+) -> HBEngineErrorCode {
+    if engine_ptr.is_null() || vm_handle.is_null() {
+        return HBEngineErrorCode::HBEngineNullPointer;
+    }
+
+    let engine = unsafe { &*(engine_ptr as *const Arc<HoneyBadgerMpcEngine>) };
+    let vm = unsafe { &mut *(vm_handle as *mut VirtualMachine) };
+    let store = vm.state.client_store();
+
+    match engine.hydrate_client_inputs_sync(&store) {
+        Ok(count) => {
+            tracing::info!("Hydrated {} client inputs to VM", count);
+            HBEngineErrorCode::HBEngineSuccess
+        }
+        Err(e) => {
+            tracing::error!("Failed to hydrate client inputs: {}", e);
+            HBEngineErrorCode::HBEngineClientInputFailed
+        }
+    }
+}
+
 // ============================================================================
 // HoneyBadgerMpcEngine FFI - Unit Tests
 // ============================================================================
