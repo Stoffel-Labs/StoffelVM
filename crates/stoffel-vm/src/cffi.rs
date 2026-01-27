@@ -771,7 +771,7 @@ pub extern "C" fn hb_engine_new(
         Arc::clone(boxed)
     };
 
-    match HoneyBadgerMpcEngine::new(instance_id, party_id, n, t, n_triples, n_random, net) {
+    match HoneyBadgerMpcEngine::new(instance_id, party_id, n, t, n_triples, n_random, net, Vec::new()) {
         Ok(engine) => {
             // engine is Arc<HoneyBadgerMpcEngine>, box it for stable FFI pointer
             Box::into_raw(Box::new(engine)) as *mut HBEngineOpaque
@@ -1133,25 +1133,26 @@ mod hb_engine_tests {
     fn test_share_type_conversion_int() {
         let c_int = CShareType { kind: 0, width: 64 };
         let st: ShareType = c_int.into();
-        assert!(matches!(st, ShareType::Int(64)));
+        assert!(matches!(st, ShareType::SecretInt { bit_length: 64 }));
     }
 
     #[test]
     fn test_share_type_conversion_bool() {
+        // Both width values should result in boolean (1-bit SecretInt)
         let c_bool_true = CShareType { kind: 1, width: 1 };
         let st: ShareType = c_bool_true.into();
-        assert!(matches!(st, ShareType::Bool(true)));
+        assert!(matches!(st, ShareType::SecretInt { bit_length: 1 }));
 
         let c_bool_false = CShareType { kind: 1, width: 0 };
         let st: ShareType = c_bool_false.into();
-        assert!(matches!(st, ShareType::Bool(false)));
+        assert!(matches!(st, ShareType::SecretInt { bit_length: 1 }));
     }
 
     #[test]
     fn test_share_type_conversion_float() {
         let c_float = CShareType { kind: 2, width: 42 };
         let st: ShareType = c_float.into();
-        assert!(matches!(st, ShareType::Float(42)));
+        assert!(matches!(st, ShareType::SecretFixedPoint { .. }));
     }
 
     #[test]
