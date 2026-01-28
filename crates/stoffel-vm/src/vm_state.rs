@@ -14,7 +14,6 @@
 //! program execution, from function calls to object manipulation.
 
 use crate::foreign_functions::{ForeignFunctionContext, Function};
-use crate::net::client_store::ClientInputStore;
 use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
 use ark_bls12_381::Fr;
 use ark_ff::Field;
@@ -28,11 +27,20 @@ use stoffel_vm_types::core_types::{
 };
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::{Instruction, ResolvedInstruction};
+
+// MPC-specific imports (only available with 'mpc' feature)
+#[cfg(feature = "mpc")]
+use crate::net::client_store::ClientInputStore;
+#[cfg(feature = "mpc")]
 use stoffelmpc_mpc::common::types::{TypeError, fixed::SecretFixedPoint, integer::SecretInt};
+#[cfg(feature = "mpc")]
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+#[cfg(feature = "mpc")]
 use stoffelnet::network_utils::ClientId;
 
+#[cfg(feature = "mpc")]
 type SecretIntShare = SecretInt<Fr, RobustShare<Fr>>;
+#[cfg(feature = "mpc")]
 type SecretFixedPointShare = SecretFixedPoint<Fr, RobustShare<Fr>>;
 
 // ============================================================================
@@ -78,9 +86,11 @@ pub struct VMState {
     pub foreign_objects: ForeignObjectStorage,
     /// Hook manager for debugging and instrumentation
     pub hook_manager: HookManager,
-    /// Optional MPC engine used to drive secret-sharing protocols
+    /// Optional MPC engine used to drive secret-sharing protocols (requires 'mpc' feature)
+    #[cfg(feature = "mpc")]
     pub mpc_engine: Option<Arc<dyn crate::net::mpc_engine::MpcEngine>>,
-    /// Per-VM client store used for loading MPC inputs
+    /// Per-VM client store used for loading MPC inputs (requires 'mpc' feature)
+    #[cfg(feature = "mpc")]
     client_store: Arc<ClientInputStore>,
 }
 
@@ -107,7 +117,9 @@ impl VMState {
             object_store: ObjectStore::new(),
             foreign_objects: ForeignObjectStorage::new(),
             hook_manager: HookManager::new(),
+            #[cfg(feature = "mpc")]
             mpc_engine: None,
+            #[cfg(feature = "mpc")]
             client_store: Arc::new(ClientInputStore::new()),
         }
     }
