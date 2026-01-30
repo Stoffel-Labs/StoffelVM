@@ -37,6 +37,9 @@ services:
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
       - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_ETH_NODE_ADDR=ws://host.docker.internal:8545
+      - STOFFEL_WALLET_SK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+      - STOFFEL_COORD_ADDR=0x5FbDB2315678afecb367f032d93F642f64180aa3
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -73,6 +76,9 @@ services:
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
       - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_ETH_NODE_ADDR=ws://host.docker.internal:8545
+      - STOFFEL_WALLET_SK=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+      - STOFFEL_COORD_ADDR=0x5FbDB2315678afecb367f032d93F642f64180aa3
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -104,6 +110,9 @@ services:
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
       - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_ETH_NODE_ADDR=ws://host.docker.internal:8545
+      - STOFFEL_WALLET_SK=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
+      - STOFFEL_COORD_ADDR=0x5FbDB2315678afecb367f032d93F642f64180aa3
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -135,6 +144,9 @@ services:
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
       - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_ETH_NODE_ADDR=ws://host.docker.internal:8545
+      - STOFFEL_WALLET_SK=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6
+      - STOFFEL_COORD_ADDR=0x5FbDB2315678afecb367f032d93F642f64180aa3
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -166,6 +178,9 @@ services:
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
       - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_ETH_NODE_ADDR=ws://host.docker.internal:8545
+      - STOFFEL_WALLET_SK=0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a
+      - STOFFEL_COORD_ADDR=0x5FbDB2315678afecb367f032d93F642f64180aa3
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -195,6 +210,9 @@ services:
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
       - STOFFEL_CLIENT_DELAY=15
+      - STOFFEL_ETH_NODE_ADDR=ws://host.docker.internal:8545
+      - STOFFEL_WALLET_SK=0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba
+      - STOFFEL_COORD_ADDR=0x5FbDB2315678afecb367f032d93F642f64180aa3
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -229,6 +247,9 @@ services:
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
       - STOFFEL_CLIENT_DELAY=15
+      - STOFFEL_ETH_NODE_ADDR=ws://host.docker.internal:8545
+      - STOFFEL_WALLET_SK=0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e
+      - STOFFEL_COORD_ADDR=0x5FbDB2315678afecb367f032d93F642f64180aa3
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:

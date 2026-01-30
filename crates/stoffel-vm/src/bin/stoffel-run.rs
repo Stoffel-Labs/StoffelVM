@@ -3,9 +3,11 @@ use std::net::SocketAddr;
 use std::process::exit;
 
 use ark_bls12_381::Fr;
+use ark_ff::{PrimeField, BigInteger};
+use ark_serialize::CanonicalSerialize;
 use std::fs::File;
 use std::sync::Arc;
-use std::time::Duration;
+use std::str::FromStr;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
 use stoffel_vm::net::{
@@ -13,19 +15,526 @@ use stoffel_vm::net::{
     run_bootnode_with_config, spawn_receive_loops,
 };
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
-use stoffel_vm_types::compiled_binary::CompiledBinary;
+use stoffel_vm::vm_state::VMState;
+use stoffel_vm_types::{core_types::{ShareType, Value}, compiled_binary::CompiledBinary};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::MPCProtocol;
+use stoffelmpc_mpc::common::SecretSharingScheme;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore, Mutex};
+use tokio::time::{Duration, timeout};
+use alloy::{
+    sol_types::{SolValue, SolEvent},
+    providers::{Provider, ProviderBuilder, WsConnect},
+    rpc::types::{BlockNumberOrTag, Filter},
+    signers::local::PrivateKeySigner,
+    network::EthereumWallet,
+    signers::Signer
+};
+use alloy_primitives::{U256, address, Address, Signature, Bytes, Keccak256, FixedBytes};
+use stoffel_solidity_bindings::{
+    fake_coordinator::FakeCoordinator::{CoordinatorInitialized, PreprocessingRoundExecuted, ClientInputMaskReservationEvent, MPCTaskExecuted, RoleAdminChanged, RoleGranted, RoleRevoked, OwnershipTransferred},
+    fake_coordinator::FakeCoordinator::{IndexBufferEvent, MaskedInputEvent, ReservedInputEvent},
+    fake_coordinator::FakeCoordinator::FakeCoordinatorInstance,
+    fake_coordinator::FakeCoordinator
+};
+use futures_util::stream::StreamExt;
+use serde::{Serialize, Deserialize};
+use dashmap::DashMap;
+use std::collections::HashMap;
 
-// Use a Tokio runtime for async operations
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClientSig {
+    client_id: ClientId,
+    i: U256,
+    sig: Vec<u8>,
+}
+
+async fn generate_client_sig(i: U256, signer: PrivateKeySigner) -> Signature {
+    let hash = {
+        let mut hasher = Keccak256::new();
+        hasher.update(i.abi_encode());
+        hasher.finalize()
+    };
+    signer.sign_message(hash.as_slice()).await.expect("signing failed")
+}
+
+async fn verify_client_sig(client_sig: ClientSig, coord: FakeCoordinatorInstance<impl Provider>) -> Option<Address> {
+    let hash = {
+        let mut hasher = Keccak256::new();
+        hasher.update(client_sig.i.abi_encode());
+        hasher.finalize()
+    };
+    let sig = Signature::try_from(client_sig.sig.as_slice()).expect("invalid sig");
+    let addr = sig.recover_address_from_msg(hash).expect("recovery failed");
+
+    if coord.authenticateClient(client_sig.i, addr, Bytes::from(client_sig.sig))
+        .call().await.expect("sending TX failed") {
+            Some(addr)
+    } else {
+        None
+    }
+}
+
+async fn coord_creation_block(coord: FakeCoordinatorInstance<impl Provider>) -> u64 {
+        let x = coord.creationBlock().call().await.expect("sending TX failed");
+        u256_to_u64(x)
+}
+
+static PK: [Address; 10] = [
+    address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+    address!("0x70997970C51812dc3A010C7d01b50e0d17dc79C8"),
+    address!("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"),
+    address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906"),
+    address!("0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65"),
+    address!("0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"),
+    address!("0x976EA74026E726554dB657fA54763abd0C3a0aa9"),
+    address!("0x14dC79964da2C08b23698B3D3cc7Ca32193d9955"),
+    address!("0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f"),
+    address!("0xa0Ee7A142d267C1f36714E4a8F75612F20a79720")
+];
+
+async fn init_input_masks(n_input_masks: usize, coord: FakeCoordinatorInstance<impl Provider>) {
+    assert!(n_input_masks == 2);
+
+    let builder = coord.initializeInputMaskBuffer(U256::from(n_input_masks));
+    let result = builder.send().await;
+    match result {
+        Ok(r) => {
+            r.watch().await.expect("TX failed");
+        }
+        Err(e) => {
+            let err = e.as_decoded_error::<FakeCoordinator::IndexBufferAlreadySet>().unwrap();
+            println!("nTotalIndices={}", err.nTotalIndices);
+            panic!();
+        }
+    }
+}
+
+
+async fn wait_for_input_mask_init(coord: FakeCoordinatorInstance<impl Provider>, contract_block: u64) {
+    let mut events = coord
+        .IndexBufferEvent_filter()
+        .from_block(contract_block)
+        .watch()
+        .await.unwrap().into_stream();
+
+    if let Some(Ok((IndexBufferEvent { totalIndices, designatedParty }, _))) = events.next().await {
+        
+    } else {
+        panic!();
+    }
+}
+
+async fn grant_roles(n_parties: usize, coord: FakeCoordinatorInstance<impl Provider>) {
+    assert!(n_parties == 5);
+
+    let PARTY_ROLE = {
+        let builder = coord.PARTY_ROLE();
+        builder.call().await.expect("sending TX failed")
+    };
+    let DESIGNATED_PARTY_ROLE = {
+        let builder = coord.DESIGNATED_PARTY_ROLE();
+        builder.call().await.expect("sending TX failed")
+    };
+
+    // grant party roles
+    for i in 0..n_parties {
+        let builder = coord.grantRole(PARTY_ROLE, PK[i]);
+        let result = builder.send().await;
+        match result {
+            Ok(r) => {
+                r.watch().await.expect("TX failed");
+            }
+            Err(e) => {
+                let err = e.as_decoded_error::<FakeCoordinator::TooManyMPCParties>().unwrap();
+                println!("current={}, max={}, new account={}", err.currentParties, err.maxParties, err.account);
+                panic!();
+            }
+        }
+        builder.send().await.expect("sending TX failed").watch().await.expect("TX failed");
+        println!("Granted party role to {}", PK[i]);
+    }
+}
+
+async fn reserve_mask_index(i: U256, coord: FakeCoordinatorInstance<impl Provider>) {
+    let builder = coord.reserveInputMask(i);
+    let result = builder.send().await;
+    match result {
+        Ok(r) => {
+            r.watch().await.expect("TX failed");
+        }
+        Err(_) => {
+            panic!();
+        }
+    }
+}
+
+async fn send_masked_input(masked_input: Fr, i: U256, coord: FakeCoordinatorInstance<impl Provider>) {
+    let builder = coord.submitMaskedInput(fr_to_u256(masked_input), i);
+    let result = builder.send().await;
+    match result {
+        Ok(r) => {
+            r.watch().await.expect("TX failed");
+        }
+        Err(e) => {
+            panic!();
+        }
+    }
+}
+
+async fn trigger_mpc(coord: FakeCoordinatorInstance<impl Provider>) {
+    let builder = coord.initiateMPCComputation();
+    let result = builder.send().await;
+    match result {
+        Ok(r) => {
+            r.watch().await.expect("TX failed");
+        }
+        Err(e) => {
+            panic!();
+        }
+    }
+}
+
+async fn wait_for_mpc(coord: FakeCoordinatorInstance<impl Provider>, contract_block: u64) {
+    let mut events = coord
+        .MPCTaskExecuted_filter()
+        .from_block(contract_block)
+        .watch()
+        .await.unwrap().into_stream();
+
+    if let Some(Ok((_, _))) = events.next().await {
+        
+    } else {
+        panic!();
+    }
+}
+
+async fn trigger_outputs(coord: FakeCoordinatorInstance<impl Provider>) {
+    let builder = coord.publishOutputs();
+    let result = builder.send().await;
+    match result {
+        Ok(r) => {
+            r.watch().await.expect("TX failed");
+        }
+        Err(_) => {
+            panic!();
+        }
+    }
+}
+
+async fn wait_for_outputs(coord: FakeCoordinatorInstance<impl Provider>, contract_block: u64) {
+    let mut events = coord
+        .ClientOutputCollection_filter()
+        .from_block(contract_block)
+        .watch()
+        .await.unwrap().into_stream();
+
+    if let Some(Ok((_, _))) = events.next().await {
+        
+    } else {
+        panic!();
+    }
+}
+
+async fn trigger_input(coord: FakeCoordinatorInstance<impl Provider>) {
+    let builder = coord.gatherInputs();
+    let result = builder.send().await;
+    match result {
+        Ok(r) => {
+            r.watch().await.expect("TX failed");
+        }
+        Err(e) => {
+            panic!();
+            //let err = e.as_decoded_error::<FakeCoordinator::NotAnExistingParty>().unwrap();
+            //println!("No such account {}", err.account);
+        }
+    }
+}
+
+async fn wait_for_input(coord: FakeCoordinatorInstance<impl Provider>, contract_block: u64) {
+    let mut events = coord
+        .ClientInputMaskReservationEvent_filter()
+        .from_block(contract_block)
+        .watch()
+        .await.unwrap().into_stream();
+
+    if let Some(Ok((_, _))) = events.next().await {
+        
+    } else {
+        panic!();
+    }
+}
+
+async fn trigger_pp(coord: FakeCoordinatorInstance<impl Provider>) {
+    let builder = coord.startPreprocessing();
+    let result = builder.send().await;
+    match result {
+        Ok(r) => {
+            r.watch().await.expect("TX failed");
+        }
+        Err(e) => {
+            let err = e.as_decoded_error::<FakeCoordinator::NotAnExistingParty>().unwrap();
+            println!("No such account {}", err.account);
+        }
+    }
+}
+
+async fn wait_for_pp(coord: FakeCoordinatorInstance<impl Provider>, contract_block: u64) {
+    let mut events = coord
+        .PreprocessingRoundExecuted_filter()
+        .from_block(contract_block)
+        .watch()
+        .await.unwrap().into_stream();
+
+    if let Some(Ok((_, _))) = events.next().await {
+        
+    } else {
+        panic!();
+    }
+}
+
+fn u256_to_u64(x: U256) -> u64 {
+    x.try_into().expect("u256_to_u64: input out of range")
+}
+
+// lossless: Fr elements always fit into 256 bits
+fn fr_to_u256(x: Fr) -> U256 {
+    let bytes = x.into_bigint().to_bytes_le();
+    U256::from_le_slice(&bytes)
+}
+
+fn u256_to_fr(x: U256) -> Fr {
+    let r = {
+        let r = <Fr as PrimeField>::MODULUS;
+        let r_bytes = r.to_bytes_le();
+        U256::from_le_slice(&r_bytes)
+    };
+
+    if x >= r {
+        panic!("u256_to_fr: input out of range");
+    }
+
+    let bytes = x.to_le_bytes::<32>();
+    Fr::from_le_bytes_mod_order(&bytes)
+}
+
+async fn wait_for_masked_inputs(coord: FakeCoordinatorInstance<impl Provider>, contract_block: u64, n_clients: usize) -> HashMap<Address, Vec<Fr>> {
+    let mut events = coord
+        .MaskedInputEvent_filter()
+        .from_block(contract_block)
+        .watch()
+        .await.unwrap().into_stream();
+
+    let mut masked_inputs: HashMap<Address, Vec<Fr>> = HashMap::new();
+    for _ in 0..n_clients {
+        if let Some(Ok((MaskedInputEvent { client, maskedInput, reservedIndex }, _))) = events.next().await {
+            masked_inputs.insert(client, vec![u256_to_fr(maskedInput)]);
+        } else {
+            panic!();
+        }
+    }
+    masked_inputs
+}
+
+//#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng;
+    use alloy::signers::local::PrivateKeySigner;
+    use ark_bls12_381::Fr;
+    use alloy::{
+        node_bindings::{Anvil, AnvilInstance},
+        providers::{Provider, ProviderBuilder, WsConnect},
+        network::EthereumWallet,
+        sol_types::SolEvent,
+        rpc::types::{BlockNumberOrTag, Filter}
+    };
+    use alloy_primitives::{Address, U256, FixedBytes};
+    use std::str::FromStr;
+    use stoffel_solidity_bindings::{
+        fake_coordinator::FakeCoordinator,
+    };
+
+    static SK: [&str; 10] = [
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+        "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+        "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
+        "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba",
+        "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e",
+        "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356",
+        "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97",
+        "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
+    ];
+
+    static ACC: [Address; 10] = [
+        address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+        address!("0x70997970C51812dc3A010C7d01b50e0d17dc79C8"),
+        address!("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"),
+        address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906"),
+        address!("0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65"),
+        address!("0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"),
+        address!("0x976EA74026E726554dB657fA54763abd0C3a0aa9"),
+        address!("0x14dC79964da2C08b23698B3D3cc7Ca32193d9955"),
+        address!("0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f"),
+        address!("0xa0Ee7A142d267C1f36714E4a8F75612F20a79720")
+    ];
+
+    fn spawn_anvil() -> AnvilInstance {
+        Anvil::new().spawn()
+    }
+    
+    async fn ws_connect(ws_addr: &str, key: &str) -> impl Provider + Clone {
+        let ws = WsConnect::new(ws_addr);
+        let wallet = EthereumWallet::from(PrivateKeySigner::from_str(key).expect("invalid private key"));
+    
+        ProviderBuilder::new()
+            .wallet(wallet)
+            .connect_ws(ws).await.expect("could not connect to Anvil via WebSockets")
+    }
+
+  //  #[tokio::test]
+    pub async fn sig_gen_onchain() {
+        let anvil = spawn_anvil();
+        let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
+        let n = U256::from(5);
+        let t = U256::from(1);
+        let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+        let designated_party = ACC[0];
+        let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
+
+        let coord = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes).await.expect("deployment failed");
+
+        let sk = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let signer = PrivateKeySigner::from_str(sk).unwrap();
+        let i = U256::from(42u64);
+
+        // Generate signature
+        let sig = generate_client_sig(i, signer.clone()).await;
+
+        let client_sig = ClientSig {
+            client_id: 1,
+            i,
+            sig: sig.as_bytes().to_vec(),
+        };
+
+        match verify_client_sig(client_sig, coord).await {
+            Some(addr) => {
+                let expected_addr = signer.address();
+                assert_eq!(addr, expected_addr);
+            }
+            None => {
+                panic!("signature verification failed");
+            }
+        }
+    }
+
+ //   #[test]
+    pub fn fr_u256_conversion() {
+        let mut rng = rand::rng();
+        for _ in 0..100 {
+            let n: u64 = rng.random();
+            let fr = Fr::from(n);
+            let u = fr_to_u256(fr);
+            let fr2 = u256_to_fr(u);
+            assert_eq!(fr, fr2);
+        }
+    }
+
+ //   #[test]
+    pub fn u64_u256_conversion() {
+        let mut rng = rand::rng();
+        for _ in 0..100 {
+            let n1: u64 = rng.random();
+            let n1_u256 = U256::from(n1);
+            let n2 = u256_to_u64(n1_u256);
+            assert_eq!(n1, n2);
+        }
+    }
+
+  //  #[tokio::test]
+    pub async fn coord_creation_block() {
+        let anvil = spawn_anvil();
+        let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
+        let n = U256::from(5);
+        let t = U256::from(1);
+        let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+        let designated_party = ACC[0];
+        let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
+
+        let coord = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes).await.expect("deployment failed");
+
+        let block = super::coord_creation_block(coord.clone()).await;
+
+        assert_eq!(block, 1);
+    }
+
+  //  #[tokio::test]
+    pub async fn event_listening() {
+        // event triggered BEFORE waiting for the event
+        {
+            let anvil = spawn_anvil();
+            let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
+            //let provider = ws_connect("ws://127.0.0.1:8545", SK[0]).await;
+            let n = U256::from(5);
+            let t = U256::from(1);
+            let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+            let designated_party = ACC[0];
+            let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
+
+            let coord = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes).await.expect("deployment failed");
+
+            //let block = super::coord_creation_block(coord.clone()).await;
+            let block = 1u64;
+            assert_eq!(block, 1);
+
+            super::trigger_input(coord.clone()).await;
+            super::wait_for_input(coord.clone(), block).await;
+        }
+
+        // event triggered AFTER waiting for the event
+        {
+            let anvil = spawn_anvil();
+            let provider = ws_connect(&anvil.ws_endpoint(), SK[0]).await;
+            //let provider = ws_connect("ws://127.0.0.1:8545", SK[0]).await;
+            let n = U256::from(5);
+            let t = U256::from(1);
+            let hash = FixedBytes::from_str("0000000000000000000000000000000000000000000000000000000000000000").expect("invalid hash");
+            let designated_party = ACC[0];
+            let initial_mpc_nodes: Vec<Address> = ACC[0..5].to_vec();
+
+            let coord = FakeCoordinator::deploy(provider.clone(), hash, n, t, designated_party, initial_mpc_nodes).await.expect("deployment failed");
+
+            let block = super::coord_creation_block(coord.clone()).await;
+            assert_eq!(block, 1);
+
+            tokio::spawn({
+                let coord = coord.clone();
+                async move {
+                    if timeout(Duration::from_millis(500), super::wait_for_input(coord.clone(), block)).await.is_err() {
+                        panic!();
+                    }
+                }
+            });
+                
+            super::trigger_input(coord.clone()).await;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+//    tests::sig_gen_onchain().await;
+//    tests::fr_u256_conversion();
+//    tests::u64_u256_conversion();
+//    tests::event_listening().await;
+
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
 
     if raw_args.is_empty() {
@@ -53,6 +562,9 @@ async fn main() {
     let mut enable_nat: bool = false;
     let mut stun_servers: Vec<SocketAddr> = Vec::new();
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
+    let mut eth_node_addr: Option<String> = None;
+    let mut contract_addr: Option<Address> = None;
+    let mut wallet_sk: Option<PrivateKeySigner> = None;
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -83,6 +595,9 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
         } else if let Some(_rest) = arg.strip_prefix("--stun-servers") {
         } else if let Some(_rest) = arg.strip_prefix("--servers") {
+        } else if let Some(_rest) = arg.strip_prefix("--eth-node") {
+        } else if let Some(_rest) = arg.strip_prefix("--coordinator") {
+        } else if let Some(_rest) = arg.strip_prefix("--wallet-sk") {
         }
     }
 
@@ -171,9 +686,58 @@ async fn main() {
                         .collect();
                 }
             }
+            "--eth-node" => {
+                if let Some(v) = args_iter.next() {
+                    eth_node_addr = Some(v);
+                }
+            }
+            "--coordinator" => {
+                if let Some(v) = args_iter.next() {
+                    contract_addr = match Address::from_str(&v) {
+                        Ok(addr) => Some(addr),
+                        Err(e) => {
+                            eprintln!("Invalid contract address '{}', skipping", e);
+                            None
+                        }
+                    }
+                }
+            }
+            "--wallet-sk" => {
+                if let Some(v) = args_iter.next() {
+                    wallet_sk = match PrivateKeySigner::from_str(&v) {
+                        Ok(sk) => Some(sk),
+                        Err(e) => {
+                            eprintln!("Invalid wallet secret key '{}', skipping", e);
+                            None
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
+
+    // Connect to Ethereum node
+    let eth = {
+        if let (Some(addr), Some(wallet_sk)) = (eth_node_addr, wallet_sk.clone()) {
+            let ws = WsConnect::new(addr.clone());
+            let wallet = EthereumWallet::from(wallet_sk);
+                
+            Some(ProviderBuilder::new()
+                .wallet(wallet)
+                .connect_ws(ws).await.expect(format!("could not connect to Ethereum node at {} via WebSockets", addr.clone()).as_str()))
+        } else {
+            panic!();
+        }
+    };
+
+    // Get an instance for the coordinator contract
+    let coord = if let (Some(eth), Some(contract_addr)) = (eth.clone(), contract_addr) {
+        Some(FakeCoordinator::new(contract_addr, eth.clone()))
+    } else {
+        panic!();
+    };
+    let contract_block = coord_creation_block(coord.clone().unwrap()).await;
 
     // Bootnode-only mode (no program execution)
     if as_bootnode && !as_leader {
@@ -273,7 +837,8 @@ async fn main() {
         }
 
         // Create channel for receiving messages
-        let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(1000);
+        let (msg_tx, mut msg_rx_raw) = mpsc::channel::<Vec<u8>>(1000);
+        let msg_rx = Arc::new(Mutex::new(msg_rx_raw));
 
         // Connect to all servers as a client
         eprintln!("[client {}] Connecting to {} servers...", cid, server_addrs.len());
@@ -331,41 +896,100 @@ async fn main() {
             }
         }
 
-        eprintln!("[client {}] Connected to all servers, starting input protocol...", cid);
+        eprintln!("[client {}] Connected to all servers, waiting for input masks to be initialized...", cid);
+
+        wait_for_input(coord.clone().unwrap(), contract_block).await;
+        eprintln!("[client {}] Input masks initialized.", cid);
+        wait_for_input_mask_init(coord.clone().unwrap(), contract_block).await;
+        eprintln!("[client {}] Input mask initialization event received.", cid);
+
+        // TODO: replace by something better, e.g., iterating through indices until a free one is
+        // found, this only works as long as the ID is chosen appropriately
+        let reserved_i = U256::from(cid);
+
+        eprintln!("[client {}] Reserving mask index {}...", cid, reserved_i);
+        reserve_mask_index(reserved_i, coord.clone().unwrap()).await;
+        eprintln!("[client {}] Reserved mask indices, sending signatures...", cid);
+
+        let sig = generate_client_sig(reserved_i, wallet_sk.clone().unwrap()).await;
+        for (_, conn) in network.lock().await.get_all_connections().await {
+            let sig_bytes = bincode::serialize::<ClientSig>(&ClientSig {
+                client_id: cid,
+                i: reserved_i,
+                sig: sig.as_bytes().to_vec(),
+            }).expect("serializing client signature failed");
+            conn.send(&sig_bytes).await.expect("sending client signature failed");
+        }
+
+        eprintln!("[client {}] Starting input protocol...", cid);
 
         // Spawn a task to process incoming messages
         // The client receives mask shares from servers and broadcasts masked inputs
         // Once the broadcast is complete, the client's job is done
-        let network_for_process = network.clone();
         let client_id_for_task = cid;
-        let process_handle = tokio::spawn(async move {
-            let mut messages_processed = 0;
-            while let Some(data) = msg_rx.recv().await {
-                // Clone network and drop lock before processing
-                let network_clone = {
-                    let guard = network_for_process.lock().await;
-                    (*guard).clone()
-                };
+        let process_handle = tokio::spawn({ let msg_rx = msg_rx.clone(); let coord = coord.clone().unwrap(); async move {
+            let mut shares_per_node: Vec<Vec<RobustShare<Fr>>> = Vec::new();
+            let mut masked_inputs_sent = false;
+            while let Some(data) = msg_rx.lock().await.recv().await {
+                // TODO: this is not safe against duplicate messages, need sender ID for that
+                let shares: Vec<RobustShare<Fr>> =
+                    ark_serialize::CanonicalDeserialize::deserialize_compressed(data.as_slice()).expect("deserializing mask shares failed");
 
-                if let Err(e) = mpc_client.process(data, Arc::new(network_clone)).await {
-                    eprintln!("[client {}] Failed to process message: {:?}", client_id_for_task, e);
+                if shares.len() != input_values.len() {
+                    eprintln!("[client {}] Received invalid number of shares: {}, expected {}",
+                             client_id_for_task, shares.len(), input_values.len());
+                    continue;
                 }
 
-                messages_processed += 1;
+                shares_per_node.push(shares);
+
+                if shares_per_node.len() >= 2 * t + 1 && !masked_inputs_sent {
+                    let mut shares_per_mask: Vec<Vec<RobustShare<Fr>>> = vec![Vec::new(); input_values.len()];
+                    for shares in shares_per_node.iter() {
+                        for i in 0..input_values.len() {
+                            shares_per_mask[i].push(shares[i].clone());
+                        }
+                    }
+
+                    let mut recon_success = true;
+                    let mut masks: Vec<Fr> = Vec::new();
+                    for shares in shares_per_mask {
+                        match RobustShare::recover_secret(&shares, n) {
+                            Ok(secret) => {
+                                masks.push(secret.1);
+                            }
+                            Err(_) => {
+                                eprintln!("[client {}] Failed to recover mask from shares", client_id_for_task);
+                                recon_success = false;
+                            }
+                        }
+                    }
+
+                    if recon_success {
+                        eprintln!("[client {}] Recovered all input masks, sending masked inputs...",
+                                 client_id_for_task);
+                        let reserved_indices = [U256::from(reserved_i)];
+                        for (i, (m, v)) in masks.into_iter().zip(input_values.iter()).enumerate() {
+                            send_masked_input(m + v, reserved_indices[i], coord.clone()).await;
+                        }
+
+                        masked_inputs_sent = true;
+                    }
+                }
 
                 // The client has done its job once it processes messages from all servers
                 // and broadcasts its masked inputs. We give it some time to complete.
-                if messages_processed >= n {
-                    eprintln!("[client {}] Processed {} messages, input submission likely complete",
-                             client_id_for_task, messages_processed);
+                if shares_per_node.len() >= n {
+                    eprintln!("[client {}] Received shares from {} parties, input submission likely complete",
+                             client_id_for_task, shares_per_node.len());
                     // Give some time for any final messages
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     break;
                 }
             }
-            eprintln!("[client {}] Message processing complete ({} messages)",
-                     client_id_for_task, messages_processed);
-        });
+            eprintln!("[client {}] Reception complete ({} parties)",
+                     client_id_for_task, shares_per_node.len());
+        }});
 
         // Wait for input protocol to complete with timeout
         let timeout_duration = Duration::from_secs(120);
@@ -382,6 +1006,68 @@ async fn main() {
                 exit(23);
             }
         }
+
+        eprintln!("[client {}] Waiting for start of MPC phase...", cid);
+        wait_for_mpc(coord.clone().unwrap(), contract_block).await;
+        eprintln!("[client {}] MPC phase started.", cid);
+
+        eprintln!("[client {}] Waiting for start of output phase...", cid);
+        wait_for_outputs(coord.clone().unwrap(), contract_block).await;
+        eprintln!("[client {}] Output phase started, receiving output shares...", cid);
+
+        // receive output shares
+        let client_id_for_task = cid;
+        let mut shares_per_node: Vec<Vec<RobustShare<Fr>>> = Vec::new();
+
+        let outputs = {
+            let mut outputs: Vec<Fr> = Vec::new();
+            while let Some(data) = msg_rx.lock().await.recv().await {
+                // TODO: this is not safe against duplicate messages, need sender ID for that
+                let shares: Vec<RobustShare<Fr>> =
+                    ark_serialize::CanonicalDeserialize::deserialize_compressed(data.as_slice()).expect("deserializing mask shares failed");
+
+                let no_outputs = 1;
+                if shares.len() != no_outputs {
+                    eprintln!("[client {}] Received invalid number of output shares: {}, expected {}",
+                             client_id_for_task, shares.len(), no_outputs);
+                    continue;
+                }
+
+                shares_per_node.push(shares);
+
+                if shares_per_node.len() >= 2 * t + 1 {
+                    let mut shares_per_mask: Vec<Vec<RobustShare<Fr>>> = vec![Vec::new(); no_outputs];
+                    for shares in shares_per_node.iter() {
+                        for i in 0..no_outputs {
+                            shares_per_mask[i].push(shares[i].clone());
+                        }
+                    }
+
+                    let mut recon_success = true;
+                    outputs = Vec::new();
+                    for shares in shares_per_mask {
+                        match RobustShare::recover_secret(&shares, n) {
+                            Ok(secret) => {
+                                outputs.push(secret.1);
+                            }
+                            Err(_) => {
+                                eprintln!("[client {}] Failed to recover output from shares", client_id_for_task);
+                                recon_success = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if recon_success {
+                        eprintln!("[client {}] Recovered all outputs...", client_id_for_task);
+                        break;
+                    }
+                }
+            }
+            outputs
+        };
+
+        eprintln!("[client {}] Outputs reconstructed: {:?}", cid, outputs);
 
         return;
     }
@@ -858,6 +1544,28 @@ async fn main() {
         let engine =
             HoneyBadgerMpcEngine::from_existing_node(instance_id, my_id, n, t, net.clone(), mpc_node.clone());
 
+        if as_leader {
+            if let (Some(n_parties), Some(coord)) = (n_parties, coord.clone()) {
+                eprintln!("[party {}] Granting roles on-chain...", my_id);
+                grant_roles(n_parties, coord.clone()).await;
+
+                eprintln!("[party {}] About to trigger preprocessing on-chain...", my_id);
+                tokio::time::sleep(Duration::from_millis(5000)).await;
+                trigger_pp(coord).await;
+                eprintln!("[party {}] Triggered preprocessing on-chain", my_id);
+            } else {
+                panic!();
+            }
+        } else {
+            if let (Some(eth), Some(addr)) = (eth.clone(), contract_addr) {
+                eprintln!("[party {}] Waiting for preprocessing to be triggered on-chain...", my_id);
+                wait_for_pp(coord.clone().unwrap(), contract_block).await;
+                eprintln!("[party {}] Preprocessing triggered on-chain", my_id);
+            } else {
+                panic!();
+            }
+        } 
+
         // Run preprocessing
         eprintln!("[party {}] Starting MPC preprocessing...", my_id);
         if let Err(e) = engine.preprocess().await {
@@ -868,6 +1576,23 @@ async fn main() {
 
         // If we have expected clients, start client accept loop and wait for connections
         if !input_ids.is_empty() {
+            // currently fixed no. of inputs to 2
+            let n_input_masks = 2;
+
+            // obtain the input mask shares
+            let input_mask_shares = match mpc_node
+                .preprocessing_material
+                .lock()
+                .await
+                .take_random_shares(n_input_masks)
+            {
+                Ok(shares) => shares,
+                Err(e) => {
+                    eprintln!("[party {}] Not enough random shares: {:?}", my_id, e);
+                    exit(15);
+                }
+            };
+
             eprintln!("[party {}] Waiting for {} clients to connect...", my_id, input_ids.len());
 
             // Spawn client accept loop - this will accept incoming client connections
@@ -876,38 +1601,17 @@ async fn main() {
             let mut accept_net = (*net).clone();
             let expected_client_ids = input_ids.clone();
             let accept_party_id = my_id;
-            let accept_mpc_node = mpc_node.clone();
-            let net_for_processing = net.clone();
 
             tokio::spawn(async move {
                 eprintln!("[party {}] Client accept loop started", accept_party_id);
                 loop {
                     // Accept incoming connection (this blocks until a connection arrives)
                     match accept_net.accept().await {
-                        Ok(connection) => {
+                        Ok(_) => {
                             // Connection is automatically registered by stoffelnet
                             // based on the ROLE:CLIENT:{id} handshake
                             eprintln!("[party {}] Accepted a client connection", accept_party_id);
 
-                            // Spawn a handler for this client's messages
-                            let client_mpc_node = accept_mpc_node.clone();
-                            let client_net = net_for_processing.clone();
-                            tokio::spawn(async move {
-                                loop {
-                                    match connection.receive().await {
-                                        Ok(data) => {
-                                            // Process the message through the MPC node
-                                            if let Err(e) = client_mpc_node.clone().process(data, client_net.clone()).await {
-                                                eprintln!("[party] Failed to process client message: {:?}", e);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[party] Client connection closed: {}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
                         }
                         Err(e) => {
                             eprintln!("[party {}] Accept error: {}", accept_party_id, e);
@@ -946,50 +1650,195 @@ async fn main() {
                 tokio::time::sleep(check_interval).await;
             }
 
-            eprintln!("[party {}] Initializing InputServer for {} clients...", my_id, input_ids.len());
+            let client_to_addr_and_i: Arc<DashMap<ClientId, (Address, U256)>> = Arc::new(DashMap::new());
+            let sig_counter = Arc::new(Semaphore::new(0));
 
-            // Initialize input server for each expected client
-            // Each client needs random shares for their inputs (assume 1 input per client for now)
-            for &cid in &input_ids {
-                // Take random shares from preprocessing material
-                let local_shares = match mpc_node
-                    .preprocessing_material
-                    .lock()
-                    .await
-                    .take_random_shares(1) // 1 input per client
-                {
-                    Ok(shares) => shares,
-                    Err(e) => {
-                        eprintln!("[party {}] Not enough random shares for client {}: {:?}", my_id, cid, e);
-                        exit(15);
+            eprintln!("[party {}] Spawning client message handlers...", my_id);
+
+            for (cid, connection) in net.get_all_client_connections().await {
+                // Spawn a handler for this client's messages
+                let client_mpc_node = mpc_node.clone();
+                let client_net = net.clone();
+                let coord = coord.clone().unwrap();
+                let client_to_addr_and_i = client_to_addr_and_i.clone();
+                let sig_counter = sig_counter.clone();
+
+                tokio::spawn(async move {
+                    loop {
+                        match connection.receive().await {
+                            Ok(data) => {
+                                // first message has to be the signed mask index reserved
+                                // on-chain
+                                if !client_to_addr_and_i.contains_key(&cid) {
+                                    eprintln!("[party {}] Received signature of client {}...", my_id, cid);
+                                    let sig = {
+                                        match bincode::deserialize::<ClientSig>(&data) {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                eprintln!("[party {}] Failed to deserialize client signature: {:?}", my_id, e);
+                                                continue;
+                                            }
+                                        }
+                                    };
+
+                                    if let Some(addr) = verify_client_sig(sig.clone(), coord.clone()).await {
+                                        client_to_addr_and_i.insert(sig.client_id, (addr, sig.i.to()));
+                                        eprintln!("[party {}] Signature of client {} is correct...", my_id, cid);
+                                        sig_counter.add_permits(1);
+                                    } else {
+                                        panic!();
+                                    }
+                                } else {
+                                    // Process the message through the MPC node
+                                    if let Err(e) = client_mpc_node.clone().process(data, client_net.clone()).await {
+                                        eprintln!("[party] Failed to process client message: {:?}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[party] Client connection closed: {}", e);
+                                break;
+                            }
+                        }
                     }
-                };
-
-                if let Err(e) = mpc_node
-                    .preprocess
-                    .input
-                    .init(cid, local_shares, 1, net.clone())
-                    .await
-                {
-                    eprintln!("[party {}] Failed to init InputServer for client {}: {:?}", my_id, cid, e);
-                    exit(15);
-                }
-                eprintln!("[party {}] InputServer initialized for client {}", my_id, cid);
+                });
             }
 
-            // Wait for all client inputs with timeout
-            eprintln!("[party {}] Waiting for client inputs (timeout: 60s)...", my_id);
-            let client_inputs = match mpc_node
-                .preprocess
-                .input
-                .wait_for_all_inputs(Duration::from_secs(60))
-                .await
-            {
-                Ok(inputs) => inputs,
-                Err(e) => {
-                    eprintln!("[party {}] Failed to receive client inputs: {:?}", my_id, e);
-                    exit(16);
+            let addr_to_i: Arc<DashMap<Address, U256>> = Arc::new(DashMap::new());
+
+            // spawn thread to receive all ReservedInputEvents
+            let reserve_inputs_handle = tokio::spawn({
+                let contract_addr = contract_addr.unwrap();
+                let eth = eth.clone().unwrap();
+                let addr_to_i = addr_to_i.clone();
+                let input_ids = input_ids.clone();
+                async move {
+                    let filter = Filter::new()
+                        .address(contract_addr)
+                        .event(ReservedInputEvent::SIGNATURE)
+                        .from_block(contract_block);
+            
+                    let sub = eth.subscribe_logs(&filter).await.expect("could not subscribe to logs");
+                    let mut stream = sub.into_stream();
+            
+                    while let Some(log) = stream.next().await {
+                        match log.topic0() {
+                            Some(&ReservedInputEvent::SIGNATURE_HASH) => {
+                                let log = match log.log_decode() {
+                                    Ok(l) => l,
+                                    Err(e) => {
+                                        eprintln!("Error decoding ClientInputMaskReservationEvent log: {}", e);
+                                        continue;
+                                    }
+                                };
+                                let ReservedInputEvent { client, reservedIndex } = log.inner.data;
+                                addr_to_i.insert(client, reservedIndex);
+                                eprintln!("[party {}] Recorded reserved mask index {} for client address {:?}",
+                                         my_id, reservedIndex, client);
+                            }
+                            _ => { }
+                        }
+
+                        if addr_to_i.len() == input_ids.len() {
+                            break;
+                        }
+                    }
                 }
+            });
+
+            // tell contract about the number of input masks
+            if as_leader {
+                init_input_masks(n_input_masks, coord.clone().unwrap()).await;
+                eprintln!("[party {}] Input masks initialized on-chain", my_id);
+                trigger_input(coord.clone().unwrap()).await;
+                eprintln!("[party {}] Input mask initialization triggered on-chain", my_id);
+            } else {
+                eprintln!("[party {}] Waiting for start of input phase...", my_id);
+                wait_for_input(coord.clone().unwrap(), contract_block).await;
+            }
+
+            // wait for all clients to reserve their mask index and send a signature of the mask
+            // index
+            let _ = sig_counter.acquire_many(input_ids.len() as u32).await;
+            eprintln!("[party {}] All clients have sent their signatures of reserved mask indices", my_id);
+
+            let _ = reserve_inputs_handle.await;
+            eprintln!("[party {}] All clients have reserved mask indices on-chain", my_id);
+
+            // contract should make sure that only authenticated clients can reserve indices
+            if client_to_addr_and_i.len() != addr_to_i.len() {
+                panic!();
+            }
+
+            let mut client_to_index: HashMap<ClientId, usize> = HashMap::new();
+            let mut addr_to_index: HashMap<Address, usize> = HashMap::new();
+            let mut addr_to_client: HashMap<Address, ClientId> = HashMap::new();
+
+            for e in client_to_addr_and_i.iter() {
+                let (client, (addr, signed_i)) = e.pair();
+                let reserved_i = {
+                    let reserved_i = addr_to_i.get(addr);
+                    // all addresses used for signatures should be used to request indices
+                    if reserved_i.is_none() {
+                        panic!();
+                    }
+                    *reserved_i.unwrap()
+                };
+
+                if reserved_i != *signed_i {
+                    eprintln!("[party {}] Client {} signed index {} but reserved index {}",
+                             my_id, client, signed_i, reserved_i);
+                    panic!();
+                }
+
+                client_to_index.insert(*client, signed_i.to());
+                addr_to_index.insert(*addr, signed_i.to());
+                addr_to_client.insert(*addr, *client);
+            }
+
+            eprintln!("[party {}] Initializing InputServer for {} clients...", my_id, input_ids.len());
+            // Initialize input server for each expected client
+            // Each client needs random shares for their inputs (assume 1 input per client for now)
+            for (cid, _) in net.get_all_client_connections().await {
+                let mask_shares = vec![input_mask_shares[*client_to_index.get(&cid).unwrap()].clone()];
+                let mut mask_shares_bytes = Vec::new();
+
+                if mask_shares.serialize_compressed(&mut mask_shares_bytes).is_err() {
+                    panic!();
+                }
+                eprintln!("[party {}] Sending {} mask shares to client {}...", my_id, mask_shares.len(), cid);
+                match net.send_to_client(cid, &mask_shares_bytes).await {
+                    Ok(_) => { }
+                    Err(e) => {
+                        eprintln!("[party {}] Failed to init InputServer for client {}: {:?}", my_id, cid, e);
+                        exit(15);
+                    }
+                }
+                eprintln!("[party {}] Sending done, InputServer initialized for client {}", my_id, cid);
+            }
+
+            eprintln!("[party {}] Waiting for client inputs...", my_id);
+
+            //  wait for all masked client inputs on-chain
+            let masked_inputs = wait_for_masked_inputs(coord.clone().unwrap(), contract_block, input_ids.len()).await;
+
+            let client_inputs: HashMap<ClientId, Vec<RobustShare<Fr>>> = {
+                let mut client_inputs: HashMap<ClientId, Vec<RobustShare<Fr>>> = HashMap::new();
+
+                for (addr, masked_inputs_per_client) in masked_inputs {
+                    let random_share = &input_mask_shares[*addr_to_index.get(&addr).unwrap()];
+                    let cid = *addr_to_client.get(&addr).unwrap();
+
+                    // calculate the masked input shares from the masked inputs
+                    client_inputs.insert(cid, masked_inputs_per_client.iter().map(|masked_input| {
+                        RobustShare::new(
+                            *masked_input - random_share.share[0],
+                            random_share.id,
+                            random_share.degree
+                        )
+                    }).collect());
+                }
+                client_inputs
             };
 
             eprintln!(
@@ -1007,18 +1856,74 @@ async fn main() {
 
         vm.state.set_mpc_engine(engine);
         eprintln!("[party {}] MPC engine set, starting VM execution...", my_id);
-    }
 
+        if as_leader {
+            trigger_mpc(coord.clone().unwrap()).await;
+            eprintln!("[party {}] MPC execution triggered", my_id);
+        } else {
+            eprintln!("[party {}] Waiting for start of MPC phase...", my_id);
+            wait_for_mpc(coord.clone().unwrap(), contract_block).await;
+        }
+    }
+    
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
 
-    // Execute entry function
-    match vm.execute(&agreed_entry) {
-        Ok(result) => {
-            println!("Program returned: {:?}", result);
+    let result = {
+        // Execute entry function
+        match vm.execute(&agreed_entry) {
+            Ok(result) => {
+                println!("Program returned: {:?}", result);
+                result
+            }
+            Err(err) => {
+                eprintln!("Execution error in '{}': {}", agreed_entry, err);
+                exit(4);
+            }
         }
-        Err(err) => {
-            eprintln!("Execution error in '{}': {}", agreed_entry, err);
-            exit(4);
+    };
+
+    // send outputs to clients
+    if let Some(net) = net_opt.clone() {
+        let my_id = party_id.unwrap_or(0usize);
+        let output_share = match result {
+            Value::Share(ty, share_bytes) => {
+                assert!(matches!(ty, ShareType::SecretInt { .. }));
+                let secret = {
+                    match VMState::secret_int_from_bytes(ty, &share_bytes) {
+                        Ok(secret) => { secret }
+                        Err(_) => { panic!(); }
+                    }
+                };
+                secret.share().clone()
+            }
+            _ => { panic!(); }
+        };
+
+        if as_leader {
+            trigger_outputs(coord.clone().unwrap()).await;
+            eprintln!("[party {}] MPC execution triggered", my_id);
+        } else {
+            eprintln!("[party {}] Waiting for start of MPC phase...", my_id);
+            wait_for_outputs(coord.clone().unwrap(), contract_block).await;
+            eprintln!("[party {}] Output phase started", my_id);
+        }
+
+        for (cid, _) in net.get_all_client_connections().await {
+            let output_shares = vec![output_share.clone()];
+            let mut output_share_bytes = Vec::new();
+
+            if output_shares.serialize_compressed(&mut output_share_bytes).is_err() {
+                panic!();
+            }
+            eprintln!("[party {}] Sending {} output shares to client {}...", my_id, output_shares.len(), cid);
+            match net.send_to_client(cid, &output_share_bytes).await {
+                Ok(_) => { }
+                Err(e) => {
+                    eprintln!("[party {}] Failed to send output shares to client {}: {:?}", my_id, cid, e);
+                    exit(16);
+                }
+            }
+            eprintln!("[party {}] Sending done, output shares sent to client {}", my_id, cid);
         }
     }
 }

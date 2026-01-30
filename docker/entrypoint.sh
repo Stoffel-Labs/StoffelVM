@@ -24,6 +24,9 @@ echo "Program: ${STOFFEL_PROGRAM}"
 echo "Entry: ${STOFFEL_ENTRY}"
 echo "NAT Enabled: ${STOFFEL_ENABLE_NAT:-false}"
 echo "STUN Servers: ${STOFFEL_STUN_SERVERS:-N/A}"
+echo "Ethereum node address: ${STOFFEL_ETH_NODE_ADDR:-N/A}"
+echo "Coordinator smart contract address: ${STOFFEL_COORD_ADDR:-N/A}"
+echo "Wallet secret key: ${STOFFEL_WALLET_SK:-N/A}"
 echo "=========================================="
 
 # Wait for a host:port to be available (UDP check for QUIC)
@@ -73,6 +76,9 @@ build_command() {
         cmd="${cmd} --servers ${STOFFEL_SERVERS}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD:-1}"
+	cmd="${cmd} --eth-node ${STOFFEL_ETH_NODE_ADDR}"
+	cmd="${cmd} --coordinator ${STOFFEL_COORD_ADDR}"
+	cmd="${cmd} --wallet-sk ${STOFFEL_WALLET_SK}"
         echo "$cmd"
         return
     fi
@@ -86,11 +92,17 @@ build_command() {
         cmd="${cmd} --bind ${STOFFEL_BIND_ADDR}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD}"
+	cmd="${cmd} --eth-node ${STOFFEL_ETH_NODE_ADDR}"
+	cmd="${cmd} --coordinator ${STOFFEL_COORD_ADDR}"
+	cmd="${cmd} --wallet-sk ${STOFFEL_WALLET_SK}"
     elif [ "${STOFFEL_ROLE}" = "bootnode" ]; then
         # Bootnode-only mode (no program execution)
         cmd="/app/stoffel-run --bootnode"
         cmd="${cmd} --bind ${STOFFEL_BIND_ADDR}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
+	cmd="${cmd} --eth-node ${STOFFEL_ETH_NODE_ADDR}"
+	cmd="${cmd} --coordinator ${STOFFEL_COORD_ADDR}"
+	cmd="${cmd} --wallet-sk ${STOFFEL_WALLET_SK}"
     else
         # Regular party mode
         cmd="${cmd} --party-id ${STOFFEL_PARTY_ID}"
@@ -98,6 +110,9 @@ build_command() {
         cmd="${cmd} --bind ${STOFFEL_BIND_ADDR}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD}"
+	cmd="${cmd} --eth-node ${STOFFEL_ETH_NODE_ADDR}"
+	cmd="${cmd} --coordinator ${STOFFEL_COORD_ADDR}"
+	cmd="${cmd} --wallet-sk ${STOFFEL_WALLET_SK}"
     fi
 
     # Add expected clients if specified (for leader and party modes)

@@ -10,10 +10,10 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 libc = "0.2"
-stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "main" }
-stoffelnet =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
+stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "with-sender-id-improvements" }
+stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git", branch = "add-all-client-conns" }
 stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
-
+stoffel-solidity-bindings = { version = "0.1.0", git = "ssh://git@github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "test-coord" }
 async-trait = "0.1"
 redb = "2.1.0"
 tokio = { version = "1.47.1", features = ["full"] }
@@ -42,6 +42,9 @@ blake3 = "1.5.4"
 hex = "0.4"
 dirs = "5"
 dashmap = "5"
+alloy = { version = "1.4.3", features = ["node-bindings", "full"] }
+alloy-primitives = "1.5.2"
+futures-util = "0.3.31"
 
 [features]
 hb_itest = []

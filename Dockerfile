@@ -30,6 +30,8 @@ COPY . .
 # Configure git for private repos if using SSH
 # For private GitHub repos, mount SSH keys during build:
 #   docker build --ssh default .
+# Under Mac OS, run this before on the host:
+#   ssh-add --apple-use-keychain
 RUN mkdir -p ~/.ssh && \
     ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null || true
 
@@ -84,6 +86,9 @@ ENV STOFFEL_BOOTSTRAP_ADDR=""
 # NAT traversal settings (only effective if built with --features nat)
 ENV STOFFEL_ENABLE_NAT="false"
 ENV STOFFEL_STUN_SERVERS=""
+ENV STOFFEL_ETH_NODE_ADDR="ws://host.docker.internal:8545"
+ENV STOFFEL_COORD_ADDR=""
+ENV STOFFEL_WALLET_SK=""
 
 # Expose ports for bootnode and party communication
 # Port 9000: bootnode coordination

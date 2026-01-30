@@ -9,6 +9,19 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use stoffelnet::network_utils::{Network, PartyId};
 use stoffelnet::transports::quic::{NetworkManager, PeerConnection, QuicNetworkManager};
+use alloy_primitives::Address;
+use alloy::{
+    sol_types::SolEvent,
+    providers::{Provider, ProviderBuilder, WsConnect},
+    rpc::types::{BlockNumberOrTag, Filter},
+};
+use stoffel_solidity_bindings::{
+    stoffel_access_control::StoffelAccessControl,
+    stoffel_access_control::StoffelAccessControl::InitializeStoffelAccessControl,
+    stoffel_coordinator::StoffelCoordinator::{CoordinatorInitialized, PreprocessingRoundExecuted, ClientInputMaskReservationEvent, MPCTaskExecuted, RoleAdminChanged, RoleGranted, RoleRevoked, OwnershipTransferred},
+    stoffel_input_manager::StoffelInputManager::{IndexBufferEvent, MaskedInputEvent, ReservedInputEvent}
+};
+use futures_util::stream::StreamExt;
 
 // NAT traversal types - use real types when feature is enabled, stubs otherwise
 #[cfg(feature = "nat")]
@@ -135,7 +148,7 @@ pub async fn run_bootnode(bind: SocketAddr) -> Result<(), String> {
 /// announcing the session. If None, uses the n_parties from first RegisterWithSession.
 pub async fn run_bootnode_with_config(
     bind: SocketAddr,
-    expected_parties: Option<usize>,
+    expected_parties: Option<usize>
 ) -> Result<(), String> {
     let mut net = QuicNetworkManager::new();
     net.listen(bind).await?;
@@ -156,6 +169,165 @@ pub async fn run_bootnode_with_config(
 
     eprintln!("[bootnode] Listening on {}", bind);
 
+    //let eth = match eth {
+    //    Some(provider) => provider,
+    //    None => {
+    //        return Err("Ethereum provider must be present".to_string());
+    //    }
+    //};
+    //let contract_addr = match contract_addr {
+    //    Some(addr) => addr,
+    //    None => {
+    //        return Err("Contract address must be provided".to_string());
+    //    }
+    //};
+
+    //// Listen for coordination contract events
+    //tokio::spawn({
+    //    let filter = Filter::new()
+    //        .address(contract_addr)
+    //        .event(ClientInputMaskReversationEvent::SIGNATURE)
+    //        .event(CoordinatorInitialized::SIGNATURE)
+    //        .event(IndexBufferEvent::SIGNATURE)
+    //        .event(InitializeStoffelAccessControl::SIGNATURE)
+    //        .event(MPCTaskExecuted::SIGNATURE)
+    //        .event(MaskedInputEvent::SIGNATURE)
+    //        .event(OwnershipTransferred::SIGNATURE)
+    //        .event(PreprocessingRoundExecuted::SIGNATURE)
+    //        .event(ReservedInputEvent::SIGNATURE)
+    //        .event(RoleAdminChanged::SIGNATURE)
+    //        .event(RoleGranted::SIGNATURE)
+    //        .event(RoleRevoked::SIGNATURE)
+    //        .from_block(BlockNumberOrTag::Latest);
+
+    //    let provider = eth.clone();
+    //    async move {
+    //        let sub = provider.subscribe_logs(&filter).await.expect("could not subscribe to logs");
+    //        let mut stream = sub.into_stream();
+
+    //        while let Some(log) = stream.next().await {
+    //            match log.topic0() {
+    //                Some(&ClientInputMaskReversationEvent::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding IndexBufferEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let ClientInputMaskReversationEvent { executor, timeOfExecution } = log.inner.data;
+    //                }
+    //                Some(&CoordinatorInitialized::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding IndexBufferEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let CoordinatorInitialized { coordinator, timeofInitialization, designatedParty } = log.inner.data;
+    //                    eprintln!("New coordinator contract initialized. This should usually not happen.");
+
+    //                }
+    //                Some(&InitializeStoffelAccessControl::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding IndexBufferEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let InitializeStoffelAccessControl { n, t, initializer } = log.inner.data;
+    //                    eprintln!("New access control initialized. This should usually not happen.");
+    //                }
+    //                Some(&MPCTaskExecuted::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding IndexBufferEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let MPCTaskExecuted { stoffelProgramHash, executor, timeOfExecution } = log.inner.data;
+    //                }
+    //                Some(&IndexBufferEvent::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding IndexBufferEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let IndexBufferEvent { totalIndices, designatedParty } = log.inner.data;
+    //                }
+    //                Some(&ReservedInputEvent::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding ReservedInputEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let ReservedInputEvent { client, reservedIndex } = log.inner.data;
+    //                }
+    //                Some(&MaskedInputEvent::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding MaskedInputEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let MaskedInputEvent { client, maskedInput, reservedIndex } = log.inner.data;
+    //                }
+    //                Some(&OwnershipTransferred::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding MaskedInputEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let OwnershipTransferred { previousOwner, newOwner } = log.inner.data;
+    //                }
+    //                Some(&RoleAdminChanged::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding MaskedInputEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let RoleAdminChanged { role, previousAdminRole, newAdminRole } = log.inner.data;
+    //                }
+    //                Some(&RoleGranted::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding MaskedInputEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let RoleGranted { role, account, sender } = log.inner.data;
+    //                }
+    //                Some(&RoleRevoked::SIGNATURE_HASH) => {
+    //                    let log = match log.log_decode() {
+    //                        Ok(l) => l,
+    //                        Err(e) => {
+    //                            eprintln!("Error decoding MaskedInputEvent log: {}", e);
+    //                            continue;
+    //                        }
+    //                    };
+    //                    let RoleRevoked { role, account, sender } = log.inner.data;
+    //                }
+    //                _ => {
+    //                    eprintln!("Unknown event topic: {:?}", log.topic0());
+    //                }
+    //            }
+    //        }
+    //    }
+    //});
+
     loop {
         let mut conn = net.accept().await?;
         let state = state.clone();
@@ -167,6 +339,8 @@ pub async fn run_bootnode_with_config(
         let mut session_rx = session_tx.subscribe();
         let ice_tx = ice_tx.clone();
         let mut ice_rx = ice_tx.subscribe();
+
+        // Listen for events from smart contract
 
         tokio::spawn(async move {
             // Track if this connection registered for a session
