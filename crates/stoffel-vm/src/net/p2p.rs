@@ -26,7 +26,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use stoffelnet::network_utils::{ClientId, Message, Network, NetworkError, Node, PartyId};
+use stoffelnet::network_utils::{ClientId, ClientType, Message, Network, NetworkError, Node, PartyId, SenderId};
 use tokio::sync::Mutex;
 use tracing::debug;
 use uuid::Uuid;
@@ -110,6 +110,18 @@ pub trait PeerConnection: Send + Sync {
     /// * `Ok(())` - If the connection was closed successfully
     /// * `Err(String)` - If there was an error closing the connection
     fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// Returns the connection role (Server or Client) of the remote peer
+    fn get_connection_role(&self) -> ClientType;
+
+    /// Returns the sender ID of the remote peer, if set.
+    /// The sender ID is assigned after all connections are established
+    /// by calling assign_sender_ids() on the network manager.
+    fn sender_id(&self) -> Option<SenderId>;
+
+    /// Sets the sender ID for this connection.
+    /// Called by the network manager once all peers are connected.
+    fn set_sender_id(&self, sender_id: SenderId);
 }
 
 /// Manages network connections for the VM
@@ -184,6 +196,10 @@ pub struct QuicPeerConnection {
     streams: Arc<Mutex<HashMap<u64, (quinn::SendStream, quinn::RecvStream)>>>,
     /// Whether this connection is on the server side
     is_server: bool,
+    /// The connection role (Server or Client)
+    connection_role: ClientType,
+    /// Computed sender ID based on public key ordering (set by network manager)
+    computed_sender_id: Arc<std::sync::Mutex<Option<SenderId>>>,
 }
 
 impl QuicPeerConnection {
@@ -203,6 +219,8 @@ impl QuicPeerConnection {
             remote_addr,
             streams: Arc::new(Mutex::new(HashMap::new())),
             is_server,
+            connection_role: if is_server { ClientType::Server } else { ClientType::Client },
+            computed_sender_id: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -320,6 +338,20 @@ impl PeerConnection for QuicPeerConnection {
             Ok(())
         })
     }
+
+    fn get_connection_role(&self) -> ClientType {
+        self.connection_role
+    }
+
+    fn sender_id(&self) -> Option<SenderId> {
+        self.computed_sender_id.lock().ok().and_then(|id| *id)
+    }
+
+    fn set_sender_id(&self, sender_id: SenderId) {
+        if let Ok(mut id) = self.computed_sender_id.lock() {
+            *id = Some(sender_id);
+        }
+    }
 }
 
 /// A node in the QUIC network
@@ -361,8 +393,8 @@ impl QuicNode {
     /// * `id` - The ID of the node (will be converted to UUID)
     /// * `address` - The network address of the node
     pub fn from_party_id(id: PartyId, address: SocketAddr) -> Self {
-        // Convert PartyId to u128 and then to UUID
-        let uuid = Uuid::from_u128(id as u128);
+        // Convert PartyId (SenderId) to u128 and then to UUID
+        let uuid = Uuid::from_u128(id.raw() as u128);
         Self { uuid, address }
     }
 
@@ -736,11 +768,8 @@ impl NetworkManager for QuicNetworkManager {
 
             eprintln!("[quic] Connection established to {}", address);
 
-            // Send identification handshake as SERVER with our node_id for stoffelnet compatibility
-            if let Ok((mut send, _recv)) = connection.open_bi().await {
-                let handshake = format!("ROLE:SERVER:{}\n", self.node_id);
-                let _ = send.write_all(handshake.as_bytes()).await;
-            }
+            // NOTE: Handshake is now handled by stoffelnet via ALPN protocol.
+            // The identity exchange happens automatically during connection establishment.
 
             // Find the node ID for this address or generate a new one
             let node_id = self
@@ -789,29 +818,20 @@ impl NetworkManager for QuicNetworkManager {
             // Get the remote address of the connection
             let remote_addr = connection.remote_address();
 
-            // Try to read a role identification handshake
-            let mut parsed_id: Option<PartyId> = None;
-            if let Ok((mut _send, mut recv)) = connection.accept_bi().await {
-                let mut buf = vec![0u8; 256];
-                if let Ok(Some(n)) = recv.read(&mut buf).await {
-                    let line = String::from_utf8_lossy(&buf[..n])
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(rest) = line.strip_prefix("ROLE:SERVER:") {
-                        if let Ok(id) = rest.trim().parse::<usize>() {
-                            parsed_id = Some(id);
-                        }
-                    }
-                }
-            }
-            let node_id = parsed_id.unwrap_or_else(|| {
-                let node = QuicNode::new_with_random_id(remote_addr);
-                let id = node.id();
-                self.nodes.push(node);
-                id
-            });
+            // NOTE: Handshake is now handled by stoffelnet via ALPN protocol.
+            // The identity exchange happens automatically during connection establishment.
+            // For now, use address-based node lookup or create a new node.
+            let node_id = self
+                .nodes
+                .iter()
+                .find(|node| node.address() == remote_addr)
+                .map(|node| node.id())
+                .unwrap_or_else(|| {
+                    let node = QuicNode::new_with_random_id(remote_addr);
+                    let id = node.id();
+                    self.nodes.push(node);
+                    id
+                });
             let mut connections = self.connections.lock().await;
             connections.insert(
                 node_id,

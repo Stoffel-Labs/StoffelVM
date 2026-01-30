@@ -288,7 +288,10 @@ async fn main() {
 
                 let connection_result = {
                     let mut net = network.lock().await;
-                    net.connect_as_client(addr, cid).await
+                    // Note: In new stoffelnet, client ID is derived from public key,
+                    // not passed as a parameter. Call assign_sender_ids() after all
+                    // connections are established.
+                    net.connect_as_client(addr).await
                 };
 
                 match connection_result {
@@ -782,7 +785,7 @@ async fn main() {
             .as_ref()
             .map(|s| {
                 s.split(',')
-                    .filter_map(|id| id.trim().parse::<ClientId>().ok())
+                    .filter_map(|id| id.trim().parse::<usize>().ok().map(ClientId::from))
                     .collect()
             })
             .unwrap_or_default();
@@ -804,6 +807,15 @@ async fn main() {
             my_id,
             conn_ids,
             connections.len()
+        );
+
+        // Assign sender IDs to all connections based on public key ordering.
+        // This must be called after all connections are established.
+        let assigned_count = net.assign_sender_ids();
+        eprintln!(
+            "[party {}] Assigned sender IDs to {} connections",
+            my_id,
+            assigned_count
         );
 
         // Create HoneyBadger MPC node options

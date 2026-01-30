@@ -248,7 +248,10 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
 
             let mut retry_count = 0;
             loop {
-                let connection_result = dialer.connect_as_server(peer_addr, self.node_id).await;
+                // Note: In new stoffelnet, server ID is derived from public key,
+                // not passed as a parameter. Call assign_sender_ids() after all
+                // connections are established.
+                let connection_result = dialer.connect_as_server(peer_addr).await;
 
                 match connection_result {
                     Ok(connection) => {
@@ -299,6 +302,14 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                 }
             }
         }
+
+        // After all connections are established, assign sender IDs based on public key ordering.
+        // This ensures all parties have consistent sender IDs for the MPC protocol.
+        let assigned_count = dialer.assign_sender_ids();
+        info!(
+            "[HB-QUIC] Node {} assigned sender IDs to {} connections",
+            self.node_id, assigned_count
+        );
 
         Ok(())
     }

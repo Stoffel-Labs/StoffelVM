@@ -398,7 +398,7 @@ impl HoneyBadgerMpcEngine {
         // Use the OutputServer from the node to send shares to the client
         let node = self.node.lock().await;
         node.output
-            .init(client_id as usize, shares, input_len, self.net.clone())
+            .init(client_id.into(), shares, input_len, self.net.clone())
             .await
             .map_err(|e| format!("OutputServer.init failed: {:?}", e))
     }
