@@ -178,12 +178,11 @@ async fn test_vm_mpc_multiplication_integration() {
     let shares_b = RobustShare::compute_shares(input_b, n_parties, threshold, None, &mut rng)
         .expect("Failed to generate shares for input B");
 
-    // Store shares directly in each server's input storage
-    for (i, server) in servers.iter().enumerate() {
-        let mut input_store = server.node.preprocess.input.input_shares.lock().await;
-        input_store.insert(client_id, vec![shares_a[i].clone(), shares_b[i].clone()]);
-        info!("✓ Server {} stored input shares", i);
-    }
+    // Store shares for each party to use in multiplication
+    // Each party's shares are cloned for use in the multiplication handles
+    let party_shares: Vec<(RobustShare<Fr>, RobustShare<Fr>)> = (0..n_parties)
+        .map(|i| (shares_a[i].clone(), shares_b[i].clone()))
+        .collect();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -191,19 +190,17 @@ async fn test_vm_mpc_multiplication_integration() {
     // (The VM will use shares from this multiplication)
     info!("Step 6: Performing MPC multiplication on servers...");
 
-    // Get the shares from each server's input storage
+    // Perform multiplication on each party using the pre-computed shares
     let mut multiplication_handles = Vec::new();
     for (pid, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
         let net = server.network.clone().expect("network should be set");
+        let (share_a, share_b) = party_shares[pid].clone();
 
         let handle = tokio::spawn(async move {
-            // Get input shares for this party
-            let (x_shares, y_shares) = {
-                let input_store = node.preprocess.input.input_shares.lock().await;
-                let inputs = input_store.get(&client_id).unwrap();
-                (vec![inputs[0].clone()], vec![inputs[1].clone()])
-            };
+            // Use the pre-computed shares for this party
+            let x_shares = vec![share_a];
+            let y_shares = vec![share_b];
 
             // Perform multiplication
             node.mul(x_shares, y_shares, net.clone())
@@ -227,7 +224,7 @@ async fn test_vm_mpc_multiplication_integration() {
     // Get the result share from party 0
     let party_id = 0;
     let session_id =
-        stoffelmpc_mpc::honeybadger::SessionId::new(ProtocolType::Mul, 0, 0, instance_id);
+        stoffelmpc_mpc::honeybadger::SessionId::new(ProtocolType::Mul, 0, 0, 0, instance_id as u32);
 
     let result_share = {
         let storage_map = servers[party_id]
@@ -239,7 +236,7 @@ async fn test_vm_mpc_multiplication_integration() {
             .await;
         let storage_mutex = storage_map.get(&session_id).unwrap();
         let storage = storage_mutex.lock().await;
-        storage.protocol_output[0].clone()
+        storage.share_mult_from_triple[0].clone()
     };
 
     let mut result_share_bytes = Vec::new();

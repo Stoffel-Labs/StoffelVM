@@ -256,9 +256,9 @@ async fn test_vm_mesh_full_integration() {
                 .node
                 .preprocess
                 .input
-                .input_shares
-                .lock()
-                .await;
+                .wait_for_all_inputs(Duration::from_secs(30))
+                .await
+                .unwrap();
             input_store
                 .iter()
                 .map(|(client, shares)| (*client, shares.clone()))
@@ -545,9 +545,9 @@ async fn test_vm_mesh_average_salary_integration() {
                 .node
                 .preprocess
                 .input
-                .input_shares
-                .lock()
-                .await;
+                .wait_for_all_inputs(Duration::from_secs(30))
+                .await
+                .unwrap();
             if let Some(shares) = input_store.get(&first_client) {
                 all_shares_for_client.push(shares[0].clone());
             }
@@ -564,9 +564,9 @@ async fn test_vm_mesh_average_salary_integration() {
                 .node
                 .preprocess
                 .input
-                .input_shares
-                .lock()
-                .await;
+                .wait_for_all_inputs(Duration::from_secs(30))
+                .await
+                .unwrap();
             input_store
                 .iter()
                 .map(|(client, shares)| (*client, shares.clone()))
@@ -1203,9 +1203,9 @@ async fn test_vm_mesh_output_client_integration() {
                 .node
                 .preprocess
                 .input
-                .input_shares
-                .lock()
-                .await;
+                .wait_for_all_inputs(Duration::from_secs(30))
+                .await
+                .unwrap();
             input_store
                 .iter()
                 .map(|(client, shares)| (*client, shares.clone()))
@@ -1312,10 +1312,12 @@ async fn test_vm_mesh_output_client_integration() {
     info!("Step 11: Verifying output client reconstruction...");
 
     let client = output_client.lock().await;
-    let reconstructed_value = client.output.clone();
+    let reconstructed_value = client.get_output();
 
     match reconstructed_value {
-        Some(secret) => {
+        Some(secrets) => {
+            // Get the first element from the output vector
+            let secret = secrets.first().expect("expected at least one output");
             // Convert Fr back to i64 for comparison
             let recovered_sum = {
                 let bigint = secret.into_bigint();
@@ -1608,9 +1610,9 @@ async fn test_vm_mesh_matrix_average_integration() {
                 .node
                 .preprocess
                 .input
-                .input_shares
-                .lock()
-                .await;
+                .wait_for_all_inputs(Duration::from_secs(30))
+                .await
+                .unwrap();
             input_store
                 .iter()
                 .map(|(client, shares)| (*client, shares.clone()))
@@ -2117,9 +2119,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                 .node
                 .preprocess
                 .input
-                .input_shares
-                .lock()
-                .await;
+                .wait_for_all_inputs(Duration::from_secs(30))
+                .await
+                .unwrap();
             input_store
                 .iter()
                 .map(|(client, shares)| (*client, shares.clone()))

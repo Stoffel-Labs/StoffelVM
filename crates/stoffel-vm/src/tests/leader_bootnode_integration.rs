@@ -462,9 +462,9 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                 .node
                 .preprocess
                 .input
-                .input_shares
-                .lock()
-                .await;
+                .wait_for_all_inputs(Duration::from_secs(30))
+                .await
+                .unwrap();
             input_store
                 .iter()
                 .map(|(client, shares)| (*client, shares.clone()))

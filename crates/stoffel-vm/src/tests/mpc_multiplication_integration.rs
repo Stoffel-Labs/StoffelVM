@@ -77,7 +77,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             F,
             RobustShare<F>,
             QuicNetworkManager,
-        >>::setup(node_id, mpc_opts)?;
+        >>::setup(node_id, mpc_opts, vec![])?;
         //let node = Arc::new(Mutex::new(mpc_node));
 
         // Create network manager
@@ -387,7 +387,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
             client_id,
             n_parties,
             threshold,
-            instance_id,
+            instance_id as u32,
             inputs,
             input_len,
         )?;
@@ -793,7 +793,7 @@ mod tests {
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
         let instance_id = 99999;
         let base_port = 9200;
-        let session_id = SessionId::new(ProtocolType::Mul, 0, 0, instance_id);
+        let session_id = SessionId::new(ProtocolType::Mul, 0, 0, 0, instance_id as u32);
         let clientid: Vec<ClientId> = vec![100, 200];
         let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
         let no_of_multiplications = input_values.len();
@@ -948,7 +948,7 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, instance_id);
+        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
@@ -1022,7 +1022,7 @@ mod tests {
             let net = servers[pid].network.clone().expect("network should be set");
 
             let (x_shares, y_shares) = {
-                let input_store = node.preprocess.input.input_shares.lock().await;
+                let input_store = node.preprocess.input.wait_for_all_inputs(Duration::from_secs(30)).await.unwrap();
                 let inputs = input_store.get(&clientid[0]).unwrap();
                 (
                     vec![inputs[0].clone(), inputs[1].clone()],
@@ -1054,10 +1054,10 @@ mod tests {
             if let Some(storage_mutex) = storage_map.get(&session_id) {
                 let storage = storage_mutex.lock().await;
 
-                if storage.protocol_output.is_empty() {
-                    panic!("protocol_output empty for node {}", i);
+                if storage.protocol_state != stoffelmpc_mpc::honeybadger::mul::MultProtocolState::Finished || storage.share_mult_from_triple.is_empty() {
+                    panic!("protocol not finished or no output for node {}", i);
                 }
-                let shares_mult_for_node: Vec<RobustShare<Fr>> = storage.protocol_output.clone();
+                let shares_mult_for_node: Vec<RobustShare<Fr>> = storage.share_mult_from_triple.clone();
                 assert_eq!(shares_mult_for_node.len(), no_of_multiplications);
                 match server
                     .node
@@ -1249,7 +1249,7 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, instance_id);
+        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
@@ -1423,7 +1423,7 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, instance_id);
+        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
