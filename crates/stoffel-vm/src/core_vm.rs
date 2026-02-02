@@ -289,6 +289,588 @@ impl VirtualMachine {
             ctx.vm_state.load_public_int(index)
         });
 
+        // =========================================================================
+        // Byte Manipulation Builtins (for cryptographic operations)
+        // =========================================================================
+
+        // Concatenate two byte arrays
+        // Usage: concat_bytes(a: bytes, b: bytes) -> bytes
+        self.register_foreign_function("concat_bytes", |ctx| {
+            if ctx.args.len() != 2 {
+                return Err("concat_bytes expects 2 arguments: a (bytes), b (bytes)".to_string());
+            }
+
+            let a = match &ctx.args[0] {
+                Value::Bytes(data) => data.clone(),
+                Value::String(s) => s.as_bytes().to_vec(),
+                _ => return Err("First argument must be bytes or string".to_string()),
+            };
+
+            let b = match &ctx.args[1] {
+                Value::Bytes(data) => data.clone(),
+                Value::String(s) => s.as_bytes().to_vec(),
+                _ => return Err("Second argument must be bytes or string".to_string()),
+            };
+
+            let mut result = Vec::with_capacity(a.len() + b.len());
+            result.extend_from_slice(&a);
+            result.extend_from_slice(&b);
+
+            Ok(Value::Bytes(result))
+        });
+
+        // Convert an integer to bytes (big-endian representation)
+        // Usage: int_to_bytes(n: i64) -> bytes
+        // Returns 8 bytes in big-endian format
+        self.register_foreign_function("int_to_bytes", |ctx| {
+            if ctx.args.len() != 1 {
+                return Err("int_to_bytes expects 1 argument: n (integer)".to_string());
+            }
+
+            let n: i64 = match &ctx.args[0] {
+                Value::I64(v) => *v,
+                Value::I32(v) => *v as i64,
+                Value::I16(v) => *v as i64,
+                Value::I8(v) => *v as i64,
+                Value::U64(v) => *v as i64,
+                Value::U32(v) => *v as i64,
+                Value::U16(v) => *v as i64,
+                Value::U8(v) => *v as i64,
+                _ => return Err("Argument must be an integer".to_string()),
+            };
+
+            Ok(Value::Bytes(n.to_be_bytes().to_vec()))
+        });
+
+        // Convert bytes to an integer (big-endian interpretation)
+        // Usage: bytes_to_int(data: bytes) -> i64
+        // Expects up to 8 bytes, returns i64
+        self.register_foreign_function("bytes_to_int", |ctx| {
+            if ctx.args.len() != 1 {
+                return Err("bytes_to_int expects 1 argument: data (bytes)".to_string());
+            }
+
+            let data = match &ctx.args[0] {
+                Value::Bytes(b) => b.clone(),
+                Value::String(s) => s.as_bytes().to_vec(),
+                _ => return Err("Argument must be bytes or string".to_string()),
+            };
+
+            if data.len() > 8 {
+                return Err("bytes_to_int: data too large (max 8 bytes)".to_string());
+            }
+
+            // Pad to 8 bytes with zeros on the left
+            let mut padded = [0u8; 8];
+            let offset = 8 - data.len();
+            padded[offset..].copy_from_slice(&data);
+
+            Ok(Value::I64(i64::from_be_bytes(padded)))
+        });
+
+        // Get the length of a byte array
+        // Usage: bytes_length(data: bytes) -> i64
+        self.register_foreign_function("bytes_length", |ctx| {
+            if ctx.args.len() != 1 {
+                return Err("bytes_length expects 1 argument: data (bytes)".to_string());
+            }
+
+            let len = match &ctx.args[0] {
+                Value::Bytes(b) => b.len(),
+                Value::String(s) => s.as_bytes().len(),
+                _ => return Err("Argument must be bytes or string".to_string()),
+            };
+
+            Ok(Value::I64(len as i64))
+        });
+
+        // Slice bytes array
+        // Usage: bytes_slice(data: bytes, start: i64, end: i64) -> bytes
+        self.register_foreign_function("bytes_slice", |ctx| {
+            if ctx.args.len() != 3 {
+                return Err("bytes_slice expects 3 arguments: data (bytes), start (i64), end (i64)".to_string());
+            }
+
+            let data = match &ctx.args[0] {
+                Value::Bytes(b) => b.clone(),
+                Value::String(s) => s.as_bytes().to_vec(),
+                _ => return Err("First argument must be bytes or string".to_string()),
+            };
+
+            let start = match &ctx.args[1] {
+                Value::I64(v) if *v >= 0 => *v as usize,
+                Value::U64(v) => *v as usize,
+                _ => return Err("start must be a non-negative integer".to_string()),
+            };
+
+            let end = match &ctx.args[2] {
+                Value::I64(v) if *v >= 0 => *v as usize,
+                Value::U64(v) => *v as usize,
+                _ => return Err("end must be a non-negative integer".to_string()),
+            };
+
+            if start > data.len() || end > data.len() || start > end {
+                return Err(format!(
+                    "Invalid slice bounds: start={}, end={}, len={}",
+                    start, end, data.len()
+                ));
+            }
+
+            Ok(Value::Bytes(data[start..end].to_vec()))
+        });
+
+        // =========================================================================
+        // Cryptographic Hash Builtins
+        // =========================================================================
+
+        // SHA-256 hash function
+        // Usage: hash_sha256(data: bytes) -> bytes
+        // Returns 32 bytes (256 bits) hash
+        self.register_foreign_function("hash_sha256", |ctx| {
+            use sha2::{Sha256, Digest};
+
+            if ctx.args.len() != 1 {
+                return Err("hash_sha256 expects 1 argument: data (bytes)".to_string());
+            }
+
+            let data = match &ctx.args[0] {
+                Value::Bytes(b) => b.as_slice(),
+                Value::String(s) => s.as_bytes(),
+                _ => return Err("Argument must be bytes or string".to_string()),
+            };
+
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            let result = hasher.finalize();
+
+            Ok(Value::Bytes(result.to_vec()))
+        });
+
+        // BLAKE3 hash function (already available in the crate)
+        // Usage: hash_blake3(data: bytes) -> bytes
+        // Returns 32 bytes hash
+        self.register_foreign_function("hash_blake3", |ctx| {
+            if ctx.args.len() != 1 {
+                return Err("hash_blake3 expects 1 argument: data (bytes)".to_string());
+            }
+
+            let data = match &ctx.args[0] {
+                Value::Bytes(b) => b.as_slice(),
+                Value::String(s) => s.as_bytes(),
+                _ => return Err("Argument must be bytes or string".to_string()),
+            };
+
+            let hash = blake3::hash(data);
+            Ok(Value::Bytes(hash.as_bytes().to_vec()))
+        });
+
+        // =========================================================================
+        // Ristretto Elliptic Curve Operations (for Twisted ElGamal decryption)
+        // =========================================================================
+
+        // Ristretto point addition
+        // Usage: Ristretto_add(a: bytes, b: bytes) -> bytes
+        // a, b: 32-byte compressed Ristretto points
+        // Returns: 32-byte compressed Ristretto point
+        self.register_foreign_function("Ristretto_add", |ctx| {
+            use curve25519_dalek::ristretto::CompressedRistretto;
+
+            if ctx.args.len() != 2 {
+                return Err("Ristretto_add expects 2 arguments: a (bytes), b (bytes)".to_string());
+            }
+
+            let a_bytes = match &ctx.args[0] {
+                Value::Bytes(b) => b.clone(),
+                _ => return Err("First argument must be bytes".to_string()),
+            };
+            let b_bytes = match &ctx.args[1] {
+                Value::Bytes(b) => b.clone(),
+                _ => return Err("Second argument must be bytes".to_string()),
+            };
+
+            if a_bytes.len() != 32 || b_bytes.len() != 32 {
+                return Err("Ristretto points must be exactly 32 bytes".to_string());
+            }
+
+            let a_compressed = CompressedRistretto::from_slice(&a_bytes)
+                .map_err(|e| format!("Invalid point a: {:?}", e))?;
+            let b_compressed = CompressedRistretto::from_slice(&b_bytes)
+                .map_err(|e| format!("Invalid point b: {:?}", e))?;
+
+            let a_point = a_compressed.decompress()
+                .ok_or_else(|| "Failed to decompress point a".to_string())?;
+            let b_point = b_compressed.decompress()
+                .ok_or_else(|| "Failed to decompress point b".to_string())?;
+
+            let result = a_point + b_point;
+            Ok(Value::Bytes(result.compress().to_bytes().to_vec()))
+        });
+
+        // Ristretto point subtraction
+        // Usage: Ristretto_sub(a: bytes, b: bytes) -> bytes
+        self.register_foreign_function("Ristretto_sub", |ctx| {
+            use curve25519_dalek::ristretto::CompressedRistretto;
+
+            if ctx.args.len() != 2 {
+                return Err("Ristretto_sub expects 2 arguments: a (bytes), b (bytes)".to_string());
+            }
+
+            let a_bytes = match &ctx.args[0] {
+                Value::Bytes(b) => b.clone(),
+                _ => return Err("First argument must be bytes".to_string()),
+            };
+            let b_bytes = match &ctx.args[1] {
+                Value::Bytes(b) => b.clone(),
+                _ => return Err("Second argument must be bytes".to_string()),
+            };
+
+            if a_bytes.len() != 32 || b_bytes.len() != 32 {
+                return Err("Ristretto points must be exactly 32 bytes".to_string());
+            }
+
+            let a_compressed = CompressedRistretto::from_slice(&a_bytes)
+                .map_err(|e| format!("Invalid point a: {:?}", e))?;
+            let b_compressed = CompressedRistretto::from_slice(&b_bytes)
+                .map_err(|e| format!("Invalid point b: {:?}", e))?;
+
+            let a_point = a_compressed.decompress()
+                .ok_or_else(|| "Failed to decompress point a".to_string())?;
+            let b_point = b_compressed.decompress()
+                .ok_or_else(|| "Failed to decompress point b".to_string())?;
+
+            let result = a_point - b_point;
+            Ok(Value::Bytes(result.compress().to_bytes().to_vec()))
+        });
+
+        // Ristretto point scalar multiplication
+        // Usage: Ristretto_mul(point: bytes, scalar: bytes) -> bytes
+        // point: 32-byte compressed Ristretto point
+        // scalar: 32-byte scalar
+        self.register_foreign_function("Ristretto_mul", |ctx| {
+            use curve25519_dalek::ristretto::CompressedRistretto;
+            use curve25519_dalek::scalar::Scalar;
+
+            if ctx.args.len() != 2 {
+                return Err("Ristretto_mul expects 2 arguments: point (bytes), scalar (bytes)".to_string());
+            }
+
+            let point_bytes = match &ctx.args[0] {
+                Value::Bytes(b) => b.clone(),
+                _ => return Err("First argument must be bytes".to_string()),
+            };
+            let scalar_bytes = match &ctx.args[1] {
+                Value::Bytes(b) => b.clone(),
+                _ => return Err("Second argument must be bytes".to_string()),
+            };
+
+            if point_bytes.len() != 32 {
+                return Err("Ristretto point must be exactly 32 bytes".to_string());
+            }
+            if scalar_bytes.len() != 32 {
+                return Err("Scalar must be exactly 32 bytes".to_string());
+            }
+
+            let point_compressed = CompressedRistretto::from_slice(&point_bytes)
+                .map_err(|e| format!("Invalid point: {:?}", e))?;
+            let point = point_compressed.decompress()
+                .ok_or_else(|| "Failed to decompress point".to_string())?;
+
+            let mut scalar_arr = [0u8; 32];
+            scalar_arr.copy_from_slice(&scalar_bytes);
+            let scalar = Scalar::from_bytes_mod_order(scalar_arr);
+
+            let result = point * scalar;
+            Ok(Value::Bytes(result.compress().to_bytes().to_vec()))
+        });
+
+        // Ristretto identity point
+        // Usage: Ristretto_identity() -> bytes
+        // Returns: 32-byte compressed identity point (all zeros)
+        self.register_foreign_function("Ristretto_identity", |ctx| {
+            use curve25519_dalek::ristretto::CompressedRistretto;
+
+            if !ctx.args.is_empty() {
+                return Err("Ristretto_identity expects 0 arguments".to_string());
+            }
+
+            // The identity point compresses to all zeros
+            let identity_bytes = [0u8; 32];
+            Ok(Value::Bytes(identity_bytes.to_vec()))
+        });
+
+        // Baby-step giant-step discrete log solver for Ristretto
+        // Usage: Ristretto_discrete_log(point: bytes, max_value: i64) -> i64
+        // Solves for x in: point = x * G (where G is the Ristretto basepoint)
+        // Returns the discrete log if found within [0, max_value], or -1 if not found
+        self.register_foreign_function("Ristretto_discrete_log", |ctx| {
+            use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
+            use curve25519_dalek::scalar::Scalar;
+            use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+            use std::collections::HashMap;
+
+            if ctx.args.len() != 2 {
+                return Err("Ristretto_discrete_log expects 2 arguments: point (bytes), max_value (i64)".to_string());
+            }
+
+            let point_bytes = match &ctx.args[0] {
+                Value::Bytes(b) => b.clone(),
+                _ => return Err("First argument must be bytes".to_string()),
+            };
+            let max_value = match &ctx.args[1] {
+                Value::I64(v) => *v,
+                Value::U64(v) => *v as i64,
+                _ => return Err("Second argument must be an integer".to_string()),
+            };
+
+            if point_bytes.len() != 32 {
+                return Err("Ristretto point must be exactly 32 bytes".to_string());
+            }
+
+            if max_value <= 0 {
+                return Err("max_value must be positive".to_string());
+            }
+
+            let point_compressed = CompressedRistretto::from_slice(&point_bytes)
+                .map_err(|e| format!("Invalid point: {:?}", e))?;
+            let target = point_compressed.decompress()
+                .ok_or_else(|| "Failed to decompress point".to_string())?;
+
+            // Baby-step giant-step algorithm
+            let m = ((max_value as f64).sqrt().ceil() as i64).max(1);
+            let g = RISTRETTO_BASEPOINT_POINT;
+
+            // Baby steps: compute {j*G : 0 <= j < m}
+            let mut baby_steps: HashMap<[u8; 32], i64> = HashMap::new();
+            // Start with identity point (0 * G)
+            let mut current = g * Scalar::ZERO;
+            for j in 0..m {
+                baby_steps.insert(current.compress().to_bytes(), j);
+                current = current + g;
+            }
+
+            // Giant step: m * G
+            let m_scalar = Scalar::from(m as u64);
+            let giant_step = g * m_scalar;
+            let neg_giant_step = -giant_step;
+
+            // Giant steps: compute target - i*m*G for i = 0, 1, 2, ...
+            let mut gamma = target;
+            for i in 0..=((max_value / m) + 1) {
+                if let Some(&j) = baby_steps.get(&gamma.compress().to_bytes()) {
+                    let result = i * m + j;
+                    if result <= max_value {
+                        return Ok(Value::I64(result));
+                    }
+                }
+                gamma = gamma + neg_giant_step;
+            }
+
+            // Not found
+            Ok(Value::I64(-1))
+        });
+
+        // Ristretto point scalar multiplication with integer (convenience function)
+        // Usage: Ristretto_mul_int(point: bytes, scalar: i64) -> bytes
+        self.register_foreign_function("Ristretto_mul_int", |ctx| {
+            use curve25519_dalek::ristretto::CompressedRistretto;
+            use curve25519_dalek::scalar::Scalar;
+
+            if ctx.args.len() != 2 {
+                return Err("Ristretto_mul_int expects 2 arguments: point (bytes), scalar (i64)".to_string());
+            }
+
+            let point_bytes = match &ctx.args[0] {
+                Value::Bytes(b) => b.clone(),
+                _ => return Err("First argument must be bytes".to_string()),
+            };
+            let scalar_int = match &ctx.args[1] {
+                Value::I64(v) => *v,
+                Value::U64(v) => *v as i64,
+                _ => return Err("Second argument must be an integer".to_string()),
+            };
+
+            if point_bytes.len() != 32 {
+                return Err("Ristretto point must be exactly 32 bytes".to_string());
+            }
+
+            let point_compressed = CompressedRistretto::from_slice(&point_bytes)
+                .map_err(|e| format!("Invalid point: {:?}", e))?;
+            let point = point_compressed.decompress()
+                .ok_or_else(|| "Failed to decompress point".to_string())?;
+
+            let scalar = if scalar_int >= 0 {
+                Scalar::from(scalar_int as u64)
+            } else {
+                -Scalar::from((-scalar_int) as u64)
+            };
+
+            let result = point * scalar;
+            Ok(Value::Bytes(result.compress().to_bytes().to_vec()))
+        });
+
+        // Convert Ristretto scalar to bytes
+        // Usage: Scalar_to_bytes(value: i64) -> bytes
+        // Returns 32-byte scalar representation
+        self.register_foreign_function("Scalar_to_bytes", |ctx| {
+            use curve25519_dalek::scalar::Scalar;
+
+            if ctx.args.len() != 1 {
+                return Err("Scalar_to_bytes expects 1 argument: value (i64)".to_string());
+            }
+
+            let value = match &ctx.args[0] {
+                Value::I64(v) => *v,
+                Value::U64(v) => *v as i64,
+                _ => return Err("Argument must be an integer".to_string()),
+            };
+
+            let scalar = if value >= 0 {
+                Scalar::from(value as u64)
+            } else {
+                -Scalar::from((-value) as u64)
+            };
+
+            Ok(Value::Bytes(scalar.to_bytes().to_vec()))
+        });
+
+        // =========================================================================
+        // Lagrange Interpolation for Secret Sharing
+        // =========================================================================
+
+        // Compute Lagrange coefficient for a party evaluated at x=0
+        // Usage: Scalar_lagrange_at_zero(party_index: i64, all_indices: array) -> bytes
+        // party_index: The index of the party (1-based, as used in Shamir secret sharing)
+        // all_indices: Array of all participating party indices
+        // Returns: 32-byte scalar (Lagrange coefficient λ_i)
+        //
+        // Formula: λ_i = ∏_{j≠i} (0 - x_j) / (x_i - x_j) = ∏_{j≠i} (-x_j) / (x_i - x_j)
+        self.register_foreign_function("Scalar_lagrange_at_zero", |ctx| {
+            use curve25519_dalek::scalar::Scalar;
+
+            if ctx.args.len() != 2 {
+                return Err("Scalar_lagrange_at_zero expects 2 arguments: party_index (i64), all_indices (array)".to_string());
+            }
+
+            let party_index = match &ctx.args[0] {
+                Value::I64(v) => *v,
+                Value::U64(v) => *v as i64,
+                _ => return Err("party_index must be an integer".to_string()),
+            };
+
+            // Get all indices from the array
+            let all_indices: Vec<i64> = match &ctx.args[1] {
+                Value::Array(id) => {
+                    if let Some(arr) = ctx.vm_state.object_store.get_array(*id) {
+                        let mut indices = Vec::new();
+                        for i in 0..arr.length() {
+                            let idx_val = Value::I64(i as i64);
+                            if let Some(val) = arr.get(&idx_val) {
+                                match val {
+                                    Value::I64(v) => indices.push(*v),
+                                    Value::U64(v) => indices.push(*v as i64),
+                                    _ => return Err("Array elements must be integers".to_string()),
+                                }
+                            }
+                        }
+                        indices
+                    } else {
+                        return Err("Invalid array reference".to_string());
+                    }
+                }
+                _ => return Err("all_indices must be an array".to_string()),
+            };
+
+            if !all_indices.contains(&party_index) {
+                return Err(format!("party_index {} not found in all_indices", party_index));
+            }
+
+            // Compute Lagrange coefficient λ_i = ∏_{j≠i} (-x_j) / (x_i - x_j)
+            let mut numerator = Scalar::ONE;
+            let mut denominator = Scalar::ONE;
+
+            for &xj in &all_indices {
+                if xj == party_index {
+                    continue;
+                }
+
+                // numerator *= -xj
+                let neg_xj = if xj >= 0 {
+                    -Scalar::from(xj as u64)
+                } else {
+                    Scalar::from((-xj) as u64)
+                };
+                numerator *= neg_xj;
+
+                // denominator *= (xi - xj)
+                let diff = party_index - xj;
+                let diff_scalar = if diff >= 0 {
+                    Scalar::from(diff as u64)
+                } else {
+                    -Scalar::from((-diff) as u64)
+                };
+                denominator *= diff_scalar;
+            }
+
+            // λ_i = numerator / denominator = numerator * denominator^(-1)
+            let result = numerator * denominator.invert();
+
+            Ok(Value::Bytes(result.to_bytes().to_vec()))
+        });
+
+        // Convenience function to compute Lagrange coefficient with a simple list of indices
+        // Usage: Scalar_lagrange_simple(party_index: i64, num_parties: i64) -> bytes
+        // Assumes parties are numbered 1, 2, 3, ..., num_parties
+        self.register_foreign_function("Scalar_lagrange_simple", |ctx| {
+            use curve25519_dalek::scalar::Scalar;
+
+            if ctx.args.len() != 2 {
+                return Err("Scalar_lagrange_simple expects 2 arguments: party_index (i64), num_parties (i64)".to_string());
+            }
+
+            let party_index = match &ctx.args[0] {
+                Value::I64(v) => *v,
+                Value::U64(v) => *v as i64,
+                _ => return Err("party_index must be an integer".to_string()),
+            };
+
+            let num_parties = match &ctx.args[1] {
+                Value::I64(v) => *v,
+                Value::U64(v) => *v as i64,
+                _ => return Err("num_parties must be an integer".to_string()),
+            };
+
+            if party_index < 1 || party_index > num_parties {
+                return Err(format!("party_index {} must be between 1 and {}", party_index, num_parties));
+            }
+
+            // Compute λ_i for parties 1, 2, ..., num_parties evaluated at x=0
+            let mut numerator = Scalar::ONE;
+            let mut denominator = Scalar::ONE;
+
+            for xj in 1..=num_parties {
+                if xj == party_index {
+                    continue;
+                }
+
+                // numerator *= -xj
+                numerator *= -Scalar::from(xj as u64);
+
+                // denominator *= (xi - xj)
+                let diff = party_index - xj;
+                let diff_scalar = if diff >= 0 {
+                    Scalar::from(diff as u64)
+                } else {
+                    -Scalar::from((-diff) as u64)
+                };
+                denominator *= diff_scalar;
+            }
+
+            // λ_i = numerator / denominator
+            let result = numerator * denominator.invert();
+
+            Ok(Value::Bytes(result.to_bytes().to_vec()))
+        });
+
         // MPC Output protocol: send secret share(s) to a specific client for private reconstruction
         // Usage: MpcOutput.send_to_client(client_id, share_value)
         // - client_id: The ID of the client to receive the output
