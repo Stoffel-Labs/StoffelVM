@@ -241,6 +241,54 @@ impl VirtualMachine {
             ctx.vm_state.load_client_share_fixed(client_id, share_index)
         });
 
+        // Public input: retrieve a byte array from the coordinator (non-secret)
+        // Usage: ClientStore.take_bytes(index)
+        // - index: The index of the byte array in the public inputs (0-based)
+        // Returns: Value::Bytes containing the byte array
+        self.register_foreign_function("ClientStore.take_bytes", |ctx| {
+            if ctx.args.len() != 1 {
+                return Err(
+                    "ClientStore.take_bytes expects 1 argument: index"
+                        .to_string(),
+                );
+            }
+
+            fn parse_index(value: &Value, name: &str) -> Result<usize, String> {
+                match value {
+                    Value::I64(v) if *v >= 0 => Ok(*v as usize),
+                    Value::U64(v) => Ok(*v as usize),
+                    _ => Err(format!("{name} must be a non-negative integer")),
+                }
+            }
+
+            let index = parse_index(&ctx.args[0], "index")?;
+            ctx.vm_state.load_public_bytes(index)
+        });
+
+        // Public input: retrieve an integer from the coordinator (non-secret)
+        // Usage: ClientStore.take_int(index)
+        // - index: The index of the integer in the public inputs (0-based)
+        // Returns: Value::I64 containing the integer
+        self.register_foreign_function("ClientStore.take_int", |ctx| {
+            if ctx.args.len() != 1 {
+                return Err(
+                    "ClientStore.take_int expects 1 argument: index"
+                        .to_string(),
+                );
+            }
+
+            fn parse_index(value: &Value, name: &str) -> Result<usize, String> {
+                match value {
+                    Value::I64(v) if *v >= 0 => Ok(*v as usize),
+                    Value::U64(v) => Ok(*v as usize),
+                    _ => Err(format!("{name} must be a non-negative integer")),
+                }
+            }
+
+            let index = parse_index(&ctx.args[0], "index")?;
+            ctx.vm_state.load_public_int(index)
+        });
+
         // MPC Output protocol: send secret share(s) to a specific client for private reconstruction
         // Usage: MpcOutput.send_to_client(client_id, share_value)
         // - client_id: The ID of the client to receive the output
@@ -613,6 +661,7 @@ impl VirtualMachine {
                 Value::U32(_) => "uint32",
                 Value::U64(_) => "uint64",
                 Value::Share(_, _) => "share",
+                Value::Bytes(_) => "bytes",
             };
 
             Ok(Value::String(type_name.to_string()))

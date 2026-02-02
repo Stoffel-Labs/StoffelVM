@@ -56,7 +56,7 @@ use std::os::raw::{c_int, c_void};
 use std::sync::{Arc, Mutex};
 
 use stoffel_vm_types::compiled_binary::CompiledBinary;
-use stoffel_vm_types::core_types::{ShareType, Value};
+use stoffel_vm_types::core_types::{F64, ShareType, Value};
 use crate::core_vm::VirtualMachine;
 use crate::foreign_functions::ForeignFunctionContext;
 use crate::net::hb_engine::HoneyBadgerMpcEngine;
@@ -199,10 +199,12 @@ pub struct CShareType {
 impl From<CShareType> for ShareType {
     fn from(c: CShareType) -> Self {
         match c.kind {
-            0 => ShareType::Int(c.width),
-            1 => ShareType::Bool(c.width != 0),
-            2 => ShareType::Float(c.width),
-            _ => ShareType::Int(c.width), // Default fallback
+            // SecretInt with bit_length from width
+            0 => ShareType::secret_int(c.width as usize),
+            // SecretFixedPoint with default precision (64 total, 32 fractional)
+            1 => ShareType::secret_fixed_point_from_bits(64, 32),
+            // Default to SecretInt
+            _ => ShareType::secret_int(if c.width > 0 { c.width as usize } else { 64 }),
         }
     }
 }
@@ -210,16 +212,9 @@ impl From<CShareType> for ShareType {
 impl From<ShareType> for CShareType {
     fn from(st: ShareType) -> Self {
         match st {
-            ShareType::Int(w) => CShareType { kind: 0, width: w },
-            ShareType::Bool(b) => CShareType { kind: 1, width: if b { 1 } else { 0 } },
-            ShareType::Float(w) => CShareType { kind: 2, width: w },
-            ShareType::I32(v) => CShareType { kind: 0, width: v as i64 },
-            ShareType::I16(v) => CShareType { kind: 0, width: v as i64 },
-            ShareType::I8(v) => CShareType { kind: 0, width: v as i64 },
-            ShareType::U8(v) => CShareType { kind: 0, width: v as i64 },
-            ShareType::U16(v) => CShareType { kind: 0, width: v as i64 },
-            ShareType::U32(v) => CShareType { kind: 0, width: v as i64 },
-            ShareType::U64(v) => CShareType { kind: 0, width: v as i64 },
+            ShareType::SecretInt { bit_length } => CShareType { kind: 0, width: bit_length as i64 },
+            // For SecretFixedPoint, use default 64 bits as the width
+            ShareType::SecretFixedPoint { .. } => CShareType { kind: 1, width: 64 },
         }
     }
 }
@@ -589,7 +584,7 @@ fn value_to_stoffel_value(value: &Value) -> StoffelValue {
         },
         Value::Float(f) => StoffelValue {
             value_type: StoffelValueType::Float,
-            data: StoffelValueData { float_val: *f as f64 },
+            data: StoffelValueData { float_val: f.0 },
         },
         Value::Bool(b) => StoffelValue {
             value_type: StoffelValueType::Bool,
@@ -638,7 +633,7 @@ fn stoffel_value_to_value(value: &StoffelValue) -> Result<Value, String> {
     match value.value_type {
         StoffelValueType::Unit => Ok(Value::Unit),
         StoffelValueType::Int => unsafe { Ok(Value::I64(value.data.int_val)) },
-        StoffelValueType::Float => unsafe { Ok(Value::Float(value.data.float_val as i64)) },
+        StoffelValueType::Float => unsafe { Ok(Value::Float(F64(value.data.float_val))) },
         StoffelValueType::Bool => unsafe { Ok(Value::Bool(value.data.bool_val)) },
         StoffelValueType::String => unsafe {
             if value.data.string_val.is_null() {

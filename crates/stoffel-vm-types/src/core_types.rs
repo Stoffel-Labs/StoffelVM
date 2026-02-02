@@ -397,6 +397,8 @@ pub enum Value {
     Unit,
     /// Secret shared value (for SMPC) TODO: Change
     Share(ShareType, Vec<u8>),
+    /// Raw byte array (for cryptographic operations, EC points, etc.)
+    Bytes(Vec<u8>),
 }
 
 impl fmt::Debug for Value {
@@ -421,6 +423,7 @@ impl fmt::Debug for Value {
             Value::Closure(c) => write!(f, "Function({})", c.function_id),
             Value::Unit => write!(f, "()"),
             Value::Share(share_type, _) => write!(f, "Share({:?})", share_type),
+            Value::Bytes(bytes) => write!(f, "Bytes({} bytes)", bytes.len()),
         }
     }
 }

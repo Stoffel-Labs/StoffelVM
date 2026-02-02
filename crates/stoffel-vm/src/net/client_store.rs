@@ -1,8 +1,11 @@
-//! Global store for client secret shares
+//! Global store for client secret shares and public inputs
 //!
 //! This module provides a thread-safe global store where MPC nodes can store
 //! client input shares received from clients. VMs can then retrieve these
 //! shares to execute programs that require secret inputs.
+//!
+//! Additionally, this store supports public inputs (bytes and integers) that
+//! are not secret-shared but are provided by clients for use in MPC programs.
 
 use ark_bls12_381::Fr;
 use parking_lot::RwLock;
@@ -21,14 +24,25 @@ pub struct ClientInputEntry {
     pub timestamp: std::time::SystemTime,
 }
 
-/// Global store for client secret shares
+/// Public inputs from the coordinator (non-secret, available to all parties)
+#[derive(Debug, Clone, Default)]
+pub struct PublicInputs {
+    /// Public byte arrays (indexed by input position)
+    pub bytes: Vec<Vec<u8>>,
+    /// Public integers (indexed by input position)
+    pub ints: Vec<i64>,
+}
+
+/// Global store for client secret shares and public inputs
 ///
 /// This store is shared across all VM nodes in the same process and provides
-/// thread-safe access to client input shares.
+/// thread-safe access to client input shares and public inputs.
 #[derive(Debug, Default)]
 pub struct ClientInputStore {
     /// Map from client ID to their input shares
     entries: RwLock<BTreeMap<ClientId, ClientInputEntry>>,
+    /// Public inputs from the coordinator (not secret-shared)
+    public_inputs: RwLock<PublicInputs>,
 }
 
 impl ClientInputStore {
@@ -36,6 +50,7 @@ impl ClientInputStore {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(BTreeMap::new()),
+            public_inputs: RwLock::new(PublicInputs::default()),
         }
     }
 
@@ -109,10 +124,12 @@ impl ClientInputStore {
         entries.remove(&client_id)
     }
 
-    /// Clear all client inputs
+    /// Clear all client inputs and public inputs
     pub fn clear(&self) {
         let mut entries = self.entries.write();
         entries.clear();
+        let mut public = self.public_inputs.write();
+        *public = PublicInputs::default();
     }
 
     /// Get the total number of clients in the store
@@ -137,6 +154,100 @@ impl ClientInputStore {
     pub fn client_ids(&self) -> Vec<ClientId> {
         let entries = self.entries.read();
         entries.keys().copied().collect()
+    }
+
+    // =========================================================================
+    // Public Input Methods (non-secret inputs from coordinator)
+    // =========================================================================
+
+    /// Store public byte array inputs
+    ///
+    /// # Arguments
+    /// * `bytes` - Vector of byte arrays to store
+    pub fn store_public_bytes(&self, bytes: Vec<Vec<u8>>) {
+        let mut public = self.public_inputs.write();
+        public.bytes = bytes;
+    }
+
+    /// Store public integer inputs
+    ///
+    /// # Arguments
+    /// * `ints` - Vector of integers to store
+    pub fn store_public_ints(&self, ints: Vec<i64>) {
+        let mut public = self.public_inputs.write();
+        public.ints = ints;
+    }
+
+    /// Add a single public byte array
+    ///
+    /// # Arguments
+    /// * `data` - Byte array to add
+    pub fn add_public_bytes(&self, data: Vec<u8>) {
+        let mut public = self.public_inputs.write();
+        public.bytes.push(data);
+    }
+
+    /// Add a single public integer
+    ///
+    /// # Arguments
+    /// * `value` - Integer to add
+    pub fn add_public_int(&self, value: i64) {
+        let mut public = self.public_inputs.write();
+        public.ints.push(value);
+    }
+
+    /// Retrieve a public byte array by index
+    ///
+    /// # Arguments
+    /// * `index` - Index of the byte array (0-based)
+    ///
+    /// # Returns
+    /// `Some(bytes)` if found, `None` otherwise
+    pub fn get_public_bytes(&self, index: usize) -> Option<Vec<u8>> {
+        let public = self.public_inputs.read();
+        public.bytes.get(index).cloned()
+    }
+
+    /// Retrieve a public integer by index
+    ///
+    /// # Arguments
+    /// * `index` - Index of the integer (0-based)
+    ///
+    /// # Returns
+    /// `Some(value)` if found, `None` otherwise
+    pub fn get_public_int(&self, index: usize) -> Option<i64> {
+        let public = self.public_inputs.read();
+        public.ints.get(index).copied()
+    }
+
+    /// Get the number of public byte arrays stored
+    pub fn public_bytes_count(&self) -> usize {
+        let public = self.public_inputs.read();
+        public.bytes.len()
+    }
+
+    /// Get the number of public integers stored
+    pub fn public_ints_count(&self) -> usize {
+        let public = self.public_inputs.read();
+        public.ints.len()
+    }
+
+    /// Get all public byte arrays
+    pub fn get_all_public_bytes(&self) -> Vec<Vec<u8>> {
+        let public = self.public_inputs.read();
+        public.bytes.clone()
+    }
+
+    /// Get all public integers
+    pub fn get_all_public_ints(&self) -> Vec<i64> {
+        let public = self.public_inputs.read();
+        public.ints.clone()
+    }
+
+    /// Clear only public inputs (keep client shares)
+    pub fn clear_public_inputs(&self) {
+        let mut public = self.public_inputs.write();
+        *public = PublicInputs::default();
     }
 }
 

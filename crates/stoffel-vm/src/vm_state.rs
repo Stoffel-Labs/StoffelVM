@@ -2352,6 +2352,54 @@ impl VMState {
         self.client_store.get_client_input_count(client_id)
     }
 
+    /// Load a public byte array from the client store
+    ///
+    /// # Arguments
+    /// * `index` - Index of the byte array (0-based)
+    ///
+    /// # Returns
+    /// The bytes as a Value::Bytes if found, or an error otherwise
+    pub fn load_public_bytes(&self, index: usize) -> Result<Value, String> {
+        self.client_store
+            .get_public_bytes(index)
+            .map(Value::Bytes)
+            .ok_or_else(|| format!("No public bytes found at index {}", index))
+    }
+
+    /// Load a public integer from the client store
+    ///
+    /// # Arguments
+    /// * `index` - Index of the integer (0-based)
+    ///
+    /// # Returns
+    /// The integer as a Value::I64 if found, or an error otherwise
+    pub fn load_public_int(&self, index: usize) -> Result<Value, String> {
+        self.client_store
+            .get_public_int(index)
+            .map(Value::I64)
+            .ok_or_else(|| format!("No public integer found at index {}", index))
+    }
+
+    /// Store public byte arrays in the client store
+    pub fn store_public_bytes(&self, bytes: Vec<Vec<u8>>) {
+        self.client_store.store_public_bytes(bytes);
+    }
+
+    /// Store public integers in the client store
+    pub fn store_public_ints(&self, ints: Vec<i64>) {
+        self.client_store.store_public_ints(ints);
+    }
+
+    /// Add a single public byte array to the store
+    pub fn add_public_bytes(&self, data: Vec<u8>) {
+        self.client_store.add_public_bytes(data);
+    }
+
+    /// Add a single public integer to the store
+    pub fn add_public_int(&self, value: i64) {
+        self.client_store.add_public_int(value);
+    }
+
     /// Send output share(s) to a specific client for private reconstruction
     ///
     /// This uses the MPC engine's output protocol to send this party's share
