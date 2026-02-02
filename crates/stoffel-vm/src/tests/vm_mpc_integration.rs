@@ -14,7 +14,7 @@ use ark_std::rand::SeedableRng;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
+use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, ProtocolSessionId, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::ProtocolType;
 use stoffelnet::network_utils::ClientId;
@@ -226,8 +226,11 @@ async fn test_vm_mpc_multiplication_integration() {
 
     // Get the result share from party 0
     let party_id = 0;
-    let session_id =
-        stoffelmpc_mpc::honeybadger::SessionId::new(ProtocolType::Mul, 0, 0, 0, instance_id as u32);
+    let session_id = stoffelmpc_mpc::honeybadger::SessionId::new(
+        ProtocolType::Mul,
+        stoffelmpc_mpc::honeybadger::SessionId::pack_slot24(0, 0, 0),
+        instance_id as u32,
+    );
 
     let result_share = {
         let storage_map = servers[party_id]

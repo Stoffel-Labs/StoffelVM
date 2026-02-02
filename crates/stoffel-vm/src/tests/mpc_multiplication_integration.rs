@@ -8,8 +8,12 @@ use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::{
     HoneyBadgerError, HoneyBadgerMPCClient, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts,
-    WrappedMessage,
+    SessionId, WrappedMessage,
 };
+use stoffelmpc_mpc::common::ProtocolSessionId; // Required for SessionId::new
+
+// Type alias for RBC with SessionId parameter
+type RBCImpl = Avid<SessionId>;
 use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId};
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
@@ -44,7 +48,7 @@ impl Default for HoneyBadgerQuicConfig {
 /// A HoneyBadger MPC server node using QUIC networking
 pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     /// The underlying MPC node
-    pub node: HoneyBadgerMPCNode<F, Avid>,
+    pub node: HoneyBadgerMPCNode<F, RBCImpl>,
     /// Network manager builder - used during setup before start() is called
     network_builder: Option<QuicNetworkManager>,
     /// Network manager Arc - created when start() is called, shared with all tasks
@@ -74,7 +78,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         client_ids: Vec<ClientId>,
     ) -> Result<Self, HoneyBadgerError> {
         // Create the MPC node
-        let mpc_node = <HoneyBadgerMPCNode<F, Avid> as MPCProtocol<
+        let mpc_node = <HoneyBadgerMPCNode<F, RBCImpl> as MPCProtocol<
             F,
             RobustShare<F>,
             QuicNetworkManager,
@@ -263,7 +267,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
 
             let mut retry_count = 0;
             loop {
-                let connection_result = dialer.connect_as_server(peer_addr, self.node_id).await;
+                let connection_result = dialer.connect_as_server(peer_addr).await;
 
                 match connection_result {
                     Ok(connection) => {
@@ -369,7 +373,7 @@ pub struct HoneyBadgerQuicClient<F: FftField> {
     /// Channel to send messages to the actor
     actor_tx: mpsc::Sender<ClientActorMessage>,
     /// Actor task handle
-    actor_task: Option<JoinHandle<HoneyBadgerMPCClient<F, Avid>>>,
+    actor_task: Option<JoinHandle<HoneyBadgerMPCClient<F, RBCImpl>>>,
 }
 
 impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
@@ -419,10 +423,10 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
 
     /// Actor loop that owns the MPC client
     async fn run_actor(
-        mut client: HoneyBadgerMPCClient<F, Avid>,
+        mut client: HoneyBadgerMPCClient<F, RBCImpl>,
         mut rx: mpsc::Receiver<ClientActorMessage>,
         network: Arc<Mutex<QuicNetworkManager>>,
-    ) -> HoneyBadgerMPCClient<F, Avid> {
+    ) -> HoneyBadgerMPCClient<F, RBCImpl> {
         let client_id = client.id;
         info!("Starting actor loop for client {}", client_id);
 
@@ -545,7 +549,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
 
                 let connection_result = {
                     let mut dialer = self.network.lock().await;
-                    dialer.connect_as_client(address, self.client_id).await
+                    dialer.connect_as_client(address).await
                 };
 
                 match connection_result {
@@ -610,7 +614,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
     }
 
     /// Stops the client and closes all connections, returning the MPC client
-    pub async fn stop(mut self) -> Result<HoneyBadgerMPCClient<F, Avid>, HoneyBadgerError> {
+    pub async fn stop(mut self) -> Result<HoneyBadgerMPCClient<F, RBCImpl>, HoneyBadgerError> {
         info!("Stopping HoneyBadger QUIC client {}", self.client_id);
 
         // Send shutdown message to actor
@@ -795,7 +799,11 @@ mod tests {
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
         let instance_id = 99999;
         let base_port = 9200;
-        let session_id = SessionId::new(ProtocolType::Mul, 0, 0, 0, instance_id as u32);
+        let session_id = SessionId::new(
+            ProtocolType::Mul,
+            SessionId::pack_slot24(0, 0, 0),
+            instance_id as u32,
+        );
         let clientid: Vec<ClientId> = vec![100]; // Only input client, 200 is output-only
         let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
         let no_of_multiplications = input_values.len();
@@ -951,7 +959,11 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
+        let _session_id = SessionId::new(
+            ProtocolType::Ransha,
+            SessionId::pack_slot24(0, 0, 0),
+            instance_id as u32,
+        );
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
@@ -1253,7 +1265,11 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
+        let _session_id = SessionId::new(
+            ProtocolType::Ransha,
+            SessionId::pack_slot24(0, 0, 0),
+            instance_id as u32,
+        );
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
@@ -1428,7 +1444,11 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
+        let _session_id = SessionId::new(
+            ProtocolType::Ransha,
+            SessionId::pack_slot24(0, 0, 0),
+            instance_id as u32,
+        );
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()

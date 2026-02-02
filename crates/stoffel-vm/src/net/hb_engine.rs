@@ -20,7 +20,9 @@ use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
 
 // RBC/SSS type aliases used by HB implementation
-use stoffelmpc_mpc::common::rbc::rbc::Avid as RBCImpl;
+// Avid now requires a SessionId type parameter
+use stoffelmpc_mpc::common::rbc::rbc::Avid;
+type RBCImpl = Avid<SessionId>;
 
 /// HoneyBadger-backed MPC engine that integrates with the VM.
 /// This wraps a real HoneyBadgerMPCNode and provides MPC operations

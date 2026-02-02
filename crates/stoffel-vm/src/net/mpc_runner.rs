@@ -24,8 +24,9 @@ use crate::net::mpc_engine::{MpcEngine, MpcEngineClientOps};
 use ark_bls12_381::Fr;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use stoffelmpc_mpc::common::rbc::rbc::Avid as RBCImpl;
-use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNode;
+use stoffelmpc_mpc::common::rbc::rbc::Avid;
+use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCNode, SessionId};
+type RBCImpl = Avid<SessionId>;
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::task::JoinHandle;
 
