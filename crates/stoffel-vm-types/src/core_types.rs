@@ -19,7 +19,38 @@ use std::any::Any;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+#[cfg(feature = "mpc")]
 use stoffelmpc_mpc::common::types::fixed::FixedPointPrecision;
+
+/// Fallback FixedPointPrecision type when MPC feature is disabled.
+/// This provides the same interface but stores raw values.
+#[cfg(not(feature = "mpc"))]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FixedPointPrecision {
+    total_bits: usize,
+    fractional_bits: usize,
+}
+
+#[cfg(not(feature = "mpc"))]
+impl FixedPointPrecision {
+    pub fn new(total_bits: usize, fractional_bits: usize) -> Self {
+        Self {
+            total_bits,
+            fractional_bits,
+        }
+    }
+
+    /// Get total bits (k value)
+    pub fn k(&self) -> usize {
+        self.total_bits
+    }
+
+    /// Get fractional bits (f value)
+    pub fn f(&self) -> usize {
+        self.fractional_bits
+    }
+}
 
 /// A wrapper around f64 that implements Eq and Hash using bit representation.
 /// This allows f64 values to be used in contexts requiring these traits.

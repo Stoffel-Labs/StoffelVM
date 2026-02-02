@@ -3,9 +3,16 @@ name = "stoffel-vm-types"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Enable MPC types (FixedPointPrecision) - requires mpc-protocols dependency
+mpc = ["stoffelmpc-mpc"]
+
 [dependencies]
 rustc-hash = "2.1.1"
 smallvec = "1.11"
 parking_lot = "0.12"
 object-pool = "0.6.0"
-stoffelmpc-mpc =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "main" }
+
+# MPC dependency - optional, only needed for SecretFixedPoint type
+stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "main", optional = true }

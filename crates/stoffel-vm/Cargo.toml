@@ -13,7 +13,7 @@ libc = "0.2"
 stoffelmpc-mpc =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "main" }
 #stoffelmpc-common =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "randousha"}
 stoffelnet =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
-stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
+stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types", features = ["mpc"] }
 
 async-trait = "0.1"
 redb = "2.1.0"
