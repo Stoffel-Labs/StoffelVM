@@ -71,13 +71,14 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         mpc_opts: HoneyBadgerMPCNodeOpts,
         config: HoneyBadgerQuicConfig,
         channels: Sender<Vec<u8>>,
+        client_ids: Vec<ClientId>,
     ) -> Result<Self, HoneyBadgerError> {
         // Create the MPC node
         let mpc_node = <HoneyBadgerMPCNode<F, Avid> as MPCProtocol<
             F,
             RobustShare<F>,
             QuicNetworkManager,
-        >>::setup(node_id, mpc_opts, vec![])?;
+        >>::setup(node_id, mpc_opts, client_ids)?;
         //let node = Arc::new(Mutex::new(mpc_node));
 
         // Create network manager
@@ -708,6 +709,7 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     instance_id: u64,
     base_port: u16,
     config: HoneyBadgerQuicConfig,
+    client_ids: Vec<ClientId>,
 ) -> Result<(Vec<HoneyBadgerQuicServer<F>>, Vec<Receiver<Vec<u8>>>), HoneyBadgerError> {
     let mut servers = Vec::new();
 
@@ -742,7 +744,7 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     for i in 0..n_parties {
         let (tx, rx) = mpsc::channel(1500);
         let mut server =
-            HoneyBadgerQuicServer::new(i, addresses[i], mpc_opts.clone(), config.clone(), tx)
+            HoneyBadgerQuicServer::new(i, addresses[i], mpc_opts.clone(), config.clone(), tx, client_ids.clone())
                 .await?;
         // Add all other servers as peers
         for j in 0..n_parties {
@@ -794,7 +796,7 @@ mod tests {
         let instance_id = 99999;
         let base_port = 9200;
         let session_id = SessionId::new(ProtocolType::Mul, 0, 0, 0, instance_id as u32);
-        let clientid: Vec<ClientId> = vec![100, 200];
+        let clientid: Vec<ClientId> = vec![100]; // Only input client, 200 is output-only
         let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
         let no_of_multiplications = input_values.len();
 
@@ -812,6 +814,7 @@ mod tests {
             instance_id,
             base_port,
             config.clone(),
+            clientid.clone(),
         )
         .await
         .expect("Failed to create servers");
@@ -1096,7 +1099,7 @@ mod tests {
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
         let instance_id = 99999;
         let base_port = 9200;
-        let clientid: Vec<ClientId> = vec![100, 200];
+        let clientid: Vec<ClientId> = vec![100]; // Only input client, 200 is output-only
         let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
 
         let mut config = HoneyBadgerQuicConfig::default();
@@ -1113,6 +1116,7 @@ mod tests {
             instance_id,
             base_port,
             config.clone(),
+            clientid.clone(),
         )
         .await
         .expect("Failed to create servers");
@@ -1343,6 +1347,7 @@ mod tests {
             instance_id,
             base_port,
             config,
+            vec![], // No clients needed for preprocessing-only test
         )
         .await
         .expect("Failed to create servers");

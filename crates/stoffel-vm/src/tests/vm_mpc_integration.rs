@@ -77,6 +77,9 @@ async fn test_vm_mpc_multiplication_integration() {
     config.mpc_timeout = Duration::from_secs(10);
     config.connection_retry_delay = Duration::from_millis(100);
 
+    // Define client_id for this test (used for tracking, though not for actual client protocol)
+    let client_id: ClientId = 100;
+
     // Step 1: Create MPC network
     info!("Step 1: Creating {} MPC servers...", n_parties);
     let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
@@ -87,6 +90,7 @@ async fn test_vm_mpc_multiplication_integration() {
         instance_id,
         base_port,
         config.clone(),
+        vec![client_id], // Register expected client
     )
     .await
     .expect("Failed to create servers");
@@ -167,7 +171,6 @@ async fn test_vm_mpc_multiplication_integration() {
 
     // Step 5: Generate input shares
     info!("Step 5: Generating input shares...");
-    let client_id: ClientId = 100;
     let input_a = Fr::from(10u64);
     let input_b = Fr::from(20u64);
 

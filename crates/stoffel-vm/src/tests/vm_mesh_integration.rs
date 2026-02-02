@@ -91,6 +91,8 @@ async fn test_vm_mesh_full_integration() {
         ..Default::default()
     };
 
+    let client_ids: Vec<ClientId> = vec![200, 201];
+
     // Step 1: Create mesh network of MPC servers
     info!(
         "Step 1: Creating {} MPC servers in mesh topology...",
@@ -104,6 +106,7 @@ async fn test_vm_mesh_full_integration() {
         instance_id,
         base_port,
         config.clone(),
+        client_ids.clone(),
     )
     .await
     .expect("Failed to create servers");
@@ -115,7 +118,6 @@ async fn test_vm_mesh_full_integration() {
                 .unwrap()
         })
         .collect();
-    let client_ids: Vec<ClientId> = vec![200, 201];
     let client_scalar_inputs = vec![15u64, 25u64];
     let client_inputs: Vec<Vec<Fr>> = client_scalar_inputs
         .iter()
@@ -392,26 +394,7 @@ async fn test_vm_mesh_average_salary_integration() {
         ..Default::default()
     };
 
-    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
-        n_parties,
-        threshold,
-        n_triples,
-        n_random_shares,
-        instance_id,
-        base_port,
-        config.clone(),
-    )
-    .await
-    .expect("Failed to create servers");
-
-    let server_addresses: Vec<SocketAddr> = (0..n_parties)
-        .map(|i| {
-            format!("127.0.0.1:{}", base_port + i as u16)
-                .parse()
-                .unwrap()
-        })
-        .collect();
-
+    // Generate client IDs and inputs first so they can be registered with servers
     let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
     let client_count = rng.gen_range(2..=6usize);
     let mut client_ids = Vec::new();
@@ -424,6 +407,27 @@ async fn test_vm_mesh_average_salary_integration() {
         expected_sum += salary;
         client_inputs.push(vec![Fr::from(salary as u64), Fr::from(1u64)]);
     }
+
+    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
+        n_parties,
+        threshold,
+        n_triples,
+        n_random_shares,
+        instance_id,
+        base_port,
+        config.clone(),
+        client_ids.clone(),
+    )
+    .await
+    .expect("Failed to create servers");
+
+    let server_addresses: Vec<SocketAddr> = (0..n_parties)
+        .map(|i| {
+            format!("127.0.0.1:{}", base_port + i as u16)
+                .parse()
+                .unwrap()
+        })
+        .collect();
     let expected_average = expected_sum / client_count as i64;
 
     info!(
@@ -802,6 +806,9 @@ async fn test_vm_mesh_large_preprocessing() {
         n_parties, n_triples, n_random_shares
     );
 
+    // Define client IDs first for server registration
+    let client_ids: Vec<ClientId> = vec![300, 301];
+
     // Step 1: Create mesh network
     info!("Step 1: Creating {} MPC servers...", n_parties);
     let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
@@ -812,6 +819,7 @@ async fn test_vm_mesh_large_preprocessing() {
         instance_id,
         base_port,
         config.clone(),
+        client_ids.clone(),
     )
     .await
     .expect("Failed to create servers");
@@ -852,7 +860,6 @@ async fn test_vm_mesh_large_preprocessing() {
 
     // Step 4: Create and connect MPC clients (required for preprocessing protocol)
     info!("Step 4: Creating and connecting MPC clients...");
-    let client_ids: Vec<ClientId> = vec![300, 301];
     let client_inputs: Vec<Vec<Fr>> = vec![
         vec![Fr::from(10u64)], // Client 300 input
         vec![Fr::from(20u64)], // Client 301 input
@@ -1030,29 +1037,7 @@ async fn test_vm_mesh_output_client_integration() {
         ..Default::default()
     };
 
-    // Step 1: Create mesh network
-    info!("Step 1: Creating {} MPC servers...", n_parties);
-    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
-        n_parties,
-        threshold,
-        n_triples,
-        n_random_shares,
-        instance_id,
-        base_port,
-        config.clone(),
-    )
-    .await
-    .expect("Failed to create servers");
-
-    let server_addresses: Vec<SocketAddr> = (0..n_parties)
-        .map(|i| {
-            format!("127.0.0.1:{}", base_port + i as u16)
-                .parse()
-                .unwrap()
-        })
-        .collect();
-
-    // Generate test client data (salaries)
+    // Generate test client data (salaries) - must be done before server setup
     let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
     let client_count = rng.gen_range(2..=4usize);
     let mut client_ids = Vec::new();
@@ -1065,6 +1050,29 @@ async fn test_vm_mesh_output_client_integration() {
         expected_sum += salary;
         client_inputs.push(vec![Fr::from(salary as u64)]);
     }
+
+    // Step 1: Create mesh network
+    info!("Step 1: Creating {} MPC servers...", n_parties);
+    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
+        n_parties,
+        threshold,
+        n_triples,
+        n_random_shares,
+        instance_id,
+        base_port,
+        config.clone(),
+        client_ids.clone(),
+    )
+    .await
+    .expect("Failed to create servers");
+
+    let server_addresses: Vec<SocketAddr> = (0..n_parties)
+        .map(|i| {
+            format!("127.0.0.1:{}", base_port + i as u16)
+                .parse()
+                .unwrap()
+        })
+        .collect();
 
     info!(
         "Output client test: {} input clients, expected sum = {}",
@@ -1412,29 +1420,7 @@ async fn test_vm_mesh_matrix_average_integration() {
         ..Default::default()
     };
 
-    // Step 1: Create mesh network
-    info!("Step 1: Creating {} MPC servers...", n_parties);
-    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
-        n_parties,
-        threshold,
-        n_triples,
-        n_random_shares,
-        instance_id,
-        base_port,
-        config.clone(),
-    )
-    .await
-    .expect("Failed to create servers");
-
-    let server_addresses: Vec<SocketAddr> = (0..n_parties)
-        .map(|i| {
-            format!("127.0.0.1:{}", base_port + i as u16)
-                .parse()
-                .unwrap()
-        })
-        .collect();
-
-    // Generate test client data (matrices)
+    // Generate test client data (matrices) - must be done before server setup
     let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
     let client_count = rng.gen_range(2..=4usize);
     let mut client_ids = Vec::new();
@@ -1466,6 +1452,29 @@ async fn test_vm_mesh_matrix_average_integration() {
             client_id, MATRIX_ROWS, MATRIX_COLS, client_sum
         );
     }
+
+    // Step 1: Create mesh network
+    info!("Step 1: Creating {} MPC servers...", n_parties);
+    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
+        n_parties,
+        threshold,
+        n_triples,
+        n_random_shares,
+        instance_id,
+        base_port,
+        config.clone(),
+        client_ids.clone(),
+    )
+    .await
+    .expect("Failed to create servers");
+
+    let server_addresses: Vec<SocketAddr> = (0..n_parties)
+        .map(|i| {
+            format!("127.0.0.1:{}", base_port + i as u16)
+                .parse()
+                .unwrap()
+        })
+        .collect();
 
     // Calculate expected overall average
     let total_elements = client_count * MATRIX_SIZE;
@@ -1907,29 +1916,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         ..Default::default()
     };
 
-    // Step 1: Create mesh network
-    info!("Step 1: Creating {} MPC servers...", n_parties);
-    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
-        n_parties,
-        threshold,
-        n_triples,
-        n_random_shares,
-        instance_id,
-        base_port,
-        config.clone(),
-    )
-    .await
-    .expect("Failed to create servers");
-
-    let server_addresses: Vec<SocketAddr> = (0..n_parties)
-        .map(|i| {
-            format!("127.0.0.1:{}", base_port + i as u16)
-                .parse()
-                .unwrap()
-        })
-        .collect();
-
-    // Generate test client data (matrices with fixed-point scaled values)
+    // Generate test client data (matrices with fixed-point scaled values) - must be done before server setup
     // For federated averaging, we need to track per-element values to compute expected averages
     let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
     let client_count = rng.gen_range(2..=4usize);
@@ -1971,6 +1958,29 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             client_id, MATRIX_ROWS, MATRIX_COLS, client_sum
         );
     }
+
+    // Step 1: Create mesh network
+    info!("Step 1: Creating {} MPC servers...", n_parties);
+    let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
+        n_parties,
+        threshold,
+        n_triples,
+        n_random_shares,
+        instance_id,
+        base_port,
+        config.clone(),
+        client_ids.clone(),
+    )
+    .await
+    .expect("Failed to create servers");
+
+    let server_addresses: Vec<SocketAddr> = (0..n_parties)
+        .map(|i| {
+            format!("127.0.0.1:{}", base_port + i as u16)
+                .parse()
+                .unwrap()
+        })
+        .collect();
 
     // Calculate expected element-wise averages
     let expected_averages: Vec<f64> = element_sums.iter()
