@@ -288,7 +288,7 @@ async fn main() {
 
                 let connection_result = {
                     let mut net = network.lock().await;
-                    net.connect_as_client(addr, cid).await
+                    net.connect_as_client(addr).await
                 };
 
                 match connection_result {
@@ -796,8 +796,8 @@ async fn main() {
             );
         }
 
-        // Debug: print established connections
-        let connections = net.get_all_connections().await;
+        // Debug: print established connections (server connections are to other MPC parties)
+        let connections = net.get_all_server_connections();
         let conn_ids: Vec<_> = connections.iter().map(|(id, _)| *id).collect();
         eprintln!(
             "[party {}] Connections before MPC: {:?} ({} total)",

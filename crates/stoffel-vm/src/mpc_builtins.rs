@@ -266,6 +266,7 @@ pub fn register_mpc_builtins(vm: &mut VirtualMachine) {
     register_mpc_info_builtins(vm);
     register_rbc_builtins(vm);
     register_aba_builtins(vm);
+    register_adkg_builtins(vm);
 }
 
 /// Register Share module builtins
@@ -1133,6 +1134,312 @@ fn share_get_party_id(ctx: ForeignFunctionContext) -> Result<Value, String> {
         }
         _ => Err("Expected Share object".to_string()),
     }
+}
+
+/// Field name constants for ADKG secret key objects
+pub mod adkg_fields {
+    pub const TYPE: &str = "__type";
+    pub const SESSION_ID: &str = "__session_id";
+    pub const SHARE_DATA: &str = "__share_data";
+    pub const COMMITMENTS: &str = "__commitments";
+    pub const PARTY_ID: &str = "__party_id";
+    pub const TYPE_VALUE: &str = "AdkgSecretKey";
+}
+
+/// Helper module for ADKG secret key object operations
+pub mod adkg_object {
+    use super::adkg_fields;
+    use stoffel_vm_types::core_types::{ObjectStore, Value};
+
+    /// Create a new ADKG secret key object in the object store
+    ///
+    /// # Arguments
+    /// * `store` - The object store to create the object in
+    /// * `session_id` - The ADKG session ID
+    /// * `share_data` - The serialized Feldman share
+    /// * `commitment_bytes` - Array of serialized commitment group elements
+    /// * `party_id` - The party ID
+    ///
+    /// # Returns
+    /// The object ID of the created ADKG secret key
+    pub fn create_adkg_secret_key_object(
+        store: &mut ObjectStore,
+        session_id: u64,
+        share_data: Vec<u8>,
+        commitment_bytes: Vec<Vec<u8>>,
+        party_id: usize,
+    ) -> usize {
+        let id = store.create_object();
+        let obj = Value::Object(id);
+
+        // Set type tag
+        store
+            .set_field(
+                &obj,
+                Value::String(adkg_fields::TYPE.to_string()),
+                Value::String(adkg_fields::TYPE_VALUE.to_string()),
+            )
+            .unwrap();
+
+        // Set session ID
+        store
+            .set_field(
+                &obj,
+                Value::String(adkg_fields::SESSION_ID.to_string()),
+                Value::I64(session_id as i64),
+            )
+            .unwrap();
+
+        // Set share data as bytes (using a binary representation)
+        // We'll store it as an array of U8 values
+        let share_array_id = store.create_array_with_capacity(share_data.len());
+        {
+            let arr = store.get_array_mut(share_array_id).unwrap();
+            for (i, byte) in share_data.into_iter().enumerate() {
+                arr.set(Value::I64(i as i64), Value::U8(byte));
+            }
+        }
+        store
+            .set_field(
+                &obj,
+                Value::String(adkg_fields::SHARE_DATA.to_string()),
+                Value::Array(share_array_id),
+            )
+            .unwrap();
+
+        // Set commitments as array of byte arrays
+        // First, create all the inner commitment arrays
+        let commitment_arr_ids: Vec<usize> = commitment_bytes
+            .into_iter()
+            .map(|commitment| {
+                let commitment_arr_id = store.create_array_with_capacity(commitment.len());
+                {
+                    let commitment_arr = store.get_array_mut(commitment_arr_id).unwrap();
+                    for (j, byte) in commitment.into_iter().enumerate() {
+                        commitment_arr.set(Value::I64(j as i64), Value::U8(byte));
+                    }
+                }
+                commitment_arr_id
+            })
+            .collect();
+
+        // Then create the outer commitments array and populate it
+        let commitments_array_id = store.create_array_with_capacity(commitment_arr_ids.len());
+        {
+            let arr = store.get_array_mut(commitments_array_id).unwrap();
+            for (i, commitment_arr_id) in commitment_arr_ids.into_iter().enumerate() {
+                arr.set(Value::I64(i as i64), Value::Array(commitment_arr_id));
+            }
+        }
+        store
+            .set_field(
+                &obj,
+                Value::String(adkg_fields::COMMITMENTS.to_string()),
+                Value::Array(commitments_array_id),
+            )
+            .unwrap();
+
+        // Set party ID
+        store
+            .set_field(
+                &obj,
+                Value::String(adkg_fields::PARTY_ID.to_string()),
+                Value::I64(party_id as i64),
+            )
+            .unwrap();
+
+        id
+    }
+
+    /// Check if a value is an ADKG secret key object
+    pub fn is_adkg_secret_key_object(store: &ObjectStore, value: &Value) -> bool {
+        match value {
+            Value::Object(_) => store
+                .get_field(value, &Value::String(adkg_fields::TYPE.to_string()))
+                .map(|v| v == Value::String(adkg_fields::TYPE_VALUE.to_string()))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// Extract session ID from an ADKG secret key object
+    pub fn get_session_id(store: &ObjectStore, value: &Value) -> Result<u64, String> {
+        let session_id_field = store
+            .get_field(value, &Value::String(adkg_fields::SESSION_ID.to_string()))
+            .ok_or_else(|| "ADKG secret key object missing __session_id field".to_string())?;
+
+        match session_id_field {
+            Value::I64(n) => Ok(n as u64),
+            _ => Err("Invalid session_id type".to_string()),
+        }
+    }
+
+    /// Extract commitment at a specific index from an ADKG secret key object
+    ///
+    /// Returns the commitment as bytes (serialized group element)
+    pub fn get_commitment(store: &ObjectStore, value: &Value, index: usize) -> Result<Vec<u8>, String> {
+        let commitments_field = store
+            .get_field(value, &Value::String(adkg_fields::COMMITMENTS.to_string()))
+            .ok_or_else(|| "ADKG secret key object missing __commitments field".to_string())?;
+
+        let commitments_array_id = match commitments_field {
+            Value::Array(id) => id,
+            _ => return Err("Invalid commitments type".to_string()),
+        };
+
+        let commitments_array = store
+            .get_array(commitments_array_id)
+            .ok_or_else(|| "Commitments array not found".to_string())?;
+
+        if index >= commitments_array.length() {
+            return Err(format!(
+                "Commitment index {} out of bounds (max: {})",
+                index,
+                commitments_array.length()
+            ));
+        }
+
+        let commitment = commitments_array
+            .get(&Value::I64(index as i64))
+            .ok_or_else(|| format!("Commitment at index {} not found", index))?;
+
+        let commitment_arr_id = match commitment {
+            Value::Array(id) => *id,
+            _ => return Err("Invalid commitment type".to_string()),
+        };
+
+        let commitment_arr = store
+            .get_array(commitment_arr_id)
+            .ok_or_else(|| "Commitment byte array not found".to_string())?;
+
+        let mut bytes = Vec::with_capacity(commitment_arr.length());
+        for i in 0..commitment_arr.length() {
+            if let Some(Value::U8(b)) = commitment_arr.get(&Value::I64(i as i64)) {
+                bytes.push(*b);
+            } else {
+                return Err("Invalid byte in commitment".to_string());
+            }
+        }
+
+        Ok(bytes)
+    }
+
+    /// Get the number of commitments in an ADKG secret key object
+    pub fn get_commitment_count(store: &ObjectStore, value: &Value) -> Result<usize, String> {
+        let commitments_field = store
+            .get_field(value, &Value::String(adkg_fields::COMMITMENTS.to_string()))
+            .ok_or_else(|| "ADKG secret key object missing __commitments field".to_string())?;
+
+        let commitments_array_id = match commitments_field {
+            Value::Array(id) => id,
+            _ => return Err("Invalid commitments type".to_string()),
+        };
+
+        let commitments_array = store
+            .get_array(commitments_array_id)
+            .ok_or_else(|| "Commitments array not found".to_string())?;
+
+        Ok(commitments_array.length())
+    }
+}
+
+/// Register ADKG (Asynchronous Distributed Key Generation) builtins
+fn register_adkg_builtins(vm: &mut VirtualMachine) {
+    // Note: AdkgMpcEngine and AdkgOperations are used when actually running ADKG
+    // These builtins work on the ADKG secret key objects stored in the VM
+
+    // Adkg.get_commitment - Get commitment at index from ADKG secret key
+    // commitment[0] is the public key
+    vm.register_foreign_function("Adkg.get_commitment", |ctx| {
+        if ctx.args.len() < 2 {
+            return Err("Adkg.get_commitment expects 2 arguments: adkg_secret_key, index".to_string());
+        }
+
+        // Check if arg is an ADKG secret key object
+        if !adkg_object::is_adkg_secret_key_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+            return Err("First argument must be an ADKG secret key object".to_string());
+        }
+
+        let index = match &ctx.args[1] {
+            Value::I64(n) if *n >= 0 => *n as usize,
+            Value::U64(n) => *n as usize,
+            _ => return Err("index must be a non-negative integer".to_string()),
+        };
+
+        let commitment_bytes = adkg_object::get_commitment(&ctx.vm_state.object_store, &ctx.args[0], index)?;
+
+        // Return as byte array
+        let arr_id = ctx.vm_state.object_store.create_array_with_capacity(commitment_bytes.len());
+        {
+            let arr = ctx.vm_state.object_store.get_array_mut(arr_id).unwrap();
+            for (i, byte) in commitment_bytes.into_iter().enumerate() {
+                arr.set(Value::I64(i as i64), Value::U8(byte));
+            }
+        }
+        Ok(Value::Array(arr_id))
+    });
+
+    // Adkg.get_public_key - Get the public key (commitment[0]) from ADKG secret key
+    vm.register_foreign_function("Adkg.get_public_key", |ctx| {
+        if ctx.args.is_empty() {
+            return Err("Adkg.get_public_key expects 1 argument: adkg_secret_key".to_string());
+        }
+
+        if !adkg_object::is_adkg_secret_key_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+            return Err("Argument must be an ADKG secret key object".to_string());
+        }
+
+        // commitment[0] is the public key
+        let commitment_bytes = adkg_object::get_commitment(&ctx.vm_state.object_store, &ctx.args[0], 0)?;
+
+        // Return as byte array
+        let arr_id = ctx.vm_state.object_store.create_array_with_capacity(commitment_bytes.len());
+        {
+            let arr = ctx.vm_state.object_store.get_array_mut(arr_id).unwrap();
+            for (i, byte) in commitment_bytes.into_iter().enumerate() {
+                arr.set(Value::I64(i as i64), Value::U8(byte));
+            }
+        }
+        Ok(Value::Array(arr_id))
+    });
+
+    // Adkg.get_session_id - Get the session ID from ADKG secret key
+    vm.register_foreign_function("Adkg.get_session_id", |ctx| {
+        if ctx.args.is_empty() {
+            return Err("Adkg.get_session_id expects 1 argument: adkg_secret_key".to_string());
+        }
+
+        if !adkg_object::is_adkg_secret_key_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+            return Err("Argument must be an ADKG secret key object".to_string());
+        }
+
+        let session_id = adkg_object::get_session_id(&ctx.vm_state.object_store, &ctx.args[0])?;
+        Ok(Value::I64(session_id as i64))
+    });
+
+    // Adkg.commitment_count - Get the number of commitments in an ADKG secret key
+    vm.register_foreign_function("Adkg.commitment_count", |ctx| {
+        if ctx.args.is_empty() {
+            return Err("Adkg.commitment_count expects 1 argument: adkg_secret_key".to_string());
+        }
+
+        if !adkg_object::is_adkg_secret_key_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+            return Err("Argument must be an ADKG secret key object".to_string());
+        }
+
+        let count = adkg_object::get_commitment_count(&ctx.vm_state.object_store, &ctx.args[0])?;
+        Ok(Value::I64(count as i64))
+    });
+
+    // Adkg.is_adkg_key - Check if value is an ADKG secret key object
+    vm.register_foreign_function("Adkg.is_adkg_key", |ctx| {
+        if ctx.args.is_empty() {
+            return Err("Adkg.is_adkg_key expects 1 argument: value".to_string());
+        }
+
+        let is_adkg = adkg_object::is_adkg_secret_key_object(&ctx.vm_state.object_store, &ctx.args[0]);
+        Ok(Value::Bool(is_adkg))
+    });
 }
 
 #[cfg(test)]

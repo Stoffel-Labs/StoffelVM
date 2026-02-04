@@ -1,3 +1,4 @@
+pub mod adkg_integration;
 pub mod leader_bootnode_integration;
 pub mod mpc_multiplication_integration;
 pub mod p2p_integration;

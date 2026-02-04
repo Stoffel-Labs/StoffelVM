@@ -263,7 +263,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
 
             let mut retry_count = 0;
             loop {
-                let connection_result = dialer.connect_as_server(peer_addr, self.node_id).await;
+                let connection_result = dialer.connect_as_server(peer_addr).await;
 
                 match connection_result {
                     Ok(connection) => {
@@ -552,7 +552,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
 
                 let connection_result = {
                     let mut dialer = self.network.lock().await;
-                    dialer.connect_as_client(address, self.client_id).await
+                    dialer.connect_as_client(address).await
                 };
 
                 match connection_result {

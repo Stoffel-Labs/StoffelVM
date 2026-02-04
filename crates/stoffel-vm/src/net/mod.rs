@@ -1,6 +1,7 @@
 // src/net/mod.rs
 //! Networking module for peer-to-peer communication.
 
+pub mod adkg_engine;
 pub mod client_store;
 pub mod discovery;
 pub mod hb_engine;

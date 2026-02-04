@@ -10,7 +10,8 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 libc = "0.2"
-stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "main" }
+# Use local path to mpc-protocols dev branch for ADKG support
+stoffelmpc-mpc = { version = "0.1.0", path = "/Users/gabriel/RustroverProjects/mpc-protocols/mpc" }
 stoffelnet =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
 stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
 
@@ -30,6 +31,8 @@ parking_lot = "0.12"
 once_cell = "1.19.0"
 serde = { version = "1.0", features = ["derive", "default"] }
 ark-ff = "0.5.0"
+ark-ec = "0.5.0"
+ark-poly = "0.5.0"
 uuid = { version = "1.17.0", features = ["v4", "serde"] }
 futures = "0.3.31"
 tracing = "0.1.41"

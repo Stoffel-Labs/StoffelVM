@@ -248,7 +248,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
 
             let mut retry_count = 0;
             loop {
-                let connection_result = dialer.connect_as_server(peer_addr, self.node_id).await;
+                let connection_result = dialer.connect_as_server(peer_addr).await;
 
                 match connection_result {
                     Ok(connection) => {
@@ -338,8 +338,8 @@ pub async fn spawn_receive_loops(
 ) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
 
-    // Get all established connections
-    let connections = net.get_all_connections().await;
+    // Get all established connections (server connections are to other MPC parties)
+    let connections = net.get_all_server_connections();
     eprintln!(
         "[party {}] spawn_receive_loops: found {} connections",
         node_id,
