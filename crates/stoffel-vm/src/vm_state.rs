@@ -2399,24 +2399,25 @@ impl VMState {
     /// println!("Hydrated inputs from {} clients", count);
     /// ```
     pub fn hydrate_from_mpc_engine(&self) -> Result<usize, String> {
-        use crate::net::hb_engine::HoneyBadgerMpcEngine;
-
         let engine = self
             .mpc_engine
             .as_ref()
             .ok_or("MPC engine not configured")?;
 
         // Try to downcast to HoneyBadgerMpcEngine which implements MpcEngineClientOps
-        // Note: In the future, we could make this more generic with Any trait
-        if let Some(hb_engine) = engine
-            .as_any()
-            .and_then(|any| any.downcast_ref::<HoneyBadgerMpcEngine>())
+        #[cfg(feature = "honeybadger")]
         {
-            use crate::net::mpc_engine::MpcEngineClientOps;
-            hb_engine.hydrate_client_inputs_sync(&self.client_store)
-        } else {
-            Err("MPC engine does not support client input hydration".to_string())
+            use crate::net::hb_engine::HoneyBadgerMpcEngine;
+            if let Some(hb_engine) = engine
+                .as_any()
+                .and_then(|any| any.downcast_ref::<HoneyBadgerMpcEngine>())
+            {
+                use crate::net::mpc_engine::MpcEngineClientOps;
+                return hb_engine.hydrate_client_inputs_sync(&self.client_store);
+            }
         }
+
+        Err("MPC engine does not support client input hydration".to_string())
     }
 
     /// Clear the client input store and re-hydrate from the MPC engine

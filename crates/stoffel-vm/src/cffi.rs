@@ -59,8 +59,11 @@ use stoffel_vm_types::compiled_binary::CompiledBinary;
 use stoffel_vm_types::core_types::{F64, ShareType, Value};
 use crate::core_vm::VirtualMachine;
 use crate::foreign_functions::ForeignFunctionContext;
+#[cfg(feature = "honeybadger")]
 use crate::net::hb_engine::HoneyBadgerMpcEngine;
+#[cfg(feature = "honeybadger")]
 use crate::net::mpc_engine::MpcEngine;
+#[cfg(feature = "honeybadger")]
 use stoffelnet::transports::quic::QuicNetworkManager;
 
 /// Opaque pointer type for the VM
@@ -130,6 +133,7 @@ pub type CForeignFunction = extern "C" fn(
 // HoneyBadgerMpcEngine FFI Types
 // ============================================================================
 
+#[cfg(feature = "honeybadger")]
 /// Opaque pointer type for HoneyBadgerMpcEngine
 ///
 /// This type is used to pass engine handles across the FFI boundary.
@@ -140,6 +144,7 @@ pub struct HBEngineOpaque {
     _marker: core::marker::PhantomData<(*mut u8, PhantomPinned)>,
 }
 
+#[cfg(feature = "honeybadger")]
 /// Opaque pointer type for QuicNetworkManager
 ///
 /// This type is used to pass network handles across the FFI boundary.
@@ -149,6 +154,7 @@ pub struct HBNetworkOpaque {
     _marker: core::marker::PhantomData<(*mut u8, PhantomPinned)>,
 }
 
+#[cfg(feature = "honeybadger")]
 /// Error codes for HoneyBadgerMpcEngine FFI operations
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -732,6 +738,7 @@ pub extern "C" fn stoffel_load_bytecode(
 // HoneyBadgerMpcEngine FFI Functions
 // ============================================================================
 
+#[cfg(feature = "honeybadger")]
 /// Creates a new HoneyBadgerMpcEngine
 ///
 /// # Arguments
@@ -780,6 +787,7 @@ pub extern "C" fn hb_engine_new(
     }
 }
 
+#[cfg(feature = "honeybadger")]
 /// Frees a HoneyBadgerMpcEngine instance
 ///
 /// # Safety
@@ -794,6 +802,7 @@ pub extern "C" fn hb_engine_free(engine_ptr: *mut HBEngineOpaque) {
     }
 }
 
+#[cfg(feature = "honeybadger")]
 /// Runs preprocessing (generates Beaver triples and random shares)
 ///
 /// This is a blocking call that runs the async preprocessing protocol.
@@ -823,6 +832,7 @@ pub extern "C" fn hb_engine_start_async(engine_ptr: *mut HBEngineOpaque) -> HBEn
     }
 }
 
+#[cfg(feature = "honeybadger")]
 /// Checks if the engine is ready (preprocessing complete)
 ///
 /// # Returns
@@ -838,6 +848,7 @@ pub extern "C" fn hb_engine_is_ready(engine_ptr: *mut HBEngineOpaque) -> c_int {
     if engine.is_ready() { 1 } else { 0 }
 }
 
+#[cfg(feature = "honeybadger")]
 /// Performs secure multiplication of two shares
 ///
 /// # Arguments
@@ -893,6 +904,7 @@ pub extern "C" fn hb_engine_multiply_share_async(
     }
 }
 
+#[cfg(feature = "honeybadger")]
 /// Opens (reconstructs) a shared value
 ///
 /// # Arguments
@@ -934,6 +946,7 @@ pub extern "C" fn hb_engine_open_share(
     }
 }
 
+#[cfg(feature = "honeybadger")]
 /// Initialize input shares from a client
 ///
 /// # Arguments
@@ -996,6 +1009,7 @@ pub extern "C" fn hb_engine_init_client_input(
     }
 }
 
+#[cfg(feature = "honeybadger")]
 /// Get shares for a specific client
 ///
 /// # Arguments
@@ -1055,6 +1069,7 @@ pub extern "C" fn hb_engine_get_client_shares(
     }
 }
 
+#[cfg(feature = "honeybadger")]
 /// Get the party ID of the engine
 #[no_mangle]
 pub extern "C" fn hb_engine_party_id(engine_ptr: *mut HBEngineOpaque) -> usize {
@@ -1065,6 +1080,7 @@ pub extern "C" fn hb_engine_party_id(engine_ptr: *mut HBEngineOpaque) -> usize {
     engine.party_id()
 }
 
+#[cfg(feature = "honeybadger")]
 /// Get the instance ID of the engine
 #[no_mangle]
 pub extern "C" fn hb_engine_instance_id(engine_ptr: *mut HBEngineOpaque) -> u64 {
@@ -1075,6 +1091,7 @@ pub extern "C" fn hb_engine_instance_id(engine_ptr: *mut HBEngineOpaque) -> u64 
     engine.instance_id()
 }
 
+#[cfg(feature = "honeybadger")]
 /// Get the protocol name (returns static string, do not free)
 #[no_mangle]
 pub extern "C" fn hb_engine_protocol_name(engine_ptr: *mut HBEngineOpaque) -> *const c_char {
@@ -1085,6 +1102,7 @@ pub extern "C" fn hb_engine_protocol_name(engine_ptr: *mut HBEngineOpaque) -> *c
     PROTOCOL_NAME.as_ptr() as *const c_char
 }
 
+#[cfg(feature = "honeybadger")]
 /// Get the network handle from the engine
 ///
 /// Returns a cloned network pointer. Caller must free with hb_network_free.
@@ -1101,6 +1119,7 @@ pub extern "C" fn hb_engine_get_network(engine_ptr: *mut HBEngineOpaque) -> *mut
     Box::into_raw(Box::new(net)) as *mut HBNetworkOpaque
 }
 
+#[cfg(feature = "honeybadger")]
 /// Free a network handle obtained from hb_engine_get_network
 #[no_mangle]
 pub extern "C" fn hb_network_free(network_ptr: *mut HBNetworkOpaque) {
@@ -1111,6 +1130,7 @@ pub extern "C" fn hb_network_free(network_ptr: *mut HBNetworkOpaque) {
     }
 }
 
+#[cfg(feature = "honeybadger")]
 /// Free bytes allocated by engine functions (e.g., multiply_share_async result)
 #[no_mangle]
 pub extern "C" fn hb_free_bytes(ptr: *mut u8, len: usize) {
@@ -1125,7 +1145,7 @@ pub extern "C" fn hb_free_bytes(ptr: *mut u8, len: usize) {
 // HoneyBadgerMpcEngine FFI - Unit Tests
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "honeybadger"))]
 mod hb_engine_tests {
     use super::*;
 
@@ -1192,5 +1212,306 @@ mod hb_engine_tests {
         // Should not crash
         hb_free_bytes(std::ptr::null_mut(), 0);
         hb_free_bytes(std::ptr::null_mut(), 10);
+    }
+}
+
+// ============================================================================
+// ADKG Engine FFI Types and Functions
+// ============================================================================
+
+#[cfg(feature = "adkg")]
+mod adkg_ffi {
+    use super::*;
+    use crate::net::adkg_engine::AdkgMpcEngine;
+    use crate::net::mpc_engine::MpcEngine;
+    use ark_bls12_381::{Fr, G1Projective as G1};
+    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+    use ark_std::rand::SeedableRng;
+    use ark_std::UniformRand;
+    use std::sync::Arc;
+    use stoffelnet::transports::quic::QuicNetworkManager;
+
+    /// Opaque pointer type for AdkgMpcEngine
+    #[repr(C)]
+    pub struct AdkgEngineOpaque {
+        _data: (),
+        _marker: core::marker::PhantomData<(*mut u8, PhantomPinned)>,
+    }
+
+    /// Error codes for ADKG engine FFI operations
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AdkgEngineErrorCode {
+        /// Operation succeeded
+        Success = 0,
+        /// Null pointer provided
+        NullPointer = 1,
+        /// Engine not ready
+        NotReady = 2,
+        /// Key generation failed
+        KeyGenFailed = 3,
+        /// Serialization error
+        SerializationError = 4,
+        /// Session not found
+        SessionNotFound = 5,
+        /// Invalid commitment index
+        InvalidCommitmentIndex = 6,
+        /// Tokio runtime creation failed
+        RuntimeError = 7,
+    }
+
+    /// Creates a new ADKG engine
+    ///
+    /// # Arguments
+    /// * `instance_id` - Unique instance identifier
+    /// * `party_id` - This party's ID (0 to n-1)
+    /// * `n` - Total number of parties
+    /// * `t` - Threshold
+    /// * `network_ptr` - Pointer to a QuicNetworkManager (same opaque type as HB)
+    /// * `sk_bytes` - Secret key bytes (serialized Fr element), or null for random key
+    /// * `sk_len` - Length of secret key bytes
+    /// * `pk_map_ptr` - Pointer to serialized public key map, or null
+    /// * `pk_map_len` - Length of public key map bytes
+    ///
+    /// # Returns
+    /// Pointer to opaque engine handle, or null on failure
+    #[no_mangle]
+    pub extern "C" fn adkg_engine_new(
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        network_ptr: *mut c_void,
+        sk_bytes: *const u8,
+        sk_len: usize,
+        pk_map_ptr: *const u8,
+        pk_map_len: usize,
+    ) -> *mut AdkgEngineOpaque {
+        if network_ptr.is_null() || pk_map_ptr.is_null() {
+            return std::ptr::null_mut();
+        }
+
+        // Extract network from opaque pointer
+        let net: Arc<QuicNetworkManager> = unsafe {
+            let boxed = &*(network_ptr as *const Arc<QuicNetworkManager>);
+            Arc::clone(boxed)
+        };
+
+        // Parse secret key
+        let sk_i = if sk_bytes.is_null() || sk_len == 0 {
+            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+            Fr::rand(&mut rng)
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(sk_bytes, sk_len) };
+            match ark_serialize::CanonicalDeserialize::deserialize_compressed(bytes) {
+                Ok(sk) => sk,
+                Err(_) => return std::ptr::null_mut(),
+            }
+        };
+
+        // Parse public key map (ark types use CanonicalDeserialize, not serde)
+        let pk_bytes = unsafe { std::slice::from_raw_parts(pk_map_ptr, pk_map_len) };
+        let pk_map: Vec<G1> = match Vec::<G1>::deserialize_compressed(pk_bytes) {
+            Ok(pks) => pks,
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        if pk_map.len() != n {
+            return std::ptr::null_mut();
+        }
+
+        match AdkgMpcEngine::new(instance_id, party_id, n, t, net, sk_i, Arc::new(pk_map)) {
+            Ok(engine) => Box::into_raw(Box::new(engine)) as *mut AdkgEngineOpaque,
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// Frees an ADKG engine instance
+    #[no_mangle]
+    pub extern "C" fn adkg_engine_free(engine_ptr: *mut AdkgEngineOpaque) {
+        if !engine_ptr.is_null() {
+            unsafe {
+                let _ = Box::from_raw(engine_ptr as *mut Arc<AdkgMpcEngine>);
+            }
+        }
+    }
+
+    /// Generates a new distributed key
+    ///
+    /// Returns session_id via out parameter on success.
+    #[no_mangle]
+    pub extern "C" fn adkg_engine_generate_key(
+        engine_ptr: *mut AdkgEngineOpaque,
+        session_id_out: *mut u64,
+    ) -> AdkgEngineErrorCode {
+        if engine_ptr.is_null() || session_id_out.is_null() {
+            return AdkgEngineErrorCode::NullPointer;
+        }
+
+        let engine = unsafe { &*(engine_ptr as *const Arc<AdkgMpcEngine>) };
+
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(_) => return AdkgEngineErrorCode::RuntimeError,
+        };
+
+        match rt.block_on(engine.generate_key()) {
+            Ok(key) => {
+                unsafe {
+                    *session_id_out = key.session_id;
+                }
+                AdkgEngineErrorCode::Success
+            }
+            Err(_) => AdkgEngineErrorCode::KeyGenFailed,
+        }
+    }
+
+    /// Get the public key for a session
+    ///
+    /// Caller must free result bytes with adkg_free_bytes.
+    #[no_mangle]
+    pub extern "C" fn adkg_engine_get_public_key(
+        engine_ptr: *mut AdkgEngineOpaque,
+        session_id: u64,
+        result_ptr: *mut *mut u8,
+        result_len_ptr: *mut usize,
+    ) -> AdkgEngineErrorCode {
+        if engine_ptr.is_null() || result_ptr.is_null() || result_len_ptr.is_null() {
+            return AdkgEngineErrorCode::NullPointer;
+        }
+
+        let engine = unsafe { &*(engine_ptr as *const Arc<AdkgMpcEngine>) };
+
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(_) => return AdkgEngineErrorCode::RuntimeError,
+        };
+
+        match rt.block_on(engine.get_public_key_bytes(session_id)) {
+            Ok(bytes) => {
+                let mut bytes = ManuallyDrop::new(bytes);
+                unsafe {
+                    *result_ptr = bytes.as_mut_ptr();
+                    *result_len_ptr = bytes.len();
+                }
+                AdkgEngineErrorCode::Success
+            }
+            Err(_) => AdkgEngineErrorCode::SessionNotFound,
+        }
+    }
+
+    /// Get a commitment at a specific index for a session
+    ///
+    /// Caller must free result bytes with adkg_free_bytes.
+    #[no_mangle]
+    pub extern "C" fn adkg_engine_get_commitment(
+        engine_ptr: *mut AdkgEngineOpaque,
+        session_id: u64,
+        index: usize,
+        result_ptr: *mut *mut u8,
+        result_len_ptr: *mut usize,
+    ) -> AdkgEngineErrorCode {
+        if engine_ptr.is_null() || result_ptr.is_null() || result_len_ptr.is_null() {
+            return AdkgEngineErrorCode::NullPointer;
+        }
+
+        let engine = unsafe { &*(engine_ptr as *const Arc<AdkgMpcEngine>) };
+
+        use crate::net::adkg_engine::AdkgOperations;
+        match engine.adkg_get_commitment(session_id, index) {
+            Ok(bytes) => {
+                let mut bytes = ManuallyDrop::new(bytes);
+                unsafe {
+                    *result_ptr = bytes.as_mut_ptr();
+                    *result_len_ptr = bytes.len();
+                }
+                AdkgEngineErrorCode::Success
+            }
+            Err(_) => AdkgEngineErrorCode::InvalidCommitmentIndex,
+        }
+    }
+
+    /// Check if the engine is ready
+    #[no_mangle]
+    pub extern "C" fn adkg_engine_is_ready(engine_ptr: *mut AdkgEngineOpaque) -> c_int {
+        if engine_ptr.is_null() {
+            return 0;
+        }
+        let engine = unsafe { &*(engine_ptr as *const Arc<AdkgMpcEngine>) };
+        if engine.is_ready() { 1 } else { 0 }
+    }
+
+    /// Get the party ID
+    #[no_mangle]
+    pub extern "C" fn adkg_engine_party_id(engine_ptr: *mut AdkgEngineOpaque) -> usize {
+        if engine_ptr.is_null() {
+            return 0;
+        }
+        let engine = unsafe { &*(engine_ptr as *const Arc<AdkgMpcEngine>) };
+        engine.party_id()
+    }
+
+    /// Get the protocol name (returns static string, do not free)
+    #[no_mangle]
+    pub extern "C" fn adkg_engine_protocol_name(
+        engine_ptr: *mut AdkgEngineOpaque,
+    ) -> *const c_char {
+        static PROTOCOL_NAME: &[u8] = b"adkg\0";
+        if engine_ptr.is_null() {
+            return std::ptr::null();
+        }
+        PROTOCOL_NAME.as_ptr() as *const c_char
+    }
+
+    /// Free bytes allocated by ADKG engine functions
+    #[no_mangle]
+    pub extern "C" fn adkg_free_bytes(ptr: *mut u8, len: usize) {
+        if !ptr.is_null() && len > 0 {
+            unsafe {
+                let _ = Vec::from_raw_parts(ptr, len, len);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_adkg_engine_new_null_network() {
+            let engine = adkg_engine_new(
+                1, 0, 5, 1,
+                std::ptr::null_mut(),
+                std::ptr::null(), 0,
+                std::ptr::null(), 0,
+            );
+            assert!(engine.is_null());
+        }
+
+        #[test]
+        fn test_adkg_engine_free_null() {
+            adkg_engine_free(std::ptr::null_mut());
+        }
+
+        #[test]
+        fn test_adkg_engine_is_ready_null() {
+            assert_eq!(adkg_engine_is_ready(std::ptr::null_mut()), 0);
+        }
+
+        #[test]
+        fn test_adkg_engine_party_id_null() {
+            assert_eq!(adkg_engine_party_id(std::ptr::null_mut()), 0);
+        }
+
+        #[test]
+        fn test_adkg_engine_protocol_name_null() {
+            assert!(adkg_engine_protocol_name(std::ptr::null_mut()).is_null());
+        }
+
+        #[test]
+        fn test_adkg_free_bytes_null() {
+            adkg_free_bytes(std::ptr::null_mut(), 0);
+            adkg_free_bytes(std::ptr::null_mut(), 10);
+        }
     }
 }

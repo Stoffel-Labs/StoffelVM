@@ -51,6 +51,28 @@ pub trait MpcEngine: Send + Sync {
             .collect()
     }
 
+    /// Generate random bytes as a secret-shared value.
+    ///
+    /// The engine uses its preprocessing pool (e.g. RanSha protocol) to produce
+    /// jointly-random shares that no single party knows.
+    fn random_share(&self, _ty: ShareType) -> Result<Vec<u8>, String> {
+        Err("random_share not implemented for this engine".to_string())
+    }
+
+    /// Reveal a share in the exponent: reconstructs `[secret] * generator`
+    /// via Lagrange interpolation in the group.
+    ///
+    /// Each party computes `share_i * generator`, then all parties exchange
+    /// partial points and reconstruct the public point.
+    fn open_share_in_exp(
+        &self,
+        _ty: ShareType,
+        _share_bytes: &[u8],
+        _generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        Err("open_share_in_exp not implemented for this engine".to_string())
+    }
+
     /// Send output share(s) to a specific client for private reconstruction
     ///
     /// Unlike `open_share` which reveals to all parties, this sends this party's
@@ -130,6 +152,21 @@ pub trait AsyncMpcEngine: MpcEngine {
     ) -> Result<Vec<Value>, String> {
         // Default implementation uses the sync version
         self.batch_open_shares(ty, shares)
+    }
+
+    /// Generate random bytes as a secret-shared value (async).
+    async fn random_share_async(&self, ty: ShareType) -> Result<Vec<u8>, String> {
+        self.random_share(ty)
+    }
+
+    /// Reveal a share in the exponent asynchronously.
+    async fn open_share_in_exp_async(
+        &self,
+        ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.open_share_in_exp(ty, share_bytes, generator_bytes)
     }
 
     /// Send output share(s) to a specific client asynchronously

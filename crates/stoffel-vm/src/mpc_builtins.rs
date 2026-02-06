@@ -264,8 +264,12 @@ pub mod share_object {
 pub fn register_mpc_builtins(vm: &mut VirtualMachine) {
     register_share_builtins(vm);
     register_mpc_info_builtins(vm);
-    register_rbc_builtins(vm);
-    register_aba_builtins(vm);
+    #[cfg(feature = "honeybadger")]
+    {
+        register_rbc_builtins(vm);
+        register_aba_builtins(vm);
+    }
+    #[cfg(feature = "adkg")]
     register_adkg_builtins(vm);
 }
 
@@ -347,6 +351,9 @@ fn register_share_builtins(vm: &mut VirtualMachine) {
 
     // Share.get_party_id - Get the party ID from share object
     vm.register_foreign_function("Share.get_party_id", share_get_party_id);
+
+    // Share.open_exp - Reveal share in the exponent (returns public group element)
+    vm.register_foreign_function("Share.open_exp", share_open_exp);
 }
 
 /// Register Mpc info builtins
@@ -396,9 +403,59 @@ fn register_mpc_info_builtins(vm: &mut VirtualMachine) {
             .ok_or_else(|| "MPC engine not configured".to_string())?;
         Ok(Value::I64(engine.instance_id() as i64))
     });
+
+    // Mpc.rand - Generate a random secret-shared value (256-bit integer)
+    vm.register_foreign_function("Mpc.rand", |ctx| {
+        let engine = ctx
+            .vm_state
+            .mpc_engine()
+            .ok_or_else(|| "MPC engine not configured".to_string())?;
+        if !engine.is_ready() {
+            return Err("MPC engine not ready".to_string());
+        }
+        let ty = ShareType::SecretInt { bit_length: 256 };
+        let share_bytes = engine.random_share(ty)?;
+        let party_id = engine.party_id();
+        let obj_id = share_object::create_share_object(
+            &mut ctx.vm_state.object_store,
+            ty,
+            share_bytes,
+            party_id,
+        );
+        Ok(Value::Object(obj_id))
+    });
+
+    // Mpc.rand_int - Generate a random secret-shared integer with custom bit length
+    vm.register_foreign_function("Mpc.rand_int", |ctx| {
+        if ctx.args.is_empty() {
+            return Err("Mpc.rand_int expects 1 argument: bit_length".to_string());
+        }
+        let bit_length = match &ctx.args[0] {
+            Value::I64(n) if *n > 0 => *n as usize,
+            _ => return Err("bit_length must be a positive integer".to_string()),
+        };
+        let engine = ctx
+            .vm_state
+            .mpc_engine()
+            .ok_or_else(|| "MPC engine not configured".to_string())?;
+        if !engine.is_ready() {
+            return Err("MPC engine not ready".to_string());
+        }
+        let ty = ShareType::SecretInt { bit_length };
+        let share_bytes = engine.random_share(ty)?;
+        let party_id = engine.party_id();
+        let obj_id = share_object::create_share_object(
+            &mut ctx.vm_state.object_store,
+            ty,
+            share_bytes,
+            party_id,
+        );
+        Ok(Value::Object(obj_id))
+    });
 }
 
 /// Register RBC (Reliable Broadcast) builtins
+#[cfg(feature = "honeybadger")]
 fn register_rbc_builtins(vm: &mut VirtualMachine) {
     use crate::net::hb_engine::HoneyBadgerMpcEngine;
     use crate::net::mpc_engine::MpcEngineConsensus;
@@ -513,6 +570,7 @@ fn register_rbc_builtins(vm: &mut VirtualMachine) {
 }
 
 /// Register ABA (Asynchronous Binary Agreement) builtins
+#[cfg(feature = "honeybadger")]
 fn register_aba_builtins(vm: &mut VirtualMachine) {
     use crate::net::hb_engine::HoneyBadgerMpcEngine;
     use crate::net::mpc_engine::MpcEngineConsensus;
@@ -1136,7 +1194,73 @@ fn share_get_party_id(ctx: ForeignFunctionContext) -> Result<Value, String> {
     }
 }
 
+/// Open a share in the exponent — returns the public group element `[secret] * generator`
+///
+/// # Arguments
+/// * `share` - A Share object
+/// * `curve_name` - String identifying the curve + generator (e.g. "bls12-381-g1")
+///
+/// # Returns
+/// An array of U8 values containing the serialized (compressed) group element
+fn share_open_exp(ctx: ForeignFunctionContext) -> Result<Value, String> {
+    if ctx.args.len() < 2 {
+        return Err("Share.open_exp expects 2 arguments: share, curve_name".to_string());
+    }
+
+    let engine = ctx
+        .vm_state
+        .mpc_engine()
+        .ok_or_else(|| "MPC engine not configured".to_string())?;
+
+    if !engine.is_ready() {
+        return Err("MPC engine not ready".to_string());
+    }
+
+    let (ty, data) = share_object::extract_share_data(&ctx.vm_state.object_store, &ctx.args[0])?;
+
+    let curve_name = match &ctx.args[1] {
+        Value::String(s) => s.as_str(),
+        _ => return Err("curve_name must be a string".to_string()),
+    };
+
+    // Map curve name to the serialized generator point
+    let generator_bytes = match curve_name {
+        "bls12-381-g1" => {
+            use ark_bls12_381::G1Projective;
+            use ark_ec::{CurveGroup, PrimeGroup};
+            use ark_serialize::CanonicalSerialize;
+            let gen = G1Projective::generator();
+            let mut buf = Vec::new();
+            gen.into_affine()
+                .serialize_compressed(&mut buf)
+                .map_err(|e| format!("serialize generator: {}", e))?;
+            buf
+        }
+        _ => return Err(format!("Unsupported curve: {}", curve_name)),
+    };
+
+    let result_bytes = engine.open_share_in_exp(ty, &data, &generator_bytes)?;
+
+    // Return as byte array
+    let arr_id = ctx
+        .vm_state
+        .object_store
+        .create_array_with_capacity(result_bytes.len());
+    {
+        let arr = ctx
+            .vm_state
+            .object_store
+            .get_array_mut(arr_id)
+            .ok_or_else(|| "Failed to create result array".to_string())?;
+        for (i, byte) in result_bytes.into_iter().enumerate() {
+            arr.set(Value::I64(i as i64), Value::U8(byte));
+        }
+    }
+    Ok(Value::Array(arr_id))
+}
+
 /// Field name constants for ADKG secret key objects
+#[cfg(feature = "adkg")]
 pub mod adkg_fields {
     pub const TYPE: &str = "__type";
     pub const SESSION_ID: &str = "__session_id";
@@ -1147,6 +1271,7 @@ pub mod adkg_fields {
 }
 
 /// Helper module for ADKG secret key object operations
+#[cfg(feature = "adkg")]
 pub mod adkg_object {
     use super::adkg_fields;
     use stoffel_vm_types::core_types::{ObjectStore, Value};
@@ -1344,6 +1469,7 @@ pub mod adkg_object {
 }
 
 /// Register ADKG (Asynchronous Distributed Key Generation) builtins
+#[cfg(feature = "adkg")]
 fn register_adkg_builtins(vm: &mut VirtualMachine) {
     // Note: AdkgMpcEngine and AdkgOperations are used when actually running ADKG
     // These builtins work on the ADKG secret key objects stored in the VM

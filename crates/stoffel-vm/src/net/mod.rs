@@ -1,13 +1,20 @@
 // src/net/mod.rs
 //! Networking module for peer-to-peer communication.
 
+#[cfg(feature = "adkg")]
 pub mod adkg_engine;
+#[cfg(feature = "adkg")]
+pub mod adkg_server;
+pub mod backend;
 pub mod client_store;
 pub mod discovery;
+#[cfg(feature = "honeybadger")]
 pub mod hb_engine;
+#[cfg(feature = "honeybadger")]
 pub mod hb_server;
 pub mod mpc;
 pub mod mpc_engine;
+#[cfg(feature = "honeybadger")]
 pub mod mpc_runner;
 pub mod p2p;
 pub mod program_sync;
@@ -19,13 +26,19 @@ pub use p2p::{
     QuicPeerConnection,
 };
 
-// Re-export MPC helpers and engine unconditionally
+// Re-export backend selection
+pub use backend::MpcBackendKind;
+
+// Re-export MPC helpers (HB-specific helpers gated)
+#[cfg(feature = "honeybadger")]
 pub use mpc::{default_node_opts, honeybadger_node_opts};
 // Re-export HoneyBadger QUIC server
+#[cfg(feature = "honeybadger")]
 pub use hb_server::{
     spawn_receive_loops, FrHoneyBadgerQuicServer, HoneyBadgerQuicConfig, HoneyBadgerQuicServer,
 };
 // Re-export MpcRunner for convenient VM+MPC orchestration
+#[cfg(feature = "honeybadger")]
 pub use mpc_runner::{MpcRunner, MpcRunnerBuilder, MpcRunnerConfig};
 // Re-export discovery helpers
 pub use discovery::{

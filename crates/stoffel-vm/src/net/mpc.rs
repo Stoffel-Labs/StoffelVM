@@ -1,27 +1,36 @@
-//! HoneyBadger MPC integration helpers for the Stoffel VM.
+//! MPC integration helpers for the Stoffel VM.
 //! Minimal public API kept to avoid cross-crate trait bound conflicts.
 //! Use the MpcEngine abstraction (net::mpc_engine) to attach an engine to VMState for VM usage.
 
 use serde::{Deserialize, Serialize};
-use stoffel_vm_types::core_types::{
-    DEFAULT_FIXED_POINT_FRACTIONAL_BITS, DEFAULT_FIXED_POINT_TOTAL_BITS,
-};
+
+#[cfg(feature = "honeybadger")]
+use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_TOTAL_BITS;
+#[cfg(feature = "honeybadger")]
+use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_FRACTIONAL_BITS;
+#[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNodeOpts;
 
+#[cfg(feature = "honeybadger")]
 const DEFAULT_MIN_PARTIES: usize = 5;
+#[cfg(feature = "honeybadger")]
 const DEFAULT_THRESHOLD: usize = 1;
+#[cfg(feature = "honeybadger")]
 const DEFAULT_SECURITY_PARAMETER_K: usize = 8;
 
+#[cfg(feature = "honeybadger")]
 fn derive_prandbit_count(n_random_shares: usize) -> usize {
     std::cmp::max(n_random_shares, DEFAULT_FIXED_POINT_FRACTIONAL_BITS)
 }
 
+#[cfg(feature = "honeybadger")]
 fn derive_prandint_count(n_triples: usize, n_random_shares: usize) -> usize {
     std::cmp::max(n_triples.max(1), n_random_shares.max(1))
 }
 
 /// Convenience for creating default node options for a n-party network.
 /// Customize n_triples / n_random_shares / instance_id as needed at callsite.
+#[cfg(feature = "honeybadger")]
 pub fn default_node_opts(
     instance_id: u64,
     n_triples: usize,
@@ -37,6 +46,7 @@ pub fn default_node_opts(
 }
 
 /// Build HoneyBadger node options, deriving ancillary preprocessing counts from existing inputs.
+#[cfg(feature = "honeybadger")]
 pub fn honeybadger_node_opts(
     n_parties: usize,
     threshold: usize,

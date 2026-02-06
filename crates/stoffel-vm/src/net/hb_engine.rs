@@ -1,8 +1,10 @@
 use crate::net::client_store::ClientInputStore;
 use crate::net::mpc::honeybadger_node_opts;
 use crate::net::mpc_engine::{AsyncMpcEngineConsensus, MpcEngine, MpcEngineClientOps, MpcEngineConsensus};
-use ark_bls12_381::Fr;
-use ark_ff::PrimeField;
+use ark_bls12_381::{Fr, G1Projective as G1};
+use ark_ec::CurveGroup;
+use ark_ff::{Field, PrimeField, Zero};
+use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
 use std::sync::{
@@ -342,6 +344,150 @@ impl HoneyBadgerMpcEngine {
             ready: AtomicBool::new(true),
             mul_session_counter: Arc::new(Mutex::new(0)),
         })
+    }
+
+    /// Pull one pre-generated random share from the preprocessing pool.
+    /// If the pool is empty, `reserve_random_shares` auto-regenerates via
+    /// the RanSha protocol over the network.
+    pub async fn random_share_async_impl(&self, _ty: ShareType) -> Result<Vec<u8>, String> {
+        let shares = self.reserve_random_shares(1).await?;
+        Self::encode_share(&shares[0])
+    }
+
+    /// Reveal a share in the exponent using in-process registry coordination.
+    ///
+    /// Each party computes `share_value * generator` and contributes its partial
+    /// point. When enough partial points are collected, Lagrange-in-the-exponent
+    /// interpolation reconstructs `[secret] * generator`.
+    pub fn open_share_in_exp_impl(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        // Decode the share
+        let share = Self::decode_share(share_bytes)?;
+
+        // Decode the generator point
+        let generator = G1::deserialize_compressed(&generator_bytes[..])
+            .map_err(|e| format!("deserialize generator: {}", e))?;
+
+        // Compute partial point: share_value * generator
+        let partial_point = generator * share.share[0];
+
+        // Serialize the partial point
+        let mut partial_bytes = Vec::new();
+        partial_point
+            .into_affine()
+            .serialize_compressed(&mut partial_bytes)
+            .map_err(|e| format!("serialize partial point: {}", e))?;
+
+        // In-process accumulator for open_share_in_exp
+        #[derive(Default, Clone)]
+        struct ExpOpenAccumulator {
+            partial_points: Vec<(usize, Vec<u8>)>, // (share_id, serialized G1Affine)
+            party_ids: Vec<usize>,
+            result: Option<Vec<u8>>,
+        }
+
+        static EXP_REGISTRY: once_cell::sync::Lazy<
+            parking_lot::Mutex<std::collections::HashMap<(u64, usize), ExpOpenAccumulator>>,
+        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let required = 2 * self.t + 1;
+        let mut my_sequence: Option<usize> = None;
+
+        loop {
+            let mut reg = EXP_REGISTRY.lock();
+
+            // Find the right accumulator (same pattern as open_share)
+            if my_sequence.is_none() {
+                let mut seq = 0;
+                loop {
+                    let key = (self.instance_id, seq);
+                    let entry = reg.entry(key).or_insert_with(ExpOpenAccumulator::default);
+
+                    if !entry.party_ids.contains(&self.party_id) {
+                        entry
+                            .partial_points
+                            .push((share.id, partial_bytes.clone()));
+                        entry.party_ids.push(self.party_id);
+                        my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.unwrap();
+            let key = (self.instance_id, seq);
+            let entry = reg.get_mut(&key).unwrap();
+
+            // Check if result is ready
+            if let Some(result) = entry.result.clone() {
+                return Ok(result);
+            }
+
+            // Check if we have enough partial points
+            if entry.partial_points.len() >= required {
+                let collected: Vec<(usize, Vec<u8>)> =
+                    entry.partial_points.iter().take(required).cloned().collect();
+
+                // Decode partial points
+                let mut points: Vec<(usize, G1)> = Vec::with_capacity(collected.len());
+                for (share_id, bytes) in &collected {
+                    let pt = <G1 as CurveGroup>::Affine::deserialize_compressed(&bytes[..])
+                        .map_err(|e| format!("deserialize partial point: {}", e))?;
+                    points.push((*share_id, pt.into()));
+                }
+
+                // Lagrange interpolation in the exponent at x=0
+                // λ_i(0) = Π_{j≠i} (-x_j) / (x_i - x_j)
+                //
+                // RobustShare uses FFT evaluation domain (roots of unity).
+                // Share with id=i is evaluated at domain.element(i) = ω^i.
+                let domain = GeneralEvaluationDomain::<Fr>::new(self.n)
+                    .ok_or_else(|| "No suitable FFT domain".to_string())?;
+                let eval_points: Vec<(usize, Fr)> = points
+                    .iter()
+                    .map(|(id, _)| (*id, domain.element(*id)))
+                    .collect();
+
+                let mut result = G1::zero();
+                for (i, (_id_i, pt_i)) in points.iter().enumerate() {
+                    let x_i = eval_points[i].1;
+                    // Compute Lagrange coefficient at x=0
+                    let mut lambda = Fr::from(1u64);
+                    for (j, _) in points.iter().enumerate() {
+                        if i == j {
+                            continue;
+                        }
+                        let x_j = eval_points[j].1;
+                        // λ_i *= (0 - x_j) / (x_i - x_j) = (-x_j) / (x_i - x_j)
+                        let num = -x_j;
+                        let den = x_i - x_j;
+                        lambda *= num
+                            * den
+                                .inverse()
+                                .ok_or_else(|| "zero denominator in Lagrange".to_string())?;
+                    }
+                    result += *pt_i * lambda;
+                }
+
+                // Serialize the result
+                let mut result_bytes = Vec::new();
+                result
+                    .into_affine()
+                    .serialize_compressed(&mut result_bytes)
+                    .map_err(|e| format!("serialize result: {}", e))?;
+
+                entry.result = Some(result_bytes.clone());
+                return Ok(result_bytes);
+            }
+
+            drop(reg);
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn ensure_rt() -> Result<tokio::runtime::Handle, String> {
@@ -778,6 +924,38 @@ impl MpcEngine for HoneyBadgerMpcEngine {
         Some(self)
     }
 
+    fn random_share(&self, ty: ShareType) -> Result<Vec<u8>, String> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                #[allow(deprecated)]
+                match handle.runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(self.random_share_async_impl(ty))
+                        })
+                    }
+                    _ => Err("random_share requires multi-thread Tokio runtime".to_string()),
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
+                rt.block_on(self.random_share_async_impl(ty))
+            }
+        }
+    }
+
+    fn open_share_in_exp(
+        &self,
+        ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.open_share_in_exp_impl(ty, share_bytes, generator_bytes)
+    }
+
     fn send_output_to_client(
         &self,
         client_id: ClientId,
@@ -849,6 +1027,19 @@ impl AsyncMpcEngine for HoneyBadgerMpcEngine {
     ) -> Result<(), String> {
         self.send_output_to_client_async_impl(client_id, shares, input_len)
             .await
+    }
+
+    async fn random_share_async(&self, ty: ShareType) -> Result<Vec<u8>, String> {
+        self.random_share_async_impl(ty).await
+    }
+
+    async fn open_share_in_exp_async(
+        &self,
+        ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.open_share_in_exp_impl(ty, share_bytes, generator_bytes)
     }
 }
 

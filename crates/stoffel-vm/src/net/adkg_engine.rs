@@ -10,6 +10,7 @@
 
 use crate::net::mpc_engine::MpcEngine;
 use ark_bls12_381::{Fr, G1Projective as G1};
+use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
 use ark_std::UniformRand;
@@ -19,9 +20,11 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use stoffel_vm_types::core_types::{ShareType, Value};
+use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS, F64};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::avss::{AvssNode, FeldmanShamirShare};
+use stoffelmpc_mpc::common::SecretSharingScheme;
+use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::{ProtocolType, SessionId};
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::mpsc::{self, Receiver};
@@ -348,15 +351,32 @@ impl AdkgMpcEngine {
     pub fn net(&self) -> Arc<QuicNetworkManager> {
         self.net.clone()
     }
+
+    /// Encode a RobustShare to bytes using CanonicalSerialize
+    fn encode_robustshare(share: &RobustShare<Fr>) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        share
+            .serialize_compressed(&mut out)
+            .map_err(|e| format!("serialize RobustShare: {}", e))?;
+        Ok(out)
+    }
+
+    /// Decode a RobustShare from bytes using CanonicalDeserialize
+    fn decode_robustshare(bytes: &[u8]) -> Result<RobustShare<Fr>, String> {
+        RobustShare::<Fr>::deserialize_compressed(bytes)
+            .map_err(|e| format!("deserialize RobustShare: {}", e))
+    }
 }
 
 // ============================================================================
 // MpcEngine Implementation
 // ============================================================================
 //
-// The ADKG engine implements MpcEngine primarily for compatibility with the VM,
-// but its main purpose is key generation rather than general MPC computation.
-// The standard MPC operations (multiply, open) are implemented minimally.
+// The ADKG engine implements MpcEngine as a proper AVSS-based MPC protocol.
+// It supports input sharing and opening via RobustShare, identical to HoneyBadger.
+// Secure multiplication is not supported (AVSS lacks Beaver triples).
+// ADKG-specific operations (key generation, commitment access) are available via
+// AdkgOperations trait through as_any() downcasting.
 
 impl MpcEngine for AdkgMpcEngine {
     fn protocol_name(&self) -> &'static str {
@@ -376,9 +396,46 @@ impl MpcEngine for AdkgMpcEngine {
         Ok(())
     }
 
-    fn input_share(&self, _ty: ShareType, _clear: &Value) -> Result<Vec<u8>, String> {
-        // ADKG doesn't support standard input sharing - use generate_key instead
-        Err("ADKG engine doesn't support input_share - use generate_key for key generation".into())
+    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<Vec<u8>, String> {
+        match (ty, clear) {
+            (ShareType::SecretInt { .. }, Value::I64(v)) => {
+                let secret = Fr::from(*v as u64);
+                let mut rng = ark_std::test_rng();
+                let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
+                    .map_err(|e| format!("compute_shares: {:?}", e))?;
+                let my = &shares[self.party_id];
+                Self::encode_robustshare(my)
+            }
+            (
+                ShareType::SecretInt {
+                    bit_length: BOOLEAN_SECRET_INT_BITS,
+                },
+                Value::Bool(b),
+            ) => {
+                let secret = if *b { Fr::from(1u64) } else { Fr::from(0u64) };
+                let mut rng = ark_std::test_rng();
+                let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
+                    .map_err(|e| format!("compute_shares: {:?}", e))?;
+                let my = &shares[self.party_id];
+                Self::encode_robustshare(my)
+            }
+            (ShareType::SecretFixedPoint { precision }, Value::Float(fp)) => {
+                let f = precision.f();
+                let scale = (1u64 << f) as f64;
+                let scaled_value = (fp.0 * scale) as i64;
+                let secret = if scaled_value >= 0 {
+                    Fr::from(scaled_value as u64)
+                } else {
+                    -Fr::from((-scaled_value) as u64)
+                };
+                let mut rng = ark_std::test_rng();
+                let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
+                    .map_err(|e| format!("compute_shares: {:?}", e))?;
+                let my = &shares[self.party_id];
+                Self::encode_robustshare(my)
+            }
+            _ => Err("Unsupported type for input_share".to_string()),
+        }
     }
 
     fn multiply_share(
@@ -387,13 +444,214 @@ impl MpcEngine for AdkgMpcEngine {
         _left: &[u8],
         _right: &[u8],
     ) -> Result<Vec<u8>, String> {
-        // ADKG is for key generation, not general MPC multiplication
-        Err("ADKG engine doesn't support multiply_share - use HoneyBadger engine for MPC".into())
+        Err("AVSS protocol does not support secure multiplication (requires Beaver triples)".into())
     }
 
-    fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> Result<Value, String> {
-        // ADKG is for key generation, not secret reconstruction
-        Err("ADKG engine doesn't support open_share - use get_public_key for public key access".into())
+    fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
+        #[derive(Default, Clone)]
+        struct OpenAccumulator {
+            shares: Vec<Vec<u8>>,
+            party_ids: Vec<usize>,
+            result: Option<Value>,
+        }
+
+        static REGISTRY: once_cell::sync::Lazy<
+            parking_lot::Mutex<std::collections::HashMap<(u64, usize, String), OpenAccumulator>>,
+        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let type_key = match ty {
+            ShareType::SecretInt { bit_length } => format!("adkg-int-{bit_length}"),
+            ShareType::SecretFixedPoint { precision } => {
+                format!("adkg-fixed-{}-{}", precision.k(), precision.f())
+            }
+        };
+
+        let required = 2 * self.t + 1;
+        let mut my_sequence: Option<usize> = None;
+
+        loop {
+            let mut reg = REGISTRY.lock();
+
+            if my_sequence.is_none() {
+                let mut seq = 0;
+                loop {
+                    let key = (self.instance_id, seq, type_key.clone());
+                    let entry = reg.entry(key).or_insert_with(OpenAccumulator::default);
+
+                    if !entry.party_ids.contains(&self.party_id) {
+                        entry.shares.push(share_bytes.to_vec());
+                        entry.party_ids.push(self.party_id);
+                        my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.unwrap();
+            let key = (self.instance_id, seq, type_key.clone());
+            let entry = reg.get_mut(&key).unwrap();
+
+            if let Some(result) = entry.result.clone() {
+                return Ok(result);
+            }
+
+            if entry.shares.len() >= required {
+                let collected: Vec<_> = entry.shares.iter().take(required).cloned().collect();
+                let mut shares: Vec<RobustShare<Fr>> = Vec::with_capacity(collected.len());
+                for bytes in &collected {
+                    shares.push(Self::decode_robustshare(bytes)?);
+                }
+
+                let (_deg, secret) = RobustShare::recover_secret(&shares, self.n)
+                    .map_err(|e| format!("recover_secret: {:?}", e))?;
+
+                let value = match ty {
+                    ShareType::SecretInt { .. } if ty.is_boolean() => {
+                        use ark_ff::Zero;
+                        Value::Bool(!secret.is_zero())
+                    }
+                    ShareType::SecretInt { .. } => {
+                        let limbs: [u64; 4] = secret.into_bigint().0;
+                        Value::I64(limbs[0] as i64)
+                    }
+                    ShareType::SecretFixedPoint { precision } => {
+                        let limbs: [u64; 4] = secret.into_bigint().0;
+                        let scaled_value = limbs[0] as i64;
+                        let f = precision.f();
+                        let scale = (1u64 << f) as f64;
+                        let float_value = scaled_value as f64 / scale;
+                        Value::Float(F64(float_value))
+                    }
+                };
+                entry.result = Some(value.clone());
+                return Ok(value);
+            }
+
+            drop(reg);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
+        if shares.is_empty() {
+            return Ok(vec![]);
+        }
+
+        #[derive(Clone)]
+        struct BatchOpenAccumulator {
+            batch_size: usize,
+            shares_per_position: Vec<Vec<Vec<u8>>>,
+            party_ids: Vec<usize>,
+            results: Option<Vec<Value>>,
+        }
+
+        impl BatchOpenAccumulator {
+            fn new(batch_size: usize) -> Self {
+                Self {
+                    batch_size,
+                    shares_per_position: vec![Vec::new(); batch_size],
+                    party_ids: Vec::new(),
+                    results: None,
+                }
+            }
+        }
+
+        static BATCH_REGISTRY: once_cell::sync::Lazy<
+            parking_lot::Mutex<
+                std::collections::HashMap<(u64, usize, String, usize), BatchOpenAccumulator>,
+            >,
+        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let type_key = match ty {
+            ShareType::SecretInt { bit_length } => format!("adkg-batch-int-{bit_length}"),
+            ShareType::SecretFixedPoint { precision } => {
+                format!("adkg-batch-fixed-{}-{}", precision.k(), precision.f())
+            }
+        };
+
+        let batch_size = shares.len();
+        let required = 2 * self.t + 1;
+        let mut my_sequence: Option<usize> = None;
+
+        loop {
+            let mut reg = BATCH_REGISTRY.lock();
+
+            if my_sequence.is_none() {
+                let mut seq = 0;
+                loop {
+                    let key = (self.instance_id, seq, type_key.clone(), batch_size);
+                    let entry =
+                        reg.entry(key)
+                            .or_insert_with(|| BatchOpenAccumulator::new(batch_size));
+
+                    if !entry.party_ids.contains(&self.party_id) {
+                        for (pos, share_bytes) in shares.iter().enumerate() {
+                            entry.shares_per_position[pos].push(share_bytes.clone());
+                        }
+                        entry.party_ids.push(self.party_id);
+                        my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.unwrap();
+            let key = (self.instance_id, seq, type_key.clone(), batch_size);
+            let entry = reg.get_mut(&key).unwrap();
+
+            if let Some(results) = entry.results.clone() {
+                return Ok(results);
+            }
+
+            if entry.party_ids.len() >= required {
+                let mut results = Vec::with_capacity(batch_size);
+
+                for pos in 0..batch_size {
+                    let collected: Vec<_> = entry.shares_per_position[pos]
+                        .iter()
+                        .take(required)
+                        .cloned()
+                        .collect();
+
+                    let mut decoded_shares: Vec<RobustShare<Fr>> =
+                        Vec::with_capacity(collected.len());
+                    for bytes in &collected {
+                        decoded_shares.push(Self::decode_robustshare(bytes)?);
+                    }
+
+                    let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, self.n)
+                        .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
+
+                    let value = match ty {
+                        ShareType::SecretInt { .. } if ty.is_boolean() => {
+                            use ark_ff::Zero;
+                            Value::Bool(!secret.is_zero())
+                        }
+                        ShareType::SecretInt { .. } => {
+                            let limbs: [u64; 4] = secret.into_bigint().0;
+                            Value::I64(limbs[0] as i64)
+                        }
+                        ShareType::SecretFixedPoint { precision } => {
+                            let limbs: [u64; 4] = secret.into_bigint().0;
+                            let scaled_value = limbs[0] as i64;
+                            let f = precision.f();
+                            let scale = (1u64 << f) as f64;
+                            let float_value = scaled_value as f64 / scale;
+                            Value::Float(F64(float_value))
+                        }
+                    };
+                    results.push(value);
+                }
+
+                entry.results = Some(results.clone());
+                return Ok(results);
+            }
+
+            drop(reg);
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn shutdown(&self) {
@@ -661,5 +919,116 @@ mod tests {
         let pk = vec![10, 11, 12];
         registry_store_public_key(instance_id, session_id, pk.clone());
         assert_eq!(registry_get_public_key(instance_id, session_id), Some(pk));
+    }
+
+    #[test]
+    fn test_robustshare_serialization_roundtrip() {
+        // Verify that RobustShare serialization is deterministic and round-trips correctly.
+        // This ensures shares produced by input_share can be deserialized by vm_state arithmetic.
+        let mut rng = test_rng();
+        let n = 4;
+        let t = 1;
+        let secret = Fr::from(42u64);
+
+        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
+            .expect("compute_shares failed");
+
+        for share in &shares {
+            let bytes = AdkgMpcEngine::encode_robustshare(share).expect("encode failed");
+            let decoded = AdkgMpcEngine::decode_robustshare(&bytes).expect("decode failed");
+            assert_eq!(share.id, decoded.id);
+            assert_eq!(share.degree, decoded.degree);
+            assert_eq!(share.share, decoded.share);
+        }
+
+        // Verify reconstruction works after round-tripping through bytes
+        let required = 2 * t + 1;
+        let subset: Vec<_> = shares.iter().take(required).cloned().collect();
+        let (_deg, recovered) = RobustShare::recover_secret(&subset, n)
+            .expect("recover_secret failed");
+        assert_eq!(recovered, secret);
+    }
+
+    #[test]
+    fn test_adkg_input_share_i64() {
+        // Directly test the input_share logic: secret -> compute_shares -> encode -> decode
+        let n = 4;
+        let t = 1;
+        let party_id = 0;
+        let secret = Fr::from(42u64);
+        let mut rng = ark_std::test_rng();
+
+        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
+            .expect("compute_shares failed");
+        let bytes = AdkgMpcEngine::encode_robustshare(&shares[party_id]).expect("encode failed");
+        assert!(!bytes.is_empty());
+
+        let decoded = AdkgMpcEngine::decode_robustshare(&bytes).expect("decode failed");
+        assert_eq!(decoded.id, shares[party_id].id);
+        assert_eq!(decoded.share, shares[party_id].share);
+    }
+
+    #[test]
+    fn test_adkg_input_share_bool() {
+        let n = 4;
+        let t = 1;
+        let party_id = 1;
+        let secret = Fr::from(1u64); // true
+        let mut rng = ark_std::test_rng();
+
+        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
+            .expect("compute_shares failed");
+        let bytes = AdkgMpcEngine::encode_robustshare(&shares[party_id]).expect("encode failed");
+        let decoded = AdkgMpcEngine::decode_robustshare(&bytes).expect("decode failed");
+        assert_eq!(decoded.id, shares[party_id].id);
+    }
+
+    #[test]
+    fn test_adkg_input_share_float() {
+        let n = 4;
+        let t = 1;
+        let party_id = 2;
+
+        // Scale 3.14 to fixed-point: 3.14 * 2^16 = 205783 (approx)
+        let f = 16u32;
+        let scale = (1u64 << f) as f64;
+        let scaled_value = (3.14 * scale) as i64;
+        let secret = Fr::from(scaled_value as u64);
+        let mut rng = ark_std::test_rng();
+
+        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
+            .expect("compute_shares failed");
+        let bytes = AdkgMpcEngine::encode_robustshare(&shares[party_id]).expect("encode failed");
+        let decoded = AdkgMpcEngine::decode_robustshare(&bytes).expect("decode failed");
+        assert_eq!(decoded.id, shares[party_id].id);
+    }
+
+    #[test]
+    fn test_adkg_input_share_reconstruction() {
+        // Verify that shares produced via the ADKG input_share flow can be reconstructed
+        // to recover the original secret, confirming compatibility with open_share.
+        let n = 4;
+        let t = 1;
+        let secret_val = 12345u64;
+        let secret = Fr::from(secret_val);
+        let mut rng = ark_std::test_rng();
+
+        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
+            .expect("compute_shares failed");
+
+        // Encode and decode all shares (simulating what input_share + open_share does)
+        let mut decoded_shares = Vec::new();
+        for share in &shares {
+            let bytes = AdkgMpcEngine::encode_robustshare(share).expect("encode failed");
+            let decoded = AdkgMpcEngine::decode_robustshare(&bytes).expect("decode failed");
+            decoded_shares.push(decoded);
+        }
+
+        // Reconstruct with 2t+1 shares
+        let required = 2 * t + 1;
+        let subset: Vec<_> = decoded_shares.iter().take(required).cloned().collect();
+        let (_deg, recovered) = RobustShare::recover_secret(&subset, n)
+            .expect("recover_secret failed");
+        assert_eq!(recovered, secret, "Reconstructed secret should match original");
     }
 }

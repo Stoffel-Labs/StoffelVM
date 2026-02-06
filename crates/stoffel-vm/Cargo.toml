@@ -47,7 +47,11 @@ dirs = "5"
 dashmap = "5"
 
 [features]
-hb_itest = []
+default = ["honeybadger", "adkg"]
+honeybadger = []
+adkg = []
+hb_itest = ["honeybadger"]
+adkg_itest = ["adkg"]
 
 [dev-dependencies]
 criterion = { version = "0.6.0", features = ["html_reports"] }

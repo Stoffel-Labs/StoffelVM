@@ -7,21 +7,32 @@ use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
 use stoffel_vm::core_vm::VirtualMachine;
+use stoffel_vm::net::MpcBackendKind;
+#[cfg(feature = "honeybadger")]
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
 use stoffel_vm::net::{
-    honeybadger_node_opts, program_id_from_bytes, register_and_wait_for_session_with_program,
-    run_bootnode_with_config, spawn_receive_loops,
+    program_id_from_bytes, register_and_wait_for_session_with_program,
+    run_bootnode_with_config,
 };
+#[cfg(feature = "honeybadger")]
+use stoffel_vm::net::{honeybadger_node_opts, spawn_receive_loops};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 use stoffel_vm_types::compiled_binary::CompiledBinary;
+#[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
+#[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::common::MPCProtocol;
+#[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+#[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
+#[cfg(feature = "honeybadger")]
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
 use tokio::sync::mpsc;
+#[cfg(feature = "adkg")]
+use stoffel_vm::net::adkg_server::{AdkgQuicConfig, AdkgQuicServer};
 
 // Use a Tokio runtime for async operations
 #[tokio::main]
@@ -53,6 +64,7 @@ async fn main() {
     let mut enable_nat: bool = false;
     let mut stun_servers: Vec<SocketAddr> = Vec::new();
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
+    let mut mpc_backend: Option<String> = None;
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -83,6 +95,7 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
         } else if let Some(_rest) = arg.strip_prefix("--stun-servers") {
         } else if let Some(_rest) = arg.strip_prefix("--servers") {
+        } else if let Some(_rest) = arg.strip_prefix("--mpc-backend") {
         }
     }
 
@@ -171,6 +184,11 @@ async fn main() {
                         .collect();
                 }
             }
+            "--mpc-backend" => {
+                if let Some(v) = args_iter.next() {
+                    mpc_backend = Some(v);
+                }
+            }
             _ => {}
         }
     }
@@ -191,7 +209,8 @@ async fn main() {
         return;
     }
 
-    // Client mode: connect to MPC servers and provide inputs
+    // Client mode: connect to MPC servers and provide inputs (HoneyBadger only)
+    #[cfg(feature = "honeybadger")]
     if as_client {
         let cid = client_id.unwrap_or_else(|| {
             eprintln!("Error: --client-id is required in client mode");
@@ -384,6 +403,42 @@ async fn main() {
         }
 
         return;
+    }
+    #[cfg(not(feature = "honeybadger"))]
+    if as_client {
+        eprintln!("Error: client mode requires the 'honeybadger' feature");
+        exit(2);
+    }
+
+    // Resolve MPC backend kind
+    let backend_kind = if let Some(ref name) = mpc_backend {
+        match MpcBackendKind::from_str(name) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                exit(2);
+            }
+        }
+    } else {
+        MpcBackendKind::default_backend()
+    };
+
+    // Validate incompatible flag combinations
+    if !backend_kind.supports_client_input() {
+        if as_client {
+            eprintln!(
+                "Error: {} backend does not support client mode",
+                backend_kind.name()
+            );
+            exit(2);
+        }
+        if expected_clients.is_some() {
+            eprintln!(
+                "Error: {} backend does not support --expected-clients",
+                backend_kind.name()
+            );
+            exit(2);
+        }
     }
 
     path_opt = if !positional.is_empty() {
@@ -762,7 +817,7 @@ async fn main() {
         );
     }
 
-    // If in party mode, configure async HoneyBadger engine and preprocess
+    // If in party mode, configure MPC engine based on selected backend
     if let Some(net) = net_opt.clone() {
         let my_id = party_id.unwrap_or(0usize);
         // Use session parameters (already agreed upon with bootnode)
@@ -773,28 +828,9 @@ async fn main() {
             session_instance_id.expect("session instance_id should be set in party mode");
 
         eprintln!(
-            "[party {}] Creating MPC engine: instance_id={}, n={}, t={}",
-            my_id, instance_id, n, t
+            "[party {}] Creating MPC engine (backend={}): instance_id={}, n={}, t={}",
+            my_id, backend_kind.name(), instance_id, n, t
         );
-
-        // Parse expected client IDs (comma-separated)
-        let input_ids: Vec<ClientId> = expected_clients
-            .as_ref()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|id| id.trim().parse::<ClientId>().ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if !input_ids.is_empty() {
-            eprintln!(
-                "[party {}] Expecting inputs from {} clients: {:?}",
-                my_id,
-                input_ids.len(),
-                input_ids
-            );
-        }
 
         // Debug: print established connections (server connections are to other MPC parties)
         let connections = net.get_all_server_connections();
@@ -806,207 +842,282 @@ async fn main() {
             connections.len()
         );
 
-        // Create HoneyBadger MPC node options
-        let n_triples = 8;
-        let n_random = 16;
-        let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
+        match backend_kind {
+            #[cfg(feature = "honeybadger")]
+            MpcBackendKind::HoneyBadger => {
+                // Parse expected client IDs (comma-separated)
+                let input_ids: Vec<ClientId> = expected_clients
+                    .as_ref()
+                    .map(|s| {
+                        s.split(',')
+                            .filter_map(|id| id.trim().parse::<ClientId>().ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
-        // Create the MPC node directly with expected client IDs
-        let mut mpc_node = match <HoneyBadgerMPCNode<Fr, Avid> as MPCProtocol<
-            Fr,
-            RobustShare<Fr>,
-            QuicNetworkManager,
-        >>::setup(my_id, mpc_opts, input_ids.clone())
-        {
-            Ok(node) => node,
-            Err(e) => {
-                eprintln!("Failed to create MPC node: {:?}", e);
-                exit(13);
-            }
-        };
-
-        // Spawn receive loops for MPC peer connections only
-        eprintln!("[party {}] Spawning receive loops for {} MPC peers...", my_id, n);
-        let mut msg_rx = spawn_receive_loops(net.clone(), my_id, n).await;
-
-        // Clone node for the message processing task
-        let mut processing_node = mpc_node.clone();
-        let processing_net = net.clone();
-        let processing_party_id = my_id;
-
-        // Spawn message processing task
-        tokio::spawn(async move {
-            eprintln!(
-                "[party {}] Message processing task started",
-                processing_party_id
-            );
-            while let Some(raw_msg) = msg_rx.recv().await {
-                if let Err(e) = processing_node.process(raw_msg, processing_net.clone()).await {
+                if !input_ids.is_empty() {
                     eprintln!(
-                        "[party {}] Failed to process message: {:?}",
-                        processing_party_id, e
+                        "[party {}] Expecting inputs from {} clients: {:?}",
+                        my_id,
+                        input_ids.len(),
+                        input_ids
                     );
                 }
-            }
-            eprintln!(
-                "[party {}] Message processing task ended",
-                processing_party_id
-            );
-        });
 
-        // Create engine wrapping the same node (shared via internal Arc state)
-        let engine =
-            HoneyBadgerMpcEngine::from_existing_node(instance_id, my_id, n, t, net.clone(), mpc_node.clone());
+                // Create HoneyBadger MPC node options
+                let n_triples = 8;
+                let n_random = 16;
+                let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
 
-        // Run preprocessing
-        eprintln!("[party {}] Starting MPC preprocessing...", my_id);
-        if let Err(e) = engine.preprocess().await {
-            eprintln!("MPC preprocessing failed: {}", e);
-            exit(14);
-        }
-        eprintln!("[party {}] MPC preprocessing complete", my_id);
-
-        // If we have expected clients, start client accept loop and wait for connections
-        if !input_ids.is_empty() {
-            eprintln!("[party {}] Waiting for {} clients to connect...", my_id, input_ids.len());
-
-            // Spawn client accept loop - this will accept incoming client connections
-            // and register them in the network's client_connections
-            // We need a mutable copy for accept(), but client_connections is shared via Arc<DashMap>
-            let mut accept_net = (*net).clone();
-            let expected_client_ids = input_ids.clone();
-            let accept_party_id = my_id;
-            let accept_mpc_node = mpc_node.clone();
-            let net_for_processing = net.clone();
-
-            tokio::spawn(async move {
-                eprintln!("[party {}] Client accept loop started", accept_party_id);
-                loop {
-                    // Accept incoming connection (this blocks until a connection arrives)
-                    match accept_net.accept().await {
-                        Ok(connection) => {
-                            // Connection is automatically registered by stoffelnet
-                            // based on the ROLE:CLIENT:{id} handshake
-                            eprintln!("[party {}] Accepted a client connection", accept_party_id);
-
-                            // Spawn a handler for this client's messages
-                            let client_mpc_node = accept_mpc_node.clone();
-                            let client_net = net_for_processing.clone();
-                            tokio::spawn(async move {
-                                loop {
-                                    match connection.receive().await {
-                                        Ok(data) => {
-                                            // Process the message through the MPC node
-                                            if let Err(e) = client_mpc_node.clone().process(data, client_net.clone()).await {
-                                                eprintln!("[party] Failed to process client message: {:?}", e);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[party] Client connection closed: {}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("[party {}] Accept error: {}", accept_party_id, e);
-                            // Don't break - keep accepting
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-            });
-
-            // Wait for all expected clients to connect with timeout
-            let connect_timeout = Duration::from_secs(60);
-            let check_interval = Duration::from_millis(500);
-            let start = std::time::Instant::now();
-
-            loop {
-                let connected_clients: Vec<ClientId> = net.clients();
-                let connected_count = connected_clients.iter()
-                    .filter(|&cid| expected_client_ids.contains(cid))
-                    .count();
-
-                eprintln!("[party {}] {} of {} expected clients connected: {:?}",
-                         my_id, connected_count, expected_client_ids.len(), connected_clients);
-
-                if connected_count >= expected_client_ids.len() {
-                    eprintln!("[party {}] All expected clients connected!", my_id);
-                    break;
-                }
-
-                if start.elapsed() > connect_timeout {
-                    eprintln!("[party {}] Timeout waiting for clients. Connected: {:?}, Expected: {:?}",
-                             my_id, connected_clients, expected_client_ids);
-                    exit(15);
-                }
-
-                tokio::time::sleep(check_interval).await;
-            }
-
-            eprintln!("[party {}] Initializing InputServer for {} clients...", my_id, input_ids.len());
-
-            // Initialize input server for each expected client
-            // Each client needs random shares for their inputs (assume 1 input per client for now)
-            for &cid in &input_ids {
-                // Take random shares from preprocessing material
-                let local_shares = match mpc_node
-                    .preprocessing_material
-                    .lock()
-                    .await
-                    .take_random_shares(1) // 1 input per client
+                // Create the MPC node directly with expected client IDs
+                let mut mpc_node = match <HoneyBadgerMPCNode<Fr, Avid> as MPCProtocol<
+                    Fr,
+                    RobustShare<Fr>,
+                    QuicNetworkManager,
+                >>::setup(my_id, mpc_opts, input_ids.clone())
                 {
-                    Ok(shares) => shares,
+                    Ok(node) => node,
                     Err(e) => {
-                        eprintln!("[party {}] Not enough random shares for client {}: {:?}", my_id, cid, e);
-                        exit(15);
+                        eprintln!("Failed to create MPC node: {:?}", e);
+                        exit(13);
                     }
                 };
 
-                if let Err(e) = mpc_node
-                    .preprocess
-                    .input
-                    .init(cid, local_shares, 1, net.clone())
-                    .await
-                {
-                    eprintln!("[party {}] Failed to init InputServer for client {}: {:?}", my_id, cid, e);
-                    exit(15);
+                // Spawn receive loops for MPC peer connections only
+                eprintln!("[party {}] Spawning receive loops for {} MPC peers...", my_id, n);
+                let mut msg_rx = spawn_receive_loops(net.clone(), my_id, n).await;
+
+                // Clone node for the message processing task
+                let mut processing_node = mpc_node.clone();
+                let processing_net = net.clone();
+                let processing_party_id = my_id;
+
+                // Spawn message processing task
+                tokio::spawn(async move {
+                    eprintln!(
+                        "[party {}] Message processing task started",
+                        processing_party_id
+                    );
+                    while let Some(raw_msg) = msg_rx.recv().await {
+                        if let Err(e) = processing_node.process(raw_msg, processing_net.clone()).await {
+                            eprintln!(
+                                "[party {}] Failed to process message: {:?}",
+                                processing_party_id, e
+                            );
+                        }
+                    }
+                    eprintln!(
+                        "[party {}] Message processing task ended",
+                        processing_party_id
+                    );
+                });
+
+                // Create engine wrapping the same node (shared via internal Arc state)
+                let engine =
+                    HoneyBadgerMpcEngine::from_existing_node(instance_id, my_id, n, t, net.clone(), mpc_node.clone());
+
+                // Run preprocessing
+                eprintln!("[party {}] Starting MPC preprocessing...", my_id);
+                if let Err(e) = engine.preprocess().await {
+                    eprintln!("MPC preprocessing failed: {}", e);
+                    exit(14);
                 }
-                eprintln!("[party {}] InputServer initialized for client {}", my_id, cid);
+                eprintln!("[party {}] MPC preprocessing complete", my_id);
+
+                // If we have expected clients, start client accept loop and wait for connections
+                if !input_ids.is_empty() {
+                    eprintln!("[party {}] Waiting for {} clients to connect...", my_id, input_ids.len());
+
+                    let mut accept_net = (*net).clone();
+                    let expected_client_ids = input_ids.clone();
+                    let accept_party_id = my_id;
+                    let accept_mpc_node = mpc_node.clone();
+                    let net_for_processing = net.clone();
+
+                    tokio::spawn(async move {
+                        eprintln!("[party {}] Client accept loop started", accept_party_id);
+                        loop {
+                            match accept_net.accept().await {
+                                Ok(connection) => {
+                                    eprintln!("[party {}] Accepted a client connection", accept_party_id);
+                                    let client_mpc_node = accept_mpc_node.clone();
+                                    let client_net = net_for_processing.clone();
+                                    tokio::spawn(async move {
+                                        loop {
+                                            match connection.receive().await {
+                                                Ok(data) => {
+                                                    if let Err(e) = client_mpc_node.clone().process(data, client_net.clone()).await {
+                                                        eprintln!("[party] Failed to process client message: {:?}", e);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[party] Client connection closed: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!("[party {}] Accept error: {}", accept_party_id, e);
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                }
+                            }
+                        }
+                    });
+
+                    let connect_timeout = Duration::from_secs(60);
+                    let check_interval = Duration::from_millis(500);
+                    let start = std::time::Instant::now();
+
+                    loop {
+                        let connected_clients: Vec<ClientId> = net.clients();
+                        let connected_count = connected_clients.iter()
+                            .filter(|&cid| expected_client_ids.contains(cid))
+                            .count();
+
+                        eprintln!("[party {}] {} of {} expected clients connected: {:?}",
+                                 my_id, connected_count, expected_client_ids.len(), connected_clients);
+
+                        if connected_count >= expected_client_ids.len() {
+                            eprintln!("[party {}] All expected clients connected!", my_id);
+                            break;
+                        }
+
+                        if start.elapsed() > connect_timeout {
+                            eprintln!("[party {}] Timeout waiting for clients. Connected: {:?}, Expected: {:?}",
+                                     my_id, connected_clients, expected_client_ids);
+                            exit(15);
+                        }
+
+                        tokio::time::sleep(check_interval).await;
+                    }
+
+                    eprintln!("[party {}] Initializing InputServer for {} clients...", my_id, input_ids.len());
+
+                    for &cid in &input_ids {
+                        let local_shares = match mpc_node
+                            .preprocessing_material
+                            .lock()
+                            .await
+                            .take_random_shares(1)
+                        {
+                            Ok(shares) => shares,
+                            Err(e) => {
+                                eprintln!("[party {}] Not enough random shares for client {}: {:?}", my_id, cid, e);
+                                exit(15);
+                            }
+                        };
+
+                        if let Err(e) = mpc_node
+                            .preprocess
+                            .input
+                            .init(cid, local_shares, 1, net.clone())
+                            .await
+                        {
+                            eprintln!("[party {}] Failed to init InputServer for client {}: {:?}", my_id, cid, e);
+                            exit(15);
+                        }
+                        eprintln!("[party {}] InputServer initialized for client {}", my_id, cid);
+                    }
+
+                    eprintln!("[party {}] Waiting for client inputs (timeout: 60s)...", my_id);
+                    let client_inputs = match mpc_node
+                        .preprocess
+                        .input
+                        .wait_for_all_inputs(Duration::from_secs(60))
+                        .await
+                    {
+                        Ok(inputs) => inputs,
+                        Err(e) => {
+                            eprintln!("[party {}] Failed to receive client inputs: {:?}", my_id, e);
+                            exit(16);
+                        }
+                    };
+
+                    eprintln!(
+                        "[party {}] Received inputs from {} clients",
+                        my_id,
+                        client_inputs.len()
+                    );
+
+                    for (cid, shares) in client_inputs {
+                        vm.state.client_store().store_client_input(cid, shares);
+                        eprintln!("[party {}] Stored inputs for client {}", my_id, cid);
+                    }
+                }
+
+                vm.state.set_mpc_engine(engine);
+                eprintln!("[party {}] HoneyBadger MPC engine set, starting VM execution...", my_id);
             }
 
-            // Wait for all client inputs with timeout
-            eprintln!("[party {}] Waiting for client inputs (timeout: 60s)...", my_id);
-            let client_inputs = match mpc_node
-                .preprocess
-                .input
-                .wait_for_all_inputs(Duration::from_secs(60))
-                .await
-            {
-                Ok(inputs) => inputs,
-                Err(e) => {
-                    eprintln!("[party {}] Failed to receive client inputs: {:?}", my_id, e);
-                    exit(16);
+            #[cfg(feature = "adkg")]
+            MpcBackendKind::Adkg => {
+                eprintln!("[party {}] Setting up ADKG backend...", my_id);
+
+                // Create ADKG server using existing network manager
+                // We need to unwrap the Arc to pass ownership; since we just created it, this is safe
+                // Actually, ADKG server needs the network from net_opt which is Arc'd. We'll use a
+                // different approach: create AdkgQuicServer with the existing Arc network.
+                let mut adkg_server = AdkgQuicServer::new(
+                    my_id,
+                    n,
+                    t,
+                    instance_id,
+                    (*net).clone(),
+                    AdkgQuicConfig::default(),
+                );
+
+                // Start the server (converts network builder to Arc)
+                let adkg_net = match adkg_server.start() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("[party {}] Failed to start ADKG server: {}", my_id, e);
+                        exit(13);
+                    }
+                };
+
+                // Exchange ECDH public keys
+                eprintln!("[party {}] Exchanging ECDH public keys...", my_id);
+                match adkg_server.exchange_public_keys().await {
+                    Ok(pk_map) => {
+                        eprintln!(
+                            "[party {}] PK exchange complete ({} keys collected)",
+                            my_id,
+                            pk_map.len()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[party {}] PK exchange failed: {}", my_id, e);
+                        exit(14);
+                    }
                 }
-            };
 
-            eprintln!(
-                "[party {}] Received inputs from {} clients",
-                my_id,
-                client_inputs.len()
-            );
+                // Create ADKG engine
+                let engine = match adkg_server.create_engine() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("[party {}] Failed to create ADKG engine: {}", my_id, e);
+                        exit(14);
+                    }
+                };
 
-            // Store client inputs in the VM's client store
-            for (cid, shares) in client_inputs {
-                vm.state.client_store().store_client_input(cid, shares);
-                eprintln!("[party {}] Stored inputs for client {}", my_id, cid);
+                // Start the engine
+                if let Err(e) = engine.start_async().await {
+                    eprintln!("[party {}] Failed to start ADKG engine: {}", my_id, e);
+                    exit(14);
+                }
+
+                // Spawn AVSS message receive/process loops
+                if let Err(e) = adkg_server.spawn_message_loops(engine.clone()).await {
+                    eprintln!("[party {}] Failed to spawn message loops: {}", my_id, e);
+                    exit(14);
+                }
+
+                vm.state.set_mpc_engine(engine);
+                eprintln!("[party {}] ADKG engine set, starting VM execution...", my_id);
             }
         }
-
-        vm.state.set_mpc_engine(engine);
-        eprintln!("[party {}] MPC engine set, starting VM execution...", my_id);
     }
 
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
@@ -1041,8 +1152,9 @@ Flags:
   --party-id <usize>      Party id (party mode, 0-indexed)
   --bootstrap <addr:port> Bootnode address (party mode or client mode)
   --n-parties <usize>     Number of parties for MPC (required in party/leader/client mode)
-  --threshold <usize>     Threshold t for HoneyBadger (default: 1)
-  --client-id <usize>     Client ID (client mode)
+  --threshold <usize>     Threshold t (default: 1)
+  --mpc-backend <name>    MPC backend: honeybadger (default) or adkg
+  --client-id <usize>     Client ID (client mode, honeybadger only)
   --inputs <values>       Comma-separated input values (client mode)
   --servers <addrs>       Comma-separated server addresses (client mode)
   --expected-clients <ids> Comma-separated client IDs expected (party/leader mode)
