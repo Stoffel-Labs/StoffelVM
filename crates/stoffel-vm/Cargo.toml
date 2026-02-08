@@ -12,7 +12,7 @@ crate-type = ["rlib", "cdylib"]
 libc = "0.2"
 stoffelmpc-mpc =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "dev" }
 #stoffelmpc-common =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "randousha"}
-stoffelnet =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
+stoffelnet =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git", rev = "bac0841120d7e99f6be867a00dd3c38a6fc5f126" }
 stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
 
 async-trait = "0.1"
