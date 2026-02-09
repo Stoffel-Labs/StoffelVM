@@ -5,6 +5,6 @@ members = [
 ]
 resolver = "2"
 
-[patch."https://github.com/Stoffel-Labs/mpc-protocols.git"]
-stoffelmpc-mpc = { path = "/Users/gabriel/RustroverProjects/mpc-protocols/mpc" }
-stoffelmpc-network = { path = "/Users/gabriel/RustroverProjects/mpc-protocols/network" }
+# [patch."https://github.com/Stoffel-Labs/mpc-protocols.git"]
+# stoffelmpc-mpc = { path = "/Users/gabriel/RustroverProjects/mpc-protocols/mpc" }
+# stoffelmpc-network = { path = "/Users/gabriel/RustroverProjects/mpc-protocols/network" }

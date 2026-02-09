@@ -3,14 +3,19 @@
 //! This module provides the networking layer for ADKG (Asynchronous Distributed
 //! Key Generation) nodes, handling connection management, ECDH public key exchange,
 //! and AVSS message routing.
+//!
+//! The server is generic over a `(F, G)` field/curve pair. Use the type aliases
+//! `Bls12381AdkgServer` and `Bn254AdkgServer` for the supported configurations.
 
-use ark_bls12_381::{Fr, G1Projective as G1};
-use ark_ec::PrimeGroup;
+use ark_ec::{CurveGroup, PrimeGroup};
+use ark_ff::{FftField, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
 use ark_std::UniformRand;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
+use stoffelmpc_mpc::avss_mpc::AvssSessionId;
 use stoffelmpc_mpc::common::share::avss::AvssMessage;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::QuicNetworkManager;
@@ -18,6 +23,15 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::adkg_engine::AdkgMpcEngine;
+
+// ============================================================================
+// Type aliases for supported curve configurations
+// ============================================================================
+
+pub type Bls12381AdkgServer =
+    AdkgQuicServer<ark_bls12_381::Fr, ark_bls12_381::G1Projective>;
+pub type Bn254AdkgServer =
+    AdkgQuicServer<ark_bn254::Fr, ark_bn254::G1Projective>;
 
 /// Configuration for ADKG over QUIC
 #[derive(Debug, Clone)]
@@ -44,7 +58,14 @@ impl Default for AdkgQuicConfig {
 ///
 /// Manages network setup, ECDH key exchange, and AVSS message routing
 /// for distributed key generation. Parallel structure to `HoneyBadgerQuicServer`.
-pub struct AdkgQuicServer {
+///
+/// Generic over `(F, G)` where `F` is the scalar field and `G` is the curve group.
+/// Use `Bls12381AdkgServer` or `Bn254AdkgServer` type aliases.
+pub struct AdkgQuicServer<F, G>
+where
+    F: FftField + PrimeField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup,
+{
     /// This party's ID
     pub node_id: usize,
     /// Total number of parties
@@ -58,16 +79,20 @@ pub struct AdkgQuicServer {
     /// Network manager Arc - created when start() is called
     pub network: Option<Arc<QuicNetworkManager>>,
     /// This party's ECDH secret key
-    sk_i: Fr,
+    sk_i: F,
     /// This party's ECDH public key
-    pk_i: G1,
+    pk_i: G,
     /// Collected public keys of all parties (populated after exchange)
-    pk_map: Option<Arc<Vec<G1>>>,
+    pk_map: Option<Arc<Vec<G>>>,
     /// Configuration
     pub config: AdkgQuicConfig,
 }
 
-impl AdkgQuicServer {
+impl<F, G> AdkgQuicServer<F, G>
+where
+    F: FftField + PrimeField + Send + Sync + 'static,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     /// Creates a new ADKG QUIC server.
     ///
     /// Generates a fresh ECDH key pair for this party.
@@ -81,8 +106,8 @@ impl AdkgQuicServer {
     ) -> Self {
         // Generate ECDH key pair: sk_i random, pk_i = g * sk_i
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        let sk_i = Fr::rand(&mut rng);
-        let pk_i = G1::generator() * sk_i;
+        let sk_i = F::rand(&mut rng);
+        let pk_i = G::generator() * sk_i;
 
         Self {
             node_id,
@@ -106,9 +131,9 @@ impl AdkgQuicServer {
         instance_id: u64,
         network: QuicNetworkManager,
         config: AdkgQuicConfig,
-        sk_i: Fr,
+        sk_i: F,
     ) -> Self {
-        let pk_i = G1::generator() * sk_i;
+        let pk_i = G::generator() * sk_i;
         Self {
             node_id,
             n,
@@ -180,7 +205,7 @@ impl AdkgQuicServer {
     ///
     /// Each party broadcasts its `pk_i = g * sk_i` and collects all others.
     /// Returns the collected public key map indexed by party ID.
-    pub async fn exchange_public_keys(&mut self) -> Result<Arc<Vec<G1>>, String> {
+    pub async fn exchange_public_keys(&mut self) -> Result<Arc<Vec<G>>, String> {
         let net = self
             .network
             .as_ref()
@@ -218,7 +243,7 @@ impl AdkgQuicServer {
         }
 
         // Collect public keys (initialize with our own)
-        let mut pk_map = vec![G1::default(); self.n];
+        let mut pk_map = vec![G::default(); self.n];
         pk_map[self.node_id] = self.pk_i;
 
         let mut received = 1usize; // Count ourselves
@@ -226,7 +251,7 @@ impl AdkgQuicServer {
             std::time::Instant::now() + self.config.pk_exchange_timeout;
 
         // Create a channel for receiving PK exchange messages
-        let (pk_tx, mut pk_rx) = mpsc::channel::<(usize, G1)>(self.n);
+        let (pk_tx, mut pk_rx) = mpsc::channel::<(usize, G)>(self.n);
 
         // Spawn receive tasks for each peer connection
         for (peer_id, conn) in &connections {
@@ -245,7 +270,7 @@ impl AdkgQuicServer {
                         }
                         let sender_id =
                             u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                        match G1::deserialize_compressed(&data[4..]) {
+                        match G::deserialize_compressed(&data[4..]) {
                             Ok(pk) => {
                                 let _ = tx.send((sender_id, pk)).await;
                             }
@@ -322,7 +347,7 @@ impl AdkgQuicServer {
     /// Create an ADKG engine using the collected public keys.
     ///
     /// Must be called after `exchange_public_keys()`.
-    pub fn create_engine(&self) -> Result<Arc<AdkgMpcEngine>, String> {
+    pub fn create_engine(&self) -> Result<Arc<AdkgMpcEngine<F, G>>, String> {
         let net = self
             .network
             .as_ref()
@@ -350,7 +375,7 @@ impl AdkgQuicServer {
     /// Incoming messages are deserialized as `AvssMessage` and routed to the engine.
     pub async fn spawn_message_loops(
         &self,
-        engine: Arc<AdkgMpcEngine>,
+        engine: Arc<AdkgMpcEngine<F, G>>,
     ) -> Result<mpsc::Receiver<Vec<u8>>, String> {
         let net = self
             .network
@@ -375,7 +400,7 @@ impl AdkgQuicServer {
                     match conn.receive().await {
                         Ok(data) => {
                             // Try to deserialize as AVSS message
-                            match bincode::deserialize::<AvssMessage>(&data) {
+                            match bincode::deserialize::<AvssMessage<AvssSessionId>>(&data) {
                                 Ok(avss_msg) => {
                                     if let Err(e) = engine.process_message(avss_msg).await {
                                         error!(

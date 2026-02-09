@@ -7,6 +7,7 @@ use ark_bls12_381::Fr;
 use ark_ff::{FftField, PrimeField};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
+use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::common::MPCProtocol;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts};
@@ -44,7 +45,7 @@ impl Default for HoneyBadgerQuicConfig {
 /// via receive loops.
 pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     /// The underlying MPC node
-    pub node: HoneyBadgerMPCNode<F, Avid>,
+    pub node: HoneyBadgerMPCNode<F, Avid<HbSessionId>>,
     /// Network manager builder - used during setup before start() is called
     network_builder: Option<QuicNetworkManager>,
     /// Network manager Arc - created when start() is called, shared with all tasks
@@ -72,7 +73,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         input_ids: Vec<ClientId>,
     ) -> Result<Self, HoneyBadgerError> {
         // Create the MPC node
-        let mpc_node = <HoneyBadgerMPCNode<F, Avid> as MPCProtocol<
+        let mpc_node = <HoneyBadgerMPCNode<F, Avid<HbSessionId>> as MPCProtocol<
             F,
             RobustShare<F>,
             QuicNetworkManager,
@@ -335,8 +336,8 @@ pub async fn spawn_receive_loops(
     net: Arc<QuicNetworkManager>,
     node_id: PartyId,
     n_parties: usize,
-) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
+) -> mpsc::Receiver<(PartyId, Vec<u8>)> {
+    let (tx, rx) = mpsc::channel::<(PartyId, Vec<u8>)>(1024);
 
     // Get all established connections (server connections are to other MPC parties)
     let connections = net.get_all_server_connections();
@@ -379,7 +380,7 @@ pub async fn spawn_receive_loops(
                             data.len(),
                             pid
                         );
-                        if let Err(e) = txx.send(data).await {
+                        if let Err(e) = txx.send((pid, data)).await {
                             eprintln!(
                                 "[party {}] Failed to forward message from peer {}: {:?}",
                                 conn_node_id, pid, e

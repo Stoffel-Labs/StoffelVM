@@ -21,18 +21,46 @@ use stoffel_vm_types::compiled_binary::CompiledBinary;
 #[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 #[cfg(feature = "honeybadger")]
+use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
+#[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::common::MPCProtocol;
 #[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 #[cfg(feature = "honeybadger")]
-use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
+use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode, WrappedMessage};
 #[cfg(feature = "honeybadger")]
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
 use tokio::sync::mpsc;
 #[cfg(feature = "adkg")]
-use stoffel_vm::net::adkg_server::{AdkgQuicConfig, AdkgQuicServer};
+use stoffel_vm::net::adkg_engine::AdkgCurveConfig;
+#[cfg(feature = "adkg")]
+use stoffel_vm::net::adkg_server::{AdkgQuicConfig, Bls12381AdkgServer, Bn254AdkgServer};
+
+/// Extract the sender_id from a raw HoneyBadger `WrappedMessage`.
+///
+/// Used for accepted client connections where we don't have transport-level
+/// authentication of the sender's identity. Falls back to `usize::MAX` if
+/// deserialization fails (the subsequent `process` call will also fail).
+#[cfg(feature = "honeybadger")]
+fn extract_sender_id(data: &[u8]) -> usize {
+    match bincode::deserialize::<WrappedMessage>(data) {
+        Ok(WrappedMessage::Input(msg)) => msg.sender_id,
+        Ok(WrappedMessage::Output(msg)) => msg.sender_id,
+        Ok(WrappedMessage::RanSha(msg)) => msg.sender_id,
+        Ok(WrappedMessage::BatchRecon(msg)) => msg.sender_id,
+        Ok(WrappedMessage::Mul(msg)) => msg.sender,
+        Ok(WrappedMessage::Triple(msg)) => msg.sender_id,
+        Ok(WrappedMessage::Dousha(msg)) => msg.sender_id,
+        Ok(WrappedMessage::RanDouSha(msg)) => msg.sender_id,
+        Ok(WrappedMessage::RandBit(msg)) => msg.sender,
+        Ok(WrappedMessage::Trunc(msg)) => msg.sender_id,
+        Ok(WrappedMessage::PRandBit(msg)) => msg.sender_id,
+        Ok(WrappedMessage::Rbc(msg)) => msg.sender_id,
+        Err(_) => usize::MAX,
+    }
+}
 
 // Use a Tokio runtime for async operations
 #[tokio::main]
@@ -65,6 +93,7 @@ async fn main() {
     let mut stun_servers: Vec<SocketAddr> = Vec::new();
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
     let mut mpc_backend: Option<String> = None;
+    let mut adkg_curve: Option<String> = None;
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -96,6 +125,7 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--stun-servers") {
         } else if let Some(_rest) = arg.strip_prefix("--servers") {
         } else if let Some(_rest) = arg.strip_prefix("--mpc-backend") {
+        } else if let Some(_rest) = arg.strip_prefix("--adkg-curve") {
         }
     }
 
@@ -189,6 +219,11 @@ async fn main() {
                     mpc_backend = Some(v);
                 }
             }
+            "--adkg-curve" => {
+                if let Some(v) = args_iter.next() {
+                    adkg_curve = Some(v);
+                }
+            }
             _ => {}
         }
     }
@@ -267,7 +302,7 @@ async fn main() {
         // Create the MPC client
         // Instance ID 0 is fine for client - it doesn't participate in the instance negotiation
         let instance_id = 0u32;
-        let mut mpc_client = match HoneyBadgerMPCClient::<Fr, Avid>::new(
+        let mut mpc_client = match HoneyBadgerMPCClient::<Fr, Avid<HbSessionId>>::new(
             cid,
             n,
             t,
@@ -291,8 +326,8 @@ async fn main() {
             eprintln!("[client {}] Added server party {} at {}", cid, party_id, addr);
         }
 
-        // Create channel for receiving messages
-        let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(1000);
+        // Create channel for receiving messages (sender_id, data)
+        let (msg_tx, mut msg_rx) = mpsc::channel::<(usize, Vec<u8>)>(1000);
 
         // Connect to all servers as a client
         eprintln!("[client {}] Connecting to {} servers...", cid, server_addrs.len());
@@ -317,12 +352,13 @@ async fn main() {
                         // Spawn message handler for this connection
                         let tx = msg_tx.clone();
                         let client_id = cid;
+                        let peer = party_id;
 
                         tokio::spawn(async move {
                             loop {
                                 match connection.receive().await {
                                     Ok(data) => {
-                                        if let Err(e) = tx.send(data).await {
+                                        if let Err(e) = tx.send((peer, data)).await {
                                             eprintln!("[client {}] Failed to forward message: {:?}", client_id, e);
                                             break;
                                         }
@@ -359,14 +395,14 @@ async fn main() {
         let client_id_for_task = cid;
         let process_handle = tokio::spawn(async move {
             let mut messages_processed = 0;
-            while let Some(data) = msg_rx.recv().await {
+            while let Some((sender_id, data)) = msg_rx.recv().await {
                 // Clone network and drop lock before processing
                 let network_clone = {
                     let guard = network_for_process.lock().await;
                     (*guard).clone()
                 };
 
-                if let Err(e) = mpc_client.process(data, Arc::new(network_clone)).await {
+                if let Err(e) = mpc_client.process(data, sender_id, Arc::new(network_clone)).await {
                     eprintln!("[client {}] Failed to process message: {:?}", client_id_for_task, e);
                 }
 
@@ -870,7 +906,7 @@ async fn main() {
                 let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
 
                 // Create the MPC node directly with expected client IDs
-                let mut mpc_node = match <HoneyBadgerMPCNode<Fr, Avid> as MPCProtocol<
+                let mut mpc_node = match <HoneyBadgerMPCNode<Fr, Avid<HbSessionId>> as MPCProtocol<
                     Fr,
                     RobustShare<Fr>,
                     QuicNetworkManager,
@@ -898,8 +934,8 @@ async fn main() {
                         "[party {}] Message processing task started",
                         processing_party_id
                     );
-                    while let Some(raw_msg) = msg_rx.recv().await {
-                        if let Err(e) = processing_node.process(raw_msg, processing_net.clone()).await {
+                    while let Some((sender_id, raw_msg)) = msg_rx.recv().await {
+                        if let Err(e) = processing_node.process(raw_msg, sender_id, processing_net.clone()).await {
                             eprintln!(
                                 "[party {}] Failed to process message: {:?}",
                                 processing_party_id, e
@@ -946,7 +982,10 @@ async fn main() {
                                         loop {
                                             match connection.receive().await {
                                                 Ok(data) => {
-                                                    if let Err(e) = client_mpc_node.clone().process(data, client_net.clone()).await {
+                                                    // Extract sender_id from the message for transport-level validation.
+                                                    // For accepted client connections, we trust the message's claimed sender.
+                                                    let sender_id = extract_sender_id(&data);
+                                                    if let Err(e) = client_mpc_node.clone().process(data, sender_id, client_net.clone()).await {
                                                         eprintln!("[party] Failed to process client message: {:?}", e);
                                                     }
                                                 }
@@ -1053,68 +1092,91 @@ async fn main() {
 
             #[cfg(feature = "adkg")]
             MpcBackendKind::Adkg => {
-                eprintln!("[party {}] Setting up ADKG backend...", my_id);
+                // Parse curve configuration
+                let curve_config = match adkg_curve.as_deref() {
+                    Some(name) => match AdkgCurveConfig::from_str(name) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            exit(15);
+                        }
+                    },
+                    None => AdkgCurveConfig::default(),
+                };
 
-                // Create ADKG server using existing network manager
-                // We need to unwrap the Arc to pass ownership; since we just created it, this is safe
-                // Actually, ADKG server needs the network from net_opt which is Arc'd. We'll use a
-                // different approach: create AdkgQuicServer with the existing Arc network.
-                let mut adkg_server = AdkgQuicServer::new(
+                eprintln!(
+                    "[party {}] Setting up ADKG backend (curve: {})...",
                     my_id,
-                    n,
-                    t,
-                    instance_id,
-                    (*net).clone(),
-                    AdkgQuicConfig::default(),
+                    curve_config.name()
                 );
 
-                // Start the server (converts network builder to Arc)
-                let adkg_net = match adkg_server.start() {
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("[party {}] Failed to start ADKG server: {}", my_id, e);
-                        exit(13);
-                    }
-                };
-
-                // Exchange ECDH public keys
-                eprintln!("[party {}] Exchanging ECDH public keys...", my_id);
-                match adkg_server.exchange_public_keys().await {
-                    Ok(pk_map) => {
-                        eprintln!(
-                            "[party {}] PK exchange complete ({} keys collected)",
+                // Macro to avoid duplicating ADKG setup for each curve
+                macro_rules! setup_adkg {
+                    ($server_type:ty) => {{
+                        let mut adkg_server = <$server_type>::new(
                             my_id,
-                            pk_map.len()
+                            n,
+                            t,
+                            instance_id,
+                            (*net).clone(),
+                            AdkgQuicConfig::default(),
                         );
-                    }
-                    Err(e) => {
-                        eprintln!("[party {}] PK exchange failed: {}", my_id, e);
-                        exit(14);
-                    }
+
+                        // Start the server (converts network builder to Arc)
+                        let _adkg_net = match adkg_server.start() {
+                            Ok(n) => n,
+                            Err(e) => {
+                                eprintln!("[party {}] Failed to start ADKG server: {}", my_id, e);
+                                exit(13);
+                            }
+                        };
+
+                        // Exchange ECDH public keys
+                        eprintln!("[party {}] Exchanging ECDH public keys...", my_id);
+                        match adkg_server.exchange_public_keys().await {
+                            Ok(pk_map) => {
+                                eprintln!(
+                                    "[party {}] PK exchange complete ({} keys collected)",
+                                    my_id,
+                                    pk_map.len()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[party {}] PK exchange failed: {}", my_id, e);
+                                exit(14);
+                            }
+                        }
+
+                        // Create ADKG engine
+                        let engine = match adkg_server.create_engine() {
+                            Ok(e) => e,
+                            Err(e) => {
+                                eprintln!("[party {}] Failed to create ADKG engine: {}", my_id, e);
+                                exit(14);
+                            }
+                        };
+
+                        // Start the engine
+                        if let Err(e) = engine.start_async().await {
+                            eprintln!("[party {}] Failed to start ADKG engine: {}", my_id, e);
+                            exit(14);
+                        }
+
+                        // Spawn AVSS message receive/process loops
+                        if let Err(e) = adkg_server.spawn_message_loops(engine.clone()).await {
+                            eprintln!("[party {}] Failed to spawn message loops: {}", my_id, e);
+                            exit(14);
+                        }
+
+                        vm.state.set_mpc_engine(engine);
+                    }};
                 }
 
-                // Create ADKG engine
-                let engine = match adkg_server.create_engine() {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("[party {}] Failed to create ADKG engine: {}", my_id, e);
-                        exit(14);
-                    }
-                };
-
-                // Start the engine
-                if let Err(e) = engine.start_async().await {
-                    eprintln!("[party {}] Failed to start ADKG engine: {}", my_id, e);
-                    exit(14);
+                match curve_config {
+                    AdkgCurveConfig::Bls12_381 => setup_adkg!(Bls12381AdkgServer),
+                    AdkgCurveConfig::Bn254 => setup_adkg!(Bn254AdkgServer),
                 }
 
-                // Spawn AVSS message receive/process loops
-                if let Err(e) = adkg_server.spawn_message_loops(engine.clone()).await {
-                    eprintln!("[party {}] Failed to spawn message loops: {}", my_id, e);
-                    exit(14);
-                }
-
-                vm.state.set_mpc_engine(engine);
                 eprintln!("[party {}] ADKG engine set, starting VM execution...", my_id);
             }
         }
@@ -1154,6 +1216,7 @@ Flags:
   --n-parties <usize>     Number of parties for MPC (required in party/leader/client mode)
   --threshold <usize>     Threshold t (default: 1)
   --mpc-backend <name>    MPC backend: honeybadger (default) or adkg
+  --adkg-curve <name>     ADKG curve: bls12-381 (default) or bn254
   --client-id <usize>     Client ID (client mode, honeybadger only)
   --inputs <values>       Comma-separated input values (client mode)
   --servers <addrs>       Comma-separated server addresses (client mode)

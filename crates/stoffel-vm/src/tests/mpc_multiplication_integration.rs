@@ -6,6 +6,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::honeybadger::{
     HoneyBadgerError, HoneyBadgerMPCClient, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts,
     WrappedMessage,
@@ -17,6 +18,26 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
+
+/// Extract sender_id from a raw `WrappedMessage` for accepted connections
+/// where the transport-level sender identity is unknown.
+fn extract_sender_from_msg(data: &[u8]) -> PartyId {
+    match bincode::deserialize::<WrappedMessage>(data) {
+        Ok(WrappedMessage::Input(msg)) => msg.sender_id,
+        Ok(WrappedMessage::Output(msg)) => msg.sender_id,
+        Ok(WrappedMessage::RanSha(msg)) => msg.sender_id,
+        Ok(WrappedMessage::BatchRecon(msg)) => msg.sender_id,
+        Ok(WrappedMessage::Mul(msg)) => msg.sender,
+        Ok(WrappedMessage::Triple(msg)) => msg.sender_id,
+        Ok(WrappedMessage::Dousha(msg)) => msg.sender_id,
+        Ok(WrappedMessage::RanDouSha(msg)) => msg.sender_id,
+        Ok(WrappedMessage::RandBit(msg)) => msg.sender,
+        Ok(WrappedMessage::Trunc(msg)) => msg.sender_id,
+        Ok(WrappedMessage::PRandBit(msg)) => msg.sender_id,
+        Ok(WrappedMessage::Rbc(msg)) => msg.sender_id,
+        Err(_) => usize::MAX,
+    }
+}
 
 /// Configuration for HoneyBadger MPC over QUIC
 #[derive(Debug, Clone)]
@@ -44,7 +65,7 @@ impl Default for HoneyBadgerQuicConfig {
 /// A HoneyBadger MPC server node using QUIC networking
 pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     /// The underlying MPC node
-    pub node: HoneyBadgerMPCNode<F, Avid>,
+    pub node: HoneyBadgerMPCNode<F, Avid<HbSessionId>>,
     /// Network manager builder - used during setup before start() is called
     network_builder: Option<QuicNetworkManager>,
     /// Network manager Arc - created when start() is called, shared with all tasks
@@ -60,7 +81,7 @@ pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     /// Node ID
     pub node_id: PartyId,
     /// Bind address
-    pub channels: Sender<Vec<u8>>,
+    pub channels: Sender<(PartyId, Vec<u8>)>,
 }
 
 impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
@@ -70,11 +91,11 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         bind_address: SocketAddr,
         mpc_opts: HoneyBadgerMPCNodeOpts,
         config: HoneyBadgerQuicConfig,
-        channels: Sender<Vec<u8>>,
+        channels: Sender<(PartyId, Vec<u8>)>,
         input_ids: Vec<ClientId>,
     ) -> Result<Self, HoneyBadgerError> {
         // Create the MPC node
-        let mpc_node = <HoneyBadgerMPCNode<F, Avid> as MPCProtocol<
+        let mpc_node = <HoneyBadgerMPCNode<F, Avid<HbSessionId>> as MPCProtocol<
             F,
             RobustShare<F>,
             QuicNetworkManager,
@@ -198,7 +219,10 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                             Ok(data) => {
                                                 info!("[HB-QUIC] Node {} received {} bytes from {}", conn_node_id, data.len(), connection.remote_address());
                                                 // Important: no locks are held across await inside handle_message
-                                                if let Err(e) =txx.send(data).await {
+                                                // Accepted connections don't have a known peer_id;
+                                                // extract sender from the message payload.
+                                                let sender = extract_sender_from_msg(&data);
+                                                if let Err(e) = txx.send((sender, data)).await {
                                                     error!("Node {} failed to handle message: {:?}", conn_node_id, e);
                                                 }
                                             }
@@ -279,7 +303,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                             loop {
                                 match connection.receive().await {
                                     Ok(data) => {
-                                        if let Err(e) = txx.send(data).await {
+                                        if let Err(e) = txx.send((pid_for_task, data)).await {
                                             error!(
                                                 "Failed to handle message from peer {}: {:?}",
                                                 pid_for_task, e
@@ -342,8 +366,8 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
 
 /// Message types for the client actor
 pub enum ClientActorMessage {
-    /// Process incoming network data
-    ProcessData(Vec<u8>),
+    /// Process incoming network data (sender_id, payload)
+    ProcessData(PartyId, Vec<u8>),
     /// Shutdown the actor
     Shutdown,
 }
@@ -369,7 +393,7 @@ pub struct HoneyBadgerQuicClient<F: FftField> {
     /// Channel to send messages to the actor
     actor_tx: mpsc::Sender<ClientActorMessage>,
     /// Actor task handle
-    actor_task: Option<JoinHandle<HoneyBadgerMPCClient<F, Avid>>>,
+    actor_task: Option<JoinHandle<HoneyBadgerMPCClient<F, Avid<HbSessionId>>>>,
 }
 
 impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
@@ -419,16 +443,16 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
 
     /// Actor loop that owns the MPC client
     async fn run_actor(
-        mut client: HoneyBadgerMPCClient<F, Avid>,
+        mut client: HoneyBadgerMPCClient<F, Avid<HbSessionId>>,
         mut rx: mpsc::Receiver<ClientActorMessage>,
         network: Arc<Mutex<QuicNetworkManager>>,
-    ) -> HoneyBadgerMPCClient<F, Avid> {
+    ) -> HoneyBadgerMPCClient<F, Avid<HbSessionId>> {
         let client_id = client.id;
         info!("Starting actor loop for client {}", client_id);
 
         while let Some(msg) = rx.recv().await {
             match msg {
-                ClientActorMessage::ProcessData(data) => {
+                ClientActorMessage::ProcessData(sender_id, data) => {
                     info!(
                         "[HB-QUIC] Client {} received {} bytes",
                         client_id,
@@ -466,7 +490,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                         guard.clone()
                     }; // guard dropped here, mutex released
 
-                    if let Err(e) = client.process(data, Arc::new(network_clone)).await {
+                    if let Err(e) = client.process(data, sender_id, Arc::new(network_clone)).await {
                         error!("Client {} failed to process message: {:?}", client_id, e);
                     }
 
@@ -565,13 +589,14 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                         // Spawn message handler for this connection
                         let actor_tx = self.actor_tx.clone();
                         let client_id = self.client_id;
+                        let server_id = i;
 
                         let task = tokio::spawn(async move {
                             loop {
                                 match connection.receive().await {
                                     Ok(data) => {
                                         if let Err(e) = actor_tx
-                                            .send(ClientActorMessage::ProcessData(data))
+                                            .send(ClientActorMessage::ProcessData(server_id, data))
                                             .await
                                         {
                                             error!(
@@ -617,7 +642,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
     }
 
     /// Stops the client and closes all connections, returning the MPC client
-    pub async fn stop(mut self) -> Result<HoneyBadgerMPCClient<F, Avid>, HoneyBadgerError> {
+    pub async fn stop(mut self) -> Result<HoneyBadgerMPCClient<F, Avid<HbSessionId>>, HoneyBadgerError> {
         info!("Stopping HoneyBadger QUIC client {}", self.client_id);
 
         // Send shutdown message to actor
@@ -720,7 +745,7 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     base_port: u16,
     config: HoneyBadgerQuicConfig,
     input_ids: Option<Vec<ClientId>>,
-) -> Result<(Vec<HoneyBadgerQuicServer<F>>, Vec<Receiver<Vec<u8>>>), HoneyBadgerError> {
+) -> Result<(Vec<HoneyBadgerQuicServer<F>>, Vec<Receiver<(PartyId, Vec<u8>)>>), HoneyBadgerError> {
     let input_ids = input_ids.unwrap_or_default();
     let mut servers = Vec::new();
 
@@ -780,6 +805,7 @@ mod tests {
     use ark_std::rand::SeedableRng;
     use std::sync::Once;
     use std::time::Duration;
+    use stoffelmpc_mpc::common::ProtocolSessionId;
     use stoffelmpc_mpc::honeybadger::{ProtocolType, SessionId};
     use tracing_subscriber::EnvFilter;
 
@@ -806,7 +832,7 @@ mod tests {
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
         let instance_id = 99999;
         let base_port = 9200;
-        let session_id = SessionId::new(ProtocolType::Mul, 0, 0, 0, instance_id as u32);
+        let session_id = SessionId::new(ProtocolType::Mul, SessionId::pack_slot24(0, 0, 0), instance_id as u32);
         // Define client IDs before network setup (client IDs must be registered at setup time)
         // Client 100 is for input, client 200 is for output only
         let input_client_id: ClientId = 100;
@@ -873,8 +899,8 @@ mod tests {
             let network = server.network.clone().expect("network should be set after start()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
-                while let Some(raw_msg) = rx.recv().await {
-                    if let Err(e) = node.process(raw_msg, network.clone()).await {
+                while let Some((sender_id, raw_msg)) = rx.recv().await {
+                    if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                         tracing::error!("Node {i} failed to process message: {e:?}");
                     }
                 }
@@ -966,7 +992,7 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
+        let _session_id = SessionId::new(ProtocolType::Ransha, SessionId::pack_slot24(0, 0, 0), instance_id as u32);
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
@@ -1175,8 +1201,8 @@ mod tests {
             let network = server.network.clone().expect("network should be set after start()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
-                while let Some(raw_msg) = rx.recv().await {
-                    if let Err(e) = node.process(raw_msg, network.clone()).await {
+                while let Some((sender_id, raw_msg)) = rx.recv().await {
+                    if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                         tracing::error!("Node {i} failed to process message: {e:?}");
                     }
                 }
@@ -1268,7 +1294,7 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
+        let _session_id = SessionId::new(ProtocolType::Ransha, SessionId::pack_slot24(0, 0, 0), instance_id as u32);
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
@@ -1379,8 +1405,8 @@ mod tests {
             let network = server.network.clone().expect("network should be set after start()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
-                while let Some(raw_msg) = rx.recv().await {
-                    if let Err(e) = node.process(raw_msg, network.clone()).await {
+                while let Some((sender_id, raw_msg)) = rx.recv().await {
+                    if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                         tracing::error!("Node {i} failed to process message: {e:?}");
                     }
                 }
@@ -1443,7 +1469,7 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, 0, 0, 0, instance_id as u32);
+        let _session_id = SessionId::new(ProtocolType::Ransha, SessionId::pack_slot24(0, 0, 0), instance_id as u32);
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()

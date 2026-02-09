@@ -8,5 +8,4 @@ rustc-hash = "2.1.1"
 smallvec = "1.11"
 parking_lot = "0.12"
 object-pool = "0.6.0"
-# Use local path to mpc-protocols dev branch for ADKG support
-stoffelmpc-mpc = { version = "0.1.0", path = "/Users/gabriel/RustroverProjects/mpc-protocols/mpc" }
+stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "fake-network-update" }

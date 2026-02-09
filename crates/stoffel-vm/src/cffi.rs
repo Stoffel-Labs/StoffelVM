@@ -1222,14 +1222,37 @@ mod hb_engine_tests {
 #[cfg(feature = "adkg")]
 mod adkg_ffi {
     use super::*;
-    use crate::net::adkg_engine::AdkgMpcEngine;
+    use crate::net::adkg_engine::{AdkgMpcEngine, AdkgOperations, Bls12381AdkgEngine, AdkgCurveConfig};
     use crate::net::mpc_engine::MpcEngine;
-    use ark_bls12_381::{Fr, G1Projective as G1};
     use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
     use ark_std::rand::SeedableRng;
     use ark_std::UniformRand;
     use std::sync::Arc;
     use stoffelnet::transports::quic::QuicNetworkManager;
+
+    /// C-compatible curve configuration for ADKG
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CAdkgCurveConfig {
+        Bls12_381 = 0,
+        Bn254 = 1,
+    }
+
+    impl CAdkgCurveConfig {
+        fn to_config(self) -> AdkgCurveConfig {
+            match self {
+                CAdkgCurveConfig::Bls12_381 => AdkgCurveConfig::Bls12_381,
+                CAdkgCurveConfig::Bn254 => AdkgCurveConfig::Bn254,
+            }
+        }
+    }
+
+    /// Internal wrapper that erases the generic (F, G) types behind trait objects.
+    /// The opaque pointer stores a `Box<AdkgFfiWrapper>`.
+    struct AdkgFfiWrapper {
+        engine: Arc<dyn MpcEngine>,
+        adkg_ops: Arc<dyn AdkgOperations>,
+    }
 
     /// Opaque pointer type for AdkgMpcEngine
     #[repr(C)]
@@ -1258,6 +1281,78 @@ mod adkg_ffi {
         InvalidCommitmentIndex = 6,
         /// Tokio runtime creation failed
         RuntimeError = 7,
+        /// Invalid curve configuration
+        InvalidCurveConfig = 8,
+    }
+
+    /// Helper: create engine for BLS12-381 and wrap it
+    fn create_bls12381_engine(
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        net: Arc<QuicNetworkManager>,
+        sk_bytes: &[u8],
+        pk_bytes: &[u8],
+    ) -> Result<AdkgFfiWrapper, ()> {
+        use ark_bls12_381::{Fr, G1Projective as G1};
+
+        let sk_i: Fr = if sk_bytes.is_empty() {
+            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+            Fr::rand(&mut rng)
+        } else {
+            CanonicalDeserialize::deserialize_compressed(sk_bytes).map_err(|_| ())?
+        };
+
+        let pk_map: Vec<G1> = Vec::<G1>::deserialize_compressed(pk_bytes).map_err(|_| ())?;
+        if pk_map.len() != n {
+            return Err(());
+        }
+
+        let engine = AdkgMpcEngine::<Fr, G1>::new(
+            instance_id, party_id, n, t, net, sk_i, Arc::new(pk_map),
+        ).map_err(|_| ())?;
+
+        let engine_arc: Arc<AdkgMpcEngine<Fr, G1>> = engine;
+        Ok(AdkgFfiWrapper {
+            engine: engine_arc.clone() as Arc<dyn MpcEngine>,
+            adkg_ops: engine_arc as Arc<dyn AdkgOperations>,
+        })
+    }
+
+    /// Helper: create engine for BN254 and wrap it
+    fn create_bn254_engine(
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        net: Arc<QuicNetworkManager>,
+        sk_bytes: &[u8],
+        pk_bytes: &[u8],
+    ) -> Result<AdkgFfiWrapper, ()> {
+        use ark_bn254::{Fr, G1Projective as G1};
+
+        let sk_i: Fr = if sk_bytes.is_empty() {
+            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+            Fr::rand(&mut rng)
+        } else {
+            CanonicalDeserialize::deserialize_compressed(sk_bytes).map_err(|_| ())?
+        };
+
+        let pk_map: Vec<G1> = Vec::<G1>::deserialize_compressed(pk_bytes).map_err(|_| ())?;
+        if pk_map.len() != n {
+            return Err(());
+        }
+
+        let engine = AdkgMpcEngine::<Fr, G1>::new(
+            instance_id, party_id, n, t, net, sk_i, Arc::new(pk_map),
+        ).map_err(|_| ())?;
+
+        let engine_arc: Arc<AdkgMpcEngine<Fr, G1>> = engine;
+        Ok(AdkgFfiWrapper {
+            engine: engine_arc.clone() as Arc<dyn MpcEngine>,
+            adkg_ops: engine_arc as Arc<dyn AdkgOperations>,
+        })
     }
 
     /// Creates a new ADKG engine
@@ -1268,6 +1363,7 @@ mod adkg_ffi {
     /// * `n` - Total number of parties
     /// * `t` - Threshold
     /// * `network_ptr` - Pointer to a QuicNetworkManager (same opaque type as HB)
+    /// * `curve_config` - Curve configuration (0 = BLS12-381, 1 = BN254)
     /// * `sk_bytes` - Secret key bytes (serialized Fr element), or null for random key
     /// * `sk_len` - Length of secret key bytes
     /// * `pk_map_ptr` - Pointer to serialized public key map, or null
@@ -1282,6 +1378,7 @@ mod adkg_ffi {
         n: usize,
         t: usize,
         network_ptr: *mut c_void,
+        curve_config: CAdkgCurveConfig,
         sk_bytes: *const u8,
         sk_len: usize,
         pk_map_ptr: *const u8,
@@ -1297,31 +1394,25 @@ mod adkg_ffi {
             Arc::clone(boxed)
         };
 
-        // Parse secret key
-        let sk_i = if sk_bytes.is_null() || sk_len == 0 {
-            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-            Fr::rand(&mut rng)
+        let sk_slice = if sk_bytes.is_null() || sk_len == 0 {
+            &[]
         } else {
-            let bytes = unsafe { std::slice::from_raw_parts(sk_bytes, sk_len) };
-            match ark_serialize::CanonicalDeserialize::deserialize_compressed(bytes) {
-                Ok(sk) => sk,
-                Err(_) => return std::ptr::null_mut(),
+            unsafe { std::slice::from_raw_parts(sk_bytes, sk_len) }
+        };
+
+        let pk_slice = unsafe { std::slice::from_raw_parts(pk_map_ptr, pk_map_len) };
+
+        let wrapper = match curve_config {
+            CAdkgCurveConfig::Bls12_381 => {
+                create_bls12381_engine(instance_id, party_id, n, t, net, sk_slice, pk_slice)
+            }
+            CAdkgCurveConfig::Bn254 => {
+                create_bn254_engine(instance_id, party_id, n, t, net, sk_slice, pk_slice)
             }
         };
 
-        // Parse public key map (ark types use CanonicalDeserialize, not serde)
-        let pk_bytes = unsafe { std::slice::from_raw_parts(pk_map_ptr, pk_map_len) };
-        let pk_map: Vec<G1> = match Vec::<G1>::deserialize_compressed(pk_bytes) {
-            Ok(pks) => pks,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        if pk_map.len() != n {
-            return std::ptr::null_mut();
-        }
-
-        match AdkgMpcEngine::new(instance_id, party_id, n, t, net, sk_i, Arc::new(pk_map)) {
-            Ok(engine) => Box::into_raw(Box::new(engine)) as *mut AdkgEngineOpaque,
+        match wrapper {
+            Ok(w) => Box::into_raw(Box::new(w)) as *mut AdkgEngineOpaque,
             Err(_) => std::ptr::null_mut(),
         }
     }
@@ -1331,9 +1422,14 @@ mod adkg_ffi {
     pub extern "C" fn adkg_engine_free(engine_ptr: *mut AdkgEngineOpaque) {
         if !engine_ptr.is_null() {
             unsafe {
-                let _ = Box::from_raw(engine_ptr as *mut Arc<AdkgMpcEngine>);
+                let _ = Box::from_raw(engine_ptr as *mut AdkgFfiWrapper);
             }
         }
+    }
+
+    /// Helper to get the wrapper from an opaque pointer
+    unsafe fn get_wrapper<'a>(ptr: *mut AdkgEngineOpaque) -> &'a AdkgFfiWrapper {
+        &*(ptr as *const AdkgFfiWrapper)
     }
 
     /// Generates a new distributed key
@@ -1348,17 +1444,17 @@ mod adkg_ffi {
             return AdkgEngineErrorCode::NullPointer;
         }
 
-        let engine = unsafe { &*(engine_ptr as *const Arc<AdkgMpcEngine>) };
+        let wrapper = unsafe { get_wrapper(engine_ptr) };
 
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(_) => return AdkgEngineErrorCode::RuntimeError,
         };
 
-        match rt.block_on(engine.generate_key()) {
-            Ok(key) => {
+        match rt.block_on(wrapper.adkg_ops.adkg_generate_key_bytes()) {
+            Ok((session_id, _key_bytes)) => {
                 unsafe {
-                    *session_id_out = key.session_id;
+                    *session_id_out = session_id;
                 }
                 AdkgEngineErrorCode::Success
             }
@@ -1380,14 +1476,9 @@ mod adkg_ffi {
             return AdkgEngineErrorCode::NullPointer;
         }
 
-        let engine = unsafe { &*(engine_ptr as *const Arc<AdkgMpcEngine>) };
+        let wrapper = unsafe { get_wrapper(engine_ptr) };
 
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(_) => return AdkgEngineErrorCode::RuntimeError,
-        };
-
-        match rt.block_on(engine.get_public_key_bytes(session_id)) {
+        match wrapper.adkg_ops.adkg_get_public_key(session_id) {
             Ok(bytes) => {
                 let mut bytes = ManuallyDrop::new(bytes);
                 unsafe {
@@ -1415,10 +1506,9 @@ mod adkg_ffi {
             return AdkgEngineErrorCode::NullPointer;
         }
 
-        let engine = unsafe { &*(engine_ptr as *const Arc<AdkgMpcEngine>) };
+        let wrapper = unsafe { get_wrapper(engine_ptr) };
 
-        use crate::net::adkg_engine::AdkgOperations;
-        match engine.adkg_get_commitment(session_id, index) {
+        match wrapper.adkg_ops.adkg_get_commitment(session_id, index) {
             Ok(bytes) => {
                 let mut bytes = ManuallyDrop::new(bytes);
                 unsafe {
@@ -1437,8 +1527,8 @@ mod adkg_ffi {
         if engine_ptr.is_null() {
             return 0;
         }
-        let engine = unsafe { &*(engine_ptr as *const Arc<AdkgMpcEngine>) };
-        if engine.is_ready() { 1 } else { 0 }
+        let wrapper = unsafe { get_wrapper(engine_ptr) };
+        if wrapper.engine.is_ready() { 1 } else { 0 }
     }
 
     /// Get the party ID
@@ -1447,8 +1537,8 @@ mod adkg_ffi {
         if engine_ptr.is_null() {
             return 0;
         }
-        let engine = unsafe { &*(engine_ptr as *const Arc<AdkgMpcEngine>) };
-        engine.party_id()
+        let wrapper = unsafe { get_wrapper(engine_ptr) };
+        wrapper.engine.party_id()
     }
 
     /// Get the protocol name (returns static string, do not free)
@@ -1482,6 +1572,7 @@ mod adkg_ffi {
             let engine = adkg_engine_new(
                 1, 0, 5, 1,
                 std::ptr::null_mut(),
+                CAdkgCurveConfig::Bls12_381,
                 std::ptr::null(), 0,
                 std::ptr::null(), 0,
             );

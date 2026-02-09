@@ -84,8 +84,8 @@ async fn test_open_share_in_exp_known_value() {
             .expect("network should be set after start()");
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -231,8 +231,8 @@ async fn test_simulated_dkg_flow() {
             .expect("network should be set after start()");
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }

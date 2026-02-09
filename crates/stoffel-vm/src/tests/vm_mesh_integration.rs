@@ -137,8 +137,8 @@ async fn test_vm_mesh_full_integration() {
         let mut rx = recv.remove(0);
 
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -445,8 +445,8 @@ async fn test_vm_mesh_average_salary_integration() {
         let network = server.network.clone().expect("network should be set after start()");
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -847,8 +847,8 @@ async fn test_vm_mesh_large_preprocessing() {
         let mut rx = recv.remove(0);
 
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -1093,8 +1093,8 @@ async fn test_vm_mesh_output_client_integration() {
         let mut rx = recv.remove(0);
 
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -1307,7 +1307,7 @@ async fn test_vm_mesh_output_client_integration() {
         // Process the message at the output client
         let mut client = output_client.lock().await;
         client
-            .process(output_msg)
+            .process(output_msg, party_id)
             .await
             .expect("OutputClient failed to process message");
 
@@ -1529,8 +1529,8 @@ async fn test_vm_mesh_matrix_average_integration() {
         let mut rx = recv.remove(0);
 
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -2059,8 +2059,8 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         let mut rx = recv.remove(0);
 
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -3106,8 +3106,8 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         let mut rx = recv.remove(0);
 
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
