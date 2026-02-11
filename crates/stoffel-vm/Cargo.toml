@@ -11,7 +11,7 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 libc = "0.2"
 stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "fake-network-update" }
-stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git", rev = "e7d199029568057a9c37bec70014056dde25b962" }
+stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
 stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
 
 async-trait = "0.1"

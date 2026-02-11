@@ -1004,23 +1004,14 @@ impl Network for QuicNetworkManager {
         false
     }
 
-    // --- sender_id management ---
+    // --- party identification ---
 
-    fn sender_id(&self) -> PartyId {
+    fn local_party_id(&self) -> PartyId {
         self.node_id
-    }
-
-    fn assign_sender_ids(&self) -> usize {
-        // In QuicNetworkManager, sender_ids are assigned based on node_id
-        self.nodes.len()
     }
 
     fn party_count(&self) -> usize {
         self.nodes.len()
-    }
-
-    fn is_fully_connected(&self, expected_count: usize) -> bool {
-        self.nodes.len() >= expected_count
     }
 }
 
