@@ -1,6 +1,7 @@
 use std::env;
 use std::net::SocketAddr;
 use std::process::exit;
+use std::str::FromStr;
 
 use ark_bls12_381::Fr;
 use std::fs::File;

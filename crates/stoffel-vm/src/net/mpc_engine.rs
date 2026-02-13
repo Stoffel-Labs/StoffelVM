@@ -101,19 +101,31 @@ pub trait MpcEngine: Send + Sync {
     }
 
     /// Get the party ID for this node
-    fn party_id(&self) -> usize {
-        0 // Default, implementations should override
-    }
+    fn party_id(&self) -> usize;
 
     /// Get the number of parties in the MPC network
-    fn n_parties(&self) -> usize {
-        1 // Default, implementations should override
-    }
+    fn n_parties(&self) -> usize;
 
     /// Get the threshold parameter
-    fn threshold(&self) -> usize {
-        0 // Default, implementations should override
-    }
+    fn threshold(&self) -> usize;
+
+    /// Whether this engine supports secure multiplication
+    fn supports_multiplication(&self) -> bool { false }
+
+    /// Whether this engine supports distributed key generation
+    fn supports_dkg(&self) -> bool { false }
+
+    /// Whether this engine supports client input operations
+    fn supports_client_input(&self) -> bool { false }
+
+    /// Whether this engine supports consensus (RBC/ABA)
+    fn supports_consensus(&self) -> bool { false }
+
+    /// Try to obtain a reference to the consensus sub-trait, if supported.
+    fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> { None }
+
+    /// Try to obtain a reference to the client-ops sub-trait, if supported.
+    fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> { None }
 
     /// Support downcasting for concrete engine types
     ///

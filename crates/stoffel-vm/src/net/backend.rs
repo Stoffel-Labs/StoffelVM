@@ -11,13 +11,15 @@ pub enum MpcBackendKind {
     Adkg,
 }
 
-impl MpcBackendKind {
+impl std::str::FromStr for MpcBackendKind {
+    type Err = String;
+
     /// Parse a backend name from a string.
     ///
     /// Accepted values:
     /// - `"honeybadger"` or `"hb"` -> `HoneyBadger`
     /// - `"adkg"` -> `Adkg`
-    pub fn from_str(s: &str) -> Result<Self, String> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             #[cfg(feature = "honeybadger")]
             "honeybadger" | "hb" => Ok(MpcBackendKind::HoneyBadger),
@@ -37,7 +39,9 @@ impl MpcBackendKind {
             }
         }
     }
+}
 
+impl MpcBackendKind {
     /// Returns the default backend.
     ///
     /// Prefers HoneyBadger when available, falls back to ADKG.
@@ -113,6 +117,7 @@ impl MpcBackendKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     #[cfg(feature = "honeybadger")]

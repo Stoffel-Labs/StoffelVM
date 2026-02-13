@@ -2385,9 +2385,9 @@ impl VMState {
     ///
     /// # Requirements
     /// - An MPC engine must be configured via `set_mpc_engine()`
-    /// - The MPC engine must implement `MpcEngineClientOps`
-    /// - When using HoneyBadgerMpcEngine, client inputs must have been initialized
-    ///   via the HB input protocol before calling this method
+    /// - The MPC engine must support client operations (`as_client_ops()`)
+    /// - Client inputs must have been initialized via the engine's input protocol
+    ///   before calling this method
     ///
     /// # Returns
     /// The number of clients whose inputs were hydrated
@@ -2404,17 +2404,8 @@ impl VMState {
             .as_ref()
             .ok_or("MPC engine not configured")?;
 
-        // Try to downcast to HoneyBadgerMpcEngine which implements MpcEngineClientOps
-        #[cfg(feature = "honeybadger")]
-        {
-            use crate::net::hb_engine::HoneyBadgerMpcEngine;
-            if let Some(hb_engine) = engine
-                .as_any()
-                .and_then(|any| any.downcast_ref::<HoneyBadgerMpcEngine>())
-            {
-                use crate::net::mpc_engine::MpcEngineClientOps;
-                return hb_engine.hydrate_client_inputs_sync(&self.client_store);
-            }
+        if let Some(client_ops) = engine.as_client_ops() {
+            return client_ops.hydrate_client_inputs_sync(&self.client_store);
         }
 
         Err("MPC engine does not support client input hydration".to_string())

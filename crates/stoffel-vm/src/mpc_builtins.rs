@@ -264,11 +264,8 @@ pub mod share_object {
 pub fn register_mpc_builtins(vm: &mut VirtualMachine) {
     register_share_builtins(vm);
     register_mpc_info_builtins(vm);
-    #[cfg(feature = "honeybadger")]
-    {
-        register_rbc_builtins(vm);
-        register_aba_builtins(vm);
-    }
+    register_rbc_builtins(vm);
+    register_aba_builtins(vm);
     #[cfg(feature = "adkg")]
     register_adkg_builtins(vm);
 }
@@ -455,11 +452,7 @@ fn register_mpc_info_builtins(vm: &mut VirtualMachine) {
 }
 
 /// Register RBC (Reliable Broadcast) builtins
-#[cfg(feature = "honeybadger")]
 fn register_rbc_builtins(vm: &mut VirtualMachine) {
-    use crate::net::hb_engine::HoneyBadgerMpcEngine;
-    use crate::net::mpc_engine::MpcEngineConsensus;
-
     // Rbc.broadcast - Broadcast a message reliably
     vm.register_foreign_function("Rbc.broadcast", |ctx| {
         let engine = ctx
@@ -467,14 +460,9 @@ fn register_rbc_builtins(vm: &mut VirtualMachine) {
             .mpc_engine()
             .ok_or_else(|| "MPC engine not configured".to_string())?;
 
-        // Try to downcast to HoneyBadgerMpcEngine which implements MpcEngineConsensus
-        let any = engine
-            .as_any()
-            .ok_or_else(|| "MPC engine does not support downcasting".to_string())?;
-
-        let hb_engine = any
-            .downcast_ref::<HoneyBadgerMpcEngine>()
-            .ok_or_else(|| "MPC engine does not support RBC".to_string())?;
+        let consensus = engine
+            .as_consensus()
+            .ok_or_else(|| "MPC engine does not support consensus (RBC/ABA)".to_string())?;
 
         // Get message from args
         if ctx.args.is_empty() {
@@ -486,7 +474,7 @@ fn register_rbc_builtins(vm: &mut VirtualMachine) {
             _ => return Err("Message must be a string".to_string()),
         };
 
-        let session_id = hb_engine.rbc_broadcast(&message_bytes)?;
+        let session_id = consensus.rbc_broadcast(&message_bytes)?;
         Ok(Value::I64(session_id as i64))
     });
 
@@ -497,13 +485,9 @@ fn register_rbc_builtins(vm: &mut VirtualMachine) {
             .mpc_engine()
             .ok_or_else(|| "MPC engine not configured".to_string())?;
 
-        let any = engine
-            .as_any()
-            .ok_or_else(|| "MPC engine does not support downcasting".to_string())?;
-
-        let hb_engine = any
-            .downcast_ref::<HoneyBadgerMpcEngine>()
-            .ok_or_else(|| "MPC engine does not support RBC".to_string())?;
+        let consensus = engine
+            .as_consensus()
+            .ok_or_else(|| "MPC engine does not support consensus (RBC/ABA)".to_string())?;
 
         if ctx.args.len() < 2 {
             return Err("Rbc.receive expects 2 arguments: from_party, timeout_ms".to_string());
@@ -519,7 +503,7 @@ fn register_rbc_builtins(vm: &mut VirtualMachine) {
             _ => return Err("timeout_ms must be a non-negative integer".to_string()),
         };
 
-        let message = hb_engine.rbc_receive(from_party, timeout_ms)?;
+        let message = consensus.rbc_receive(from_party, timeout_ms)?;
         Ok(Value::String(
             String::from_utf8(message).unwrap_or_else(|_| "<binary data>".to_string()),
         ))
@@ -532,13 +516,9 @@ fn register_rbc_builtins(vm: &mut VirtualMachine) {
             .mpc_engine()
             .ok_or_else(|| "MPC engine not configured".to_string())?;
 
-        let any = engine
-            .as_any()
-            .ok_or_else(|| "MPC engine does not support downcasting".to_string())?;
-
-        let hb_engine = any
-            .downcast_ref::<HoneyBadgerMpcEngine>()
-            .ok_or_else(|| "MPC engine does not support RBC".to_string())?;
+        let consensus = engine
+            .as_consensus()
+            .ok_or_else(|| "MPC engine does not support consensus (RBC/ABA)".to_string())?;
 
         if ctx.args.is_empty() {
             return Err("Rbc.receive_any expects 1 argument: timeout_ms".to_string());
@@ -549,7 +529,7 @@ fn register_rbc_builtins(vm: &mut VirtualMachine) {
             _ => return Err("timeout_ms must be a non-negative integer".to_string()),
         };
 
-        let (party_id, message) = hb_engine.rbc_receive_any(timeout_ms)?;
+        let (party_id, message) = consensus.rbc_receive_any(timeout_ms)?;
 
         // Create result object with party_id and message
         let obj_id = ctx.vm_state.object_store.create_object();
@@ -570,11 +550,7 @@ fn register_rbc_builtins(vm: &mut VirtualMachine) {
 }
 
 /// Register ABA (Asynchronous Binary Agreement) builtins
-#[cfg(feature = "honeybadger")]
 fn register_aba_builtins(vm: &mut VirtualMachine) {
-    use crate::net::hb_engine::HoneyBadgerMpcEngine;
-    use crate::net::mpc_engine::MpcEngineConsensus;
-
     // Aba.propose - Propose a binary value
     vm.register_foreign_function("Aba.propose", |ctx| {
         let engine = ctx
@@ -582,13 +558,9 @@ fn register_aba_builtins(vm: &mut VirtualMachine) {
             .mpc_engine()
             .ok_or_else(|| "MPC engine not configured".to_string())?;
 
-        let any = engine
-            .as_any()
-            .ok_or_else(|| "MPC engine does not support downcasting".to_string())?;
-
-        let hb_engine = any
-            .downcast_ref::<HoneyBadgerMpcEngine>()
-            .ok_or_else(|| "MPC engine does not support ABA".to_string())?;
+        let consensus = engine
+            .as_consensus()
+            .ok_or_else(|| "MPC engine does not support consensus (RBC/ABA)".to_string())?;
 
         if ctx.args.is_empty() {
             return Err("Aba.propose expects 1 argument: value (bool)".to_string());
@@ -599,7 +571,7 @@ fn register_aba_builtins(vm: &mut VirtualMachine) {
             _ => return Err("value must be a boolean".to_string()),
         };
 
-        let session_id = hb_engine.aba_propose(value)?;
+        let session_id = consensus.aba_propose(value)?;
         Ok(Value::I64(session_id as i64))
     });
 
@@ -610,13 +582,9 @@ fn register_aba_builtins(vm: &mut VirtualMachine) {
             .mpc_engine()
             .ok_or_else(|| "MPC engine not configured".to_string())?;
 
-        let any = engine
-            .as_any()
-            .ok_or_else(|| "MPC engine does not support downcasting".to_string())?;
-
-        let hb_engine = any
-            .downcast_ref::<HoneyBadgerMpcEngine>()
-            .ok_or_else(|| "MPC engine does not support ABA".to_string())?;
+        let consensus = engine
+            .as_consensus()
+            .ok_or_else(|| "MPC engine does not support consensus (RBC/ABA)".to_string())?;
 
         if ctx.args.len() < 2 {
             return Err("Aba.result expects 2 arguments: session_id, timeout_ms".to_string());
@@ -632,7 +600,7 @@ fn register_aba_builtins(vm: &mut VirtualMachine) {
             _ => return Err("timeout_ms must be a non-negative integer".to_string()),
         };
 
-        let result = hb_engine.aba_result(session_id, timeout_ms)?;
+        let result = consensus.aba_result(session_id, timeout_ms)?;
         Ok(Value::Bool(result))
     });
 
@@ -643,13 +611,9 @@ fn register_aba_builtins(vm: &mut VirtualMachine) {
             .mpc_engine()
             .ok_or_else(|| "MPC engine not configured".to_string())?;
 
-        let any = engine
-            .as_any()
-            .ok_or_else(|| "MPC engine does not support downcasting".to_string())?;
-
-        let hb_engine = any
-            .downcast_ref::<HoneyBadgerMpcEngine>()
-            .ok_or_else(|| "MPC engine does not support ABA".to_string())?;
+        let consensus = engine
+            .as_consensus()
+            .ok_or_else(|| "MPC engine does not support consensus (RBC/ABA)".to_string())?;
 
         if ctx.args.len() < 2 {
             return Err(
@@ -667,7 +631,7 @@ fn register_aba_builtins(vm: &mut VirtualMachine) {
             _ => return Err("timeout_ms must be a non-negative integer".to_string()),
         };
 
-        let result = hb_engine.aba_propose_and_wait(value, timeout_ms)?;
+        let result = consensus.aba_propose_and_wait(value, timeout_ms)?;
         Ok(Value::Bool(result))
     });
 }

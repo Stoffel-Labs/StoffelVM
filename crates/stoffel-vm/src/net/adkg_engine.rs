@@ -814,6 +814,8 @@ where
         self.t
     }
 
+    fn supports_dkg(&self) -> bool { true }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }

@@ -922,6 +922,13 @@ impl MpcEngine for HoneyBadgerMpcEngine {
         self.t
     }
 
+    fn supports_multiplication(&self) -> bool { true }
+    fn supports_client_input(&self) -> bool { true }
+    fn supports_consensus(&self) -> bool { true }
+
+    fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> { Some(self) }
+    fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> { Some(self) }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }

@@ -20,6 +20,7 @@ use stoffelmpc_mpc::common::share::avss::AvssMessage;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::adkg_engine::AdkgMpcEngine;
@@ -86,6 +87,8 @@ where
     pk_map: Option<Arc<Vec<G>>>,
     /// Configuration
     pub config: AdkgQuicConfig,
+    /// Cancellation token for graceful shutdown
+    shutdown_token: CancellationToken,
 }
 
 impl<F, G> AdkgQuicServer<F, G>
@@ -120,6 +123,7 @@ where
             pk_i,
             pk_map: None,
             config,
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -145,6 +149,7 @@ where
             pk_i,
             pk_map: None,
             config,
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -394,33 +399,42 @@ where
             let engine = engine.clone();
             let tx = msg_tx.clone();
             let conn = conn.clone();
+            let shutdown_token = self.shutdown_token.clone();
 
             tokio::spawn(async move {
                 loop {
-                    match conn.receive().await {
-                        Ok(data) => {
-                            // Try to deserialize as AVSS message
-                            match bincode::deserialize::<AvssMessage<AvssSessionId>>(&data) {
-                                Ok(avss_msg) => {
-                                    if let Err(e) = engine.process_message(avss_msg).await {
-                                        error!(
-                                            "[ADKG] Party failed to process AVSS message from {}: {}",
-                                            peer_id, e
-                                        );
+                    tokio::select! {
+                        _ = shutdown_token.cancelled() => {
+                            info!("[ADKG] Message loop for peer {} shutting down", peer_id);
+                            break;
+                        }
+                        result = conn.receive() => {
+                            match result {
+                                Ok(data) => {
+                                    // Try to deserialize as AVSS message
+                                    match bincode::deserialize::<AvssMessage<AvssSessionId>>(&data) {
+                                        Ok(avss_msg) => {
+                                            if let Err(e) = engine.process_message(avss_msg).await {
+                                                error!(
+                                                    "[ADKG] Party failed to process AVSS message from {}: {}",
+                                                    peer_id, e
+                                                );
+                                            }
+                                        }
+                                        Err(_) => {
+                                            // Not an AVSS message, forward as raw bytes
+                                            let _ = tx.send(data).await;
+                                        }
                                     }
                                 }
-                                Err(_) => {
-                                    // Not an AVSS message, forward as raw bytes
-                                    let _ = tx.send(data).await;
+                                Err(e) => {
+                                    warn!(
+                                        "[ADKG] Connection to peer {} closed: {}",
+                                        peer_id, e
+                                    );
+                                    break;
                                 }
                             }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "[ADKG] Connection to peer {} closed: {}",
-                                peer_id, e
-                            );
-                            break;
                         }
                     }
                 }
@@ -428,5 +442,11 @@ where
         }
 
         Ok(msg_rx)
+    }
+
+    /// Gracefully shut down the server, cancelling all message loops.
+    pub fn stop(&self) {
+        info!("[ADKG] Shutting down server for party {}", self.node_id);
+        self.shutdown_token.cancel();
     }
 }

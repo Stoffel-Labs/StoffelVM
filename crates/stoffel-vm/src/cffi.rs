@@ -629,7 +629,10 @@ fn value_to_stoffel_value(value: &Value) -> StoffelValue {
             value_type: StoffelValueType::Closure,
             data: StoffelValueData { closure_id: 0 }, // Simplified
         },
-        _ => panic!("Invalid value type"),
+        _ => StoffelValue {
+            value_type: StoffelValueType::Unit,
+            data: StoffelValueData { int_val: 0 },
+        },
     }
 }
 
