@@ -31,7 +31,7 @@ use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::avss::AvssNode;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::{ProtocolSessionId, SecretSharingScheme};
-use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+use ark_ec::PrimeGroup;
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::Mutex;
@@ -57,6 +57,12 @@ pub enum AdkgCurveConfig {
     Bls12_381,
     /// BN254: 254-bit Fr, 32-byte compressed G1 points
     Bn254,
+    /// Curve25519 (Edwards form): 253-bit Fr, 32-byte compressed points
+    Curve25519,
+    /// Ed25519 (twisted Edwards curve): same scalar field as Curve25519
+    Ed25519,
+    // TODO: Ristretto — prime-order group over Curve25519 (no ark crate yet;
+    //       needs curve25519-dalek or a custom ark adapter)
 }
 
 impl AdkgCurveConfig {
@@ -65,8 +71,10 @@ impl AdkgCurveConfig {
         match s.to_lowercase().as_str() {
             "bls12-381" | "bls12_381" | "bls12381" => Ok(AdkgCurveConfig::Bls12_381),
             "bn254" => Ok(AdkgCurveConfig::Bn254),
+            "curve25519" => Ok(AdkgCurveConfig::Curve25519),
+            "ed25519" => Ok(AdkgCurveConfig::Ed25519),
             other => Err(format!(
-                "Unknown ADKG curve '{}'. Supported curves: bls12-381, bn254",
+                "Unknown curve '{}'. Supported curves: bls12-381, bn254, curve25519, ed25519",
                 other
             )),
         }
@@ -77,6 +85,8 @@ impl AdkgCurveConfig {
         match self {
             AdkgCurveConfig::Bls12_381 => "bls12-381",
             AdkgCurveConfig::Bn254 => "bn254",
+            AdkgCurveConfig::Curve25519 => "curve25519",
+            AdkgCurveConfig::Ed25519 => "ed25519",
         }
     }
 }
@@ -153,73 +163,6 @@ impl AdkgEngineOpts {
 }
 
 // ============================================================================
-// AdkgSecretKey<F, G> - Generic secret key
-// ============================================================================
-
-/// Stored ADKG secret key with its Feldman commitments.
-///
-/// Generic over field `F` and curve group `G` where `G: CurveGroup<ScalarField = F>`.
-#[derive(Clone, Debug)]
-pub struct AdkgSecretKey<F: FftField, G: CurveGroup<ScalarField = F>> {
-    /// The session ID this key belongs to
-    pub session_id: u64,
-    /// The Feldman-verifiable share
-    pub share: FeldmanShamirShare<F, G>,
-}
-
-impl<F, G> AdkgSecretKey<F, G>
-where
-    F: FftField,
-    G: CurveGroup<ScalarField = F>,
-{
-    /// Get the public key (commitment[0] = g^secret)
-    pub fn public_key(&self) -> G {
-        self.share.commitments[0]
-    }
-
-    /// Get commitment at a specific index
-    pub fn commitment(&self, index: usize) -> Option<G> {
-        self.share.commitments.get(index).cloned()
-    }
-
-    /// Get all commitments
-    pub fn commitments(&self) -> &[G] {
-        &self.share.commitments
-    }
-
-    /// Serialize the public key to bytes
-    pub fn public_key_bytes(&self) -> Result<Vec<u8>, String> {
-        let mut bytes = Vec::new();
-        self.share.commitments[0]
-            .serialize_compressed(&mut bytes)
-            .map_err(|e| format!("Failed to serialize public key: {:?}", e))?;
-        Ok(bytes)
-    }
-
-    /// Serialize the entire secret key (share + commitments) to bytes
-    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        let mut bytes = Vec::new();
-        self.share
-            .serialize_compressed(&mut bytes)
-            .map_err(|e| format!("Failed to serialize secret key: {:?}", e))?;
-        Ok(bytes)
-    }
-
-    /// Deserialize from bytes
-    pub fn from_bytes(session_id: u64, bytes: &[u8]) -> Result<Self, String> {
-        let share = FeldmanShamirShare::<F, G>::deserialize_compressed(bytes)
-            .map_err(|e| format!("Failed to deserialize secret key: {:?}", e))?;
-        Ok(Self { session_id, share })
-    }
-}
-
-/// Type alias for BLS12-381 secret key
-pub type Bls12381AdkgSecretKey =
-    AdkgSecretKey<ark_bls12_381::Fr, ark_bls12_381::G1Projective>;
-/// Type alias for BN254 secret key
-pub type Bn254AdkgSecretKey = AdkgSecretKey<ark_bn254::Fr, ark_bn254::G1Projective>;
-
-// ============================================================================
 // AdkgMpcEngine<F, G> - Generic ADKG engine
 // ============================================================================
 
@@ -247,8 +190,8 @@ where
     avss_node: Arc<Mutex<AvssNode<F, Avid<AvssSessionId>, G, AvssSessionId>>>,
     /// Channel to receive AVSS completion notifications
     output_receiver: Arc<Mutex<Receiver<AvssSessionId>>>,
-    /// Generated secret keys indexed by session ID
-    secret_keys: Arc<Mutex<BTreeMap<u64, AdkgSecretKey<F, G>>>>,
+    /// Generated Feldman shares indexed by user-defined key name
+    stored_shares: Arc<Mutex<BTreeMap<String, FeldmanShamirShare<F, G>>>>,
     /// Session counter for generating unique session IDs
     session_counter: Arc<Mutex<u64>>,
     ready: AtomicBool,
@@ -305,7 +248,7 @@ where
             net,
             avss_node: Arc::new(Mutex::new(avss_node)),
             output_receiver: Arc::new(Mutex::new(output_receiver)),
-            secret_keys: Arc::new(Mutex::new(BTreeMap::new())),
+            stored_shares: Arc::new(Mutex::new(BTreeMap::new())),
             session_counter: Arc::new(Mutex::new(0)),
             ready: AtomicBool::new(false),
             sk_i,
@@ -323,28 +266,26 @@ where
         Ok(())
     }
 
-    /// Run ADKG as the dealer to generate a new distributed key
+    /// Generate a new random AVSS share and store it under the given key name.
     ///
-    /// This party initiates the AVSS protocol with a randomly generated secret.
-    /// All parties will receive Feldman-verifiable shares.
-    pub async fn generate_key(&self) -> Result<AdkgSecretKey<F, G>, String> {
+    /// The `key_name` must be the same across all parties so they can
+    /// coordinate retrieval later. This party initiates the AVSS protocol
+    /// with a randomly generated secret.
+    pub async fn generate_random_share(&self, key_name: &str) -> Result<FeldmanShamirShare<F, G>, String> {
         if !self.is_ready() {
-            return Err("ADKG engine not ready".into());
+            return Err("AVSS engine not ready".into());
         }
 
-        // Generate a random secret
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
         let secret = F::rand(&mut rng);
 
-        self.generate_key_with_secret(secret).await
+        self.generate_share_with_secret(key_name, secret).await
     }
 
-    /// Run ADKG as the dealer with a specific secret
-    ///
-    /// This allows testing with known secrets.
-    pub async fn generate_key_with_secret(&self, secret: F) -> Result<AdkgSecretKey<F, G>, String> {
+    /// Generate an AVSS share for a specific secret and store under the given key name.
+    pub async fn generate_share_with_secret(&self, key_name: &str, secret: F) -> Result<FeldmanShamirShare<F, G>, String> {
         if !self.is_ready() {
-            return Err("ADKG engine not ready".into());
+            return Err("AVSS engine not ready".into());
         }
 
         // Generate session ID
@@ -370,25 +311,22 @@ where
         }
 
         info!(
-            "ADKG key generation initiated: party={}, session={}",
+            "AVSS share generation initiated: party={}, key='{}', session={}",
             self.party_id,
+            key_name,
             session_id.as_u64()
         );
 
         // Wait for our own share to be processed
         let share = self.wait_for_share(session_id).await?;
 
-        // Store the key
-        let key = AdkgSecretKey {
-            session_id: session_id.as_u64(),
-            share,
-        };
+        // Store the share under the user-defined key name
         {
-            let mut keys = self.secret_keys.lock().await;
-            keys.insert(session_id.as_u64(), key.clone());
+            let mut shares = self.stored_shares.lock().await;
+            shares.insert(key_name.to_string(), share.clone());
         }
 
-        Ok(key)
+        Ok(share)
     }
 
     /// Wait for a share from a specific session
@@ -423,26 +361,26 @@ where
         }
     }
 
-    /// Get a secret key by session ID
-    pub async fn get_secret_key(&self, session_id: u64) -> Option<AdkgSecretKey<F, G>> {
-        let keys = self.secret_keys.lock().await;
-        keys.get(&session_id).cloned()
+    /// Retrieve a stored Feldman share by key name.
+    pub async fn get_share(&self, key_name: &str) -> Option<FeldmanShamirShare<F, G>> {
+        let shares = self.stored_shares.lock().await;
+        shares.get(key_name).cloned()
     }
 
-    /// Get the public key for a session
-    pub async fn get_public_key(&self, session_id: u64) -> Option<G> {
-        self.get_secret_key(session_id)
+    /// Get the public key (commitment[0]) for a stored share.
+    pub async fn get_public_key(&self, key_name: &str) -> Option<G> {
+        self.get_share(key_name)
             .await
-            .map(|k| k.public_key())
+            .map(|s| s.commitments[0])
     }
 
-    /// Get public key bytes for a session
-    pub async fn get_public_key_bytes(&self, session_id: u64) -> Result<Vec<u8>, String> {
-        let key = self
-            .get_secret_key(session_id)
+    /// Get public key bytes for a stored share.
+    pub async fn get_public_key_bytes(&self, key_name: &str) -> Result<Vec<u8>, String> {
+        let share = self
+            .get_share(key_name)
             .await
-            .ok_or_else(|| format!("Session {} not found", session_id))?;
-        key.public_key_bytes()
+            .ok_or_else(|| format!("Key '{}' not found", key_name))?;
+        Self::encode_group_element(&share.commitments[0])
     }
 
     /// Process incoming AVSS message
@@ -482,19 +420,49 @@ where
         self.net.clone()
     }
 
-    /// Encode a RobustShare to bytes using CanonicalSerialize
-    fn encode_robustshare(share: &RobustShare<F>) -> Result<Vec<u8>, String> {
+    /// Encode a FeldmanShamirShare to bytes using CanonicalSerialize
+    pub fn encode_feldman_share(share: &FeldmanShamirShare<F, G>) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         share
             .serialize_compressed(&mut out)
-            .map_err(|e| format!("serialize RobustShare: {}", e))?;
+            .map_err(|e| format!("serialize FeldmanShamirShare: {}", e))?;
         Ok(out)
     }
 
-    /// Decode a RobustShare from bytes using CanonicalDeserialize
-    fn decode_robustshare(bytes: &[u8]) -> Result<RobustShare<F>, String> {
-        RobustShare::<F>::deserialize_compressed(bytes)
-            .map_err(|e| format!("deserialize RobustShare: {}", e))
+    /// Decode a FeldmanShamirShare from bytes using CanonicalDeserialize
+    pub fn decode_feldman_share(bytes: &[u8]) -> Result<FeldmanShamirShare<F, G>, String> {
+        FeldmanShamirShare::<F, G>::deserialize_compressed(bytes)
+            .map_err(|e| format!("deserialize FeldmanShamirShare: {}", e))
+    }
+
+    /// Create AVSS shares for a secret value (generates Feldman-verifiable shares for all parties).
+    ///
+    /// Returns this party's share.
+    fn create_avss_share(&self, secret: F) -> Result<FeldmanShamirShare<F, G>, String> {
+        use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
+        let mut rng = ark_std::test_rng();
+
+        // Generate random polynomial with p(0) = secret
+        let mut poly = DensePolynomial::<F>::rand(self.t, &mut rng);
+        poly[0] = secret;
+
+        // Compute Feldman commitments: C_j = g * c_j
+        let generator = G::generator();
+        let commitments: Vec<G> = poly.coeffs.iter().map(|c| generator * c).collect();
+
+        // Evaluate at this party's point (1-indexed)
+        let x = F::from((self.party_id + 1) as u64);
+        let share_value = poly.evaluate(&x);
+
+        FeldmanShamirShare::new(share_value, self.party_id + 1, self.t, commitments)
+            .map_err(|e| format!("Failed to create FeldmanShamirShare: {:?}", e))
+    }
+
+    /// Reconstruct the secret from a set of Feldman shares using Lagrange interpolation.
+    fn reconstruct_secret(shares: &[FeldmanShamirShare<F, G>], n: usize) -> Result<F, String> {
+        let (_, secret) = FeldmanShamirShare::<F, G>::recover_secret(shares, n)
+            .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
+        Ok(secret)
     }
 }
 
@@ -503,15 +471,21 @@ pub type Bls12381AdkgEngine =
     AdkgMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>;
 /// Type alias for BN254 ADKG engine
 pub type Bn254AdkgEngine = AdkgMpcEngine<ark_bn254::Fr, ark_bn254::G1Projective>;
+/// Type alias for Curve25519 ADKG engine
+pub type Curve25519AdkgEngine =
+    AdkgMpcEngine<ark_curve25519::Fr, ark_curve25519::EdwardsProjective>;
+/// Type alias for Ed25519 ADKG engine
+pub type Ed25519AdkgEngine =
+    AdkgMpcEngine<ark_ed25519::Fr, ark_ed25519::EdwardsProjective>;
 
 // ============================================================================
 // MpcEngine Implementation
 // ============================================================================
 //
-// The ADKG engine implements MpcEngine as a proper AVSS-based MPC protocol.
-// It supports input sharing and opening via RobustShare, identical to HoneyBadger.
+// The AVSS engine implements MpcEngine using Feldman-verifiable secret sharing.
+// It supports input sharing and opening via FeldmanShamirShare.
 // Secure multiplication is not supported (AVSS lacks Beaver triples).
-// ADKG-specific operations (key generation, commitment access) are available via
+// AVSS-specific operations (key generation, commitment access) are available via
 // AdkgOperations trait through as_any() downcasting.
 
 impl<F, G> MpcEngine for AdkgMpcEngine<F, G>
@@ -520,7 +494,7 @@ where
     G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
 {
     fn protocol_name(&self) -> &'static str {
-        "adkg"
+        "avss"
     }
 
     fn instance_id(&self) -> u64 {
@@ -537,45 +511,31 @@ where
     }
 
     fn input_share(&self, ty: ShareType, clear: &Value) -> Result<Vec<u8>, String> {
-        match (ty, clear) {
-            (ShareType::SecretInt { .. }, Value::I64(v)) => {
-                let secret = F::from(*v as u64);
-                let mut rng = ark_std::test_rng();
-                let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
-                    .map_err(|e| format!("compute_shares: {:?}", e))?;
-                let my = &shares[self.party_id];
-                Self::encode_robustshare(my)
-            }
+        let secret = match (ty, clear) {
+            (ShareType::SecretInt { .. }, Value::I64(v)) => F::from(*v as u64),
             (
                 ShareType::SecretInt {
                     bit_length: BOOLEAN_SECRET_INT_BITS,
                 },
                 Value::Bool(b),
             ) => {
-                let secret = if *b { F::from(1u64) } else { F::from(0u64) };
-                let mut rng = ark_std::test_rng();
-                let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
-                    .map_err(|e| format!("compute_shares: {:?}", e))?;
-                let my = &shares[self.party_id];
-                Self::encode_robustshare(my)
+                if *b { F::from(1u64) } else { F::from(0u64) }
             }
             (ShareType::SecretFixedPoint { precision }, Value::Float(fp)) => {
                 let f = precision.f();
                 let scale = (1u64 << f) as f64;
                 let scaled_value = (fp.0 * scale) as i64;
-                let secret = if scaled_value >= 0 {
+                if scaled_value >= 0 {
                     F::from(scaled_value as u64)
                 } else {
                     -F::from((-scaled_value) as u64)
-                };
-                let mut rng = ark_std::test_rng();
-                let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
-                    .map_err(|e| format!("compute_shares: {:?}", e))?;
-                let my = &shares[self.party_id];
-                Self::encode_robustshare(my)
+                }
             }
-            _ => Err("Unsupported type for input_share".to_string()),
-        }
+            _ => return Err("Unsupported type for input_share".to_string()),
+        };
+
+        let share = self.create_avss_share(secret)?;
+        Self::encode_feldman_share(&share)
     }
 
     fn multiply_share(
@@ -584,7 +544,8 @@ where
         _left: &[u8],
         _right: &[u8],
     ) -> Result<Vec<u8>, String> {
-        Err("AVSS protocol does not support secure multiplication (requires Beaver triples)".into())
+        Err("AVSS backend does not support secure multiplication. \
+             Use the HoneyBadger backend for programs that require multiplication (it provides Beaver triples via preprocessing).".into())
     }
 
     fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
@@ -600,13 +561,13 @@ where
         > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
         let type_key = match ty {
-            ShareType::SecretInt { bit_length } => format!("adkg-int-{bit_length}"),
+            ShareType::SecretInt { bit_length } => format!("avss-int-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
-                format!("adkg-fixed-{}-{}", precision.k(), precision.f())
+                format!("avss-fixed-{}-{}", precision.k(), precision.f())
             }
         };
 
-        let required = 2 * self.t + 1;
+        let required = self.t + 1;
         let mut my_sequence: Option<usize> = None;
 
         loop {
@@ -638,13 +599,12 @@ where
 
             if entry.shares.len() >= required {
                 let collected: Vec<_> = entry.shares.iter().take(required).cloned().collect();
-                let mut shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
+                let mut shares: Vec<FeldmanShamirShare<F, G>> = Vec::with_capacity(collected.len());
                 for bytes in &collected {
-                    shares.push(Self::decode_robustshare(bytes)?);
+                    shares.push(Self::decode_feldman_share(bytes)?);
                 }
 
-                let (_deg, secret) = RobustShare::recover_secret(&shares, self.n)
-                    .map_err(|e| format!("recover_secret: {:?}", e))?;
+                let secret = Self::reconstruct_secret(&shares, self.n)?;
 
                 let value = match ty {
                     ShareType::SecretInt { .. } if ty.is_boolean() => {
@@ -653,7 +613,7 @@ where
                     }
                     ShareType::SecretInt { .. } => {
                         let bigint = secret.into_bigint();
-                        let limbs = bigint.as_ref(); // &[u64] — works for any field size
+                        let limbs = bigint.as_ref();
                         Value::I64(limbs[0] as i64)
                     }
                     ShareType::SecretFixedPoint { precision } => {
@@ -706,14 +666,14 @@ where
         > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
         let type_key = match ty {
-            ShareType::SecretInt { bit_length } => format!("adkg-batch-int-{bit_length}"),
+            ShareType::SecretInt { bit_length } => format!("avss-batch-int-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
-                format!("adkg-batch-fixed-{}-{}", precision.k(), precision.f())
+                format!("avss-batch-fixed-{}-{}", precision.k(), precision.f())
             }
         };
 
         let batch_size = shares.len();
-        let required = 2 * self.t + 1;
+        let required = self.t + 1;
         let mut my_sequence: Option<usize> = None;
 
         loop {
@@ -757,14 +717,14 @@ where
                         .cloned()
                         .collect();
 
-                    let mut decoded_shares: Vec<RobustShare<F>> =
+                    let mut decoded_shares: Vec<FeldmanShamirShare<F, G>> =
                         Vec::with_capacity(collected.len());
                     for bytes in &collected {
-                        decoded_shares.push(Self::decode_robustshare(bytes)?);
+                        decoded_shares.push(Self::decode_feldman_share(bytes)?);
                     }
 
-                    let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, self.n)
-                        .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
+                    let secret = Self::reconstruct_secret(&decoded_shares, self.n)
+                        .map_err(|e| format!("batch reconstruct_secret pos {}: {}", pos, e))?;
 
                     let value = match ty {
                         ShareType::SecretInt { .. } if ty.is_boolean() => {
@@ -814,7 +774,7 @@ where
         self.t
     }
 
-    fn supports_dkg(&self) -> bool { true }
+    fn supports_elliptic_curves(&self) -> bool { true }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
@@ -825,21 +785,23 @@ where
 // Additional Trait Implementations for ADKG-specific Operations
 // ============================================================================
 
-/// ADKG-specific operations trait.
+/// AVSS-specific operations trait.
 ///
-/// This trait is object-safe and uses `Vec<u8>` for key data so it can be
+/// This trait is object-safe and uses `Vec<u8>` for share data so it can be
 /// used through `dyn AdkgOperations` without knowing the concrete `(F, G)`.
 pub trait AdkgOperations {
-    /// Generate a new distributed key (async)
-    fn adkg_generate_key_bytes(
+    /// Generate a new random share and store it under `key_name` (async).
+    /// Returns the serialized FeldmanShamirShare.
+    fn avss_generate_share(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(u64, Vec<u8>), String>> + Send + '_>>;
+        key_name: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send + '_>>;
 
-    /// Get commitment at index (synchronous)
-    fn adkg_get_commitment(&self, session_id: u64, index: usize) -> Result<Vec<u8>, String>;
+    /// Get commitment at index for a stored share (synchronous).
+    fn avss_get_commitment(&self, key_name: &str, index: usize) -> Result<Vec<u8>, String>;
 
-    /// Get the public key (commitment[0]) for a session
-    fn adkg_get_public_key(&self, session_id: u64) -> Result<Vec<u8>, String>;
+    /// Get the public key (commitment[0]) for a stored share.
+    fn avss_get_public_key(&self, key_name: &str) -> Result<Vec<u8>, String>;
 }
 
 impl<F, G> AdkgOperations for AdkgMpcEngine<F, G>
@@ -847,40 +809,42 @@ where
     F: FftField + PrimeField + Send + Sync + 'static,
     G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
 {
-    fn adkg_generate_key_bytes(
+    fn avss_generate_share(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(u64, Vec<u8>), String>> + Send + '_>>
+        key_name: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send + '_>>
     {
         Box::pin(async move {
-            let key = self.generate_key().await?;
-            let bytes = key.to_bytes()?;
-            Ok((key.session_id, bytes))
+            let share = self.generate_random_share(&key_name).await?;
+            Self::encode_feldman_share(&share)
         })
     }
 
-    fn adkg_get_commitment(&self, session_id: u64, index: usize) -> Result<Vec<u8>, String> {
+    fn avss_get_commitment(&self, key_name: &str, index: usize) -> Result<Vec<u8>, String> {
         // Use blocking approach for sync interface
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 #[allow(deprecated)]
                 match handle.runtime_flavor() {
                     tokio::runtime::RuntimeFlavor::MultiThread => {
+                        let key_name = key_name.to_string();
                         tokio::task::block_in_place(|| {
                             handle.block_on(async {
-                                let key = self
-                                    .get_secret_key(session_id)
+                                let share = self
+                                    .get_share(&key_name)
                                     .await
-                                    .ok_or_else(|| format!("Session {} not found", session_id))?;
-                                let commitment = key
-                                    .commitment(index)
+                                    .ok_or_else(|| format!("Key '{}' not found", key_name))?;
+                                let commitment = share
+                                    .commitments
+                                    .get(index)
                                     .ok_or_else(|| {
                                         format!("Commitment index {} out of bounds", index)
                                     })?;
-                                Self::encode_group_element(&commitment)
+                                Self::encode_group_element(commitment)
                             })
                         })
                     }
-                    _ => Err("Cannot call adkg_get_commitment from single-thread runtime".into()),
+                    _ => Err("Cannot call avss_get_commitment from single-thread runtime".into()),
                 }
             }
             Err(_) => {
@@ -888,22 +852,24 @@ where
                     .enable_all()
                     .build()
                     .map_err(|e| format!("Failed to build runtime: {}", e))?;
+                let key_name = key_name.to_string();
                 rt.block_on(async {
-                    let key = self
-                        .get_secret_key(session_id)
+                    let share = self
+                        .get_share(&key_name)
                         .await
-                        .ok_or_else(|| format!("Session {} not found", session_id))?;
-                    let commitment = key
-                        .commitment(index)
+                        .ok_or_else(|| format!("Key '{}' not found", key_name))?;
+                    let commitment = share
+                        .commitments
+                        .get(index)
                         .ok_or_else(|| format!("Commitment index {} out of bounds", index))?;
-                    Self::encode_group_element(&commitment)
+                    Self::encode_group_element(commitment)
                 })
             }
         }
     }
 
-    fn adkg_get_public_key(&self, session_id: u64) -> Result<Vec<u8>, String> {
-        self.adkg_get_commitment(session_id, 0)
+    fn avss_get_public_key(&self, key_name: &str) -> Result<Vec<u8>, String> {
+        self.avss_get_commitment(key_name, 0)
     }
 }
 
@@ -1004,6 +970,14 @@ mod tests {
             AdkgCurveConfig::from_str("BN254").unwrap(),
             AdkgCurveConfig::Bn254
         );
+        assert_eq!(
+            AdkgCurveConfig::from_str("curve25519").unwrap(),
+            AdkgCurveConfig::Curve25519
+        );
+        assert_eq!(
+            AdkgCurveConfig::from_str("ed25519").unwrap(),
+            AdkgCurveConfig::Ed25519
+        );
         assert!(AdkgCurveConfig::from_str("unknown").is_err());
         assert!(AdkgCurveConfig::from_str("secp256k1").is_err());
     }
@@ -1017,10 +991,12 @@ mod tests {
     fn test_adkg_curve_config_name() {
         assert_eq!(AdkgCurveConfig::Bls12_381.name(), "bls12-381");
         assert_eq!(AdkgCurveConfig::Bn254.name(), "bn254");
+        assert_eq!(AdkgCurveConfig::Curve25519.name(), "curve25519");
+        assert_eq!(AdkgCurveConfig::Ed25519.name(), "ed25519");
     }
 
     #[test]
-    fn test_adkg_secret_key_serialization() {
+    fn test_feldman_share_serialization() {
         let mut rng = test_rng();
 
         // Create a Feldman share manually for testing
@@ -1030,30 +1006,23 @@ mod tests {
             .map(|_| G1::generator() * Fr::rand(&mut rng))
             .collect();
 
-        let feldman_share = FeldmanShamirShare::new(share_value, 1, degree, commitments.clone())
+        let share = FeldmanShamirShare::new(share_value, 1, degree, commitments.clone())
             .expect("Failed to create FeldmanShamirShare");
 
-        let key = Bls12381AdkgSecretKey {
-            session_id: 42,
-            share: feldman_share,
-        };
-
-        // Test serialization
-        let bytes = key.to_bytes().expect("Serialization failed");
+        // Test serialization roundtrip
+        let bytes = Bls12381AdkgEngine::encode_feldman_share(&share)
+            .expect("Serialization failed");
         assert!(!bytes.is_empty());
 
-        // Test deserialization
-        let restored =
-            Bls12381AdkgSecretKey::from_bytes(42, &bytes).expect("Deserialization failed");
-        assert_eq!(restored.session_id, key.session_id);
-        assert_eq!(
-            restored.share.commitments.len(),
-            key.share.commitments.len()
-        );
+        let restored = Bls12381AdkgEngine::decode_feldman_share(&bytes)
+            .expect("Deserialization failed");
+        assert_eq!(restored.commitments.len(), share.commitments.len());
+        assert_eq!(restored.feldmanshare.id, share.feldmanshare.id);
+        assert_eq!(restored.feldmanshare.share, share.feldmanshare.share);
     }
 
     #[test]
-    fn test_bn254_secret_key_serialization() {
+    fn test_bn254_feldman_share_serialization() {
         use ark_bn254::{Fr as BnFr, G1Projective as BnG1};
 
         let mut rng = test_rng();
@@ -1063,25 +1032,18 @@ mod tests {
             .map(|_| <BnG1 as PrimeGroup>::generator() * BnFr::rand(&mut rng))
             .collect();
 
-        let feldman_share =
-            FeldmanShamirShare::new(share_value, 1, degree, commitments.clone())
-                .expect("Failed to create FeldmanShamirShare");
+        let share = FeldmanShamirShare::new(share_value, 1, degree, commitments.clone())
+            .expect("Failed to create FeldmanShamirShare");
 
-        let key = Bn254AdkgSecretKey {
-            session_id: 42,
-            share: feldman_share,
-        };
-
-        let bytes = key.to_bytes().expect("Serialization failed");
+        let bytes = Bn254AdkgEngine::encode_feldman_share(&share)
+            .expect("Serialization failed");
         assert!(!bytes.is_empty());
 
-        let restored =
-            Bn254AdkgSecretKey::from_bytes(42, &bytes).expect("Deserialization failed");
-        assert_eq!(restored.session_id, key.session_id);
-        assert_eq!(
-            restored.share.commitments.len(),
-            key.share.commitments.len()
-        );
+        let restored = Bn254AdkgEngine::decode_feldman_share(&bytes)
+            .expect("Deserialization failed");
+        assert_eq!(restored.commitments.len(), share.commitments.len());
+        assert_eq!(restored.feldmanshare.id, share.feldmanshare.id);
+        assert_eq!(restored.feldmanshare.share, share.feldmanshare.share);
     }
 
     #[test]
@@ -1102,17 +1064,11 @@ mod tests {
             commitments.push(G1::generator() * Fr::rand(&mut rng));
         }
 
-        let feldman_share = FeldmanShamirShare::new(share_value, 1, degree, commitments)
+        let share = FeldmanShamirShare::new(share_value, 1, degree, commitments)
             .expect("Failed to create FeldmanShamirShare");
 
-        let key = Bls12381AdkgSecretKey {
-            session_id: 1,
-            share: feldman_share,
-        };
-
-        // Verify public key extraction
-        assert_eq!(key.public_key(), public_key);
-        assert_eq!(key.commitment(0), Some(public_key));
+        // Verify public key extraction from commitment[0]
+        assert_eq!(share.commitments[0], public_key);
     }
 
     #[test]
@@ -1122,15 +1078,12 @@ mod tests {
         let t = 1;
         let secret = Fr::from(12345u64);
 
-        // Generate polynomial
         use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
         let mut poly = DensePolynomial::rand(t, &mut rng);
         poly[0] = secret;
 
-        // Generate commitments
         let commitments: Vec<G1> = poly.coeffs.iter().map(|c| G1::generator() * c).collect();
 
-        // Generate shares and verify
         for i in 1..=n {
             let x = Fr::from(i as u64);
             let y = poly.evaluate(&x);
@@ -1138,7 +1091,6 @@ mod tests {
             let share = FeldmanShamirShare::new(y, i, t, commitments.clone())
                 .expect("Failed to create share");
 
-            // Verify the share
             assert!(
                 verify_feldman(share.clone()),
                 "Feldman verification failed for party {}",
@@ -1146,7 +1098,6 @@ mod tests {
             );
         }
 
-        // Verify that commitment[0] = g^secret
         assert_eq!(commitments[0], G1::generator() * secret);
     }
 
@@ -1155,116 +1106,140 @@ mod tests {
         let instance_id = 100;
         let session_id = 1;
 
-        // Store shares
         registry_store_share(instance_id, session_id, 0, vec![1, 2, 3]);
         registry_store_share(instance_id, session_id, 1, vec![4, 5, 6]);
         registry_store_share(instance_id, session_id, 2, vec![7, 8, 9]);
 
-        // Get shares
         let shares = registry_get_shares(instance_id, session_id);
         assert_eq!(shares.len(), 3);
 
-        // Store and get public key
         let pk = vec![10, 11, 12];
         registry_store_public_key(instance_id, session_id, pk.clone());
         assert_eq!(registry_get_public_key(instance_id, session_id), Some(pk));
     }
 
-    #[test]
-    fn test_robustshare_serialization_roundtrip() {
+    /// Helper to generate Feldman shares for testing
+    fn generate_feldman_shares(
+        secret: Fr,
+        n: usize,
+        t: usize,
+    ) -> Vec<FeldmanShamirShare<Fr, G1>> {
+        use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
         let mut rng = test_rng();
+        let mut poly = DensePolynomial::<Fr>::rand(t, &mut rng);
+        poly[0] = secret;
+        let generator = G1::generator();
+        let commitments: Vec<G1> = poly.coeffs.iter().map(|c| generator * c).collect();
+
+        (1..=n)
+            .map(|i| {
+                let x = Fr::from(i as u64);
+                let share_value = poly.evaluate(&x);
+                FeldmanShamirShare::new(share_value, i, t, commitments.clone()).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_feldman_share_serialization_roundtrip() {
         let n = 4;
         let t = 1;
         let secret = Fr::from(42u64);
 
-        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
-            .expect("compute_shares failed");
+        let shares = generate_feldman_shares(secret, n, t);
 
         for share in &shares {
             let bytes =
-                Bls12381AdkgEngine::encode_robustshare(share).expect("encode failed");
+                Bls12381AdkgEngine::encode_feldman_share(share).expect("encode failed");
             let decoded =
-                Bls12381AdkgEngine::decode_robustshare(&bytes).expect("decode failed");
-            assert_eq!(share.id, decoded.id);
-            assert_eq!(share.degree, decoded.degree);
-            assert_eq!(share.share, decoded.share);
+                Bls12381AdkgEngine::decode_feldman_share(&bytes).expect("decode failed");
+            assert_eq!(share.feldmanshare.id, decoded.feldmanshare.id);
+            assert_eq!(share.feldmanshare.degree, decoded.feldmanshare.degree);
+            assert_eq!(share.feldmanshare.share, decoded.feldmanshare.share);
         }
 
         // Verify reconstruction works after round-tripping through bytes
-        let required = 2 * t + 1;
+        let required = t + 1;
         let subset: Vec<_> = shares.iter().take(required).cloned().collect();
-        let (_deg, recovered) =
-            RobustShare::recover_secret(&subset, n).expect("recover_secret failed");
+        let recovered =
+            Bls12381AdkgEngine::reconstruct_secret(&subset, n).expect("reconstruct_secret failed");
         assert_eq!(recovered, secret);
     }
 
     #[test]
-    fn test_bn254_robustshare_roundtrip() {
-        use ark_bn254::Fr as BnFr;
+    fn test_bn254_feldman_share_roundtrip() {
+        use ark_bn254::{Fr as BnFr, G1Projective as BnG1};
+        use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
 
         let mut rng = test_rng();
         let n = 4;
         let t = 1;
         let secret = BnFr::from(42u64);
 
-        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
-            .expect("compute_shares failed");
+        let mut poly = DensePolynomial::<BnFr>::rand(t, &mut rng);
+        poly[0] = secret;
+        let generator = <BnG1 as PrimeGroup>::generator();
+        let commitments: Vec<BnG1> = poly.coeffs.iter().map(|c| generator * c).collect();
+
+        let shares: Vec<_> = (1..=n)
+            .map(|i| {
+                let x = BnFr::from(i as u64);
+                let y = poly.evaluate(&x);
+                FeldmanShamirShare::<BnFr, BnG1>::new(y, i, t, commitments.clone()).unwrap()
+            })
+            .collect();
 
         for share in &shares {
-            let bytes = Bn254AdkgEngine::encode_robustshare(share).expect("encode failed");
+            let bytes = Bn254AdkgEngine::encode_feldman_share(share).expect("encode failed");
             let decoded =
-                Bn254AdkgEngine::decode_robustshare(&bytes).expect("decode failed");
-            assert_eq!(share.id, decoded.id);
-            assert_eq!(share.degree, decoded.degree);
-            assert_eq!(share.share, decoded.share);
+                Bn254AdkgEngine::decode_feldman_share(&bytes).expect("decode failed");
+            assert_eq!(share.feldmanshare.id, decoded.feldmanshare.id);
+            assert_eq!(share.feldmanshare.degree, decoded.feldmanshare.degree);
+            assert_eq!(share.feldmanshare.share, decoded.feldmanshare.share);
         }
 
-        let required = 2 * t + 1;
+        let required = t + 1;
         let subset: Vec<_> = shares.iter().take(required).cloned().collect();
-        let (_deg, recovered) =
-            RobustShare::recover_secret(&subset, n).expect("recover_secret failed");
+        let recovered =
+            Bn254AdkgEngine::reconstruct_secret(&subset, n).expect("reconstruct_secret failed");
         assert_eq!(recovered, secret);
     }
 
     #[test]
-    fn test_adkg_input_share_i64() {
+    fn test_avss_input_share_i64() {
         let n = 4;
         let t = 1;
         let party_id = 0;
         let secret = Fr::from(42u64);
-        let mut rng = ark_std::test_rng();
 
-        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
-            .expect("compute_shares failed");
+        let shares = generate_feldman_shares(secret, n, t);
         let bytes =
-            Bls12381AdkgEngine::encode_robustshare(&shares[party_id]).expect("encode failed");
+            Bls12381AdkgEngine::encode_feldman_share(&shares[party_id]).expect("encode failed");
         assert!(!bytes.is_empty());
 
         let decoded =
-            Bls12381AdkgEngine::decode_robustshare(&bytes).expect("decode failed");
-        assert_eq!(decoded.id, shares[party_id].id);
-        assert_eq!(decoded.share, shares[party_id].share);
+            Bls12381AdkgEngine::decode_feldman_share(&bytes).expect("decode failed");
+        assert_eq!(decoded.feldmanshare.id, shares[party_id].feldmanshare.id);
+        assert_eq!(decoded.feldmanshare.share, shares[party_id].feldmanshare.share);
     }
 
     #[test]
-    fn test_adkg_input_share_bool() {
+    fn test_avss_input_share_bool() {
         let n = 4;
         let t = 1;
         let party_id = 1;
         let secret = Fr::from(1u64); // true
-        let mut rng = ark_std::test_rng();
 
-        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
-            .expect("compute_shares failed");
+        let shares = generate_feldman_shares(secret, n, t);
         let bytes =
-            Bls12381AdkgEngine::encode_robustshare(&shares[party_id]).expect("encode failed");
+            Bls12381AdkgEngine::encode_feldman_share(&shares[party_id]).expect("encode failed");
         let decoded =
-            Bls12381AdkgEngine::decode_robustshare(&bytes).expect("decode failed");
-        assert_eq!(decoded.id, shares[party_id].id);
+            Bls12381AdkgEngine::decode_feldman_share(&bytes).expect("decode failed");
+        assert_eq!(decoded.feldmanshare.id, shares[party_id].feldmanshare.id);
     }
 
     #[test]
-    fn test_adkg_input_share_float() {
+    fn test_avss_input_share_float() {
         let n = 4;
         let t = 1;
         let party_id = 2;
@@ -1273,41 +1248,37 @@ mod tests {
         let scale = (1u64 << f) as f64;
         let scaled_value = (3.14 * scale) as i64;
         let secret = Fr::from(scaled_value as u64);
-        let mut rng = ark_std::test_rng();
 
-        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
-            .expect("compute_shares failed");
+        let shares = generate_feldman_shares(secret, n, t);
         let bytes =
-            Bls12381AdkgEngine::encode_robustshare(&shares[party_id]).expect("encode failed");
+            Bls12381AdkgEngine::encode_feldman_share(&shares[party_id]).expect("encode failed");
         let decoded =
-            Bls12381AdkgEngine::decode_robustshare(&bytes).expect("decode failed");
-        assert_eq!(decoded.id, shares[party_id].id);
+            Bls12381AdkgEngine::decode_feldman_share(&bytes).expect("decode failed");
+        assert_eq!(decoded.feldmanshare.id, shares[party_id].feldmanshare.id);
     }
 
     #[test]
-    fn test_adkg_input_share_reconstruction() {
+    fn test_avss_input_share_reconstruction() {
         let n = 4;
         let t = 1;
         let secret_val = 12345u64;
         let secret = Fr::from(secret_val);
-        let mut rng = ark_std::test_rng();
 
-        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
-            .expect("compute_shares failed");
+        let shares = generate_feldman_shares(secret, n, t);
 
         let mut decoded_shares = Vec::new();
         for share in &shares {
             let bytes =
-                Bls12381AdkgEngine::encode_robustshare(share).expect("encode failed");
+                Bls12381AdkgEngine::encode_feldman_share(share).expect("encode failed");
             let decoded =
-                Bls12381AdkgEngine::decode_robustshare(&bytes).expect("decode failed");
+                Bls12381AdkgEngine::decode_feldman_share(&bytes).expect("decode failed");
             decoded_shares.push(decoded);
         }
 
-        let required = 2 * t + 1;
+        let required = t + 1;
         let subset: Vec<_> = decoded_shares.iter().take(required).cloned().collect();
-        let (_deg, recovered) =
-            RobustShare::recover_secret(&subset, n).expect("recover_secret failed");
+        let recovered =
+            Bls12381AdkgEngine::reconstruct_secret(&subset, n).expect("reconstruct_secret failed");
         assert_eq!(
             recovered, secret,
             "Reconstructed secret should match original"
@@ -1316,30 +1287,41 @@ mod tests {
 
     #[test]
     fn test_bn254_input_share_reconstruction() {
-        use ark_bn254::Fr as BnFr;
+        use ark_bn254::{Fr as BnFr, G1Projective as BnG1};
+        use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
 
+        let mut rng = test_rng();
         let n = 4;
         let t = 1;
         let secret_val = 12345u64;
         let secret = BnFr::from(secret_val);
-        let mut rng = ark_std::test_rng();
 
-        let shares = RobustShare::compute_shares(secret, n, t, None, &mut rng)
-            .expect("compute_shares failed");
+        let mut poly = DensePolynomial::<BnFr>::rand(t, &mut rng);
+        poly[0] = secret;
+        let generator = <BnG1 as PrimeGroup>::generator();
+        let commitments: Vec<BnG1> = poly.coeffs.iter().map(|c| generator * c).collect();
+
+        let shares: Vec<_> = (1..=n)
+            .map(|i| {
+                let x = BnFr::from(i as u64);
+                let y = poly.evaluate(&x);
+                FeldmanShamirShare::<BnFr, BnG1>::new(y, i, t, commitments.clone()).unwrap()
+            })
+            .collect();
 
         let mut decoded_shares = Vec::new();
         for share in &shares {
             let bytes =
-                Bn254AdkgEngine::encode_robustshare(share).expect("encode failed");
+                Bn254AdkgEngine::encode_feldman_share(share).expect("encode failed");
             let decoded =
-                Bn254AdkgEngine::decode_robustshare(&bytes).expect("decode failed");
+                Bn254AdkgEngine::decode_feldman_share(&bytes).expect("decode failed");
             decoded_shares.push(decoded);
         }
 
-        let required = 2 * t + 1;
+        let required = t + 1;
         let subset: Vec<_> = decoded_shares.iter().take(required).cloned().collect();
-        let (_deg, recovered) =
-            RobustShare::recover_secret(&subset, n).expect("recover_secret failed");
+        let recovered =
+            Bn254AdkgEngine::reconstruct_secret(&subset, n).expect("reconstruct_secret failed");
         assert_eq!(
             recovered, secret,
             "Reconstructed secret should match original"

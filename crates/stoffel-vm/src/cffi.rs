@@ -1225,7 +1225,7 @@ mod hb_engine_tests {
 #[cfg(feature = "adkg")]
 mod adkg_ffi {
     use super::*;
-    use crate::net::adkg_engine::{AdkgMpcEngine, AdkgOperations, Bls12381AdkgEngine, AdkgCurveConfig};
+    use crate::net::adkg_engine::{AdkgMpcEngine, AdkgOperations, AdkgCurveConfig};
     use crate::net::mpc_engine::MpcEngine;
     use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
     use ark_std::rand::SeedableRng;
@@ -1239,6 +1239,8 @@ mod adkg_ffi {
     pub enum CAdkgCurveConfig {
         Bls12_381 = 0,
         Bn254 = 1,
+        Curve25519 = 2,
+        Ed25519 = 3,
     }
 
     impl CAdkgCurveConfig {
@@ -1246,6 +1248,8 @@ mod adkg_ffi {
             match self {
                 CAdkgCurveConfig::Bls12_381 => AdkgCurveConfig::Bls12_381,
                 CAdkgCurveConfig::Bn254 => AdkgCurveConfig::Bn254,
+                CAdkgCurveConfig::Curve25519 => AdkgCurveConfig::Curve25519,
+                CAdkgCurveConfig::Ed25519 => AdkgCurveConfig::Ed25519,
             }
         }
     }
@@ -1412,6 +1416,10 @@ mod adkg_ffi {
             CAdkgCurveConfig::Bn254 => {
                 create_bn254_engine(instance_id, party_id, n, t, net, sk_slice, pk_slice)
             }
+            CAdkgCurveConfig::Curve25519 | CAdkgCurveConfig::Ed25519 => {
+                // TODO: implement Curve25519/Ed25519 engine creation
+                Err(())
+            }
         };
 
         match wrapper {
@@ -1435,29 +1443,40 @@ mod adkg_ffi {
         &*(ptr as *const AdkgFfiWrapper)
     }
 
-    /// Generates a new distributed key
+    /// Generates a new distributed share under the given key name
     ///
-    /// Returns session_id via out parameter on success.
+    /// Returns serialized share bytes via out parameters on success.
+    /// Caller must free result bytes with adkg_free_bytes.
     #[no_mangle]
-    pub extern "C" fn adkg_engine_generate_key(
+    pub extern "C" fn adkg_engine_generate_share(
         engine_ptr: *mut AdkgEngineOpaque,
-        session_id_out: *mut u64,
+        key_name: *const c_char,
+        result_ptr: *mut *mut u8,
+        result_len_ptr: *mut usize,
     ) -> AdkgEngineErrorCode {
-        if engine_ptr.is_null() || session_id_out.is_null() {
+        if engine_ptr.is_null() || key_name.is_null() || result_ptr.is_null() || result_len_ptr.is_null() {
             return AdkgEngineErrorCode::NullPointer;
         }
 
         let wrapper = unsafe { get_wrapper(engine_ptr) };
+
+        let c_str = unsafe { CStr::from_ptr(key_name) };
+        let key_name_str = match c_str.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return AdkgEngineErrorCode::SerializationError,
+        };
 
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(_) => return AdkgEngineErrorCode::RuntimeError,
         };
 
-        match rt.block_on(wrapper.adkg_ops.adkg_generate_key_bytes()) {
-            Ok((session_id, _key_bytes)) => {
+        match rt.block_on(wrapper.adkg_ops.avss_generate_share(key_name_str)) {
+            Ok(share_bytes) => {
+                let mut bytes = ManuallyDrop::new(share_bytes);
                 unsafe {
-                    *session_id_out = session_id;
+                    *result_ptr = bytes.as_mut_ptr();
+                    *result_len_ptr = bytes.len();
                 }
                 AdkgEngineErrorCode::Success
             }
@@ -1465,23 +1484,29 @@ mod adkg_ffi {
         }
     }
 
-    /// Get the public key for a session
+    /// Get the public key for a stored share by key name
     ///
     /// Caller must free result bytes with adkg_free_bytes.
     #[no_mangle]
     pub extern "C" fn adkg_engine_get_public_key(
         engine_ptr: *mut AdkgEngineOpaque,
-        session_id: u64,
+        key_name: *const c_char,
         result_ptr: *mut *mut u8,
         result_len_ptr: *mut usize,
     ) -> AdkgEngineErrorCode {
-        if engine_ptr.is_null() || result_ptr.is_null() || result_len_ptr.is_null() {
+        if engine_ptr.is_null() || key_name.is_null() || result_ptr.is_null() || result_len_ptr.is_null() {
             return AdkgEngineErrorCode::NullPointer;
         }
 
         let wrapper = unsafe { get_wrapper(engine_ptr) };
 
-        match wrapper.adkg_ops.adkg_get_public_key(session_id) {
+        let c_str = unsafe { CStr::from_ptr(key_name) };
+        let key_name_str = match c_str.to_str() {
+            Ok(s) => s,
+            Err(_) => return AdkgEngineErrorCode::SerializationError,
+        };
+
+        match wrapper.adkg_ops.avss_get_public_key(key_name_str) {
             Ok(bytes) => {
                 let mut bytes = ManuallyDrop::new(bytes);
                 unsafe {
@@ -1494,24 +1519,30 @@ mod adkg_ffi {
         }
     }
 
-    /// Get a commitment at a specific index for a session
+    /// Get a commitment at a specific index for a stored share by key name
     ///
     /// Caller must free result bytes with adkg_free_bytes.
     #[no_mangle]
     pub extern "C" fn adkg_engine_get_commitment(
         engine_ptr: *mut AdkgEngineOpaque,
-        session_id: u64,
+        key_name: *const c_char,
         index: usize,
         result_ptr: *mut *mut u8,
         result_len_ptr: *mut usize,
     ) -> AdkgEngineErrorCode {
-        if engine_ptr.is_null() || result_ptr.is_null() || result_len_ptr.is_null() {
+        if engine_ptr.is_null() || key_name.is_null() || result_ptr.is_null() || result_len_ptr.is_null() {
             return AdkgEngineErrorCode::NullPointer;
         }
 
         let wrapper = unsafe { get_wrapper(engine_ptr) };
 
-        match wrapper.adkg_ops.adkg_get_commitment(session_id, index) {
+        let c_str = unsafe { CStr::from_ptr(key_name) };
+        let key_name_str = match c_str.to_str() {
+            Ok(s) => s,
+            Err(_) => return AdkgEngineErrorCode::SerializationError,
+        };
+
+        match wrapper.adkg_ops.avss_get_commitment(key_name_str, index) {
             Ok(bytes) => {
                 let mut bytes = ManuallyDrop::new(bytes);
                 unsafe {
@@ -1549,7 +1580,7 @@ mod adkg_ffi {
     pub extern "C" fn adkg_engine_protocol_name(
         engine_ptr: *mut AdkgEngineOpaque,
     ) -> *const c_char {
-        static PROTOCOL_NAME: &[u8] = b"adkg\0";
+        static PROTOCOL_NAME: &[u8] = b"avss\0";
         if engine_ptr.is_null() {
             return std::ptr::null();
         }

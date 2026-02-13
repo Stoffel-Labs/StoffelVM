@@ -1,9 +1,9 @@
-//! ADKG Integration Tests
+//! AVSS Integration Tests
 //!
-//! This module tests the ADKG (Asynchronous Distributed Key Generation) functionality:
-//! 1. Unit tests for ADKG secret key objects and builtins
+//! This module tests the AVSS (Asynchronously Verifiable Secret Sharing) functionality:
+//! 1. Unit tests for AVSS share objects and builtins
 //! 2. Integration tests with simulated network
-//! 3. Example VM program that extracts public key from ADKG result
+//! 3. Example VM program that extracts public key from AVSS result
 
 use ark_bls12_381::{Fr, G1Projective as G1};
 use ark_ec::{CurveGroup, PrimeGroup};
@@ -32,10 +32,9 @@ fn setup_test_tracing() {
     });
 }
 
-/// Create a mock ADKG secret key for testing
-/// This simulates what the ADKG protocol would produce
-fn create_mock_adkg_secret_key(
-    session_id: u64,
+/// Create a mock AVSS share for testing
+/// This simulates what the AVSS protocol would produce
+fn create_mock_avss_share(
     party_id: usize,
     threshold: usize,
 ) -> (Vec<u8>, Vec<Vec<u8>>, G1) {
@@ -80,40 +79,37 @@ fn create_mock_adkg_secret_key(
     (share_bytes, commitment_bytes, public_key)
 }
 
-/// Test that ADKG secret key objects can be created and queried
+/// Test that AVSS share objects can be created and queried
 #[test]
-fn test_adkg_secret_key_object_creation() {
+fn test_avss_share_object_creation() {
     setup_test_tracing();
 
     let mut vm = VirtualMachine::new();
-    let session_id = 42u64;
+    let key_name = "test_key";
     let party_id = 1usize;
     let threshold = 2;
 
-    // Create mock ADKG result
     let (share_bytes, commitment_bytes, expected_public_key) =
-        create_mock_adkg_secret_key(session_id, party_id, threshold);
+        create_mock_avss_share(party_id, threshold);
 
-    // Create ADKG secret key object in VM's object store
-    let obj_id = adkg_object::create_adkg_secret_key_object(
+    let obj_id = adkg_object::create_avss_share_object(
         &mut vm.state.object_store,
-        session_id,
+        key_name,
         share_bytes,
         commitment_bytes.clone(),
         party_id,
     );
 
-    // Verify the object was created
     let obj = Value::Object(obj_id);
-    assert!(adkg_object::is_adkg_secret_key_object(
+    assert!(adkg_object::is_avss_share_object(
         &vm.state.object_store,
         &obj
     ));
 
-    // Verify session ID
-    let retrieved_session_id =
-        adkg_object::get_session_id(&vm.state.object_store, &obj).unwrap();
-    assert_eq!(retrieved_session_id, session_id);
+    // Verify key name
+    let retrieved_key_name =
+        adkg_object::get_key_name(&vm.state.object_store, &obj).unwrap();
+    assert_eq!(retrieved_key_name, key_name);
 
     // Verify commitment count
     let count = adkg_object::get_commitment_count(&vm.state.object_store, &obj).unwrap();
@@ -130,83 +126,67 @@ fn test_adkg_secret_key_object_creation() {
     assert_eq!(retrieved_pk, expected_public_key);
 }
 
-/// Test ADKG builtins through VM function calls
+/// Test AVSS builtins through VM function calls
 #[test]
-fn test_adkg_builtins_via_vm() {
+fn test_avss_builtins_via_vm() {
     setup_test_tracing();
 
     let mut vm = VirtualMachine::new();
-    let session_id = 100u64;
     let party_id = 0usize;
     let threshold = 1;
 
-    // Create mock ADKG result
     let (share_bytes, commitment_bytes, _expected_public_key) =
-        create_mock_adkg_secret_key(session_id, party_id, threshold);
+        create_mock_avss_share(party_id, threshold);
 
-    // Create ADKG secret key object
-    let obj_id = adkg_object::create_adkg_secret_key_object(
+    let obj_id = adkg_object::create_avss_share_object(
         &mut vm.state.object_store,
-        session_id,
+        "vm_test_key",
         share_bytes,
         commitment_bytes.clone(),
         party_id,
     );
 
-    // Create VM function that tests the builtins
-    // This function:
-    // 1. Loads the ADKG object into r0
-    // 2. Calls Adkg.is_adkg_key to verify it's an ADKG key
-    // 3. Returns the result
-    let test_is_adkg_key_fn = VMFunction::new(
-        "test_is_adkg_key".to_string(),
+    let test_is_avss_share_fn = VMFunction::new(
+        "test_is_avss_share".to_string(),
         vec![],
         Vec::new(),
         None,
         4,
         vec![
-            // Load ADKG object ID into r0
             Instruction::LDI(0, Value::Object(obj_id)),
-            // Push as argument
             Instruction::PUSHARG(0),
-            // Call Adkg.is_adkg_key
-            Instruction::CALL("Adkg.is_adkg_key".to_string()),
-            // r0 now contains the result, return it
+            Instruction::CALL("Avss.is_avss_share".to_string()),
             Instruction::RET(0),
         ],
         HashMap::new(),
     );
 
-    vm.register_function(test_is_adkg_key_fn);
+    vm.register_function(test_is_avss_share_fn);
 
-    let result = vm.execute("test_is_adkg_key").expect("Execution failed");
-    assert_eq!(result, Value::Bool(true), "Should recognize ADKG key object");
+    let result = vm.execute("test_is_avss_share").expect("Execution failed");
+    assert_eq!(result, Value::Bool(true), "Should recognize AVSS share object");
 }
 
-/// Test Adkg.get_public_key builtin
+/// Test Avss.get_public_key builtin
 #[test]
-fn test_adkg_get_public_key_builtin() {
+fn test_avss_get_public_key_builtin() {
     setup_test_tracing();
 
     let mut vm = VirtualMachine::new();
-    let session_id = 200u64;
     let party_id = 2usize;
     let threshold = 1;
 
-    // Create mock ADKG result
     let (share_bytes, commitment_bytes, expected_public_key) =
-        create_mock_adkg_secret_key(session_id, party_id, threshold);
+        create_mock_avss_share(party_id, threshold);
 
-    // Create ADKG secret key object
-    let obj_id = adkg_object::create_adkg_secret_key_object(
+    let obj_id = adkg_object::create_avss_share_object(
         &mut vm.state.object_store,
-        session_id,
+        "pk_test_key",
         share_bytes,
         commitment_bytes.clone(),
         party_id,
     );
 
-    // Create VM function that gets the public key
     let get_public_key_fn = VMFunction::new(
         "get_public_key".to_string(),
         vec![],
@@ -214,13 +194,9 @@ fn test_adkg_get_public_key_builtin() {
         None,
         4,
         vec![
-            // Load ADKG object into r0
             Instruction::LDI(0, Value::Object(obj_id)),
-            // Push as argument
             Instruction::PUSHARG(0),
-            // Call Adkg.get_public_key
-            Instruction::CALL("Adkg.get_public_key".to_string()),
-            // Return the public key (as byte array)
+            Instruction::CALL("Avss.get_public_key".to_string()),
             Instruction::RET(0),
         ],
         HashMap::new(),
@@ -230,14 +206,12 @@ fn test_adkg_get_public_key_builtin() {
 
     let result = vm.execute("get_public_key").expect("Execution failed");
 
-    // Result should be an array of bytes
     match result {
         Value::Array(arr_id) => {
             let arr = vm.state.object_store.get_array(arr_id).unwrap();
             let len = arr.length();
             assert!(len > 0, "Public key should have non-zero length");
 
-            // Extract bytes from array
             let mut pk_bytes = Vec::with_capacity(len);
             for i in 0..len {
                 if let Some(Value::U8(b)) = arr.get(&Value::I64(i as i64)) {
@@ -245,7 +219,6 @@ fn test_adkg_get_public_key_builtin() {
                 }
             }
 
-            // Verify it matches expected public key
             let retrieved_pk = G1::deserialize_compressed(&pk_bytes[..])
                 .expect("Failed to deserialize public key");
             assert_eq!(
@@ -257,30 +230,26 @@ fn test_adkg_get_public_key_builtin() {
     }
 }
 
-/// Test Adkg.get_commitment builtin for arbitrary index
+/// Test Avss.get_commitment builtin for arbitrary index
 #[test]
-fn test_adkg_get_commitment_builtin() {
+fn test_avss_get_commitment_builtin() {
     setup_test_tracing();
 
     let mut vm = VirtualMachine::new();
-    let session_id = 300u64;
     let party_id = 0usize;
     let threshold = 2; // This gives us 3 commitments (degree + 1)
 
-    // Create mock ADKG result
     let (share_bytes, commitment_bytes, _) =
-        create_mock_adkg_secret_key(session_id, party_id, threshold);
+        create_mock_avss_share(party_id, threshold);
 
-    // Create ADKG secret key object
-    let obj_id = adkg_object::create_adkg_secret_key_object(
+    let obj_id = adkg_object::create_avss_share_object(
         &mut vm.state.object_store,
-        session_id,
+        "commitment_test_key",
         share_bytes,
         commitment_bytes.clone(),
         party_id,
     );
 
-    // Test getting commitment at index 1
     let get_commitment_fn = VMFunction::new(
         "get_commitment_1".to_string(),
         vec![],
@@ -288,16 +257,11 @@ fn test_adkg_get_commitment_builtin() {
         None,
         4,
         vec![
-            // Load ADKG object into r0
             Instruction::LDI(0, Value::Object(obj_id)),
-            // Load index 1 into r1
             Instruction::LDI(1, Value::I64(1)),
-            // Push arguments
             Instruction::PUSHARG(0),
             Instruction::PUSHARG(1),
-            // Call Adkg.get_commitment
-            Instruction::CALL("Adkg.get_commitment".to_string()),
-            // Return the commitment
+            Instruction::CALL("Avss.get_commitment".to_string()),
             Instruction::RET(0),
         ],
         HashMap::new(),
@@ -307,7 +271,6 @@ fn test_adkg_get_commitment_builtin() {
 
     let result = vm.execute("get_commitment_1").expect("Execution failed");
 
-    // Verify we got the correct commitment
     match result {
         Value::Array(arr_id) => {
             let arr = vm.state.object_store.get_array(arr_id).unwrap();
@@ -326,32 +289,28 @@ fn test_adkg_get_commitment_builtin() {
     }
 }
 
-/// Test Adkg.commitment_count builtin
+/// Test Avss.commitment_count builtin
 #[test]
-fn test_adkg_commitment_count_builtin() {
+fn test_avss_commitment_count_builtin() {
     setup_test_tracing();
 
     let mut vm = VirtualMachine::new();
-    let session_id = 400u64;
     let party_id = 0usize;
     let threshold = 3; // This gives us 4 commitments (degree + 1)
 
-    // Create mock ADKG result
     let (share_bytes, commitment_bytes, _) =
-        create_mock_adkg_secret_key(session_id, party_id, threshold);
+        create_mock_avss_share(party_id, threshold);
 
     let expected_count = commitment_bytes.len();
 
-    // Create ADKG secret key object
-    let obj_id = adkg_object::create_adkg_secret_key_object(
+    let obj_id = adkg_object::create_avss_share_object(
         &mut vm.state.object_store,
-        session_id,
+        "count_test_key",
         share_bytes,
         commitment_bytes,
         party_id,
     );
 
-    // Create VM function that gets commitment count
     let get_count_fn = VMFunction::new(
         "get_commitment_count".to_string(),
         vec![],
@@ -361,7 +320,7 @@ fn test_adkg_commitment_count_builtin() {
         vec![
             Instruction::LDI(0, Value::Object(obj_id)),
             Instruction::PUSHARG(0),
-            Instruction::CALL("Adkg.commitment_count".to_string()),
+            Instruction::CALL("Avss.commitment_count".to_string()),
             Instruction::RET(0),
         ],
         HashMap::new(),
@@ -378,32 +337,29 @@ fn test_adkg_commitment_count_builtin() {
     );
 }
 
-/// Test Adkg.get_session_id builtin
+/// Test Avss.get_key_name builtin
 #[test]
-fn test_adkg_get_session_id_builtin() {
+fn test_avss_get_key_name_builtin() {
     setup_test_tracing();
 
     let mut vm = VirtualMachine::new();
-    let session_id = 12345u64;
+    let key_name = "my_signing_key";
     let party_id = 0usize;
     let threshold = 1;
 
-    // Create mock ADKG result
     let (share_bytes, commitment_bytes, _) =
-        create_mock_adkg_secret_key(session_id, party_id, threshold);
+        create_mock_avss_share(party_id, threshold);
 
-    // Create ADKG secret key object
-    let obj_id = adkg_object::create_adkg_secret_key_object(
+    let obj_id = adkg_object::create_avss_share_object(
         &mut vm.state.object_store,
-        session_id,
+        key_name,
         share_bytes,
         commitment_bytes,
         party_id,
     );
 
-    // Create VM function that gets session ID
-    let get_session_id_fn = VMFunction::new(
-        "get_session_id".to_string(),
+    let get_key_name_fn = VMFunction::new(
+        "get_key_name".to_string(),
         vec![],
         Vec::new(),
         None,
@@ -411,48 +367,44 @@ fn test_adkg_get_session_id_builtin() {
         vec![
             Instruction::LDI(0, Value::Object(obj_id)),
             Instruction::PUSHARG(0),
-            Instruction::CALL("Adkg.get_session_id".to_string()),
+            Instruction::CALL("Avss.get_key_name".to_string()),
             Instruction::RET(0),
         ],
         HashMap::new(),
     );
 
-    vm.register_function(get_session_id_fn);
+    vm.register_function(get_key_name_fn);
 
-    let result = vm.execute("get_session_id").expect("Execution failed");
+    let result = vm.execute("get_key_name").expect("Execution failed");
 
     assert_eq!(
         result,
-        Value::I64(session_id as i64),
-        "Session ID should match"
+        Value::String(key_name.to_string()),
+        "Key name should match"
     );
 }
 
-/// Example VM program that demonstrates ADKG public key extraction
-///
-/// This is the example program requested: it takes an ADKG secret key
-/// and extracts the public key (commitment[0]).
+/// Example VM program that demonstrates AVSS public key extraction
 #[test]
-fn test_example_adkg_public_key_program() {
+fn test_example_avss_public_key_program() {
     setup_test_tracing();
-    tracing::info!("=== ADKG Public Key Extraction Example ===");
+    tracing::info!("=== AVSS Public Key Extraction Example ===");
 
     let mut vm = VirtualMachine::new();
 
-    // Simulate ADKG result (in real usage, this would come from the ADKG protocol)
-    let session_id = 999u64;
+    let key_name = "signing_key";
     let party_id = 0usize;
     let threshold = 2;
 
     tracing::info!(
-        "Creating mock ADKG result with session_id={}, party_id={}, threshold={}",
-        session_id,
+        "Creating mock AVSS result with key='{}', party_id={}, threshold={}",
+        key_name,
         party_id,
         threshold
     );
 
     let (share_bytes, commitment_bytes, expected_public_key) =
-        create_mock_adkg_secret_key(session_id, party_id, threshold);
+        create_mock_avss_share(party_id, threshold);
 
     tracing::info!(
         "Generated {} commitments, public key size: {} bytes",
@@ -460,27 +412,16 @@ fn test_example_adkg_public_key_program() {
         commitment_bytes[0].len()
     );
 
-    // Create ADKG secret key object in VM
-    let adkg_key_obj_id = adkg_object::create_adkg_secret_key_object(
+    let avss_share_obj_id = adkg_object::create_avss_share_object(
         &mut vm.state.object_store,
-        session_id,
+        key_name,
         share_bytes,
         commitment_bytes,
         party_id,
     );
 
-    tracing::info!("Created ADKG secret key object with ID: {}", adkg_key_obj_id);
+    tracing::info!("Created AVSS share object with ID: {}", avss_share_obj_id);
 
-    // Example program: main
-    //
-    // This program demonstrates how a StoffelLang program would extract
-    // the public key from an ADKG result:
-    //
-    // fn main():
-    //     adkg_key = <loaded from ADKG protocol>
-    //     public_key = Adkg.get_public_key(adkg_key)
-    //     return public_key
-    //
     let main_fn = VMFunction::new(
         "main".to_string(),
         vec![],
@@ -488,13 +429,9 @@ fn test_example_adkg_public_key_program() {
         None,
         4,
         vec![
-            // Load ADKG key object into r0
-            Instruction::LDI(0, Value::Object(adkg_key_obj_id)),
-            // Push as argument for builtin
+            Instruction::LDI(0, Value::Object(avss_share_obj_id)),
             Instruction::PUSHARG(0),
-            // Call Adkg.get_public_key builtin
-            Instruction::CALL("Adkg.get_public_key".to_string()),
-            // Return the public key (byte array now in r0)
+            Instruction::CALL("Avss.get_public_key".to_string()),
             Instruction::RET(0),
         ],
         HashMap::new(),
@@ -505,14 +442,12 @@ fn test_example_adkg_public_key_program() {
     tracing::info!("Executing main program...");
     let result = vm.execute("main").expect("Execution failed");
 
-    // Verify result
     match result {
         Value::Array(arr_id) => {
             let arr = vm.state.object_store.get_array(arr_id).unwrap();
             let len = arr.length();
             tracing::info!("Got public key as byte array with {} bytes", len);
 
-            // Extract bytes
             let mut pk_bytes = Vec::with_capacity(len);
             for i in 0..len {
                 if let Some(Value::U8(b)) = arr.get(&Value::I64(i as i64)) {
@@ -520,7 +455,6 @@ fn test_example_adkg_public_key_program() {
                 }
             }
 
-            // Deserialize and verify
             let retrieved_pk = G1::deserialize_compressed(&pk_bytes[..])
                 .expect("Failed to deserialize public key");
 
@@ -529,7 +463,6 @@ fn test_example_adkg_public_key_program() {
                 "Public key should match expected value"
             );
 
-            // Print public key hex for demonstration
             let pk_hex: String = pk_bytes.iter().map(|b| format!("{:02x}", b)).collect();
             tracing::info!("Public key (hex): {}", pk_hex);
             tracing::info!("=== Example completed successfully ===");
@@ -538,14 +471,14 @@ fn test_example_adkg_public_key_program() {
     }
 }
 
-/// Test that non-ADKG objects are correctly rejected
+/// Test that non-AVSS objects are correctly rejected
 #[test]
-fn test_adkg_builtin_rejects_non_adkg_objects() {
+fn test_avss_builtin_rejects_non_avss_objects() {
     setup_test_tracing();
 
     let mut vm = VirtualMachine::new();
 
-    // Create a regular object (not an ADKG key)
+    // Create a regular object (not an AVSS share)
     let regular_obj_id = vm.state.object_store.create_object();
 
     let test_fn = VMFunction::new(
@@ -557,7 +490,7 @@ fn test_adkg_builtin_rejects_non_adkg_objects() {
         vec![
             Instruction::LDI(0, Value::Object(regular_obj_id)),
             Instruction::PUSHARG(0),
-            Instruction::CALL("Adkg.is_adkg_key".to_string()),
+            Instruction::CALL("Avss.is_avss_share".to_string()),
             Instruction::RET(0),
         ],
         HashMap::new(),
@@ -569,27 +502,18 @@ fn test_adkg_builtin_rejects_non_adkg_objects() {
     assert_eq!(
         result,
         Value::Bool(false),
-        "Regular object should not be recognized as ADKG key"
+        "Regular object should not be recognized as AVSS share"
     );
 }
 
 // ============================================================================
-// End-to-End Test: 5 Parties ADKG Simulation
+// End-to-End Test: 5 Parties AVSS Simulation
 // ============================================================================
 
-/// Simulate 5 parties running ADKG and producing consistent secret keys
-///
-/// In real ADKG, each party would run the protocol over a network and get their
-/// individual share. Here we simulate the ADKG output by:
-/// 1. Generating a random polynomial of degree t (threshold)
-/// 2. Computing commitments C_i = g^a_i for each coefficient
-/// 3. Evaluating the polynomial at points 1, 2, 3, 4, 5 for each party's share
-///
-/// All parties share the same commitments (including commitment[0] = public key)
-fn simulate_adkg_for_n_parties(
+/// Simulate 5 parties running AVSS and producing consistent shares
+fn simulate_avss_for_n_parties(
     n_parties: usize,
     threshold: usize,
-    session_id: u64,
 ) -> (Vec<(Vec<u8>, Vec<Vec<u8>>)>, G1) {
     use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
     use ark_std::test_rng;
@@ -597,14 +521,11 @@ fn simulate_adkg_for_n_parties(
     let mut rng = test_rng();
     let secret = Fr::rand(&mut rng);
 
-    // Generate polynomial with random coefficients
     let mut poly = DensePolynomial::rand(threshold, &mut rng);
     poly[0] = secret;
 
-    // Generate commitments: C_i = g^a_i (same for all parties)
     let commitments: Vec<G1> = poly.coeffs.iter().map(|c| G1::generator() * c).collect();
 
-    // Serialize commitments (shared by all parties)
     let commitment_bytes: Vec<Vec<u8>> = commitments
         .iter()
         .map(|c| {
@@ -616,13 +537,11 @@ fn simulate_adkg_for_n_parties(
         })
         .collect();
 
-    // Generate shares for each party
     let mut party_data = Vec::new();
     for party_id in 1..=n_parties {
         let x = Fr::from(party_id as u64);
         let share_value = poly.evaluate(&x);
 
-        // Serialize share
         let mut share_bytes = Vec::new();
         share_value
             .serialize_compressed(&mut share_bytes)
@@ -631,70 +550,57 @@ fn simulate_adkg_for_n_parties(
         party_data.push((share_bytes, commitment_bytes.clone()));
     }
 
-    // Public key is commitment[0] = g^secret
     let public_key = commitments[0];
 
     (party_data, public_key)
 }
 
-/// End-to-end test: 5 parties run ADKG and extract public key
-///
-/// This test simulates a complete ADKG workflow:
-/// 1. 5 MPC parties run ADKG (simulated)
-/// 2. Each party gets their secret share and shared commitments
-/// 3. Each party's VM program extracts the public key
-/// 4. All parties should get the same public key
-/// 5. An output client receives and verifies the public key
+/// End-to-end test: 5 parties run AVSS and extract public key
 #[test]
-fn test_e2e_5_parties_adkg_public_key() {
+fn test_e2e_5_parties_avss_public_key() {
     setup_test_tracing();
-    tracing::info!("=== End-to-End ADKG Test: 5 Parties ===");
+    tracing::info!("=== End-to-End AVSS Test: 5 Parties ===");
 
     let n_parties = 5;
-    let threshold = 2; // t+1 = 3 parties needed to reconstruct
-    let session_id = 1001u64;
+    let threshold = 2;
 
-    // Step 1: Simulate ADKG - all parties run the distributed protocol
     tracing::info!(
-        "Step 1: Simulating ADKG with {} parties, threshold={}",
+        "Step 1: Simulating AVSS with {} parties, threshold={}",
         n_parties,
         threshold
     );
     let (party_data, expected_public_key) =
-        simulate_adkg_for_n_parties(n_parties, threshold, session_id);
+        simulate_avss_for_n_parties(n_parties, threshold);
 
     tracing::info!(
-        "ADKG produced {} commitments per party",
+        "AVSS produced {} commitments per party",
         party_data[0].1.len()
     );
 
-    // Step 2: Each party creates a VM and loads their ADKG result
     tracing::info!("Step 2: Creating VMs for each party");
     let mut party_vms: Vec<VirtualMachine> = Vec::new();
 
     for (party_id, (share_bytes, commitment_bytes)) in party_data.into_iter().enumerate() {
         let mut vm = VirtualMachine::new();
 
-        // Create ADKG secret key object for this party
-        let adkg_key_id = adkg_object::create_adkg_secret_key_object(
+        let avss_share_id = adkg_object::create_avss_share_object(
             &mut vm.state.object_store,
-            session_id,
+            "shared_key",
             share_bytes,
             commitment_bytes,
             party_id,
         );
 
-        // Register the VM program that extracts public key
         let extract_pk_fn = VMFunction::new(
-            "get_adkg_public_key".to_string(),
+            "get_avss_public_key".to_string(),
             vec![],
             Vec::new(),
             None,
             4,
             vec![
-                Instruction::LDI(0, Value::Object(adkg_key_id)),
+                Instruction::LDI(0, Value::Object(avss_share_id)),
                 Instruction::PUSHARG(0),
-                Instruction::CALL("Adkg.get_public_key".to_string()),
+                Instruction::CALL("Avss.get_public_key".to_string()),
                 Instruction::RET(0),
             ],
             HashMap::new(),
@@ -703,17 +609,15 @@ fn test_e2e_5_parties_adkg_public_key() {
         vm.register_function(extract_pk_fn);
         party_vms.push(vm);
 
-        tracing::info!("Party {} VM initialized with ADKG key", party_id);
+        tracing::info!("Party {} VM initialized with AVSS share", party_id);
     }
 
-    // Step 3: Each party executes VM program to extract public key
     tracing::info!("Step 3: Executing VM programs on all parties");
     let mut extracted_public_keys: Vec<G1> = Vec::new();
 
     for (party_id, vm) in party_vms.iter_mut().enumerate() {
-        let result = vm.execute("get_adkg_public_key").expect("Execution failed");
+        let result = vm.execute("get_avss_public_key").expect("Execution failed");
 
-        // Extract public key bytes from result
         let pk_bytes = match result {
             Value::Array(arr_id) => {
                 let arr = vm.state.object_store.get_array(arr_id).unwrap();
@@ -728,7 +632,6 @@ fn test_e2e_5_parties_adkg_public_key() {
             other => panic!("Party {} got unexpected result: {:?}", party_id, other),
         };
 
-        // Deserialize public key
         let pk = G1::deserialize_compressed(&pk_bytes[..])
             .expect("Failed to deserialize public key");
 
@@ -736,7 +639,6 @@ fn test_e2e_5_parties_adkg_public_key() {
         tracing::info!("Party {} extracted public key ({} bytes)", party_id, pk_bytes.len());
     }
 
-    // Step 4: Verify all parties got the same public key
     tracing::info!("Step 4: Verifying all parties have consistent public key");
     for (party_id, pk) in extracted_public_keys.iter().enumerate() {
         assert_eq!(
@@ -746,7 +648,6 @@ fn test_e2e_5_parties_adkg_public_key() {
         );
     }
 
-    // Verify all parties have the same public key as each other
     for i in 1..n_parties {
         assert_eq!(
             extracted_public_keys[i], extracted_public_keys[0],
@@ -757,17 +658,14 @@ fn test_e2e_5_parties_adkg_public_key() {
 
     tracing::info!("All {} parties have consistent public key!", n_parties);
 
-    // Step 5: Simulate output client receiving the public key
     tracing::info!("Step 5: Output client receives and verifies public key");
 
-    // Serialize the public key for transmission to client
     let mut pk_transmission_bytes = Vec::new();
     expected_public_key
         .into_affine()
         .serialize_compressed(&mut pk_transmission_bytes)
         .expect("Failed to serialize public key");
 
-    // Output client verifies the received public key
     let received_pk = G1::deserialize_compressed(&pk_transmission_bytes[..])
         .expect("Output client failed to deserialize public key");
 
@@ -781,7 +679,6 @@ fn test_e2e_5_parties_adkg_public_key() {
         pk_transmission_bytes.len()
     );
 
-    // Print summary
     let pk_hex: String = pk_transmission_bytes
         .iter()
         .take(16)
@@ -791,50 +688,36 @@ fn test_e2e_5_parties_adkg_public_key() {
     tracing::info!("=== End-to-End Test Completed Successfully ===");
 }
 
-/// Test that demonstrates the complete ADKG workflow with input and output clients
-///
-/// This test shows:
-/// 1. Input clients provide secrets to the MPC parties (simulated)
-/// 2. MPC parties run ADKG combining the inputs (simulated)
-/// 3. Output client retrieves the combined public key
+/// Test that demonstrates the complete AVSS workflow with input and output clients
 #[test]
-fn test_e2e_adkg_with_input_output_clients() {
+fn test_e2e_avss_with_input_output_clients() {
     setup_test_tracing();
-    tracing::info!("=== ADKG with Input/Output Clients ===");
+    tracing::info!("=== AVSS with Input/Output Clients ===");
 
     let n_parties = 5;
     let threshold = 2;
-    let session_id = 2002u64;
 
-    // Simulate input clients - in real system, these would provide secret shares
-    // Here we just note that the ADKG secret is generated from distributed inputs
     let input_client_ids = vec![100usize, 101, 102];
     tracing::info!(
         "Input clients: {:?} would contribute to the distributed secret",
         input_client_ids
     );
 
-    // Run ADKG simulation
     let (party_data, expected_public_key) =
-        simulate_adkg_for_n_parties(n_parties, threshold, session_id);
+        simulate_avss_for_n_parties(n_parties, threshold);
 
-    // Create VMs for each party
     let mut party_vms: Vec<VirtualMachine> = Vec::new();
     for (party_id, (share_bytes, commitment_bytes)) in party_data.into_iter().enumerate() {
         let mut vm = VirtualMachine::new();
 
-        let adkg_key_id = adkg_object::create_adkg_secret_key_object(
+        let avss_share_id = adkg_object::create_avss_share_object(
             &mut vm.state.object_store,
-            session_id,
+            "client_key",
             share_bytes,
             commitment_bytes,
             party_id,
         );
 
-        // VM program that:
-        // 1. Gets the public key from ADKG result
-        // 2. Gets the commitment count (for verification)
-        // 3. Returns the public key
         let main_fn = VMFunction::new(
             "main".to_string(),
             vec![],
@@ -842,12 +725,9 @@ fn test_e2e_adkg_with_input_output_clients() {
             None,
             8,
             vec![
-                // Load ADKG key
-                Instruction::LDI(0, Value::Object(adkg_key_id)),
-                // Get public key
+                Instruction::LDI(0, Value::Object(avss_share_id)),
                 Instruction::PUSHARG(0),
-                Instruction::CALL("Adkg.get_public_key".to_string()),
-                // Result is now in r0, return it
+                Instruction::CALL("Avss.get_public_key".to_string()),
                 Instruction::RET(0),
             ],
             HashMap::new(),
@@ -857,7 +737,6 @@ fn test_e2e_adkg_with_input_output_clients() {
         party_vms.push(vm);
     }
 
-    // Execute on all parties
     let mut results: Vec<Vec<u8>> = Vec::new();
     for (party_id, vm) in party_vms.iter_mut().enumerate() {
         let result = vm.execute("main").expect("Execution failed");
@@ -880,20 +759,16 @@ fn test_e2e_adkg_with_input_output_clients() {
         tracing::info!("Party {} completed VM execution", party_id);
     }
 
-    // Output client (ID 200) receives public key from any party
     let output_client_id = 200usize;
     tracing::info!(
         "Output client {} receiving public key from parties",
         output_client_id
     );
 
-    // In real system, output client would receive from threshold+1 parties
-    // and verify consistency. Here we verify all results match.
     for i in 1..n_parties {
         assert_eq!(results[i], results[0], "Inconsistent results from parties");
     }
 
-    // Output client decodes the public key
     let final_pk = G1::deserialize_compressed(&results[0][..])
         .expect("Failed to deserialize final public key");
 

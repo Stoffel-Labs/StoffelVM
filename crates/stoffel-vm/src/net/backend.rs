@@ -1,6 +1,6 @@
 //! MPC backend selection.
 //!
-//! Provides an enum for choosing between HoneyBadger and ADKG backends at runtime.
+//! Provides an enum for choosing between HoneyBadger and AVSS backends at runtime.
 
 /// Available MPC backend implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,7 +8,7 @@ pub enum MpcBackendKind {
     #[cfg(feature = "honeybadger")]
     HoneyBadger,
     #[cfg(feature = "adkg")]
-    Adkg,
+    Avss,
 }
 
 impl std::str::FromStr for MpcBackendKind {
@@ -24,13 +24,13 @@ impl std::str::FromStr for MpcBackendKind {
             #[cfg(feature = "honeybadger")]
             "honeybadger" | "hb" => Ok(MpcBackendKind::HoneyBadger),
             #[cfg(feature = "adkg")]
-            "adkg" => Ok(MpcBackendKind::Adkg),
+            "avss" | "adkg" => Ok(MpcBackendKind::Avss),
             other => {
                 let mut available = Vec::new();
                 #[cfg(feature = "honeybadger")]
                 available.push("honeybadger");
                 #[cfg(feature = "adkg")]
-                available.push("adkg");
+                available.push("avss");
                 Err(format!(
                     "Unknown MPC backend '{}'. Available: {}",
                     other,
@@ -54,7 +54,7 @@ impl MpcBackendKind {
         {
             #[cfg(feature = "adkg")]
             {
-                MpcBackendKind::Adkg
+                MpcBackendKind::Avss
             }
             #[cfg(not(feature = "adkg"))]
             {
@@ -69,7 +69,7 @@ impl MpcBackendKind {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => true,
             #[cfg(feature = "adkg")]
-            MpcBackendKind::Adkg => true,
+            MpcBackendKind::Avss => true,
         }
     }
 
@@ -79,27 +79,30 @@ impl MpcBackendKind {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => true,
             #[cfg(feature = "adkg")]
-            MpcBackendKind::Adkg => false,
+            MpcBackendKind::Avss => false,
         }
     }
 
-    /// Whether this backend supports distributed key generation.
-    pub fn supports_dkg(&self) -> bool {
+    /// Whether this backend supports elliptic curve operations.
+    pub fn supports_elliptic_curves(&self) -> bool {
         match self {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => false,
             #[cfg(feature = "adkg")]
-            MpcBackendKind::Adkg => true,
+            MpcBackendKind::Avss => true,
         }
     }
 
     /// Whether this backend supports client inputs.
+    ///
+    /// Both backends support client inputs; in ADKG the client and server roles
+    /// are unified (every party is also a client).
     pub fn supports_client_input(&self) -> bool {
         match self {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => true,
             #[cfg(feature = "adkg")]
-            MpcBackendKind::Adkg => false,
+            MpcBackendKind::Avss => true,
         }
     }
 
@@ -109,7 +112,7 @@ impl MpcBackendKind {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => "honeybadger",
             #[cfg(feature = "adkg")]
-            MpcBackendKind::Adkg => "adkg",
+            MpcBackendKind::Avss => "avss",
         }
     }
 }
@@ -138,14 +141,19 @@ mod tests {
 
     #[test]
     #[cfg(feature = "adkg")]
-    fn test_parse_adkg() {
+    fn test_parse_avss() {
         assert_eq!(
-            MpcBackendKind::from_str("adkg").unwrap(),
-            MpcBackendKind::Adkg
+            MpcBackendKind::from_str("avss").unwrap(),
+            MpcBackendKind::Avss
         );
         assert_eq!(
-            MpcBackendKind::from_str("ADKG").unwrap(),
-            MpcBackendKind::Adkg
+            MpcBackendKind::from_str("AVSS").unwrap(),
+            MpcBackendKind::Avss
+        );
+        // "adkg" is kept as a backward-compatible alias
+        assert_eq!(
+            MpcBackendKind::from_str("adkg").unwrap(),
+            MpcBackendKind::Avss
         );
     }
 
@@ -165,18 +173,18 @@ mod tests {
     fn test_honeybadger_capabilities() {
         let hb = MpcBackendKind::HoneyBadger;
         assert!(hb.supports_general_mpc());
-        assert!(!hb.supports_dkg());
+        assert!(!hb.supports_elliptic_curves());
         assert!(hb.supports_client_input());
     }
 
     #[test]
     #[cfg(feature = "adkg")]
-    fn test_adkg_capabilities() {
-        let adkg = MpcBackendKind::Adkg;
-        assert!(adkg.supports_general_mpc());
-        assert!(!adkg.supports_multiplication());
-        assert!(adkg.supports_dkg());
-        assert!(!adkg.supports_client_input());
+    fn test_avss_capabilities() {
+        let avss = MpcBackendKind::Avss;
+        assert!(avss.supports_general_mpc());
+        assert!(!avss.supports_multiplication());
+        assert!(avss.supports_elliptic_curves());
+        assert!(avss.supports_client_input());
     }
 
     #[test]

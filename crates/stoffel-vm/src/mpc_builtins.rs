@@ -1223,37 +1223,37 @@ fn share_open_exp(ctx: ForeignFunctionContext) -> Result<Value, String> {
     Ok(Value::Array(arr_id))
 }
 
-/// Field name constants for ADKG secret key objects
+/// Field name constants for AVSS share objects
 #[cfg(feature = "adkg")]
 pub mod adkg_fields {
     pub const TYPE: &str = "__type";
-    pub const SESSION_ID: &str = "__session_id";
+    pub const KEY_NAME: &str = "__key_name";
     pub const SHARE_DATA: &str = "__share_data";
     pub const COMMITMENTS: &str = "__commitments";
     pub const PARTY_ID: &str = "__party_id";
-    pub const TYPE_VALUE: &str = "AdkgSecretKey";
+    pub const TYPE_VALUE: &str = "AvssShare";
 }
 
-/// Helper module for ADKG secret key object operations
+/// Helper module for AVSS share object operations
 #[cfg(feature = "adkg")]
 pub mod adkg_object {
     use super::adkg_fields;
     use stoffel_vm_types::core_types::{ObjectStore, Value};
 
-    /// Create a new ADKG secret key object in the object store
+    /// Create a new AVSS share object in the object store
     ///
     /// # Arguments
     /// * `store` - The object store to create the object in
-    /// * `session_id` - The ADKG session ID
+    /// * `key_name` - User-defined key name for this share
     /// * `share_data` - The serialized Feldman share
     /// * `commitment_bytes` - Array of serialized commitment group elements
     /// * `party_id` - The party ID
     ///
     /// # Returns
-    /// The object ID of the created ADKG secret key
-    pub fn create_adkg_secret_key_object(
+    /// The object ID of the created AVSS share
+    pub fn create_avss_share_object(
         store: &mut ObjectStore,
-        session_id: u64,
+        key_name: &str,
         share_data: Vec<u8>,
         commitment_bytes: Vec<Vec<u8>>,
         party_id: usize,
@@ -1270,12 +1270,12 @@ pub mod adkg_object {
             )
             .unwrap();
 
-        // Set session ID
+        // Set key name
         store
             .set_field(
                 &obj,
-                Value::String(adkg_fields::SESSION_ID.to_string()),
-                Value::I64(session_id as i64),
+                Value::String(adkg_fields::KEY_NAME.to_string()),
+                Value::String(key_name.to_string()),
             )
             .unwrap();
 
@@ -1297,7 +1297,6 @@ pub mod adkg_object {
             .unwrap();
 
         // Set commitments as array of byte arrays
-        // First, create all the inner commitment arrays
         let commitment_arr_ids: Vec<usize> = commitment_bytes
             .into_iter()
             .map(|commitment| {
@@ -1312,7 +1311,6 @@ pub mod adkg_object {
             })
             .collect();
 
-        // Then create the outer commitments array and populate it
         let commitments_array_id = store.create_array_with_capacity(commitment_arr_ids.len());
         {
             let arr = store.get_array_mut(commitments_array_id).unwrap();
@@ -1340,8 +1338,8 @@ pub mod adkg_object {
         id
     }
 
-    /// Check if a value is an ADKG secret key object
-    pub fn is_adkg_secret_key_object(store: &ObjectStore, value: &Value) -> bool {
+    /// Check if a value is an AVSS share object
+    pub fn is_avss_share_object(store: &ObjectStore, value: &Value) -> bool {
         match value {
             Value::Object(_) => store
                 .get_field(value, &Value::String(adkg_fields::TYPE.to_string()))
@@ -1351,25 +1349,25 @@ pub mod adkg_object {
         }
     }
 
-    /// Extract session ID from an ADKG secret key object
-    pub fn get_session_id(store: &ObjectStore, value: &Value) -> Result<u64, String> {
-        let session_id_field = store
-            .get_field(value, &Value::String(adkg_fields::SESSION_ID.to_string()))
-            .ok_or_else(|| "ADKG secret key object missing __session_id field".to_string())?;
+    /// Extract key name from an AVSS share object
+    pub fn get_key_name(store: &ObjectStore, value: &Value) -> Result<String, String> {
+        let key_name_field = store
+            .get_field(value, &Value::String(adkg_fields::KEY_NAME.to_string()))
+            .ok_or_else(|| "AVSS share object missing __key_name field".to_string())?;
 
-        match session_id_field {
-            Value::I64(n) => Ok(n as u64),
-            _ => Err("Invalid session_id type".to_string()),
+        match key_name_field {
+            Value::String(s) => Ok(s),
+            _ => Err("Invalid key_name type".to_string()),
         }
     }
 
-    /// Extract commitment at a specific index from an ADKG secret key object
+    /// Extract commitment at a specific index from an AVSS share object
     ///
     /// Returns the commitment as bytes (serialized group element)
     pub fn get_commitment(store: &ObjectStore, value: &Value, index: usize) -> Result<Vec<u8>, String> {
         let commitments_field = store
             .get_field(value, &Value::String(adkg_fields::COMMITMENTS.to_string()))
-            .ok_or_else(|| "ADKG secret key object missing __commitments field".to_string())?;
+            .ok_or_else(|| "AVSS share object missing __commitments field".to_string())?;
 
         let commitments_array_id = match commitments_field {
             Value::Array(id) => id,
@@ -1413,11 +1411,11 @@ pub mod adkg_object {
         Ok(bytes)
     }
 
-    /// Get the number of commitments in an ADKG secret key object
+    /// Get the number of commitments in an AVSS share object
     pub fn get_commitment_count(store: &ObjectStore, value: &Value) -> Result<usize, String> {
         let commitments_field = store
             .get_field(value, &Value::String(adkg_fields::COMMITMENTS.to_string()))
-            .ok_or_else(|| "ADKG secret key object missing __commitments field".to_string())?;
+            .ok_or_else(|| "AVSS share object missing __commitments field".to_string())?;
 
         let commitments_array_id = match commitments_field {
             Value::Array(id) => id,
@@ -1432,22 +1430,20 @@ pub mod adkg_object {
     }
 }
 
-/// Register ADKG (Asynchronous Distributed Key Generation) builtins
+/// Register AVSS (Asynchronously Verifiable Secret Sharing) builtins
 #[cfg(feature = "adkg")]
 fn register_adkg_builtins(vm: &mut VirtualMachine) {
-    // Note: AdkgMpcEngine and AdkgOperations are used when actually running ADKG
-    // These builtins work on the ADKG secret key objects stored in the VM
+    // These builtins work on AVSS share objects stored in the VM
 
-    // Adkg.get_commitment - Get commitment at index from ADKG secret key
+    // Avss.get_commitment - Get commitment at index from AVSS share
     // commitment[0] is the public key
-    vm.register_foreign_function("Adkg.get_commitment", |ctx| {
+    vm.register_foreign_function("Avss.get_commitment", |ctx| {
         if ctx.args.len() < 2 {
-            return Err("Adkg.get_commitment expects 2 arguments: adkg_secret_key, index".to_string());
+            return Err("Avss.get_commitment expects 2 arguments: avss_share, index".to_string());
         }
 
-        // Check if arg is an ADKG secret key object
-        if !adkg_object::is_adkg_secret_key_object(&ctx.vm_state.object_store, &ctx.args[0]) {
-            return Err("First argument must be an ADKG secret key object".to_string());
+        if !adkg_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+            return Err("First argument must be an AVSS share object".to_string());
         }
 
         let index = match &ctx.args[1] {
@@ -1458,7 +1454,6 @@ fn register_adkg_builtins(vm: &mut VirtualMachine) {
 
         let commitment_bytes = adkg_object::get_commitment(&ctx.vm_state.object_store, &ctx.args[0], index)?;
 
-        // Return as byte array
         let arr_id = ctx.vm_state.object_store.create_array_with_capacity(commitment_bytes.len());
         {
             let arr = ctx.vm_state.object_store.get_array_mut(arr_id).unwrap();
@@ -1469,20 +1464,19 @@ fn register_adkg_builtins(vm: &mut VirtualMachine) {
         Ok(Value::Array(arr_id))
     });
 
-    // Adkg.get_public_key - Get the public key (commitment[0]) from ADKG secret key
-    vm.register_foreign_function("Adkg.get_public_key", |ctx| {
+    // Avss.get_public_key - Get the public key (commitment[0]) from AVSS share
+    vm.register_foreign_function("Avss.get_public_key", |ctx| {
         if ctx.args.is_empty() {
-            return Err("Adkg.get_public_key expects 1 argument: adkg_secret_key".to_string());
+            return Err("Avss.get_public_key expects 1 argument: avss_share".to_string());
         }
 
-        if !adkg_object::is_adkg_secret_key_object(&ctx.vm_state.object_store, &ctx.args[0]) {
-            return Err("Argument must be an ADKG secret key object".to_string());
+        if !adkg_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+            return Err("Argument must be an AVSS share object".to_string());
         }
 
         // commitment[0] is the public key
         let commitment_bytes = adkg_object::get_commitment(&ctx.vm_state.object_store, &ctx.args[0], 0)?;
 
-        // Return as byte array
         let arr_id = ctx.vm_state.object_store.create_array_with_capacity(commitment_bytes.len());
         {
             let arr = ctx.vm_state.object_store.get_array_mut(arr_id).unwrap();
@@ -1493,42 +1487,42 @@ fn register_adkg_builtins(vm: &mut VirtualMachine) {
         Ok(Value::Array(arr_id))
     });
 
-    // Adkg.get_session_id - Get the session ID from ADKG secret key
-    vm.register_foreign_function("Adkg.get_session_id", |ctx| {
+    // Avss.get_key_name - Get the key name from AVSS share
+    vm.register_foreign_function("Avss.get_key_name", |ctx| {
         if ctx.args.is_empty() {
-            return Err("Adkg.get_session_id expects 1 argument: adkg_secret_key".to_string());
+            return Err("Avss.get_key_name expects 1 argument: avss_share".to_string());
         }
 
-        if !adkg_object::is_adkg_secret_key_object(&ctx.vm_state.object_store, &ctx.args[0]) {
-            return Err("Argument must be an ADKG secret key object".to_string());
+        if !adkg_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+            return Err("Argument must be an AVSS share object".to_string());
         }
 
-        let session_id = adkg_object::get_session_id(&ctx.vm_state.object_store, &ctx.args[0])?;
-        Ok(Value::I64(session_id as i64))
+        let key_name = adkg_object::get_key_name(&ctx.vm_state.object_store, &ctx.args[0])?;
+        Ok(Value::String(key_name))
     });
 
-    // Adkg.commitment_count - Get the number of commitments in an ADKG secret key
-    vm.register_foreign_function("Adkg.commitment_count", |ctx| {
+    // Avss.commitment_count - Get the number of commitments in an AVSS share
+    vm.register_foreign_function("Avss.commitment_count", |ctx| {
         if ctx.args.is_empty() {
-            return Err("Adkg.commitment_count expects 1 argument: adkg_secret_key".to_string());
+            return Err("Avss.commitment_count expects 1 argument: avss_share".to_string());
         }
 
-        if !adkg_object::is_adkg_secret_key_object(&ctx.vm_state.object_store, &ctx.args[0]) {
-            return Err("Argument must be an ADKG secret key object".to_string());
+        if !adkg_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+            return Err("Argument must be an AVSS share object".to_string());
         }
 
         let count = adkg_object::get_commitment_count(&ctx.vm_state.object_store, &ctx.args[0])?;
         Ok(Value::I64(count as i64))
     });
 
-    // Adkg.is_adkg_key - Check if value is an ADKG secret key object
-    vm.register_foreign_function("Adkg.is_adkg_key", |ctx| {
+    // Avss.is_avss_share - Check if value is an AVSS share object
+    vm.register_foreign_function("Avss.is_avss_share", |ctx| {
         if ctx.args.is_empty() {
-            return Err("Adkg.is_adkg_key expects 1 argument: value".to_string());
+            return Err("Avss.is_avss_share expects 1 argument: value".to_string());
         }
 
-        let is_adkg = adkg_object::is_adkg_secret_key_object(&ctx.vm_state.object_store, &ctx.args[0]);
-        Ok(Value::Bool(is_adkg))
+        let is_avss = adkg_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]);
+        Ok(Value::Bool(is_avss))
     });
 }
 

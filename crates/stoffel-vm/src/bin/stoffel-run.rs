@@ -1092,7 +1092,7 @@ async fn main() {
             }
 
             #[cfg(feature = "adkg")]
-            MpcBackendKind::Adkg => {
+            MpcBackendKind::Avss => {
                 // Parse curve configuration
                 let curve_config = match adkg_curve.as_deref() {
                     Some(name) => match AdkgCurveConfig::from_str(name) {
@@ -1176,6 +1176,10 @@ async fn main() {
                 match curve_config {
                     AdkgCurveConfig::Bls12_381 => setup_adkg!(Bls12381AdkgServer),
                     AdkgCurveConfig::Bn254 => setup_adkg!(Bn254AdkgServer),
+                    AdkgCurveConfig::Curve25519 | AdkgCurveConfig::Ed25519 => {
+                        eprintln!("[party {}] Curve25519/Ed25519 server not yet implemented", my_id);
+                        exit(15);
+                    }
                 }
 
                 eprintln!("[party {}] ADKG engine set, starting VM execution...", my_id);

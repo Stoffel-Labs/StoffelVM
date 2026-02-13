@@ -112,8 +112,8 @@ pub trait MpcEngine: Send + Sync {
     /// Whether this engine supports secure multiplication
     fn supports_multiplication(&self) -> bool { false }
 
-    /// Whether this engine supports distributed key generation
-    fn supports_dkg(&self) -> bool { false }
+    /// Whether this engine supports elliptic curve operations
+    fn supports_elliptic_curves(&self) -> bool { false }
 
     /// Whether this engine supports client input operations
     fn supports_client_input(&self) -> bool { false }
