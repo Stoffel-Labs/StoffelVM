@@ -405,7 +405,7 @@ fn register_mpc_info_builtins(vm: &mut VirtualMachine) {
     vm.register_foreign_function("Mpc.rand", |ctx| {
         use rand::RngCore;
         let mut bytes = vec![0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let arr_id = ctx.vm_state.object_store.create_array_with_capacity(bytes.len());
         {
             let arr = ctx.vm_state.object_store.get_array_mut(arr_id)
@@ -428,12 +428,12 @@ fn register_mpc_info_builtins(vm: &mut VirtualMachine) {
             Value::I64(n) if *n > 0 => *n as usize,
             _ => return Err("bit_length must be a positive integer".to_string()),
         };
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         match bit_length {
-            8 => Ok(Value::U8(rng.gen())),
-            16 => Ok(Value::U16(rng.gen())),
-            32 => Ok(Value::U32(rng.gen())),
-            64 => Ok(Value::U64(rng.gen())),
+            8 => Ok(Value::U8(rng.random())),
+            16 => Ok(Value::U16(rng.random())),
+            32 => Ok(Value::U32(rng.random())),
+            64 => Ok(Value::U64(rng.random())),
             _ => Err(format!(
                 "Unsupported bit_length {}. Must be 8, 16, 32, or 64",
                 bit_length
