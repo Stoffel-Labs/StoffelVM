@@ -401,53 +401,44 @@ fn register_mpc_info_builtins(vm: &mut VirtualMachine) {
         Ok(Value::I64(engine.instance_id() as i64))
     });
 
-    // Mpc.rand - Generate a random secret-shared value (256-bit integer)
+    // Mpc.rand - Generate random bytes from a secure PRNG (32 bytes / 256 bits)
     vm.register_foreign_function("Mpc.rand", |ctx| {
-        let engine = ctx
-            .vm_state
-            .mpc_engine()
-            .ok_or_else(|| "MPC engine not configured".to_string())?;
-        if !engine.is_ready() {
-            return Err("MPC engine not ready".to_string());
+        use rand::RngCore;
+        let mut bytes = vec![0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let arr_id = ctx.vm_state.object_store.create_array_with_capacity(bytes.len());
+        {
+            let arr = ctx.vm_state.object_store.get_array_mut(arr_id)
+                .ok_or_else(|| "Failed to create result array".to_string())?;
+            for (i, byte) in bytes.into_iter().enumerate() {
+                arr.set(Value::I64(i as i64), Value::U8(byte));
+            }
         }
-        let ty = ShareType::SecretInt { bit_length: 256 };
-        let share_bytes = engine.random_share(ty)?;
-        let party_id = engine.party_id();
-        let obj_id = share_object::create_share_object(
-            &mut ctx.vm_state.object_store,
-            ty,
-            share_bytes,
-            party_id,
-        );
-        Ok(Value::Object(obj_id))
+        Ok(Value::Array(arr_id))
     });
 
-    // Mpc.rand_int - Generate a random secret-shared integer with custom bit length
-    vm.register_foreign_function("Mpc.rand_int", |ctx| {
-        if ctx.args.is_empty() {
-            return Err("Mpc.rand_int expects 1 argument: bit_length".to_string());
+    // Mpc.rand_int - Generate a random integer from a secure PRNG
+    // Accepts bit_length: 8, 16, 32, or 64 — returns the corresponding unsigned int type
+    vm.register_foreign_function("Mpc.rand_int", |_ctx| {
+        use rand::Rng;
+        if _ctx.args.is_empty() {
+            return Err("Mpc.rand_int expects 1 argument: bit_length (8, 16, 32, or 64)".to_string());
         }
-        let bit_length = match &ctx.args[0] {
+        let bit_length = match &_ctx.args[0] {
             Value::I64(n) if *n > 0 => *n as usize,
             _ => return Err("bit_length must be a positive integer".to_string()),
         };
-        let engine = ctx
-            .vm_state
-            .mpc_engine()
-            .ok_or_else(|| "MPC engine not configured".to_string())?;
-        if !engine.is_ready() {
-            return Err("MPC engine not ready".to_string());
+        let mut rng = rand::thread_rng();
+        match bit_length {
+            8 => Ok(Value::U8(rng.gen())),
+            16 => Ok(Value::U16(rng.gen())),
+            32 => Ok(Value::U32(rng.gen())),
+            64 => Ok(Value::U64(rng.gen())),
+            _ => Err(format!(
+                "Unsupported bit_length {}. Must be 8, 16, 32, or 64",
+                bit_length
+            )),
         }
-        let ty = ShareType::SecretInt { bit_length };
-        let share_bytes = engine.random_share(ty)?;
-        let party_id = engine.party_id();
-        let obj_id = share_object::create_share_object(
-            &mut ctx.vm_state.object_store,
-            ty,
-            share_bytes,
-            party_id,
-        );
-        Ok(Value::Object(obj_id))
     });
 }
 
