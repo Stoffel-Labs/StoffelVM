@@ -9,7 +9,6 @@ use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustS
 use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::honeybadger::{
     HoneyBadgerError, HoneyBadgerMPCClient, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts,
-    WrappedMessage,
 };
 use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId};
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
@@ -18,26 +17,6 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
-
-/// Extract sender_id from a raw `WrappedMessage` for accepted connections
-/// where the transport-level sender identity is unknown.
-fn extract_sender_from_msg(data: &[u8]) -> PartyId {
-    match bincode::deserialize::<WrappedMessage>(data) {
-        Ok(WrappedMessage::Input(msg)) => msg.sender_id,
-        Ok(WrappedMessage::Output(msg)) => msg.sender_id,
-        Ok(WrappedMessage::RanSha(msg)) => msg.sender_id,
-        Ok(WrappedMessage::BatchRecon(msg)) => msg.sender_id,
-        Ok(WrappedMessage::Mul(msg)) => msg.sender,
-        Ok(WrappedMessage::Triple(msg)) => msg.sender_id,
-        Ok(WrappedMessage::Dousha(msg)) => msg.sender_id,
-        Ok(WrappedMessage::RanDouSha(msg)) => msg.sender_id,
-        Ok(WrappedMessage::RandBit(msg)) => msg.sender,
-        Ok(WrappedMessage::Trunc(msg)) => msg.sender_id,
-        Ok(WrappedMessage::PRandBit(msg)) => msg.sender_id,
-        Ok(WrappedMessage::Rbc(msg)) => msg.sender_id,
-        Err(_) => usize::MAX,
-    }
-}
 
 /// Configuration for HoneyBadger MPC over QUIC
 #[derive(Debug, Clone)]
@@ -211,6 +190,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                 // Spawn a task to handle this connection's messages
                                 let txx = tx.clone();
                                 let conn_node_id = node_id;
+                                let sender_id = connection.remote_party_id().unwrap_or(usize::MAX);
 
                                 info!("[HB-QUIC] Node {} spawning message handler for connection {}", conn_node_id, connection.remote_address());
                                 tokio::spawn(async move {
@@ -218,11 +198,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                         match connection.receive().await {
                                             Ok(data) => {
                                                 info!("[HB-QUIC] Node {} received {} bytes from {}", conn_node_id, data.len(), connection.remote_address());
-                                                // Important: no locks are held across await inside handle_message
-                                                // Accepted connections don't have a known peer_id;
-                                                // extract sender from the message payload.
-                                                let sender = extract_sender_from_msg(&data);
-                                                if let Err(e) = txx.send((sender, data)).await {
+                                                if let Err(e) = txx.send((sender_id, data)).await {
                                                     error!("Node {} failed to handle message: {:?}", conn_node_id, e);
                                                 }
                                             }

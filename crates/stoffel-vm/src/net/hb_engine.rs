@@ -1,12 +1,13 @@
 use crate::net::client_store::ClientInputStore;
 use crate::net::mpc::honeybadger_node_opts;
+use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
 use crate::net::mpc_engine::{AsyncMpcEngineConsensus, MpcEngine, MpcEngineClientOps, MpcEngineConsensus};
-use ark_bls12_381::{Fr, G1Projective as G1};
-use ark_ec::CurveGroup;
-use ark_ff::{Field, PrimeField, Zero};
+use ark_ec::{CurveGroup, PrimeGroup};
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
+use std::any::TypeId;
+use std::marker::PhantomData;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -28,19 +29,37 @@ type RBCImpl = Avid<HbSessionId>;
 /// HoneyBadger-backed MPC engine that integrates with the VM.
 /// This wraps a real HoneyBadgerMPCNode and provides MPC operations
 /// (input sharing, multiplication, output reconstruction) to the VM.
-pub struct HoneyBadgerMpcEngine {
+pub struct HoneyBadgerMpcEngine<F = ark_bls12_381::Fr, G = ark_bls12_381::G1Projective>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     instance_id: u64,
     party_id: usize,
     n: usize,
     t: usize,
     net: Arc<QuicNetworkManager>,
-    node: Arc<Mutex<HoneyBadgerMPCNode<Fr, RBCImpl>>>,
+    node: Arc<Mutex<HoneyBadgerMPCNode<F, RBCImpl>>>,
     ready: AtomicBool,
     /// Session counter for multiplication operations
     mul_session_counter: Arc<Mutex<usize>>,
+    group_marker: PhantomData<G>,
 }
 
-impl HoneyBadgerMpcEngine {
+pub type Bls12381HoneyBadgerMpcEngine =
+    HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>;
+pub type Bn254HoneyBadgerMpcEngine =
+    HoneyBadgerMpcEngine<ark_bn254::Fr, ark_bn254::G1Projective>;
+pub type Curve25519HoneyBadgerMpcEngine =
+    HoneyBadgerMpcEngine<ark_curve25519::Fr, ark_curve25519::EdwardsProjective>;
+pub type Ed25519HoneyBadgerMpcEngine =
+    HoneyBadgerMpcEngine<ark_ed25519::Fr, ark_ed25519::EdwardsProjective>;
+
+impl<F, G> HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     /// Fully async startup + preprocessing
     pub async fn start_async(&self) -> Result<(), String> {
         self.preprocess().await
@@ -117,7 +136,7 @@ impl HoneyBadgerMpcEngine {
     pub async fn init_client_input(
         &self,
         client_id: ClientId,
-        shares: Vec<RobustShare<Fr>>,
+        shares: Vec<RobustShare<F>>,
     ) -> Result<(), String> {
         if !self.is_ready() {
             return Err("MPC engine not ready".into());
@@ -144,7 +163,7 @@ impl HoneyBadgerMpcEngine {
     async fn reserve_random_shares(
         &self,
         num_shares: usize,
-    ) -> Result<Vec<RobustShare<Fr>>, String> {
+    ) -> Result<Vec<RobustShare<F>>, String> {
         loop {
             let attempt = {
                 let mut node = self.node.lock().await;
@@ -188,7 +207,7 @@ impl HoneyBadgerMpcEngine {
     pub async fn get_client_shares(
         &self,
         client_id: ClientId,
-    ) -> Result<Vec<RobustShare<Fr>>, String> {
+    ) -> Result<Vec<RobustShare<F>>, String> {
         let all_inputs = self.wait_for_inputs().await?;
         all_inputs
             .get(&client_id)
@@ -212,7 +231,7 @@ impl HoneyBadgerMpcEngine {
     /// Note: This method waits for all inputs to be received before returning.
     pub async fn get_all_client_inputs(
         &self,
-    ) -> Result<Vec<(ClientId, Vec<RobustShare<Fr>>)>, String> {
+    ) -> Result<Vec<(ClientId, Vec<RobustShare<F>>)>, String> {
         let all_inputs = self.wait_for_inputs().await?;
         Ok(all_inputs
             .into_iter()
@@ -223,7 +242,7 @@ impl HoneyBadgerMpcEngine {
     /// Wait for all client inputs to be received
     ///
     /// Uses the InputServer's wait_for_all_inputs method with a default timeout.
-    async fn wait_for_inputs(&self) -> Result<std::collections::HashMap<ClientId, Vec<RobustShare<Fr>>>, String> {
+    async fn wait_for_inputs(&self) -> Result<std::collections::HashMap<ClientId, Vec<RobustShare<F>>>, String> {
         let mut node = self.node.lock().await;
         node.preprocess
             .input
@@ -300,9 +319,9 @@ impl HoneyBadgerMpcEngine {
         let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
 
         // Create the MPC node
-        let node = <HoneyBadgerMPCNode<Fr, RBCImpl> as MPCProtocol<
-            Fr,
-            RobustShare<Fr>,
+        let node = <HoneyBadgerMPCNode<F, RBCImpl> as MPCProtocol<
+            F,
+            RobustShare<F>,
             QuicNetworkManager,
         >>::setup(party_id, mpc_opts, input_ids)
         .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
@@ -316,6 +335,7 @@ impl HoneyBadgerMpcEngine {
             node: Arc::new(Mutex::new(node)),
             ready: AtomicBool::new(false),
             mul_session_counter: Arc::new(Mutex::new(0)),
+            group_marker: PhantomData,
         }))
     }
 
@@ -327,7 +347,7 @@ impl HoneyBadgerMpcEngine {
         n: usize,
         t: usize,
         net: Arc<QuicNetworkManager>,
-        node: HoneyBadgerMPCNode<Fr, RBCImpl>,
+        node: HoneyBadgerMPCNode<F, RBCImpl>,
     ) -> Arc<Self> {
         // Wrap the provided node so this engine can access it via async locks.
         // Note: This currently clones/moves a node instance rather than sharing the
@@ -345,6 +365,7 @@ impl HoneyBadgerMpcEngine {
             // Assume the provided node has been preprocessed already in tests; callers can override via start()/preprocess().
             ready: AtomicBool::new(true),
             mul_session_counter: Arc::new(Mutex::new(0)),
+            group_marker: PhantomData,
         })
     }
 
@@ -371,7 +392,7 @@ impl HoneyBadgerMpcEngine {
         let share = Self::decode_share(share_bytes)?;
 
         // Decode the generator point
-        let generator = G1::deserialize_compressed(&generator_bytes[..])
+        let generator = G::deserialize_compressed(&generator_bytes[..])
             .map_err(|e| format!("deserialize generator: {}", e))?;
 
         // Compute partial point: share_value * generator
@@ -436,9 +457,9 @@ impl HoneyBadgerMpcEngine {
                     entry.partial_points.iter().take(required).cloned().collect();
 
                 // Decode partial points
-                let mut points: Vec<(usize, G1)> = Vec::with_capacity(collected.len());
+                let mut points: Vec<(usize, G)> = Vec::with_capacity(collected.len());
                 for (share_id, bytes) in &collected {
-                    let pt = <G1 as CurveGroup>::Affine::deserialize_compressed(&bytes[..])
+                    let pt = <G as CurveGroup>::Affine::deserialize_compressed(&bytes[..])
                         .map_err(|e| format!("deserialize partial point: {}", e))?;
                     points.push((*share_id, pt.into()));
                 }
@@ -448,18 +469,18 @@ impl HoneyBadgerMpcEngine {
                 //
                 // RobustShare uses FFT evaluation domain (roots of unity).
                 // Share with id=i is evaluated at domain.element(i) = ω^i.
-                let domain = GeneralEvaluationDomain::<Fr>::new(self.n)
+                let domain = GeneralEvaluationDomain::<F>::new(self.n)
                     .ok_or_else(|| "No suitable FFT domain".to_string())?;
-                let eval_points: Vec<(usize, Fr)> = points
+                let eval_points: Vec<(usize, F)> = points
                     .iter()
                     .map(|(id, _)| (*id, domain.element(*id)))
                     .collect();
 
-                let mut result = G1::zero();
+                let mut result = G::zero();
                 for (i, (_id_i, pt_i)) in points.iter().enumerate() {
                     let x_i = eval_points[i].1;
                     // Compute Lagrange coefficient at x=0
-                    let mut lambda = Fr::from(1u64);
+                    let mut lambda = F::from(1u64);
                     for (j, _) in points.iter().enumerate() {
                         if i == j {
                             continue;
@@ -497,7 +518,18 @@ impl HoneyBadgerMpcEngine {
             .map_err(|e| format!("Tokio runtime not available: {}", e))
     }
 
-    fn encode_share(share: &RobustShare<Fr>) -> Result<Vec<u8>, String> {
+    #[inline]
+    fn field_from_i64(value: i64) -> F {
+        // Keep conversion consistent with reveal decoding (low-limb -> i64).
+        F::from(value as u64)
+    }
+
+    #[inline]
+    fn field_to_i64(value: F) -> i64 {
+        value.into_bigint().as_ref().first().copied().unwrap_or(0) as i64
+    }
+
+    fn encode_share(share: &RobustShare<F>) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         share
             .serialize_compressed(&mut out)
@@ -505,8 +537,8 @@ impl HoneyBadgerMpcEngine {
         Ok(out)
     }
 
-    fn decode_share(bytes: &[u8]) -> Result<RobustShare<Fr>, String> {
-        RobustShare::<Fr>::deserialize_compressed(bytes)
+    fn decode_share(bytes: &[u8]) -> Result<RobustShare<F>, String> {
+        RobustShare::<F>::deserialize_compressed(bytes)
             .map_err(|e| format!("deserialize share: {}", e))
     }
 
@@ -523,9 +555,9 @@ impl HoneyBadgerMpcEngine {
         // Deserialize shares from bytes
         // If input_len == 1, try to deserialize as a single RobustShare first
         // (Value::Share stores a single share's bytes)
-        let shares: Vec<RobustShare<Fr>> = if input_len == 1 {
+        let shares: Vec<RobustShare<F>> = if input_len == 1 {
             // Try to deserialize as a single share
-            let single_share: RobustShare<Fr> =
+            let single_share: RobustShare<F> =
                 CanonicalDeserialize::deserialize_compressed(shares_bytes)
                     .map_err(|e| format!("Failed to deserialize single share: {:?}", e))?;
             vec![single_share]
@@ -552,7 +584,11 @@ impl HoneyBadgerMpcEngine {
     }
 }
 
-impl MpcEngine for HoneyBadgerMpcEngine {
+impl<F, G> MpcEngine for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     fn protocol_name(&self) -> &'static str {
         "honeybadger-mpc"
     }
@@ -573,7 +609,7 @@ impl MpcEngine for HoneyBadgerMpcEngine {
         // Minimal support: ShareType::Int over Fr via direct embedding (u64 -> Fr).
         match (ty, clear) {
             (ShareType::SecretInt { .. }, Value::I64(v)) => {
-                let secret = Fr::from(*v as u64);
+                let secret = F::from(*v as u64);
                 let mut rng = ark_std::test_rng();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
@@ -586,7 +622,7 @@ impl MpcEngine for HoneyBadgerMpcEngine {
                 },
                 Value::Bool(b),
             ) => {
-                let secret = if *b { Fr::from(1u64) } else { Fr::from(0u64) };
+                let secret = if *b { F::from(1u64) } else { F::from(0u64) };
                 let mut rng = ark_std::test_rng();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
@@ -599,13 +635,7 @@ impl MpcEngine for HoneyBadgerMpcEngine {
                 let f = precision.f();
                 let scale = (1u64 << f) as f64;
                 let scaled_value = (fp.0 * scale) as i64;
-                // Map to field (handle negative values by wrapping)
-                let secret = if scaled_value >= 0 {
-                    Fr::from(scaled_value as u64)
-                } else {
-                    // For negative values, use field modular arithmetic
-                    -Fr::from((-scaled_value) as u64)
-                };
+                let secret = Self::field_from_i64(scaled_value);
                 let mut rng = ark_std::test_rng();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
@@ -721,7 +751,7 @@ impl MpcEngine for HoneyBadgerMpcEngine {
             // Check if we have enough shares to reconstruct
             if entry.shares.len() >= required {
                 let collected: Vec<_> = entry.shares.iter().take(required).cloned().collect();
-                let mut shares: Vec<RobustShare<Fr>> = Vec::with_capacity(collected.len());
+                let mut shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
                 for bytes in &collected {
                     shares.push(Self::decode_share(bytes)?);
                 }
@@ -740,7 +770,7 @@ impl MpcEngine for HoneyBadgerMpcEngine {
                     tracing::info!(
                         "  sorted_share[{}]: id={}, degree={}, value={:?}",
                         i, share.id, share.degree,
-                        share.share[0].into_bigint().0 // All limbs of the share value
+                        share.share[0].into_bigint().as_ref() // All limbs of the share value
                     );
                 }
 
@@ -752,12 +782,10 @@ impl MpcEngine for HoneyBadgerMpcEngine {
                         Value::Bool(!secret.is_zero())
                     }
                     ShareType::SecretInt { .. } => {
-                        let limbs: [u64; 4] = secret.into_bigint().0;
-                        Value::I64(limbs[0] as i64)
+                        Value::I64(Self::field_to_i64(secret))
                     }
                     ShareType::SecretFixedPoint { precision } => {
-                        let limbs: [u64; 4] = secret.into_bigint().0;
-                        let scaled_value = limbs[0] as i64;
+                        let scaled_value = Self::field_to_i64(secret);
                         // Convert from fixed-point scaled integer back to f64
                         let f = precision.f();
                         let scale = (1u64 << f) as f64;
@@ -863,7 +891,7 @@ impl MpcEngine for HoneyBadgerMpcEngine {
                         .cloned()
                         .collect();
 
-                    let mut decoded_shares: Vec<RobustShare<Fr>> = Vec::with_capacity(collected.len());
+                    let mut decoded_shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
                     for bytes in &collected {
                         decoded_shares.push(Self::decode_share(bytes)?);
                     }
@@ -877,12 +905,10 @@ impl MpcEngine for HoneyBadgerMpcEngine {
                             Value::Bool(!secret.is_zero())
                         }
                         ShareType::SecretInt { .. } => {
-                            let limbs: [u64; 4] = secret.into_bigint().0;
-                            Value::I64(limbs[0] as i64)
+                            Value::I64(Self::field_to_i64(secret))
                         }
                         ShareType::SecretFixedPoint { precision } => {
-                            let limbs: [u64; 4] = secret.into_bigint().0;
-                            let scaled_value = limbs[0] as i64;
+                            let scaled_value = Self::field_to_i64(secret);
                             let f = precision.f();
                             let scale = (1u64 << f) as f64;
                             let float_value = scaled_value as f64 / scale;
@@ -920,6 +946,20 @@ impl MpcEngine for HoneyBadgerMpcEngine {
 
     fn threshold(&self) -> usize {
         self.t
+    }
+
+    fn curve_config(&self) -> MpcCurveConfig {
+        if TypeId::of::<G>() == TypeId::of::<ark_bls12_381::G1Projective>() {
+            MpcCurveConfig::Bls12_381
+        } else if TypeId::of::<G>() == TypeId::of::<ark_bn254::G1Projective>() {
+            MpcCurveConfig::Bn254
+        } else if TypeId::of::<G>() == TypeId::of::<ark_curve25519::EdwardsProjective>() {
+            MpcCurveConfig::Curve25519
+        } else if TypeId::of::<G>() == TypeId::of::<ark_ed25519::EdwardsProjective>() {
+            MpcCurveConfig::Ed25519
+        } else {
+            F::CURVE_CONFIG
+        }
     }
 
     fn supports_multiplication(&self) -> bool { true }
@@ -1005,7 +1045,11 @@ impl MpcEngine for HoneyBadgerMpcEngine {
 use crate::net::mpc_engine::AsyncMpcEngine;
 
 #[async_trait::async_trait]
-impl AsyncMpcEngine for HoneyBadgerMpcEngine {
+impl<F, G> AsyncMpcEngine for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     async fn multiply_share_async(
         &self,
         ty: ShareType,
@@ -1052,7 +1096,11 @@ impl AsyncMpcEngine for HoneyBadgerMpcEngine {
     }
 }
 
-impl MpcEngineClientOps for HoneyBadgerMpcEngine {
+impl<F, G> MpcEngineClientOps for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     fn get_client_ids_sync(&self) -> Vec<ClientId> {
         // Use the async/sync bridging pattern
         match tokio::runtime::Handle::try_current() {
@@ -1170,7 +1218,11 @@ static RBC_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<RbcRegistry>> =
 static ABA_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<AbaRegistry>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(AbaRegistry::default()));
 
-impl MpcEngineConsensus for HoneyBadgerMpcEngine {
+impl<F, G> MpcEngineConsensus for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     fn rbc_broadcast(&self, message: &[u8]) -> Result<u64, String> {
         let mut registry = RBC_REGISTRY.lock();
 
@@ -1350,7 +1402,11 @@ impl MpcEngineConsensus for HoneyBadgerMpcEngine {
 }
 
 #[async_trait::async_trait]
-impl AsyncMpcEngineConsensus for HoneyBadgerMpcEngine {
+impl<F, G> AsyncMpcEngineConsensus for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     async fn rbc_broadcast_async(&self, message: &[u8]) -> Result<u64, String> {
         // Use sync version since registry operations are quick
         self.rbc_broadcast(message)

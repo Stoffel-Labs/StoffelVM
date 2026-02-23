@@ -4,15 +4,17 @@
 //! Key Generation) nodes, handling connection management, ECDH public key exchange,
 //! and AVSS message routing.
 //!
+//! QUIC/TLS (including ALPN and certificates) provides transport authentication
+//! and peer identity. The AVSS ECDH keys exchanged here are used for payload
+//! confidentiality inside ADKG protocol messages. These mechanisms are
+//! complementary and intentionally both required.
+//!
 //! The server is generic over a `(F, G)` field/curve pair. Use the type aliases
 //! `Bls12381AdkgServer` and `Bn254AdkgServer` for the supported configurations.
 
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_ff::{FftField, PrimeField};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
-use ark_std::UniformRand;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 use stoffelmpc_mpc::avss_mpc::AvssSessionId;
@@ -79,9 +81,10 @@ where
     network_builder: Option<QuicNetworkManager>,
     /// Network manager Arc - created when start() is called
     pub network: Option<Arc<QuicNetworkManager>>,
-    /// This party's ECDH secret key
+    /// This party's AVSS ECDH secret key used for protocol payload encryption.
+    /// Transport identity/authentication is handled separately by QUIC/TLS.
     sk_i: F,
-    /// This party's ECDH public key
+    /// This party's AVSS ECDH public key.
     pk_i: G,
     /// Collected public keys of all parties (populated after exchange)
     pk_map: Option<Arc<Vec<G>>>,

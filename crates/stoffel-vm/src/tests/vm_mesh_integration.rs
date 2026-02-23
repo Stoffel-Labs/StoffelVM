@@ -233,7 +233,7 @@ async fn test_vm_mesh_full_integration() {
         let mut vm = VirtualMachine::new();
 
         // Attach MPC engine to VM, wrapping the already-running HB node for this party
-        let mpc_engine = HoneyBadgerMpcEngine::from_existing_node(
+        let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             instance_id,
             party_id,
             n_parties,
@@ -526,7 +526,7 @@ async fn test_vm_mesh_average_salary_integration() {
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
     for party_id in 0..n_parties {
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             instance_id,
             party_id,
             n_parties,
@@ -1190,7 +1190,7 @@ async fn test_vm_mesh_output_client_integration() {
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
     for party_id in 0..n_parties {
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             instance_id,
             party_id,
             n_parties,
@@ -1628,7 +1628,7 @@ async fn test_vm_mesh_matrix_average_integration() {
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
     for party_id in 0..n_parties {
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             instance_id,
             party_id,
             n_parties,
@@ -2318,7 +2318,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
     for party_id in 0..n_parties {
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             instance_id,
             party_id,
             n_parties,
@@ -3207,7 +3207,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
     for party_id in 0..n_parties {
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             instance_id,
             party_id,
             n_parties,

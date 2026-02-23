@@ -1191,6 +1191,39 @@ fn share_open_exp(ctx: ForeignFunctionContext) -> Result<Value, String> {
                 .map_err(|e| format!("serialize generator: {}", e))?;
             buf
         }
+        "bn254-g1" => {
+            use ark_bn254::G1Projective;
+            use ark_ec::{CurveGroup, PrimeGroup};
+            use ark_serialize::CanonicalSerialize;
+            let gen = G1Projective::generator();
+            let mut buf = Vec::new();
+            gen.into_affine()
+                .serialize_compressed(&mut buf)
+                .map_err(|e| format!("serialize generator: {}", e))?;
+            buf
+        }
+        "curve25519-edwards" => {
+            use ark_curve25519::EdwardsProjective;
+            use ark_ec::{CurveGroup, PrimeGroup};
+            use ark_serialize::CanonicalSerialize;
+            let gen = EdwardsProjective::generator();
+            let mut buf = Vec::new();
+            gen.into_affine()
+                .serialize_compressed(&mut buf)
+                .map_err(|e| format!("serialize generator: {}", e))?;
+            buf
+        }
+        "ed25519-edwards" => {
+            use ark_ec::{CurveGroup, PrimeGroup};
+            use ark_ed25519::EdwardsProjective;
+            use ark_serialize::CanonicalSerialize;
+            let gen = EdwardsProjective::generator();
+            let mut buf = Vec::new();
+            gen.into_affine()
+                .serialize_compressed(&mut buf)
+                .map_err(|e| format!("serialize generator: {}", e))?;
+            buf
+        }
         _ => return Err(format!("Unsupported curve: {}", curve_name)),
     };
 

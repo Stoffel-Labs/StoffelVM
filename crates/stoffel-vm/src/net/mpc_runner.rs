@@ -122,7 +122,7 @@ impl MpcRunner {
         node: HoneyBadgerMPCNode<Fr, RBCImpl>,
     ) -> Self {
         let mut vm = VirtualMachine::new();
-        let mpc_engine = HoneyBadgerMpcEngine::from_existing_node(
+        let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             instance_id,
             party_id,
             n_parties,
@@ -323,7 +323,7 @@ impl MpcRunnerBuilder {
         node: HoneyBadgerMPCNode<Fr, RBCImpl>,
     ) -> MpcRunner {
         let mut vm = VirtualMachine::new();
-        let mpc_engine = HoneyBadgerMpcEngine::from_existing_node(
+        let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             self.instance_id,
             self.party_id,
             self.n_parties,

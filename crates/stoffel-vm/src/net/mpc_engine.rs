@@ -2,6 +2,7 @@
 // Minimal trait needed by VMState and current HoneyBadger engine.
 
 use crate::net::client_store::ClientInputStore;
+use crate::net::curve::{MpcCurveConfig, MpcFieldKind};
 use std::any::Any;
 use stoffel_vm_types::core_types::{ShareType, Value};
 use stoffelnet::network_utils::ClientId;
@@ -108,6 +109,16 @@ pub trait MpcEngine: Send + Sync {
 
     /// Get the threshold parameter
     fn threshold(&self) -> usize;
+
+    /// MPC curve in use by this engine.
+    fn curve_config(&self) -> MpcCurveConfig {
+        MpcCurveConfig::default()
+    }
+
+    /// Share field used by this engine.
+    fn field_kind(&self) -> MpcFieldKind {
+        self.curve_config().field_kind()
+    }
 
     /// Whether this engine supports secure multiplication
     fn supports_multiplication(&self) -> bool { false }

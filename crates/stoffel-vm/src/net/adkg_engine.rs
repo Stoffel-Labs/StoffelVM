@@ -8,10 +8,14 @@
 // The ADKG protocol produces secret keys for threshold cryptography where no single party
 // knows the full secret, but any t+1 parties can collaborate to use it.
 //
+// Transport identity and authentication are handled by QUIC/TLS (ALPN + certificates).
+// AVSS ECDH keys are used separately for protocol payload confidentiality.
+//
 // The engine is generic over a (field, curve) pair `(F, G)` where `G: CurveGroup<ScalarField = F>`.
 // Only tested pairs from `AdkgCurveConfig` should be used; arbitrary pairs are not guaranteed
 // to work correctly with the AVSS protocol.
 
+use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
 use crate::net::mpc_engine::MpcEngine;
 use ark_ec::CurveGroup;
 use ark_ff::{FftField, PrimeField};
@@ -195,7 +199,8 @@ where
     /// Session counter for generating unique session IDs
     session_counter: Arc<Mutex<u64>>,
     ready: AtomicBool,
-    /// This party's secret key for ECDH in AVSS
+    /// This party's AVSS ECDH key used for payload confidentiality.
+    /// Transport identity/authentication is handled separately by TLS.
     sk_i: F,
     _marker: PhantomData<G>,
 }
@@ -213,8 +218,8 @@ where
     /// * `n` - Number of parties
     /// * `t` - Threshold (tolerates up to t malicious parties)
     /// * `net` - Network manager for communication
-    /// * `sk_i` - This party's secret key for ECDH
-    /// * `pk_map` - Public keys of all parties for ECDH
+    /// * `sk_i` - This party's AVSS ECDH secret key for share encryption
+    /// * `pk_map` - AVSS ECDH public keys from all parties
     pub fn new(
         instance_id: u64,
         party_id: usize,
@@ -272,7 +277,7 @@ where
     /// coordinate retrieval later. This party initiates the AVSS protocol
     /// with a randomly generated secret.
     pub async fn generate_random_share(&self, key_name: &str) -> Result<FeldmanShamirShare<F, G>, String> {
-        if !self.is_ready() {
+        if !self.ready.load(Ordering::SeqCst) {
             return Err("AVSS engine not ready".into());
         }
 
@@ -284,7 +289,7 @@ where
 
     /// Generate an AVSS share for a specific secret and store under the given key name.
     pub async fn generate_share_with_secret(&self, key_name: &str, secret: F) -> Result<FeldmanShamirShare<F, G>, String> {
-        if !self.is_ready() {
+        if !self.ready.load(Ordering::SeqCst) {
             return Err("AVSS engine not ready".into());
         }
 
@@ -490,7 +495,7 @@ pub type Ed25519AdkgEngine =
 
 impl<F, G> MpcEngine for AdkgMpcEngine<F, G>
 where
-    F: FftField + PrimeField + Send + Sync + 'static,
+    F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
 {
     fn protocol_name(&self) -> &'static str {
@@ -772,6 +777,10 @@ where
 
     fn threshold(&self) -> usize {
         self.t
+    }
+
+    fn curve_config(&self) -> MpcCurveConfig {
+        F::CURVE_CONFIG
     }
 
     fn supports_elliptic_curves(&self) -> bool { true }

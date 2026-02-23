@@ -4,7 +4,7 @@
 //! client input shares received from clients. VMs can then retrieve these
 //! shares to execute programs that require secret inputs.
 
-use ark_bls12_381::Fr;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
@@ -15,8 +15,8 @@ use stoffelnet::network_utils::ClientId;
 pub struct ClientInputEntry {
     /// The client's ID
     pub client_id: ClientId,
-    /// The shares provided by this client (indexed by input position)
-    pub shares: Vec<RobustShare<Fr>>,
+    /// Serialized RobustShare bytes provided by this client (indexed by input position)
+    pub share_bytes: Vec<Vec<u8>>,
     /// Timestamp when the shares were stored
     pub timestamp: std::time::SystemTime,
 }
@@ -39,15 +39,11 @@ impl ClientInputStore {
         }
     }
 
-    /// Store shares from a client
-    ///
-    /// # Arguments
-    /// * `client_id` - The ID of the client providing inputs
-    /// * `shares` - The secret shares from this client
-    pub fn store_client_input(&self, client_id: ClientId, shares: Vec<RobustShare<Fr>>) {
+    /// Store serialized share bytes from a client.
+    pub fn store_client_input_bytes(&self, client_id: ClientId, share_bytes: Vec<Vec<u8>>) {
         let entry = ClientInputEntry {
             client_id,
-            shares,
+            share_bytes,
             timestamp: std::time::SystemTime::now(),
         };
 
@@ -55,31 +51,58 @@ impl ClientInputStore {
         entries.insert(client_id, entry);
     }
 
-    /// Retrieve shares for a specific client
-    ///
-    /// # Arguments
-    /// * `client_id` - The ID of the client
-    ///
-    /// # Returns
-    /// `Some(shares)` if the client has provided inputs, `None` otherwise
-    pub fn get_client_input(&self, client_id: ClientId) -> Option<Vec<RobustShare<Fr>>> {
-        let entries = self.entries.read();
-        entries.get(&client_id).map(|entry| entry.shares.clone())
+    /// Store typed robust shares from a client.
+    pub fn store_client_input<F>(&self, client_id: ClientId, shares: Vec<RobustShare<F>>)
+    where
+        F: ark_ff::FftField,
+    {
+        let mut serialized = Vec::with_capacity(shares.len());
+        for share in shares {
+            let mut bytes = Vec::new();
+            if share.serialize_compressed(&mut bytes).is_ok() {
+                serialized.push(bytes);
+            }
+        }
+        self.store_client_input_bytes(client_id, serialized);
     }
 
-    /// Retrieve a specific share for a client by index
-    ///
-    /// # Arguments
-    /// * `client_id` - The ID of the client
-    /// * `index` - The index of the share (0-based)
-    ///
-    /// # Returns
-    /// `Some(share)` if found, `None` otherwise
-    pub fn get_client_share(&self, client_id: ClientId, index: usize) -> Option<RobustShare<Fr>> {
+    /// Retrieve serialized shares for a specific client.
+    pub fn get_client_input_bytes(&self, client_id: ClientId) -> Option<Vec<Vec<u8>>> {
+        let entries = self.entries.read();
+        entries.get(&client_id).map(|entry| entry.share_bytes.clone())
+    }
+
+    /// Retrieve a specific serialized share for a client by index.
+    pub fn get_client_share_bytes(&self, client_id: ClientId, index: usize) -> Option<Vec<u8>> {
         let entries = self.entries.read();
         entries
             .get(&client_id)
-            .and_then(|entry| entry.shares.get(index).cloned())
+            .and_then(|entry| entry.share_bytes.get(index).cloned())
+    }
+
+    /// Retrieve typed shares for a specific client.
+    pub fn get_client_input<F>(&self, client_id: ClientId) -> Option<Vec<RobustShare<F>>>
+    where
+        F: ark_ff::FftField,
+    {
+        let share_bytes = self.get_client_input_bytes(client_id)?;
+        let mut shares = Vec::with_capacity(share_bytes.len());
+        for bytes in share_bytes {
+            match RobustShare::<F>::deserialize_compressed(bytes.as_slice()) {
+                Ok(share) => shares.push(share),
+                Err(_) => return None,
+            }
+        }
+        Some(shares)
+    }
+
+    /// Retrieve a specific typed share for a client by index.
+    pub fn get_client_share<F>(&self, client_id: ClientId, index: usize) -> Option<RobustShare<F>>
+    where
+        F: ark_ff::FftField,
+    {
+        let bytes = self.get_client_share_bytes(client_id, index)?;
+        RobustShare::<F>::deserialize_compressed(bytes.as_slice()).ok()
     }
 
     /// Check if a client has provided inputs
@@ -93,7 +116,7 @@ impl ClientInputStore {
         let entries = self.entries.read();
         entries
             .get(&client_id)
-            .map(|entry| entry.shares.len())
+            .map(|entry| entry.share_bytes.len())
             .unwrap_or(0)
     }
 
@@ -143,7 +166,7 @@ impl ClientInputStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ff::PrimeField;
+    use ark_bls12_381::Fr;
     use stoffelmpc_mpc::common::SecretSharingScheme;
 
     #[test]
@@ -163,7 +186,7 @@ mod tests {
         assert!(store.has_client_input(client_id));
         assert_eq!(store.get_client_input_count(client_id), shares.len());
 
-        let retrieved = store.get_client_input(client_id).unwrap();
+        let retrieved: Vec<RobustShare<Fr>> = store.get_client_input(client_id).unwrap();
         assert_eq!(retrieved.len(), shares.len());
     }
 
@@ -179,7 +202,7 @@ mod tests {
         store.store_client_input(client_id, shares.clone());
 
         // Get specific share
-        let share_1 = store.get_client_share(client_id, 1).unwrap();
+        let share_1: RobustShare<Fr> = store.get_client_share(client_id, 1).unwrap();
         assert_eq!(share_1.share, shares[1].share);
     }
 
@@ -187,9 +210,9 @@ mod tests {
     fn test_list_and_clear() {
         let store = ClientInputStore::new();
 
-        store.store_client_input(1, vec![]);
-        store.store_client_input(2, vec![]);
-        store.store_client_input(3, vec![]);
+        store.store_client_input_bytes(1, vec![]);
+        store.store_client_input_bytes(2, vec![]);
+        store.store_client_input_bytes(3, vec![]);
 
         assert_eq!(store.len(), 3);
         let clients = store.list_clients();

@@ -781,7 +781,16 @@ pub extern "C" fn hb_engine_new(
         Arc::clone(boxed)
     };
 
-    match HoneyBadgerMpcEngine::new(instance_id, party_id, n, t, n_triples, n_random, net, Vec::new()) {
+    match HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::new(
+        instance_id,
+        party_id,
+        n,
+        t,
+        n_triples,
+        n_random,
+        net,
+        Vec::new(),
+    ) {
         Ok(engine) => {
             // engine is Arc<HoneyBadgerMpcEngine>, box it for stable FFI pointer
             Box::into_raw(Box::new(engine)) as *mut HBEngineOpaque

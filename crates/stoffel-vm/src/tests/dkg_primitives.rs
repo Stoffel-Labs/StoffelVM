@@ -104,7 +104,7 @@ async fn test_open_share_in_exp_known_value() {
     // Create engines from existing nodes
     let engines: Vec<Arc<HoneyBadgerMpcEngine>> = (0..n)
         .map(|i| {
-            HoneyBadgerMpcEngine::from_existing_node(
+            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
                 instance_id,
                 i,
                 n,
@@ -251,7 +251,7 @@ async fn test_simulated_dkg_flow() {
     // Create engines from existing nodes
     let engines: Vec<Arc<HoneyBadgerMpcEngine>> = (0..n)
         .map(|i| {
-            HoneyBadgerMpcEngine::from_existing_node(
+            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
                 instance_id,
                 i,
                 n,

@@ -36,7 +36,7 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_EXPECTED_CLIENT_COUNT=2
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -72,7 +72,7 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_EXPECTED_CLIENT_COUNT=2
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -103,7 +103,7 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_EXPECTED_CLIENT_COUNT=2
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -134,7 +134,7 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_EXPECTED_CLIENT_COUNT=2
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -165,7 +165,7 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_EXPECTED_CLIENT_COUNT=2
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -189,7 +189,6 @@ services:
     hostname: client0
     environment:
       - STOFFEL_ROLE=client
-      - STOFFEL_CLIENT_ID=0
       - STOFFEL_INPUTS=15
       - STOFFEL_SERVERS=172.28.0.10:10000,172.28.0.11:9001,172.28.0.12:9002,172.28.0.13:9003,172.28.0.14:9004
       - STOFFEL_N_PARTIES=5
@@ -223,7 +222,6 @@ services:
     hostname: client1
     environment:
       - STOFFEL_ROLE=client
-      - STOFFEL_CLIENT_ID=1
       - STOFFEL_INPUTS=25
       - STOFFEL_SERVERS=172.28.0.10:10000,172.28.0.11:9001,172.28.0.12:9002,172.28.0.13:9003,172.28.0.14:9004
       - STOFFEL_N_PARTIES=5

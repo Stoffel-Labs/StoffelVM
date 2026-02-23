@@ -7,6 +7,7 @@ pub mod adkg_engine;
 pub mod adkg_server;
 pub mod backend;
 pub mod client_store;
+pub mod curve;
 pub mod discovery;
 #[cfg(feature = "honeybadger")]
 pub mod hb_engine;
@@ -28,6 +29,7 @@ pub use p2p::{
 
 // Re-export backend selection
 pub use backend::MpcBackendKind;
+pub use curve::{MpcCurveConfig, MpcFieldKind};
 
 // Re-export MPC helpers (HB-specific helpers gated)
 #[cfg(feature = "honeybadger")]

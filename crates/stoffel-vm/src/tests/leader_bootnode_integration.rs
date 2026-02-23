@@ -441,7 +441,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
     for party_id in 0..n_parties {
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             instance_id,
             party_id,
             n_parties,

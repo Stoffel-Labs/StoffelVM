@@ -338,67 +338,102 @@ pub async fn spawn_receive_loops(
     n_parties: usize,
 ) -> mpsc::Receiver<(PartyId, Vec<u8>)> {
     let (tx, rx) = mpsc::channel::<(PartyId, Vec<u8>)>(1024);
+    let scan_tx = tx.clone();
+    let scan_net = net.clone();
+    tokio::spawn(async move {
+        let mut spawned_server_ids = std::collections::HashSet::new();
+        let mut spawned_client_ids = std::collections::HashSet::new();
 
-    // Get all established connections (server connections are to other MPC parties)
-    let connections = net.get_all_server_connections();
-    eprintln!(
-        "[party {}] spawn_receive_loops: found {} connections",
-        node_id,
-        connections.len()
-    );
+        loop {
+            // Server-to-server connections (MPC parties)
+            for (derived_id, connection) in scan_net.get_all_server_connections() {
+                let sender_id = connection.remote_party_id().unwrap_or(derived_id);
+                if sender_id >= n_parties {
+                    eprintln!(
+                        "[party {}] Skipping non-party server connection {} (sender_id={}, n_parties={})",
+                        node_id,
+                        derived_id,
+                        sender_id,
+                        n_parties
+                    );
+                    continue;
+                }
 
-    // Spawn a receive loop for each MPC peer connection (party IDs 0 to n_parties-1)
-    // Skip bootnode and other non-MPC connections (which have large random UUIDs)
-    for (peer_id, connection) in connections {
-        // Only process connections to MPC peers (party IDs < n_parties)
-        if peer_id >= n_parties {
-            eprintln!(
-                "[party {}] Skipping receive loop for non-MPC connection {} (bootnode/other)",
-                node_id, peer_id
-            );
-            continue;
-        }
-        let txx = tx.clone();
-        let conn_node_id = node_id;
-        let pid = peer_id;
-        eprintln!(
-            "[party {}] Spawning receive loop for peer {}",
-            conn_node_id, pid
-        );
+                if !spawned_server_ids.insert(sender_id) {
+                    continue;
+                }
 
-        tokio::spawn(async move {
-            eprintln!(
-                "[party {}] Receive loop started for peer {}",
-                conn_node_id, pid
-            );
-            loop {
-                match connection.receive().await {
-                    Ok(data) => {
-                        eprintln!(
-                            "[party {}] Received {} bytes from peer {}",
-                            conn_node_id,
-                            data.len(),
-                            pid
-                        );
-                        if let Err(e) = txx.send((pid, data)).await {
-                            eprintln!(
-                                "[party {}] Failed to forward message from peer {}: {:?}",
-                                conn_node_id, pid, e
-                            );
-                            break;
+                let txx = scan_tx.clone();
+                let conn_node_id = node_id;
+                eprintln!(
+                    "[party {}] Spawning receive loop for server connection {} (sender_id={})",
+                    conn_node_id, derived_id, sender_id
+                );
+
+                tokio::spawn(async move {
+                    loop {
+                        match connection.receive().await {
+                            Ok(data) => {
+                                if let Err(e) = txx.send((sender_id, data)).await {
+                                    eprintln!(
+                                        "[party {}] Failed to forward server message from {}: {:?}",
+                                        conn_node_id, sender_id, e
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[party {}] Server connection {} closed: {}",
+                                    conn_node_id, sender_id, e
+                                );
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "[party {}] Connection to peer {} closed: {}",
-                            conn_node_id, pid, e
-                        );
-                        break;
-                    }
-                }
+                });
             }
-        });
-    }
+
+            // Client-to-server connections (external input clients)
+            for (client_id, connection) in scan_net.get_all_client_connections() {
+                if !spawned_client_ids.insert(client_id) {
+                    continue;
+                }
+
+                let txx = scan_tx.clone();
+                let conn_node_id = node_id;
+                eprintln!(
+                    "[party {}] Spawning receive loop for client connection {}",
+                    conn_node_id, client_id
+                );
+
+                tokio::spawn(async move {
+                    loop {
+                        match connection.receive().await {
+                            Ok(data) => {
+                                if let Err(e) = txx.send((client_id, data)).await {
+                                    eprintln!(
+                                        "[party {}] Failed to forward client message from {}: {:?}",
+                                        conn_node_id, client_id, e
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[party {}] Client connection {} closed: {}",
+                                    conn_node_id, client_id, e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
 
     rx
 }

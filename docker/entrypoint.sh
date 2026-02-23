@@ -4,19 +4,34 @@ set -e
 # StoffelVM Docker Entrypoint Script
 # Handles both leader and party node startup with proper coordination
 
+validate_env() {
+    if [ -n "${STOFFEL_CLIENT_ID:-}" ]; then
+        echo "ERROR: STOFFEL_CLIENT_ID is no longer supported."
+        echo "Client IDs are now transport-derived. Remove STOFFEL_CLIENT_ID."
+        exit 2
+    fi
+
+    if [ -n "${STOFFEL_EXPECTED_CLIENTS:-}" ]; then
+        echo "ERROR: STOFFEL_EXPECTED_CLIENTS is no longer supported."
+        echo "Use STOFFEL_EXPECTED_CLIENT_COUNT instead."
+        exit 2
+    fi
+}
+
+validate_env
+
 echo "=========================================="
 echo "StoffelVM Node Startup"
 echo "=========================================="
 echo "Role: ${STOFFEL_ROLE}"
 if [ "${STOFFEL_ROLE}" = "client" ]; then
-    echo "Client ID: ${STOFFEL_CLIENT_ID}"
     echo "Inputs: ${STOFFEL_INPUTS}"
     echo "Servers: ${STOFFEL_SERVERS}"
 else
     echo "Party ID: ${STOFFEL_PARTY_ID}"
     echo "Bind Address: ${STOFFEL_BIND_ADDR}"
     echo "Bootstrap: ${STOFFEL_BOOTSTRAP_ADDR:-N/A}"
-    echo "Expected Clients: ${STOFFEL_EXPECTED_CLIENTS:-none}"
+    echo "Expected Client Count: ${STOFFEL_EXPECTED_CLIENT_COUNT:-none}"
 fi
 echo "N Parties: ${STOFFEL_N_PARTIES}"
 echo "Threshold: ${STOFFEL_THRESHOLD}"
@@ -68,7 +83,6 @@ build_command() {
     if [ "${STOFFEL_ROLE}" = "client" ]; then
         # Client mode: connect to servers and submit inputs
         cmd="${cmd} --client"
-        cmd="${cmd} --client-id ${STOFFEL_CLIENT_ID}"
         cmd="${cmd} --inputs ${STOFFEL_INPUTS}"
         cmd="${cmd} --servers ${STOFFEL_SERVERS}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
@@ -100,9 +114,9 @@ build_command() {
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD}"
     fi
 
-    # Add expected clients if specified (for leader and party modes)
-    if [ -n "${STOFFEL_EXPECTED_CLIENTS}" ]; then
-        cmd="${cmd} --expected-clients ${STOFFEL_EXPECTED_CLIENTS}"
+    # Add expected client count if specified (for leader and party modes)
+    if [ -n "${STOFFEL_EXPECTED_CLIENT_COUNT}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
+        cmd="${cmd} --expected-client-count ${STOFFEL_EXPECTED_CLIENT_COUNT}"
     fi
 
     # Add optional trace flags
@@ -139,7 +153,7 @@ main() {
 
         # Add startup delay to let servers complete preprocessing
         DELAY=${STOFFEL_CLIENT_DELAY:-30}
-        echo "Client ${STOFFEL_CLIENT_ID}: waiting ${DELAY}s for servers to complete preprocessing..."
+        echo "Client: waiting ${DELAY}s for servers to complete preprocessing..."
         sleep $DELAY
 
         # Wait for first server to be reachable
