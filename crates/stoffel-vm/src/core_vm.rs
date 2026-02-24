@@ -271,7 +271,8 @@ impl VirtualMachine {
             };
 
             // Send via MPC engine
-            ctx.vm_state.send_output_to_client(client_id, &share_bytes, input_len)?;
+            ctx.vm_state
+                .send_output_to_client(client_id, &share_bytes, input_len)?;
 
             Ok(Value::Bool(true))
         });

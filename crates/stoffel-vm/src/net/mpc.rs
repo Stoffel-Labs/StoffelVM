@@ -5,9 +5,9 @@
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "honeybadger")]
-use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_TOTAL_BITS;
-#[cfg(feature = "honeybadger")]
 use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_FRACTIONAL_BITS;
+#[cfg(feature = "honeybadger")]
+use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_TOTAL_BITS;
 #[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNodeOpts;
 

@@ -7,35 +7,38 @@ use std::str::FromStr;
 use ark_ec::{CurveGroup, PrimeGroup};
 #[cfg(feature = "honeybadger")]
 use ark_ff::PrimeField;
+#[cfg(feature = "honeybadger")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "honeybadger")]
+use std::collections::HashSet;
 use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "honeybadger")]
-use std::collections::HashSet;
-#[cfg(feature = "honeybadger")]
-use serde::{Deserialize, Serialize};
 use stoffel_vm::core_vm::VirtualMachine;
-use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
+#[cfg(feature = "adkg")]
+use stoffel_vm::net::avss_server::{
+    AvssQuicConfig, Bls12381AvssServer, Bn254AvssServer, Curve25519AvssServer, Ed25519AvssServer,
+};
+#[cfg(feature = "honeybadger")]
+use stoffel_vm::net::curve::SupportedMpcField;
 #[cfg(feature = "honeybadger")]
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
 #[cfg(feature = "honeybadger")]
-use stoffel_vm::net::curve::SupportedMpcField;
-use stoffel_vm::net::{
-    program_id_from_bytes, register_and_wait_for_session_with_program,
-    run_bootnode_with_config,
-};
-#[cfg(feature = "honeybadger")]
 use stoffel_vm::net::{honeybadger_node_opts, spawn_receive_loops};
+use stoffel_vm::net::{
+    program_id_from_bytes, register_and_wait_for_session_with_program, run_bootnode_with_config,
+};
+use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 use stoffel_vm_types::compiled_binary::CompiledBinary;
 #[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 #[cfg(feature = "honeybadger")]
-use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
-#[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::common::MPCProtocol;
 #[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+#[cfg(feature = "honeybadger")]
+use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 #[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
 #[cfg(feature = "honeybadger")]
@@ -43,8 +46,6 @@ use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
-#[cfg(feature = "adkg")]
-use stoffel_vm::net::adkg_server::{AdkgQuicConfig, Bls12381AdkgServer, Bn254AdkgServer};
 
 fn is_flag_present(raw_args: &[String], flag: &str) -> bool {
     raw_args
@@ -54,10 +55,7 @@ fn is_flag_present(raw_args: &[String], flag: &str) -> bool {
 
 fn fail_removed_flag(raw_args: &[String], old_flag: &str, replacement_hint: &str) {
     if is_flag_present(raw_args, old_flag) {
-        eprintln!(
-            "Error: `{}` was removed. {}",
-            old_flag, replacement_hint
-        );
+        eprintln!("Error: `{}` was removed. {}", old_flag, replacement_hint);
         exit(2);
     }
 }
@@ -163,7 +161,9 @@ async fn sync_client_set_across_parties(
         let mut progressed = false;
         for (derived_id, connection) in net.get_all_server_connections() {
             let sender_id = connection.remote_party_id().unwrap_or(derived_id);
-            if sender_id >= n_parties || sender_id == my_id || confirmed_parties.contains(&sender_id)
+            if sender_id >= n_parties
+                || sender_id == my_id
+                || confirmed_parties.contains(&sender_id)
             {
                 continue;
             }
@@ -637,10 +637,8 @@ async fn main() {
             }
             "--expected-client-count" => {
                 if let Some(v) = args_iter.next() {
-                    expected_client_count = Some(
-                        v.parse()
-                            .expect("Invalid --expected-client-count"),
-                    );
+                    expected_client_count =
+                        Some(v.parse().expect("Invalid --expected-client-count"));
                 }
             }
             "--stun-servers" => {
@@ -739,7 +737,11 @@ async fn main() {
         }
 
         if server_addrs.len() != n {
-            eprintln!("Warning: number of servers ({}) doesn't match n_parties ({})", server_addrs.len(), n);
+            eprintln!(
+                "Warning: number of servers ({}) doesn't match n_parties ({})",
+                server_addrs.len(),
+                n
+            );
         }
 
         let curve_config = if let Some(ref name) = mpc_curve {
@@ -812,12 +814,18 @@ async fn main() {
                                 match connection.receive().await {
                                     Ok(data) => {
                                         if let Err(e) = tx.send((peer, data)).await {
-                                            eprintln!("[{}] Failed to forward message: {:?}", client_tag, e);
+                                            eprintln!(
+                                                "[{}] Failed to forward message: {:?}",
+                                                client_tag, e
+                                            );
                                             break;
                                         }
                                     }
                                     Err(e) => {
-                                        eprintln!("[{}] Connection to server closed: {}", client_tag, e);
+                                        eprintln!(
+                                            "[{}] Connection to server closed: {}",
+                                            client_tag, e
+                                        );
                                         break;
                                     }
                                 }
@@ -839,8 +847,7 @@ async fn main() {
                         }
                         eprintln!(
                             "[client] Connection attempt {} failed: {}, retrying...",
-                            retry_count,
-                            e
+                            retry_count, e
                         );
                         tokio::time::sleep(retry_delay).await;
                     }
@@ -855,7 +862,10 @@ async fn main() {
         };
         eprintln!("[client {}] Derived transport client ID", cid);
 
-        eprintln!("[client {}] Connected to all servers, starting input protocol...", cid);
+        eprintln!(
+            "[client {}] Connected to all servers, starting input protocol...",
+            cid
+        );
 
         // Spawn protocol processing with the selected field.
         let network_for_process = network.clone();
@@ -879,7 +889,10 @@ async fn main() {
         let timeout_duration = Duration::from_secs(120);
         match tokio::time::timeout(timeout_duration, process_handle).await {
             Ok(Ok(Ok(()))) => {
-                eprintln!("[client {}] Successfully submitted inputs to MPC network", cid);
+                eprintln!(
+                    "[client {}] Successfully submitted inputs to MPC network",
+                    cid
+                );
             }
             Ok(Ok(Err(e))) => {
                 eprintln!("[client {}] Input protocol failed: {}", cid, e);
@@ -890,7 +903,10 @@ async fn main() {
                 exit(22);
             }
             Err(_) => {
-                eprintln!("[client {}] Timeout waiting for input protocol to complete", cid);
+                eprintln!(
+                    "[client {}] Timeout waiting for input protocol to complete",
+                    cid
+                );
                 exit(23);
             }
         }
@@ -1063,7 +1079,11 @@ async fn main() {
 
         eprintln!(
             "[leader/party {}] Session started: instance_id={}, n={}, t={}, entry={}",
-            my_id, session_info.instance_id, session_info.n_parties, session_info.threshold, agreed_entry
+            my_id,
+            session_info.instance_id,
+            session_info.n_parties,
+            session_info.threshold,
+            agreed_entry
         );
 
         let net = Arc::new(mgr);
@@ -1141,7 +1161,11 @@ async fn main() {
 
         eprintln!(
             "[party {}] Session started: instance_id={}, n={}, t={}, entry={}",
-            my_id, session_info.instance_id, session_info.n_parties, session_info.threshold, agreed_entry
+            my_id,
+            session_info.instance_id,
+            session_info.n_parties,
+            session_info.threshold,
+            agreed_entry
         );
 
         let net = Arc::new(mgr);
@@ -1341,7 +1365,11 @@ async fn main() {
 
         eprintln!(
             "[party {}] Creating MPC engine (backend={}): instance_id={}, n={}, t={}",
-            my_id, backend_kind.name(), instance_id, n, t
+            my_id,
+            backend_kind.name(),
+            instance_id,
+            n,
+            t
         );
 
         // Debug: print established connections (server connections are to other MPC parties)
@@ -1416,47 +1444,50 @@ async fn main() {
                     exit(13);
                 }
 
-                eprintln!("[party {}] HoneyBadger MPC engine set, starting VM execution...", my_id);
+                eprintln!(
+                    "[party {}] HoneyBadger MPC engine set, starting VM execution...",
+                    my_id
+                );
             }
 
             #[cfg(feature = "adkg")]
             MpcBackendKind::Avss => {
                 eprintln!(
-                    "[party {}] Setting up ADKG backend (curve: {})...",
+                    "[party {}] Setting up AVSS backend (curve: {})...",
                     my_id,
                     curve_config.name()
                 );
 
-                // Macro to avoid duplicating ADKG setup for each curve
-                macro_rules! setup_adkg {
+                // Macro to avoid duplicating AVSS setup for each curve
+                macro_rules! setup_avss {
                     ($server_type:ty) => {{
-                        let mut adkg_server = <$server_type>::new(
+                        let mut avss_server = <$server_type>::new(
                             my_id,
                             n,
                             t,
                             instance_id,
                             (*net).clone(),
-                            AdkgQuicConfig::default(),
+                            AvssQuicConfig::default(),
                         );
 
                         // Start the server (converts network builder to Arc)
-                        let _adkg_net = match adkg_server.start() {
+                        let _avss_net = match avss_server.start() {
                             Ok(n) => n,
                             Err(e) => {
-                                eprintln!("[party {}] Failed to start ADKG server: {}", my_id, e);
+                                eprintln!("[party {}] Failed to start AVSS server: {}", my_id, e);
                                 exit(13);
                             }
                         };
 
                         // Ensure server lifecycle mirrors HoneyBadger setup.
-                        if let Err(e) = adkg_server.connect_to_peers().await {
-                            eprintln!("[party {}] Failed to connect ADKG peers: {}", my_id, e);
+                        if let Err(e) = avss_server.connect_to_peers().await {
+                            eprintln!("[party {}] Failed to connect AVSS peers: {}", my_id, e);
                             exit(13);
                         }
 
                         // Exchange ECDH public keys
                         eprintln!("[party {}] Exchanging ECDH public keys...", my_id);
-                        match adkg_server.exchange_public_keys().await {
+                        match avss_server.exchange_public_keys().await {
                             Ok(pk_map) => {
                                 eprintln!(
                                     "[party {}] PK exchange complete ({} keys collected)",
@@ -1470,23 +1501,23 @@ async fn main() {
                             }
                         }
 
-                        // Create ADKG engine
-                        let engine = match adkg_server.create_engine() {
+                        // Create AVSS engine
+                        let engine = match avss_server.create_engine().await {
                             Ok(e) => e,
                             Err(e) => {
-                                eprintln!("[party {}] Failed to create ADKG engine: {}", my_id, e);
+                                eprintln!("[party {}] Failed to create AVSS engine: {}", my_id, e);
                                 exit(14);
                             }
                         };
 
                         // Start the engine
                         if let Err(e) = engine.start_async().await {
-                            eprintln!("[party {}] Failed to start ADKG engine: {}", my_id, e);
+                            eprintln!("[party {}] Failed to start AVSS engine: {}", my_id, e);
                             exit(14);
                         }
 
                         // Spawn AVSS message receive/process loops
-                        if let Err(e) = adkg_server.spawn_message_loops(engine.clone()).await {
+                        if let Err(e) = avss_server.spawn_message_loops(engine.clone()).await {
                             eprintln!("[party {}] Failed to spawn message loops: {}", my_id, e);
                             exit(14);
                         }
@@ -1496,12 +1527,16 @@ async fn main() {
                 }
 
                 match curve_config {
-                    MpcCurveConfig::Bls12_381 => setup_adkg!(Bls12381AdkgServer),
-                    MpcCurveConfig::Bn254 => setup_adkg!(Bn254AdkgServer),
-                    MpcCurveConfig::Curve25519 | MpcCurveConfig::Ed25519 => unreachable!(),
+                    MpcCurveConfig::Bls12_381 => setup_avss!(Bls12381AvssServer),
+                    MpcCurveConfig::Bn254 => setup_avss!(Bn254AvssServer),
+                    MpcCurveConfig::Curve25519 => setup_avss!(Curve25519AvssServer),
+                    MpcCurveConfig::Ed25519 => setup_avss!(Ed25519AvssServer),
                 }
 
-                eprintln!("[party {}] ADKG engine set, starting VM execution...", my_id);
+                eprintln!(
+                    "[party {}] AVSS engine set, starting VM execution...",
+                    my_id
+                );
             }
         }
     }
@@ -1544,7 +1579,8 @@ Flags:
   --inputs <values>       Comma-separated input values (client mode)
   --servers <addrs>       Comma-separated server addresses (client mode)
   --expected-client-count <n>
-                          Number of clients to wait for (HoneyBadger party/leader mode)
+                          Number of client inputs to collect before starting computation
+                          (HoneyBadger only; ALPN handles routing, this controls coordination)
   -h, --help              Show this help
 
 Multi-Party Execution:

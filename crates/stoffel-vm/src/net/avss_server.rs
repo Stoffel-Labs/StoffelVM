@@ -1,44 +1,46 @@
-//! ADKG server with QUIC networking.
+//! AVSS server with QUIC networking.
 //!
-//! This module provides the networking layer for ADKG (Asynchronous Distributed
-//! Key Generation) nodes, handling connection management, ECDH public key exchange,
+//! This module provides the networking layer for AVSS (Asynchronous Verifiable
+//! Secret Sharing) nodes, handling connection management, ECDH public key exchange,
 //! and AVSS message routing.
 //!
 //! QUIC/TLS (including ALPN and certificates) provides transport authentication
 //! and peer identity. The AVSS ECDH keys exchanged here are used for payload
-//! confidentiality inside ADKG protocol messages. These mechanisms are
+//! confidentiality inside AVSS protocol messages. These mechanisms are
 //! complementary and intentionally both required.
 //!
 //! The server is generic over a `(F, G)` field/curve pair. Use the type aliases
-//! `Bls12381AdkgServer` and `Bn254AdkgServer` for the supported configurations.
+//! `Bls12381AvssServer`, `Bn254AvssServer`, `Curve25519AvssServer`, or
+//! `Ed25519AvssServer` for the supported configurations.
 
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_ff::{FftField, PrimeField};
 use ark_std::rand::SeedableRng;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use stoffelmpc_mpc::avss_mpc::AvssSessionId;
-use stoffelmpc_mpc::common::share::avss::AvssMessage;
-use stoffelnet::network_utils::Network;
-use stoffelnet::transports::quic::QuicNetworkManager;
+use stoffelnet::network_utils::{Network, Node};
+use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use super::adkg_engine::AdkgMpcEngine;
+use super::avss_engine::AvssMpcEngine;
 
 // ============================================================================
 // Type aliases for supported curve configurations
 // ============================================================================
 
-pub type Bls12381AdkgServer =
-    AdkgQuicServer<ark_bls12_381::Fr, ark_bls12_381::G1Projective>;
-pub type Bn254AdkgServer =
-    AdkgQuicServer<ark_bn254::Fr, ark_bn254::G1Projective>;
+pub type Bls12381AvssServer = AvssQuicServer<ark_bls12_381::Fr, ark_bls12_381::G1Projective>;
+pub type Bn254AvssServer = AvssQuicServer<ark_bn254::Fr, ark_bn254::G1Projective>;
+pub type Curve25519AvssServer =
+    AvssQuicServer<ark_curve25519::Fr, ark_curve25519::EdwardsProjective>;
+pub type Ed25519AvssServer = AvssQuicServer<ark_ed25519::Fr, ark_ed25519::EdwardsProjective>;
 
-/// Configuration for ADKG over QUIC
+/// Configuration for AVSS over QUIC
 #[derive(Debug, Clone)]
-pub struct AdkgQuicConfig {
+pub struct AvssQuicConfig {
     /// Timeout for public key exchange
     pub pk_exchange_timeout: Duration,
     /// Connection retry attempts
@@ -47,7 +49,7 @@ pub struct AdkgQuicConfig {
     pub connection_retry_delay: Duration,
 }
 
-impl Default for AdkgQuicConfig {
+impl Default for AvssQuicConfig {
     fn default() -> Self {
         Self {
             pk_exchange_timeout: Duration::from_secs(30),
@@ -57,14 +59,20 @@ impl Default for AdkgQuicConfig {
     }
 }
 
-/// An ADKG server node using QUIC networking.
+/// An AVSS server node using QUIC networking.
 ///
 /// Manages network setup, ECDH key exchange, and AVSS message routing
-/// for distributed key generation. Parallel structure to `HoneyBadgerQuicServer`.
+/// for the full AVSS MPC protocol (share generation, multiplication via Beaver
+/// triples, random share generation, and preprocessing).
+///
+/// ECDH keys are needed because AVSS encrypts share payloads with ECDH between
+/// parties (unlike HoneyBadger, which sends shares in plaintext over TLS).
+/// Transport authentication is handled separately by QUIC/TLS.
 ///
 /// Generic over `(F, G)` where `F` is the scalar field and `G` is the curve group.
-/// Use `Bls12381AdkgServer` or `Bn254AdkgServer` type aliases.
-pub struct AdkgQuicServer<F, G>
+/// Use the type aliases: `Bls12381AvssServer`, `Bn254AvssServer`,
+/// `Curve25519AvssServer`, or `Ed25519AvssServer`.
+pub struct AvssQuicServer<F, G>
 where
     F: FftField + PrimeField,
     G: CurveGroup<ScalarField = F> + PrimeGroup,
@@ -75,7 +83,7 @@ where
     pub n: usize,
     /// Threshold (tolerates up to t malicious parties)
     pub t: usize,
-    /// Instance ID for the ADKG session
+    /// Instance ID for the AVSS session
     pub instance_id: u64,
     /// Network manager builder - used during setup before start() is called
     network_builder: Option<QuicNetworkManager>,
@@ -89,17 +97,19 @@ where
     /// Collected public keys of all parties (populated after exchange)
     pk_map: Option<Arc<Vec<G>>>,
     /// Configuration
-    pub config: AdkgQuicConfig,
+    pub config: AvssQuicConfig,
+    /// Accept loop task handle
+    accept_task: Option<JoinHandle<()>>,
     /// Cancellation token for graceful shutdown
     shutdown_token: CancellationToken,
 }
 
-impl<F, G> AdkgQuicServer<F, G>
+impl<F, G> AvssQuicServer<F, G>
 where
     F: FftField + PrimeField + Send + Sync + 'static,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
-    /// Creates a new ADKG QUIC server.
+    /// Creates a new AVSS QUIC server.
     ///
     /// Generates a fresh ECDH key pair for this party.
     pub fn new(
@@ -108,7 +118,7 @@ where
         t: usize,
         instance_id: u64,
         network: QuicNetworkManager,
-        config: AdkgQuicConfig,
+        config: AvssQuicConfig,
     ) -> Self {
         // Generate ECDH key pair: sk_i random, pk_i = g * sk_i
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
@@ -126,18 +136,19 @@ where
             pk_i,
             pk_map: None,
             config,
+            accept_task: None,
             shutdown_token: CancellationToken::new(),
         }
     }
 
-    /// Creates an ADKG server with a pre-existing key pair (for testing).
+    /// Creates an AVSS server with a pre-existing key pair (for testing).
     pub fn with_keys(
         node_id: usize,
         n: usize,
         t: usize,
         instance_id: u64,
         network: QuicNetworkManager,
-        config: AdkgQuicConfig,
+        config: AvssQuicConfig,
         sk_i: F,
     ) -> Self {
         let pk_i = G::generator() * sk_i;
@@ -152,6 +163,7 @@ where
             pk_i,
             pk_map: None,
             config,
+            accept_task: None,
             shutdown_token: CancellationToken::new(),
         }
     }
@@ -163,7 +175,11 @@ where
         }
     }
 
-    /// Start the server: convert builder to shared Arc.
+    /// Start the server: convert builder to shared Arc and spawn accept loop.
+    ///
+    /// The accept loop handles incoming connections from peers that dial us.
+    /// After calling `start()`, call `connect_to_peers()` to establish outgoing
+    /// connections to all known peers.
     pub fn start(&mut self) -> Result<Arc<QuicNetworkManager>, String> {
         let mgr = self
             .network_builder
@@ -171,39 +187,111 @@ where
             .ok_or("Server already started")?;
         let net = Arc::new(mgr);
         self.network = Some(net.clone());
+
+        // Spawn accept loop to handle incoming connections
+        let mut acceptor = (*net).clone();
+        let node_id = self.node_id;
+        let shutdown_token = self.shutdown_token.clone();
+
+        let accept_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => {
+                        info!("[AVSS] Accept loop for node {} shutting down", node_id);
+                        break;
+                    }
+                    result = acceptor.accept() => {
+                        match result {
+                            Ok(connection) => {
+                                info!(
+                                    "[AVSS] Node {} accepted connection from {}",
+                                    node_id,
+                                    connection.remote_address()
+                                );
+                                // Connection is accepted; the peer's dialer will use
+                                // its own connection handle for send/receive.
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[AVSS] Node {} failed to accept connection: {}",
+                                    node_id, e
+                                );
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        self.accept_task = Some(accept_task);
+
+        info!(
+            "[AVSS] Server started for party {} (accept loop spawned)",
+            self.node_id
+        );
+
         Ok(net)
     }
 
-    /// Connect to all known peers.
+    /// Connect to all known peers by dialing each one.
+    ///
+    /// Must be called after `start()`. Establishes outgoing QUIC connections
+    /// to every registered peer. The accept loop (spawned in `start()`) handles
+    /// the incoming side of these connections on the remote peers.
     pub async fn connect_to_peers(&self) -> Result<(), String> {
-        let net = self
-            .network
-            .as_ref()
-            .ok_or("Server not started")?;
+        let net = self.network.as_ref().ok_or("Server not started")?;
 
-        let connections = net.get_all_server_connections();
-        let peer_addrs: Vec<_> = connections
+        let peers: Vec<(usize, SocketAddr)> = net
+            .parties()
             .iter()
-            .filter(|(id, _)| *id != self.node_id)
-            .map(|(id, conn)| (*id, conn.clone()))
+            .map(|p| (p.id(), p.address()))
             .collect();
 
+        // Clone the network manager to get mutable access for dialing
+        let mut dialer = (**net).clone();
+
         info!(
-            "[ADKG] Party {} connecting to {} peers",
+            "[AVSS] Party {} connecting to {} peers (including self)",
             self.node_id,
-            peer_addrs.len()
+            peers.len()
         );
 
-        // Connections are already established through discovery/session setup
-        // Just verify we have the right number of peers
-        let connected = net.parties().len();
-        if connected < self.n - 1 {
-            warn!(
-                "[ADKG] Party {} has {} connections, expected {}",
-                self.node_id,
-                connected,
-                self.n - 1
+        for (peer_id, peer_addr) in peers {
+            info!(
+                "[AVSS] Node {} connecting to peer {} at {}",
+                self.node_id, peer_id, peer_addr
             );
+
+            let mut retry_count = 0u32;
+            loop {
+                match dialer.connect_as_server(peer_addr).await {
+                    Ok(connection) => {
+                        info!(
+                            "[AVSS] Node {} connected to peer {} at {}",
+                            self.node_id,
+                            peer_id,
+                            connection.remote_address()
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        retry_count += 1;
+                        if retry_count >= self.config.max_connection_retries {
+                            warn!(
+                                "[AVSS] Node {} failed to connect to peer {} after {} attempts: {}",
+                                self.node_id, peer_id, retry_count, e
+                            );
+                            break;
+                        }
+                        info!(
+                            "[AVSS] Node {} attempt {} to peer {} failed: {}",
+                            self.node_id, retry_count, peer_id, e
+                        );
+                        tokio::time::sleep(self.config.connection_retry_delay).await;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -214,14 +302,10 @@ where
     /// Each party broadcasts its `pk_i = g * sk_i` and collects all others.
     /// Returns the collected public key map indexed by party ID.
     pub async fn exchange_public_keys(&mut self) -> Result<Arc<Vec<G>>, String> {
-        let net = self
-            .network
-            .as_ref()
-            .ok_or("Server not started")?
-            .clone();
+        let net = self.network.as_ref().ok_or("Server not started")?.clone();
 
         info!(
-            "[ADKG] Party {} starting public key exchange (n={})",
+            "[AVSS] Party {} starting public key exchange (n={})",
             self.node_id, self.n
         );
 
@@ -244,7 +328,7 @@ where
             }
             if let Err(e) = conn.send(&envelope).await {
                 error!(
-                    "[ADKG] Party {} failed to send PK to peer {}: {}",
+                    "[AVSS] Party {} failed to send PK to peer {}: {}",
                     self.node_id, peer_id, e
                 );
             }
@@ -255,8 +339,7 @@ where
         pk_map[self.node_id] = self.pk_i;
 
         let mut received = 1usize; // Count ourselves
-        let deadline =
-            std::time::Instant::now() + self.config.pk_exchange_timeout;
+        let deadline = std::time::Instant::now() + self.config.pk_exchange_timeout;
 
         // Create a channel for receiving PK exchange messages
         let (pk_tx, mut pk_rx) = mpsc::channel::<(usize, G)>(self.n);
@@ -273,7 +356,7 @@ where
                 match conn.receive().await {
                     Ok(data) => {
                         if data.len() < 4 {
-                            error!("[ADKG] Invalid PK message from peer {}", peer_id);
+                            error!("[AVSS] Invalid PK message from peer {}", peer_id);
                             return;
                         }
                         let sender_id =
@@ -284,17 +367,14 @@ where
                             }
                             Err(e) => {
                                 error!(
-                                    "[ADKG] Failed to deserialize PK from party {}: {:?}",
+                                    "[AVSS] Failed to deserialize PK from party {}: {:?}",
                                     sender_id, e
                                 );
                             }
                         }
                     }
                     Err(e) => {
-                        error!(
-                            "[ADKG] Failed to receive PK from peer {}: {}",
-                            peer_id, e
-                        );
+                        error!("[AVSS] Failed to receive PK from peer {}: {}", peer_id, e);
                     }
                 }
             });
@@ -317,7 +397,7 @@ where
                         pk_map[sender_id] = pk;
                         received += 1;
                         info!(
-                            "[ADKG] Party {} received PK from party {} ({}/{})",
+                            "[AVSS] Party {} received PK from party {} ({}/{})",
                             self.node_id, sender_id, received, self.n
                         );
                     }
@@ -343,7 +423,7 @@ where
         }
 
         info!(
-            "[ADKG] Party {} completed PK exchange with all {} parties",
+            "[AVSS] Party {} completed PK exchange with all {} parties",
             self.node_id, self.n
         );
 
@@ -352,22 +432,18 @@ where
         Ok(pk_arc)
     }
 
-    /// Create an ADKG engine using the collected public keys.
+    /// Create an AVSS engine using the collected public keys.
     ///
     /// Must be called after `exchange_public_keys()`.
-    pub fn create_engine(&self) -> Result<Arc<AdkgMpcEngine<F, G>>, String> {
-        let net = self
-            .network
-            .as_ref()
-            .ok_or("Server not started")?
-            .clone();
+    pub async fn create_engine(&self) -> Result<Arc<AvssMpcEngine<F, G>>, String> {
+        let net = self.network.as_ref().ok_or("Server not started")?.clone();
         let pk_map = self
             .pk_map
             .as_ref()
             .ok_or("Public keys not exchanged yet")?
             .clone();
 
-        AdkgMpcEngine::new(
+        AvssMpcEngine::new(
             self.instance_id,
             self.node_id,
             self.n,
@@ -376,20 +452,19 @@ where
             self.sk_i,
             pk_map,
         )
+        .await
     }
 
     /// Spawn AVSS message receive/process loops for all peer connections.
     ///
-    /// Incoming messages are deserialized as `AvssMessage` and routed to the engine.
+    /// Incoming messages are routed as raw bytes to the AVSS node via the engine.
+    /// With ALPN-based routing, these per-peer loops may be superseded by
+    /// per-protocol accept loops in the future.
     pub async fn spawn_message_loops(
         &self,
-        engine: Arc<AdkgMpcEngine<F, G>>,
+        engine: Arc<AvssMpcEngine<F, G>>,
     ) -> Result<mpsc::Receiver<Vec<u8>>, String> {
-        let net = self
-            .network
-            .as_ref()
-            .ok_or("Server not started")?
-            .clone();
+        let net = self.network.as_ref().ok_or("Server not started")?.clone();
 
         let (msg_tx, msg_rx) = mpsc::channel::<Vec<u8>>(1000);
 
@@ -402,37 +477,34 @@ where
             let engine = engine.clone();
             let tx = msg_tx.clone();
             let conn = conn.clone();
+            let net_clone = net.clone();
             let shutdown_token = self.shutdown_token.clone();
 
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _ = shutdown_token.cancelled() => {
-                            info!("[ADKG] Message loop for peer {} shutting down", peer_id);
+                            info!("[AVSS] Message loop for peer {} shutting down", peer_id);
                             break;
                         }
                         result = conn.receive() => {
                             match result {
                                 Ok(data) => {
-                                    // Try to deserialize as AVSS message
-                                    match bincode::deserialize::<AvssMessage<AvssSessionId>>(&data) {
-                                        Ok(avss_msg) => {
-                                            if let Err(e) = engine.process_message(avss_msg).await {
-                                                error!(
-                                                    "[ADKG] Party failed to process AVSS message from {}: {}",
-                                                    peer_id, e
-                                                );
-                                            }
-                                        }
-                                        Err(_) => {
-                                            // Not an AVSS message, forward as raw bytes
-                                            let _ = tx.send(data).await;
+                                    // Route raw bytes to the AVSS node with sender_id
+                                    if let Err(e) = engine.process_wrapped_message_with_network(peer_id, &data, net_clone.clone()).await {
+                                        // May fail to process non-protocol messages; forward as raw bytes
+                                        let _ = tx.send(data).await;
+                                        if !e.contains("deserialize") && !e.contains("process failed") {
+                                            error!(
+                                                "[AVSS] Party failed to process message from {}: {}",
+                                                peer_id, e
+                                            );
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     warn!(
-                                        "[ADKG] Connection to peer {} closed: {}",
+                                        "[AVSS] Connection to peer {} closed: {}",
                                         peer_id, e
                                     );
                                     break;
@@ -447,9 +519,12 @@ where
         Ok(msg_rx)
     }
 
-    /// Gracefully shut down the server, cancelling all message loops.
+    /// Gracefully shut down the server, cancelling accept loop and message loops.
     pub fn stop(&self) {
-        info!("[ADKG] Shutting down server for party {}", self.node_id);
+        info!("[AVSS] Shutting down server for party {}", self.node_id);
         self.shutdown_token.cancel();
+        if let Some(task) = &self.accept_task {
+            task.abort();
+        }
     }
 }

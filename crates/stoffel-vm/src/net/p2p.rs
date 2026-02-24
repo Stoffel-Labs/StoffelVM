@@ -692,9 +692,9 @@ impl NetworkManager for QuicNetworkManager {
                 match endpoint.connect(address, "localhost") {
                     Ok(connecting) => {
                         eprintln!("[quic] Awaiting connection handshake to {}", address);
-                        connecting
-                            .await
-                            .map_err(|e| format!("Failed to establish connection to {}: {}", address, e))?
+                        connecting.await.map_err(|e| {
+                            format!("Failed to establish connection to {}: {}", address, e)
+                        })?
                     }
                     Err(e) => {
                         // Server endpoint failed, create a dedicated client endpoint
@@ -706,25 +706,35 @@ impl NetworkManager for QuicNetworkManager {
                             .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
                         client_endpoint.set_default_client_config(client_config);
 
-                        let connecting = client_endpoint
-                            .connect(address, "localhost")
-                            .map_err(|e| format!("Failed to initiate connection to {}: {}", address, e))?;
+                        let connecting =
+                            client_endpoint.connect(address, "localhost").map_err(|e| {
+                                format!("Failed to initiate connection to {}: {}", address, e)
+                            })?;
 
-                        eprintln!("[quic] Awaiting connection handshake to {} (client endpoint)", address);
-                        connecting
-                            .await
-                            .map_err(|e| format!("Failed to establish connection to {}: {}", address, e))?
+                        eprintln!(
+                            "[quic] Awaiting connection handshake to {} (client endpoint)",
+                            address
+                        );
+                        connecting.await.map_err(|e| {
+                            format!("Failed to establish connection to {}: {}", address, e)
+                        })?
                     }
                 }
             } else {
                 // No endpoint exists, create a client endpoint
-                eprintln!("[quic] Creating new client endpoint to connect to {}", address);
+                eprintln!(
+                    "[quic] Creating new client endpoint to connect to {}",
+                    address
+                );
                 let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
                     .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
                 endpoint.set_default_client_config(client_config);
                 self.endpoint = Some(endpoint);
 
-                let connecting = self.endpoint.as_ref().unwrap()
+                let connecting = self
+                    .endpoint
+                    .as_ref()
+                    .unwrap()
                     .connect(address, "localhost")
                     .map_err(|e| format!("Failed to initiate connection to {}: {}", address, e))?;
 
@@ -760,7 +770,10 @@ impl NetworkManager for QuicNetworkManager {
             let mut connections = self.connections.lock().await;
             connections.insert(
                 node_id,
-                Arc::new(Mutex::new(Box::new(QuicPeerConnection::new(connection.clone(), false)) as Box<dyn PeerConnection>)),
+                Arc::new(Mutex::new(
+                    Box::new(QuicPeerConnection::new(connection.clone(), false))
+                        as Box<dyn PeerConnection>,
+                )),
             );
 
             // Return the original connection
@@ -815,7 +828,10 @@ impl NetworkManager for QuicNetworkManager {
             let mut connections = self.connections.lock().await;
             connections.insert(
                 node_id,
-                Arc::new(Mutex::new(Box::new(QuicPeerConnection::new(connection.clone(), true)) as Box<dyn PeerConnection>)),
+                Arc::new(Mutex::new(
+                    Box::new(QuicPeerConnection::new(connection.clone(), true))
+                        as Box<dyn PeerConnection>,
+                )),
             );
 
             // Return the original connection
@@ -917,7 +933,9 @@ impl Network for QuicNetworkManager {
                 .iter()
                 .filter(|node| node.id() != self.node_id)
                 .filter_map(|node| {
-                    connections.get(&node.id()).map(|conn| (node.id(), conn.clone()))
+                    connections
+                        .get(&node.id())
+                        .map(|conn| (node.id(), conn.clone()))
                 })
                 .collect()
         };
@@ -950,9 +968,7 @@ impl Network for QuicNetworkManager {
                 Err(e) => {
                     debug!(
                         "[MSG:BROADCAST-FAIL] from node {} -> node {}: {}",
-                        self.node_id,
-                        node_id,
-                        e
+                        self.node_id, node_id, e
                     );
                     // Continue with other nodes even if one fails
                 }

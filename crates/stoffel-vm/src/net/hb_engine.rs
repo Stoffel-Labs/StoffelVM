@@ -1,7 +1,9 @@
 use crate::net::client_store::ClientInputStore;
-use crate::net::mpc::honeybadger_node_opts;
 use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
-use crate::net::mpc_engine::{AsyncMpcEngineConsensus, MpcEngine, MpcEngineClientOps, MpcEngineConsensus};
+use crate::net::mpc::honeybadger_node_opts;
+use crate::net::mpc_engine::{
+    AsyncMpcEngineConsensus, MpcEngine, MpcEngineClientOps, MpcEngineConsensus,
+};
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -9,11 +11,11 @@ use ark_std::rand::SeedableRng;
 use std::any::TypeId;
 use std::marker::PhantomData;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::time::Duration;
-use stoffel_vm_types::core_types::{BOOLEAN_SECRET_INT_BITS, F64, ShareType, Value};
+use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS, F64};
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode};
@@ -22,8 +24,8 @@ use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
 
 // RBC/SSS type aliases used by HB implementation
-use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
+use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 type RBCImpl = Avid<HbSessionId>;
 
 /// HoneyBadger-backed MPC engine that integrates with the VM.
@@ -48,8 +50,7 @@ where
 
 pub type Bls12381HoneyBadgerMpcEngine =
     HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>;
-pub type Bn254HoneyBadgerMpcEngine =
-    HoneyBadgerMpcEngine<ark_bn254::Fr, ark_bn254::G1Projective>;
+pub type Bn254HoneyBadgerMpcEngine = HoneyBadgerMpcEngine<ark_bn254::Fr, ark_bn254::G1Projective>;
 pub type Curve25519HoneyBadgerMpcEngine =
     HoneyBadgerMpcEngine<ark_curve25519::Fr, ark_curve25519::EdwardsProjective>;
 pub type Ed25519HoneyBadgerMpcEngine =
@@ -100,12 +101,15 @@ where
                 // Lock node and perform multiplication
                 // node.mul() returns the result directly (via internal wait_for_result)
                 let mut node = self.node.lock().await;
-                let result_shares = node.mul(x_shares, y_shares, self.net.clone())
+                let result_shares = node
+                    .mul(x_shares, y_shares, self.net.clone())
                     .await
                     .map_err(|e| format!("MPC multiplication failed: {:?}", e))?;
 
                 // Get the first result share
-                let result_share = result_shares.into_iter().next()
+                let result_share = result_shares
+                    .into_iter()
+                    .next()
                     .ok_or_else(|| "Multiplication returned no shares".to_string())?;
 
                 Self::encode_share(&result_share)
@@ -242,7 +246,9 @@ where
     /// Wait for all client inputs to be received
     ///
     /// Uses the InputServer's wait_for_all_inputs method with a default timeout.
-    async fn wait_for_inputs(&self) -> Result<std::collections::HashMap<ClientId, Vec<RobustShare<F>>>, String> {
+    async fn wait_for_inputs(
+        &self,
+    ) -> Result<std::collections::HashMap<ClientId, Vec<RobustShare<F>>>, String> {
         let mut node = self.node.lock().await;
         node.preprocess
             .input
@@ -294,11 +300,7 @@ where
                     count += 1;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to get shares for client {}: {}",
-                        client_id,
-                        e
-                    );
+                    tracing::warn!("Failed to get shares for client {}: {}", client_id, e);
                 }
             }
         }
@@ -415,7 +417,9 @@ where
 
         static EXP_REGISTRY: once_cell::sync::Lazy<
             parking_lot::Mutex<std::collections::HashMap<(u64, usize), ExpOpenAccumulator>>,
-        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+        > = once_cell::sync::Lazy::new(
+            || parking_lot::Mutex::new(std::collections::HashMap::new()),
+        );
 
         let required = 2 * self.t + 1;
         let mut my_sequence: Option<usize> = None;
@@ -431,9 +435,7 @@ where
                     let entry = reg.entry(key).or_insert_with(ExpOpenAccumulator::default);
 
                     if !entry.party_ids.contains(&self.party_id) {
-                        entry
-                            .partial_points
-                            .push((share.id, partial_bytes.clone()));
+                        entry.partial_points.push((share.id, partial_bytes.clone()));
                         entry.party_ids.push(self.party_id);
                         my_sequence = Some(seq);
                         break;
@@ -453,8 +455,12 @@ where
 
             // Check if we have enough partial points
             if entry.partial_points.len() >= required {
-                let collected: Vec<(usize, Vec<u8>)> =
-                    entry.partial_points.iter().take(required).cloned().collect();
+                let collected: Vec<(usize, Vec<u8>)> = entry
+                    .partial_points
+                    .iter()
+                    .take(required)
+                    .cloned()
+                    .collect();
 
                 // Decode partial points
                 let mut points: Vec<(usize, G)> = Vec::with_capacity(collected.len());
@@ -705,7 +711,9 @@ where
         // Registry: maps (instance_id, sequence, type_string) to accumulator
         static REGISTRY: once_cell::sync::Lazy<
             parking_lot::Mutex<std::collections::HashMap<(u64, usize, String), OpenAccumulator>>,
-        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+        > = once_cell::sync::Lazy::new(
+            || parking_lot::Mutex::new(std::collections::HashMap::new()),
+        );
 
         let type_key = match ty {
             ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
@@ -759,7 +767,10 @@ where
                 // Debug: log share IDs, degrees, and values being used for reconstruction
                 tracing::info!(
                     "open_share reconstruction: n={}, t={}, required={}, shares.len()={}",
-                    self.n, self.t, required, shares.len()
+                    self.n,
+                    self.t,
+                    required,
+                    shares.len()
                 );
 
                 // Sort shares by ID for interpolation debugging
@@ -769,7 +780,9 @@ where
                 for (i, share) in sorted_shares.iter().enumerate() {
                     tracing::info!(
                         "  sorted_share[{}]: id={}, degree={}, value={:?}",
-                        i, share.id, share.degree,
+                        i,
+                        share.id,
+                        share.degree,
                         share.share[0].into_bigint().as_ref() // All limbs of the share value
                     );
                 }
@@ -781,9 +794,7 @@ where
                         use ark_ff::Zero;
                         Value::Bool(!secret.is_zero())
                     }
-                    ShareType::SecretInt { .. } => {
-                        Value::I64(Self::field_to_i64(secret))
-                    }
+                    ShareType::SecretInt { .. } => Value::I64(Self::field_to_i64(secret)),
                     ShareType::SecretFixedPoint { precision } => {
                         let scaled_value = Self::field_to_i64(secret);
                         // Convert from fixed-point scaled integer back to f64
@@ -832,8 +843,12 @@ where
 
         // Registry: maps (instance_id, batch_sequence, type_key, batch_size) to accumulator
         static BATCH_REGISTRY: once_cell::sync::Lazy<
-            parking_lot::Mutex<std::collections::HashMap<(u64, usize, String, usize), BatchOpenAccumulator>>,
-        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+            parking_lot::Mutex<
+                std::collections::HashMap<(u64, usize, String, usize), BatchOpenAccumulator>,
+            >,
+        > = once_cell::sync::Lazy::new(
+            || parking_lot::Mutex::new(std::collections::HashMap::new()),
+        );
 
         let type_key = match ty {
             ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
@@ -854,7 +869,9 @@ where
                 let mut seq = 0;
                 loop {
                     let key = (self.instance_id, seq, type_key.clone(), batch_size);
-                    let entry = reg.entry(key).or_insert_with(|| BatchOpenAccumulator::new(batch_size));
+                    let entry = reg
+                        .entry(key)
+                        .or_insert_with(|| BatchOpenAccumulator::new(batch_size));
 
                     if !entry.party_ids.contains(&self.party_id) {
                         // This party hasn't contributed to this batch yet
@@ -891,7 +908,8 @@ where
                         .cloned()
                         .collect();
 
-                    let mut decoded_shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
+                    let mut decoded_shares: Vec<RobustShare<F>> =
+                        Vec::with_capacity(collected.len());
                     for bytes in &collected {
                         decoded_shares.push(Self::decode_share(bytes)?);
                     }
@@ -904,9 +922,7 @@ where
                             use ark_ff::Zero;
                             Value::Bool(!secret.is_zero())
                         }
-                        ShareType::SecretInt { .. } => {
-                            Value::I64(Self::field_to_i64(secret))
-                        }
+                        ShareType::SecretInt { .. } => Value::I64(Self::field_to_i64(secret)),
                         ShareType::SecretFixedPoint { precision } => {
                             let scaled_value = Self::field_to_i64(secret);
                             let f = precision.f();
@@ -920,7 +936,9 @@ where
 
                 tracing::info!(
                     "batch_open_shares: reconstructed {} values in batch (instance={}, seq={})",
-                    batch_size, self.instance_id, seq
+                    batch_size,
+                    self.instance_id,
+                    seq
                 );
 
                 entry.results = Some(results.clone());
@@ -962,12 +980,22 @@ where
         }
     }
 
-    fn supports_multiplication(&self) -> bool { true }
-    fn supports_client_input(&self) -> bool { true }
-    fn supports_consensus(&self) -> bool { true }
+    fn supports_multiplication(&self) -> bool {
+        true
+    }
+    fn supports_client_input(&self) -> bool {
+        true
+    }
+    fn supports_consensus(&self) -> bool {
+        true
+    }
 
-    fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> { Some(self) }
-    fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> { Some(self) }
+    fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> {
+        Some(self)
+    }
+    fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> {
+        Some(self)
+    }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
@@ -975,7 +1003,8 @@ where
 
     fn random_share(&self, ty: ShareType) -> Result<Vec<u8>, String> {
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
+            Ok(handle) =>
+            {
                 #[allow(deprecated)]
                 match handle.runtime_flavor() {
                     tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -1126,7 +1155,8 @@ where
 
     fn hydrate_client_inputs_sync(&self, store: &ClientInputStore) -> Result<usize, String> {
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
+            Ok(handle) =>
+            {
                 #[allow(deprecated)]
                 match handle.runtime_flavor() {
                     tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -1134,9 +1164,9 @@ where
                             handle.block_on(self.hydrate_client_inputs(store))
                         })
                     }
-                    tokio::runtime::RuntimeFlavor::CurrentThread => {
-                        Err("Cannot hydrate client inputs from single-thread Tokio runtime".to_string())
-                    }
+                    tokio::runtime::RuntimeFlavor::CurrentThread => Err(
+                        "Cannot hydrate client inputs from single-thread Tokio runtime".to_string(),
+                    ),
                     _ => Err("Unsupported Tokio runtime flavor".to_string()),
                 }
             }
@@ -1156,7 +1186,8 @@ where
         client_ids: &[ClientId],
     ) -> Result<usize, String> {
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
+            Ok(handle) =>
+            {
                 #[allow(deprecated)]
                 match handle.runtime_flavor() {
                     tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -1164,9 +1195,9 @@ where
                             handle.block_on(self.hydrate_client_inputs_for(store, client_ids))
                         })
                     }
-                    tokio::runtime::RuntimeFlavor::CurrentThread => {
-                        Err("Cannot hydrate client inputs from single-thread Tokio runtime".to_string())
-                    }
+                    tokio::runtime::RuntimeFlavor::CurrentThread => Err(
+                        "Cannot hydrate client inputs from single-thread Tokio runtime".to_string(),
+                    ),
                     _ => Err("Unsupported Tokio runtime flavor".to_string()),
                 }
             }
@@ -1307,7 +1338,9 @@ where
             }
 
             if std::time::Instant::now() >= deadline {
-                return Err("RBC receive_any timeout waiting for message from any party".to_string());
+                return Err(
+                    "RBC receive_any timeout waiting for message from any party".to_string()
+                );
             }
 
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1365,7 +1398,9 @@ where
 
                 // ABA agreement rule: if 2t+1 parties agree on a value, that's the result
                 if true_count >= required {
-                    registry.results.insert((self.instance_id, session_id), true);
+                    registry
+                        .results
+                        .insert((self.instance_id, session_id), true);
                     tracing::info!(
                         instance_id = self.instance_id,
                         session_id = session_id,
@@ -1377,7 +1412,9 @@ where
                 }
 
                 if false_count >= required {
-                    registry.results.insert((self.instance_id, session_id), false);
+                    registry
+                        .results
+                        .insert((self.instance_id, session_id), false);
                     tracing::info!(
                         instance_id = self.instance_id,
                         session_id = session_id,

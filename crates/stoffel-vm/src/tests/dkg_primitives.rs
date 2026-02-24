@@ -69,7 +69,14 @@ async fn test_open_share_in_exp_known_value() {
 
     // Create network
     let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
-        n, t, 0, 0, instance_id, base_port, config.clone(), None,
+        n,
+        t,
+        0,
+        0,
+        instance_id,
+        base_port,
+        config.clone(),
+        None,
     )
     .await
     .expect("Failed to create servers");
@@ -178,14 +185,13 @@ async fn test_open_share_in_exp_known_value() {
 
     // Also verify all parties agree
     for i in 1..n {
-        assert_eq!(
-            results[0], results[i],
-            "Party 0 and party {} disagree",
-            i
-        );
+        assert_eq!(results[0], results[i], "Party 0 and party {} disagree", i);
     }
 
-    tracing::info!("open_share_in_exp: all {} parties agree on correct public point", n);
+    tracing::info!(
+        "open_share_in_exp: all {} parties agree on correct public point",
+        n
+    );
 }
 
 /// Test: simulated DKG flow — shares of a random secret → open_share_in_exp.
@@ -216,7 +222,14 @@ async fn test_simulated_dkg_flow() {
 
     // Create network (no preprocessing needed for this test)
     let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
-        n, t, 0, 0, instance_id, base_port, config.clone(), None,
+        n,
+        t,
+        0,
+        0,
+        instance_id,
+        base_port,
+        config.clone(),
+        None,
     )
     .await
     .expect("Failed to create servers");
@@ -268,9 +281,8 @@ async fn test_simulated_dkg_flow() {
     // Simulate random_share: create shares of a random secret
     let mut rng = ark_std::test_rng();
     let random_secret = Fr::from(ark_std::rand::Rng::gen::<u64>(&mut rng));
-    let all_shares =
-        RobustShare::compute_shares(random_secret, n, t, None, &mut rng)
-            .expect("compute_shares failed");
+    let all_shares = RobustShare::compute_shares(random_secret, n, t, None, &mut rng)
+        .expect("compute_shares failed");
 
     let share_bytes_vec: Vec<Vec<u8>> = all_shares
         .iter()

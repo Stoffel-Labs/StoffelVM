@@ -99,7 +99,10 @@ async fn test_vm_mpc_multiplication_integration() {
         server.start().await.expect("Failed to start server");
 
         let mut node = server.node.clone();
-        let network = server.network.clone().expect("network should be set after start()");
+        let network = server
+            .network
+            .clone()
+            .expect("network should be set after start()");
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
@@ -132,7 +135,10 @@ async fn test_vm_mpc_multiplication_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network = server
+                .network
+                .clone()
+                .expect("network should be set after start()");
 
             tokio::spawn(async move {
                 info!("[Server {}] Starting preprocessing...", i);
@@ -219,10 +225,18 @@ async fn test_vm_mpc_multiplication_integration() {
             .node
             .preprocess
             .input
-            .init(client_id, local_shares, 2, server.network.clone().expect("network should be set"))
+            .init(
+                client_id,
+                local_shares,
+                2,
+                server.network.clone().expect("network should be set"),
+            )
             .await
             .expect("input.init failed");
-        info!("✓ Server {} initialized input protocol for client {}", i, client_id);
+        info!(
+            "✓ Server {} initialized input protocol for client {}",
+            i, client_id
+        );
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -240,7 +254,9 @@ async fn test_vm_mpc_multiplication_integration() {
         let handle = tokio::spawn(async move {
             // Get input shares for this party
             let (x_shares, y_shares) = {
-                let input_store = node.preprocess.input
+                let input_store = node
+                    .preprocess
+                    .input
                     .wait_for_all_inputs(std::time::Duration::from_secs(30))
                     .await
                     .expect("Failed to get client inputs");
@@ -249,7 +265,8 @@ async fn test_vm_mpc_multiplication_integration() {
             };
 
             // Perform multiplication - returns the result shares directly
-            let result = node.mul(x_shares, y_shares, net.clone())
+            let result = node
+                .mul(x_shares, y_shares, net.clone())
                 .await
                 .expect("mul failed");
 
@@ -273,7 +290,8 @@ async fn test_vm_mpc_multiplication_integration() {
     let mut vm = VirtualMachine::new();
 
     // Get the result share from party 0 (from the collected results)
-    let result_share = results.iter()
+    let result_share = results
+        .iter()
         .find(|(pid, _)| *pid == 0)
         .map(|(_, shares)| shares[0].clone())
         .expect("Party 0 result not found");

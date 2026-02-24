@@ -69,7 +69,9 @@ impl ClientInputStore {
     /// Retrieve serialized shares for a specific client.
     pub fn get_client_input_bytes(&self, client_id: ClientId) -> Option<Vec<Vec<u8>>> {
         let entries = self.entries.read();
-        entries.get(&client_id).map(|entry| entry.share_bytes.clone())
+        entries
+            .get(&client_id)
+            .map(|entry| entry.share_bytes.clone())
     }
 
     /// Retrieve a specific serialized share for a client by index.

@@ -13,7 +13,7 @@
 //! This module is designed to be portable and can be copied directly to the compiler
 //! codebase without modification.
 
-use crate::core_types::{Value, F64};
+use crate::core_types::{F64, Value};
 use crate::functions::VMFunction;
 use crate::instructions::{Instruction, ReducedOpcode};
 use std::collections::HashMap;

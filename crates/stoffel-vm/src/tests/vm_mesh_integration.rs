@@ -15,11 +15,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
-use stoffelmpc_mpc::honeybadger::ProtocolType;
 use stoffelmpc_mpc::common::SecretSharingScheme;
+use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::honeybadger::output::output::OutputClient;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+use stoffelmpc_mpc::honeybadger::ProtocolType;
 use stoffelmpc_mpc::honeybadger::WrappedMessage;
 use stoffelnet::network_utils::ClientId;
 use tokio::sync::Mutex;
@@ -29,8 +29,8 @@ use crate::core_vm::VirtualMachine;
 use crate::net::hb_engine::HoneyBadgerMpcEngine;
 use crate::net::mpc_engine::MpcEngine;
 use crate::tests::mpc_multiplication_integration::{
-    HoneyBadgerQuicConfig, HoneyBadgerQuicServer, setup_honeybadger_quic_clients,
-    setup_honeybadger_quic_network,
+    setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
+    HoneyBadgerQuicServer,
 };
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
@@ -133,7 +133,10 @@ async fn test_vm_mesh_full_integration() {
         server.start().await.expect("Failed to start server");
 
         let mut node = server.node.clone();
-        let network = server.network.clone().expect("network should be set after start()");
+        let network = server
+            .network
+            .clone()
+            .expect("network should be set after start()");
         let mut rx = recv.remove(0);
 
         tokio::spawn(async move {
@@ -183,7 +186,10 @@ async fn test_vm_mesh_full_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network = server
+                .network
+                .clone()
+                .expect("network should be set after start()");
 
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
@@ -213,7 +219,12 @@ async fn test_vm_mesh_full_integration() {
                 .node
                 .preprocess
                 .input
-                .init(*client_id, local_shares, 1, server.network.clone().expect("network should be set"))
+                .init(
+                    *client_id,
+                    local_shares,
+                    1,
+                    server.network.clone().expect("network should be set"),
+                )
                 .await
                 .expect("input.init failed");
             info!(
@@ -442,7 +453,10 @@ async fn test_vm_mesh_average_salary_integration() {
         server.start().await.expect("Failed to start server");
 
         let mut node = server.node.clone();
-        let network = server.network.clone().expect("network should be set after start()");
+        let network = server
+            .network
+            .clone()
+            .expect("network should be set after start()");
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
@@ -486,7 +500,10 @@ async fn test_vm_mesh_average_salary_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network = server
+                .network
+                .clone()
+                .expect("network should be set after start()");
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 node.run_preprocessing(network, &mut rng)
@@ -513,7 +530,12 @@ async fn test_vm_mesh_average_salary_integration() {
                 .node
                 .preprocess
                 .input
-                .init(*client_id, local_shares, 2, server.network.clone().expect("network should be set"))
+                .init(
+                    *client_id,
+                    local_shares,
+                    2,
+                    server.network.clone().expect("network should be set"),
+                )
                 .await
                 .expect("input.init failed");
         }
@@ -560,7 +582,11 @@ async fn test_vm_mesh_average_salary_integration() {
 
         // Verify that individual client shares can be reconstructed
         let result = RobustShare::recover_secret(&all_shares_for_client, n_parties);
-        assert!(result.is_ok(), "Failed to reconstruct individual client shares: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to reconstruct individual client shares: {:?}",
+            result.err()
+        );
     }
 
     for (party_id, vm_arc) in vms.iter().enumerate() {
@@ -622,7 +648,11 @@ async fn test_vm_mesh_average_salary_integration() {
             }
         }
         let result = RobustShare::recover_secret(&salary_sums, n_parties);
-        assert!(result.is_ok(), "Failed to reconstruct summed shares: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to reconstruct summed shares: {:?}",
+            result.err()
+        );
     }
 
     info!("Executing average salary program on all parties...");
@@ -706,30 +736,30 @@ fn build_average_salary_program() -> (Vec<Instruction>, HashMap<String, usize>) 
     instructions.push(Instruction::CALL(
         "ClientStore.get_number_clients".to_string(),
     ));
-    instructions.push(Instruction::MOV(1, 0));  // reg1 = num_clients
+    instructions.push(Instruction::MOV(1, 0)); // reg1 = num_clients
 
     // Initialize loop counter to 0
-    instructions.push(Instruction::LDI(2, Value::I64(0)));  // reg2 = 0 (loop counter)
-    instructions.push(Instruction::LDI(3, Value::I64(1)));  // reg3 = 1 (constant for increments)
+    instructions.push(Instruction::LDI(2, Value::I64(0))); // reg2 = 0 (loop counter)
+    instructions.push(Instruction::LDI(3, Value::I64(1))); // reg3 = 1 (constant for increments)
 
     // Load first client's shares to initialize accumulators (client index 0)
     // This avoids creating an incompatible "zero share" via clear->secret conversion
-    instructions.push(Instruction::LDI(0, Value::I64(0)));  // client_index = 0
+    instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
-    instructions.push(Instruction::LDI(4, Value::I64(0)));  // share_index = 0 (salary)
+    instructions.push(Instruction::LDI(4, Value::I64(0))); // share_index = 0 (salary)
     instructions.push(Instruction::PUSHARG(4));
     instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
-    instructions.push(Instruction::MOV(16, 0));  // reg16 = first client's salary share
+    instructions.push(Instruction::MOV(16, 0)); // reg16 = first client's salary share
 
-    instructions.push(Instruction::LDI(0, Value::I64(0)));  // client_index = 0
+    instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
-    instructions.push(Instruction::LDI(4, Value::I64(1)));  // share_index = 1 (count)
+    instructions.push(Instruction::LDI(4, Value::I64(1))); // share_index = 1 (count)
     instructions.push(Instruction::PUSHARG(4));
     instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
-    instructions.push(Instruction::MOV(17, 0));  // reg17 = first client's count share
+    instructions.push(Instruction::MOV(17, 0)); // reg17 = first client's count share
 
     // Start loop from index 1 (already processed index 0)
-    instructions.push(Instruction::LDI(2, Value::I64(1)));  // reg2 = 1 (loop counter starts at 1)
+    instructions.push(Instruction::LDI(2, Value::I64(1))); // reg2 = 1 (loop counter starts at 1)
 
     let loop_label = "avg_loop_start".to_string();
     let process_label = "avg_process".to_string();
@@ -742,34 +772,34 @@ fn build_average_salary_program() -> (Vec<Instruction>, HashMap<String, usize>) 
 
     labels.insert(process_label.clone(), instructions.len());
     // Get salary share (index 0) for current client
-    instructions.push(Instruction::MOV(0, 2));  // reg0 = client_index
+    instructions.push(Instruction::MOV(0, 2)); // reg0 = client_index
     instructions.push(Instruction::PUSHARG(0));
-    instructions.push(Instruction::LDI(4, Value::I64(0)));  // share_index = 0 (salary)
+    instructions.push(Instruction::LDI(4, Value::I64(0))); // share_index = 0 (salary)
     instructions.push(Instruction::PUSHARG(4));
     instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
-    instructions.push(Instruction::MOV(18, 0));  // reg18 = salary share
+    instructions.push(Instruction::MOV(18, 0)); // reg18 = salary share
 
     // Get count share (index 1) for current client
-    instructions.push(Instruction::MOV(0, 2));  // reg0 = client_index
+    instructions.push(Instruction::MOV(0, 2)); // reg0 = client_index
     instructions.push(Instruction::PUSHARG(0));
-    instructions.push(Instruction::LDI(4, Value::I64(1)));  // share_index = 1 (count)
+    instructions.push(Instruction::LDI(4, Value::I64(1))); // share_index = 1 (count)
     instructions.push(Instruction::PUSHARG(4));
     instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
-    instructions.push(Instruction::MOV(19, 0));  // reg19 = count share
+    instructions.push(Instruction::MOV(19, 0)); // reg19 = count share
 
     // Accumulate: reg16 += reg18, reg17 += reg19
     instructions.push(Instruction::ADD(16, 16, 18));
     instructions.push(Instruction::ADD(17, 17, 19));
-    instructions.push(Instruction::ADD(2, 2, 3));  // reg2++ (increment loop counter)
+    instructions.push(Instruction::ADD(2, 2, 3)); // reg2++ (increment loop counter)
     instructions.push(Instruction::JMP(loop_label.clone()));
 
     labels.insert(done_label.clone(), instructions.len());
 
     // Compute average: total_salary / total_count
-    instructions.push(Instruction::MOV(2, 16));  // reg2 = total salary (secret)
-    instructions.push(Instruction::MOV(3, 17));  // reg3 = total count (secret)
-    instructions.push(Instruction::DIV(4, 2, 3));  // reg4 = salary / count (secret division)
-    instructions.push(Instruction::MOV(0, 4));  // Move result to reg0 (triggers reveal)
+    instructions.push(Instruction::MOV(2, 16)); // reg2 = total salary (secret)
+    instructions.push(Instruction::MOV(3, 17)); // reg3 = total count (secret)
+    instructions.push(Instruction::DIV(4, 2, 3)); // reg4 = salary / count (secret division)
+    instructions.push(Instruction::MOV(0, 4)); // Move result to reg0 (triggers reveal)
     instructions.push(Instruction::RET(0));
 
     (instructions, labels)
@@ -843,7 +873,10 @@ async fn test_vm_mesh_large_preprocessing() {
         server.start().await.expect("Failed to start server");
 
         let mut node = server.node.clone();
-        let network = server.network.clone().expect("network should be set after start()");
+        let network = server
+            .network
+            .clone()
+            .expect("network should be set after start()");
         let mut rx = recv.remove(0);
 
         tokio::spawn(async move {
@@ -895,7 +928,10 @@ async fn test_vm_mesh_large_preprocessing() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network = server
+                .network
+                .clone()
+                .expect("network should be set after start()");
 
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
@@ -1173,10 +1209,7 @@ async fn test_vm_mesh_output_client_integration() {
                     *client_id,
                     local_shares,
                     1,
-                    server
-                        .network
-                        .clone()
-                        .expect("network should be set"),
+                    server.network.clone().expect("network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -1282,7 +1315,10 @@ async fn test_vm_mesh_output_client_integration() {
     // Note: In a real deployment, the OutputServer would send shares via network
     // to the OutputClient. Here we simulate the output protocol by directly
     // processing the output messages at the client.
-    info!("Step 10: Setting up output protocol for client {}...", output_client_id);
+    info!(
+        "Step 10: Setting up output protocol for client {}...",
+        output_client_id
+    );
 
     // Create the output client
     let output_client = Arc::new(Mutex::new(
@@ -1592,8 +1628,10 @@ async fn test_vm_mesh_matrix_average_integration() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Step 6: Initialize input protocol for each client
-    info!("Step 6: Initializing input protocol for {} clients with {} shares each...",
-          client_count, MATRIX_SIZE);
+    info!(
+        "Step 6: Initializing input protocol for {} clients with {} shares each...",
+        client_count, MATRIX_SIZE
+    );
     for (idx, server) in servers.iter_mut().enumerate() {
         for client_id in &client_ids {
             let local_shares = server
@@ -1611,10 +1649,7 @@ async fn test_vm_mesh_matrix_average_integration() {
                     *client_id,
                     local_shares,
                     MATRIX_SIZE,
-                    server
-                        .network
-                        .clone()
-                        .expect("network should be set"),
+                    server.network.clone().expect("network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -1725,7 +1760,10 @@ async fn test_vm_mesh_matrix_average_integration() {
                 assert!(
                     diff <= 1,
                     "Party {} average mismatch: got {}, expected {} (diff {})",
-                    pid, computed_avg, expected_average, diff
+                    pid,
+                    computed_avg,
+                    expected_average,
+                    diff
                 );
                 info!(
                     "✓ Party {} computed average {} (expected {})",
@@ -1753,7 +1791,10 @@ async fn test_vm_mesh_matrix_average_integration() {
         "Successfully computed federated average of {} matrices ({}x{}) from {} clients",
         client_count, MATRIX_ROWS, MATRIX_COLS, client_count
     );
-    info!("Total sum: {}, Total elements: {}, Average: {}", total_sum, total_elements, expected_average);
+    info!(
+        "Total sum: {}, Total elements: {}, Average: {}",
+        total_sum, total_elements, expected_average
+    );
 }
 
 /// Build a program that computes the overall average of all matrix elements from all clients
@@ -1943,8 +1984,14 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         "Matrix dimensions: {}x{} = {} elements per client",
         LARGE_MATRIX_ROWS, LARGE_MATRIX_COLS, LARGE_MATRIX_SIZE
     );
-    info!("Fixed-point scale: 2^{} = {}", FIXED_POINT_FRACTIONAL_BITS, FIXED_POINT_SCALE);
-    info!("Max preprocessing batch size: {}", MAX_PREPROCESSING_BATCH_SIZE);
+    info!(
+        "Fixed-point scale: 2^{} = {}",
+        FIXED_POINT_FRACTIONAL_BITS, FIXED_POINT_SCALE
+    );
+    info!(
+        "Max preprocessing batch size: {}",
+        MAX_PREPROCESSING_BATCH_SIZE
+    );
 
     let n_parties = 5;
     let threshold = 1;
@@ -1952,7 +1999,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     let initial_n_triples = 32;
     let initial_n_random_shares = MAX_PREPROCESSING_BATCH_SIZE;
     let instance_id = 66666; // Different instance ID to avoid collision
-    let base_port = 9800;   // Different port range
+    let base_port = 9800; // Different port range
 
     let config = HoneyBadgerQuicConfig {
         mpc_timeout: Duration::from_secs(60), // Longer timeout for large matrix
@@ -2005,7 +2052,8 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     }
 
     // Calculate expected element-wise averages (just show first few for large matrices)
-    let expected_averages: Vec<f64> = element_sums.iter()
+    let expected_averages: Vec<f64> = element_sums
+        .iter()
         .map(|sum| sum / client_count as f64)
         .collect();
 
@@ -2072,7 +2120,8 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
 
     // Step 3: Connect servers (PARALLELIZED)
     info!("Step 3: Connecting servers in mesh topology...");
-    let connect_handles: Vec<_> = servers.iter()
+    let connect_handles: Vec<_> = servers
+        .iter()
         .map(|server| server.connect_to_peers())
         .collect();
     let connect_results = futures::future::join_all(connect_handles).await;
@@ -2090,7 +2139,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     // NOTE: We create clients early to register client IDs, but delay connect_to_servers()
     // until after preprocessing and input.init(). This prevents QUIC connection timeouts
     // during the potentially long preprocessing phase.
-    info!("Step 4: Creating {} matrix input clients (will connect after preprocessing)...", client_count);
+    info!(
+        "Step 4: Creating {} matrix input clients (will connect after preprocessing)...",
+        client_count
+    );
     let mut clients = setup_honeybadger_quic_clients::<Fr>(
         client_ids.clone(),
         server_addresses.clone(),
@@ -2120,14 +2172,19 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     let total_random_shares_needed = client_count * LARGE_MATRIX_SIZE;
     // Use batch size closer to the 511 limit for fewer iterations
     let optimized_batch_size = 510;
-    let total_batches = (total_random_shares_needed + optimized_batch_size - 1) / optimized_batch_size;
+    let total_batches =
+        (total_random_shares_needed + optimized_batch_size - 1) / optimized_batch_size;
 
     info!("Step 5: Running OPTIMIZED batched preprocessing...");
-    info!("  Need {} total shares, batch size {}, ~{} batches expected",
-          total_random_shares_needed, optimized_batch_size, total_batches);
+    info!(
+        "  Need {} total shares, batch size {}, ~{} batches expected",
+        total_random_shares_needed, optimized_batch_size, total_batches
+    );
 
     // External accumulators for each server - avoids O(n²) drain/restore
-    let mut accumulated_shares: Vec<Vec<_>> = (0..n_parties).map(|_| Vec::with_capacity(total_random_shares_needed)).collect();
+    let mut accumulated_shares: Vec<Vec<_>> = (0..n_parties)
+        .map(|_| Vec::with_capacity(total_random_shares_needed))
+        .collect();
     let mut total_accumulated = 0usize;
     let mut batch_idx = 0;
     let start_time = std::time::Instant::now();
@@ -2144,16 +2201,26 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         // Log progress every 10 batches to reduce output spam
         if batch_idx % 10 == 1 || batch_idx == 1 {
             let elapsed = start_time.elapsed().as_secs_f32();
-            let rate = if elapsed > 0.0 { total_accumulated as f32 / elapsed } else { 0.0 };
-            info!("  Batch {}/{}: accumulated {}/{} shares ({:.0} shares/sec)...",
-                  batch_idx, total_batches, total_accumulated, total_random_shares_needed, rate);
+            let rate = if elapsed > 0.0 {
+                total_accumulated as f32 / elapsed
+            } else {
+                0.0
+            };
+            info!(
+                "  Batch {}/{}: accumulated {}/{} shares ({:.0} shares/sec)...",
+                batch_idx, total_batches, total_accumulated, total_random_shares_needed, rate
+            );
         }
 
         // Set preprocessing parameters for this batch
         // OPTIMIZATION: Only generate triples once (first batch) - they're expensive!
         for server in servers.iter_mut() {
             server.node.params.n_random_shares = batch_size;
-            server.node.params.n_triples = if !triples_generated { triples_needed } else { 0 };
+            server.node.params.n_triples = if !triples_generated {
+                triples_needed
+            } else {
+                0
+            };
         }
         triples_generated = true;
 
@@ -2179,11 +2246,15 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         // Wait for all servers to complete this batch
         let results = futures::future::join_all(preprocessing_handles).await;
         for result in results {
-            result.expect("Task panicked").expect("Preprocessing failed");
+            result
+                .expect("Task panicked")
+                .expect("Preprocessing failed");
         }
 
         // Extract newly generated shares from each server and add to external accumulator
-        let extract_futures: Vec<_> = servers.iter().enumerate()
+        let extract_futures: Vec<_> = servers
+            .iter()
+            .enumerate()
             .map(|(server_idx, server)| async move {
                 let mut material = server.node.preprocessing_material.lock().await;
                 let share_count = material.len().1;
@@ -2207,18 +2278,27 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
 
         // Safety limit to prevent infinite loops
         if batch_idx > 2000 {
-            panic!("Too many preprocessing batches ({}) - something is wrong", batch_idx);
+            panic!(
+                "Too many preprocessing batches ({}) - something is wrong",
+                batch_idx
+            );
         }
     }
 
     let elapsed = start_time.elapsed();
-    info!("  ✓ Generated {} shares in {} batches ({:.1}s, {:.0} shares/sec)",
-          total_accumulated, batch_idx, elapsed.as_secs_f32(),
-          total_accumulated as f32 / elapsed.as_secs_f32());
+    info!(
+        "  ✓ Generated {} shares in {} batches ({:.1}s, {:.0} shares/sec)",
+        total_accumulated,
+        batch_idx,
+        elapsed.as_secs_f32(),
+        total_accumulated as f32 / elapsed.as_secs_f32()
+    );
 
     // Add all accumulated shares back to preprocessing material in one operation
     info!("  Finalizing: adding accumulated shares to preprocessing material...");
-    let finalize_futures: Vec<_> = servers.iter().zip(accumulated_shares.into_iter())
+    let finalize_futures: Vec<_> = servers
+        .iter()
+        .zip(accumulated_shares.into_iter())
         .map(|(server, shares)| async move {
             let mut material = server.node.preprocessing_material.lock().await;
             let count = shares.len();
@@ -2227,8 +2307,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         })
         .collect();
     let finalize_results = futures::future::join_all(finalize_futures).await;
-    info!("  ✓ All {} servers now have {} random shares each",
-          n_parties, finalize_results[0]);
+    info!(
+        "  ✓ All {} servers now have {} random shares each",
+        n_parties, finalize_results[0]
+    );
 
     info!("✓ All preprocessing complete");
 
@@ -2239,14 +2321,20 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     // IMPORTANT: Connect clients RIGHT BEFORE input.init() to avoid QUIC connection timeouts.
     // input.init() sends random shares to clients, so clients must be connected first.
     info!("Step 6: Connecting clients and initializing input protocol...");
-    info!("  Connecting {} clients to servers (parallel)...", client_count);
+    info!(
+        "  Connecting {} clients to servers (parallel)...",
+        client_count
+    );
 
     // OPTIMIZATION: Connect all clients in parallel
-    let client_connect_handles: Vec<_> = clients.iter_mut()
+    let client_connect_handles: Vec<_> = clients
+        .iter_mut()
         .map(|client| {
             let client_id = client.client_id;
             async move {
-                client.connect_to_servers().await
+                client
+                    .connect_to_servers()
+                    .await
                     .map_err(|e| format!("Client {} failed to connect: {:?}", client_id, e))?;
                 Ok::<_, String>(client_id)
             }
@@ -2264,10 +2352,14 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
 
     // OPTIMIZATION: Initialize input protocol for all servers in parallel
     // Each server initializes input protocol for all clients
-    info!("  Initializing input protocol for {} clients with {} shares each (parallel per server)...",
-          client_count, LARGE_MATRIX_SIZE);
+    info!(
+        "  Initializing input protocol for {} clients with {} shares each (parallel per server)...",
+        client_count, LARGE_MATRIX_SIZE
+    );
 
-    let input_init_handles: Vec<_> = servers.iter_mut().enumerate()
+    let input_init_handles: Vec<_> = servers
+        .iter_mut()
+        .enumerate()
         .map(|(idx, server)| {
             let client_ids = client_ids.clone();
             let network = server.network.clone().expect("network should be set");
@@ -2282,12 +2374,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                         .take_random_shares(LARGE_MATRIX_SIZE)
                         .expect("Failed to take random shares");
                     preprocess_input
-                        .init(
-                            *client_id,
-                            local_shares,
-                            LARGE_MATRIX_SIZE,
-                            network.clone(),
-                        )
+                        .init(*client_id, local_shares, LARGE_MATRIX_SIZE, network.clone())
                         .await
                         .expect("input.init failed");
                     // RELEASE MODE FIX: yield to allow client tasks to progress
@@ -2332,16 +2419,25 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
     }
-    info!("  ✓ {} VMs created in {:.2}s", n_parties, vm_create_start.elapsed().as_secs_f32());
+    info!(
+        "  ✓ {} VMs created in {:.2}s",
+        n_parties,
+        vm_create_start.elapsed().as_secs_f32()
+    );
 
     // Step 7b: Wait for all inputs in PARALLEL across all parties
     // This is the slow part - waiting for clients to process 16K shares each
     let input_timeout = Duration::from_secs(300);
-    info!("  Waiting for client inputs (timeout: {}s, {} elements per client)...",
-          input_timeout.as_secs(), LARGE_MATRIX_SIZE);
+    info!(
+        "  Waiting for client inputs (timeout: {}s, {} elements per client)...",
+        input_timeout.as_secs(),
+        LARGE_MATRIX_SIZE
+    );
 
     let wait_start = std::time::Instant::now();
-    let wait_handles: Vec<_> = servers.iter().enumerate()
+    let wait_handles: Vec<_> = servers
+        .iter()
+        .enumerate()
         .map(|(party_id, server)| {
             let mut input = server.node.preprocess.input.clone();
             async move {
@@ -2359,12 +2455,16 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         .collect();
 
     let all_shares = futures::future::join_all(wait_handles).await;
-    info!("  ✓ All inputs received in {:.2}s", wait_start.elapsed().as_secs_f32());
+    info!(
+        "  ✓ All inputs received in {:.2}s",
+        wait_start.elapsed().as_secs_f32()
+    );
 
     // Step 7c: Hydrate client stores with received shares
     // OPTIMIZATION: Use drain() to move ownership instead of cloning ~65K shares
     let hydrate_start = std::time::Instant::now();
-    let mut shares_by_party: Vec<Vec<(ClientId, Vec<RobustShare<Fr>>)>> = vec![Vec::new(); n_parties];
+    let mut shares_by_party: Vec<Vec<(ClientId, Vec<RobustShare<Fr>>)>> =
+        vec![Vec::new(); n_parties];
     for result in all_shares {
         let (party_id, shares) = result.expect("Failed to get client inputs");
         shares_by_party[party_id] = shares;
@@ -2379,7 +2479,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             store.store_client_input(client_id, shares);
         }
     }
-    info!("  ✓ Client stores hydrated in {:.2}s", hydrate_start.elapsed().as_secs_f32());
+    info!(
+        "  ✓ Client stores hydrated in {:.2}s",
+        hydrate_start.elapsed().as_secs_f32()
+    );
 
     step_timings.push(("Step 7: Create VMs & hydrate stores", step_start.elapsed()));
     step_start = std::time::Instant::now();
@@ -2394,7 +2497,8 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     //
     // Using fixed-point mode since this test uses scaled fixed-point values
     info!("Step 8: Registering federated averaging program (using manual loops)...");
-    let (fed_avg_program, labels) = build_manual_federated_average_program_with_type(LARGE_MATRIX_SIZE, true);
+    let (fed_avg_program, labels) =
+        build_manual_federated_average_program_with_type(LARGE_MATRIX_SIZE, true);
     for vm_arc in &vms {
         let avg_fn = VMFunction::new(
             "federated_average".to_string(),
@@ -2444,7 +2548,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         results.push((pid, val));
     }
 
-    step_timings.push(("Step 9: Execute program (batch reveal)", step_start.elapsed()));
+    step_timings.push((
+        "Step 9: Execute program (batch reveal)",
+        step_start.elapsed(),
+    ));
     step_start = std::time::Instant::now();
 
     // Step 10: Verify results
@@ -2473,7 +2580,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         if let Value::Array(array_id) = first_val {
             let vm = vms[*first_pid].lock();
             if let Some(arr) = vm.state.object_store.get_array(*array_id) {
-                info!("Verifying {} averaged matrix elements (sampling first 10 and last 10):", arr.length());
+                info!(
+                    "Verifying {} averaged matrix elements (sampling first 10 and last 10):",
+                    arr.length()
+                );
                 let sample_indices: Vec<usize> = (0..10)
                     .chain((LARGE_MATRIX_SIZE - 10)..LARGE_MATRIX_SIZE)
                     .collect();
@@ -2486,7 +2596,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                         let computed_avg: f64 = match elem_val {
                             Value::I64(v) => *v as f64,
                             Value::Float(v) => v.0,
-                            other => panic!("Element {} has unexpected type: {:?}", elem_idx, other),
+                            other => {
+                                panic!("Element {} has unexpected type: {:?}", elem_idx, other)
+                            }
                         };
 
                         let expected = expected_averages[elem_idx];
@@ -2498,7 +2610,11 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                         assert!(
                             diff <= 0.01,
                             "Element [{},{}] mismatch: got {:.4}, expected {:.4} (diff {:.4})",
-                            row, col, computed_avg, expected, diff
+                            row,
+                            col,
+                            computed_avg,
+                            expected,
+                            diff
                         );
                         info!(
                             "  ✓ [{},{}] = {:.4} (expected {:.4})",
@@ -2508,7 +2624,11 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                         panic!("Element {} not found in result array", elem_idx);
                     }
                 }
-                info!("  ... (verified {} sampled elements out of {})", sample_indices.len(), LARGE_MATRIX_SIZE);
+                info!(
+                    "  ... (verified {} sampled elements out of {})",
+                    sample_indices.len(),
+                    LARGE_MATRIX_SIZE
+                );
             } else {
                 panic!("Array {} not found in VM object store", array_id);
             }
@@ -2536,8 +2656,13 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             Value::Array(id) => *id,
             _ => panic!("Expected array"),
         };
-        let arr = vm.state.object_store.get_array(array_id).expect("array exists");
-        sample_indices.iter()
+        let arr = vm
+            .state
+            .object_store
+            .get_array(array_id)
+            .expect("array exists");
+        sample_indices
+            .iter()
             .map(|&i| {
                 let idx = Value::I64(i as i64);
                 match arr.get(&idx).expect("element exists") {
@@ -2555,8 +2680,14 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             Value::Array(id) => *id,
             _ => panic!("Expected array"),
         };
-        let arr = vm.state.object_store.get_array(array_id).expect("array exists");
-        for (sample_idx, (&i, &ref_val)) in sample_indices.iter().zip(reference_vals.iter()).enumerate() {
+        let arr = vm
+            .state
+            .object_store
+            .get_array(array_id)
+            .expect("array exists");
+        for (sample_idx, (&i, &ref_val)) in
+            sample_indices.iter().zip(reference_vals.iter()).enumerate()
+        {
             let idx = Value::I64(i as i64);
             let party_val: f64 = match arr.get(&idx).expect("element exists") {
                 Value::I64(v) => *v as f64,
@@ -2568,10 +2699,18 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             assert!(
                 diff < 0.0001,
                 "Party {} sample {} (element {}) mismatch: got {}, expected {} (diff {})",
-                pid, sample_idx, i, party_val, ref_val, diff
+                pid,
+                sample_idx,
+                i,
+                party_val,
+                ref_val,
+                diff
             );
         }
-        info!("  ✓ Party {} results match reference ({} samples)", pid, sample_size);
+        info!(
+            "  ✓ Party {} results match reference ({} samples)",
+            pid, sample_size
+        );
     }
 
     step_timings.push(("Step 10: Verify results", step_start.elapsed()));
@@ -2594,9 +2733,18 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     info!("=== TIMING BREAKDOWN ===");
     for (step_name, duration) in &step_timings {
         let pct = (duration.as_secs_f64() / total_elapsed.as_secs_f64()) * 100.0;
-        info!("  {:40} {:>8.2}s ({:>5.1}%)", step_name, duration.as_secs_f64(), pct);
+        info!(
+            "  {:40} {:>8.2}s ({:>5.1}%)",
+            step_name,
+            duration.as_secs_f64(),
+            pct
+        );
     }
-    info!("  {:40} {:>8.2}s (100.0%)", "TOTAL", total_elapsed.as_secs_f64());
+    info!(
+        "  {:40} {:>8.2}s (100.0%)",
+        "TOTAL",
+        total_elapsed.as_secs_f64()
+    );
     info!("");
 
     info!("=== VM Mesh Large Matrix (128x128) Federated Averaging Integration Test PASSED ===");
@@ -2604,7 +2752,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         "Successfully computed federated average of {} matrices ({}x{} = {} elements) from {} clients",
         client_count, LARGE_MATRIX_ROWS, LARGE_MATRIX_COLS, LARGE_MATRIX_SIZE, client_count
     );
-    info!("All {} parties computed identical element-wise averages", n_parties);
+    info!(
+        "All {} parties computed identical element-wise averages",
+        n_parties
+    );
 }
 
 /// Build a program that computes the overall average using fixed-point shares
@@ -2612,7 +2763,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
 /// Uses ClientStore.take_share_fixed to load shares as SecretFixedPoint type.
 /// After summing and revealing, the result is still in fixed-point format
 /// and needs to be unscaled for the final average.
-fn build_matrix_average_program_fixed_point(matrix_size: usize) -> (Vec<Instruction>, HashMap<String, usize>) {
+fn build_matrix_average_program_fixed_point(
+    matrix_size: usize,
+) -> (Vec<Instruction>, HashMap<String, usize>) {
     let mut instructions = Vec::new();
     let mut labels = HashMap::new();
 
@@ -2652,7 +2805,9 @@ fn build_matrix_average_program_fixed_point(matrix_size: usize) -> (Vec<Instruct
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::LDI(5, Value::I64(0))); // element_index = 0
     instructions.push(Instruction::PUSHARG(5));
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string())); // Fixed-point share
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    )); // Fixed-point share
     instructions.push(Instruction::MOV(16, 0)); // reg16 = first share (accumulator)
 
     // Start inner loop from element index 1
@@ -2679,7 +2834,9 @@ fn build_matrix_average_program_fixed_point(matrix_size: usize) -> (Vec<Instruct
     instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string())); // Fixed-point share
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    )); // Fixed-point share
     instructions.push(Instruction::MOV(18, 0)); // reg18 = share
 
     // Accumulate
@@ -2715,7 +2872,9 @@ fn build_matrix_average_program_fixed_point(matrix_size: usize) -> (Vec<Instruct
     // Get fixed-point share for current client, current element
     instructions.push(Instruction::PUSHARG(2)); // client_index
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string())); // Fixed-point share
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    )); // Fixed-point share
     instructions.push(Instruction::MOV(18, 0)); // reg18 = share
 
     // Accumulate: reg16 += reg18
@@ -2765,7 +2924,10 @@ fn build_matrix_average_program_fixed_point(matrix_size: usize) -> (Vec<Instruct
 /// - Divide each sum by `num_clients` to get the average
 /// - Store results in an array and return it
 /// - Send averaged values back to each client
-fn build_federated_average_program(matrix_size: usize, _num_clients: usize) -> (Vec<Instruction>, HashMap<String, usize>) {
+fn build_federated_average_program(
+    matrix_size: usize,
+    _num_clients: usize,
+) -> (Vec<Instruction>, HashMap<String, usize>) {
     let mut instructions = Vec::new();
     let mut labels = HashMap::new();
 
@@ -2787,7 +2949,9 @@ fn build_federated_average_program(matrix_size: usize, _num_clients: usize) -> (
     // reg18 = scratch for shares
 
     // Step 1: Get number of clients and initialize constants
-    instructions.push(Instruction::CALL("ClientStore.get_number_clients".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.get_number_clients".to_string(),
+    ));
     instructions.push(Instruction::MOV(1, 0)); // reg1 = num_clients
 
     instructions.push(Instruction::LDI(3, Value::I64(1))); // reg3 = 1
@@ -2829,7 +2993,9 @@ fn build_federated_average_program(matrix_size: usize, _num_clients: usize) -> (
     instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    ));
     instructions.push(Instruction::MOV(16, 0)); // reg16 = first share (accumulator)
 
     // Sum remaining clients for this element
@@ -2845,7 +3011,9 @@ fn build_federated_average_program(matrix_size: usize, _num_clients: usize) -> (
     // Get share for current client, current element
     instructions.push(Instruction::PUSHARG(2)); // client_index
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    ));
     instructions.push(Instruction::MOV(17, 0)); // reg17 = share
 
     // Accumulate: reg16 += reg17
@@ -2955,8 +3123,8 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/tests/binaries/matrix_average_fixed_point.stflb"
     );
-    let compiled_binary = load_from_file(bytecode_path)
-        .expect("Failed to load compiled bytecode from .stflb file");
+    let compiled_binary =
+        load_from_file(bytecode_path).expect("Failed to load compiled bytecode from .stflb file");
     let mut vm_functions = to_vm_functions(&compiled_binary);
 
     info!("  Loaded {} functions from bytecode:", vm_functions.len());
@@ -2965,7 +3133,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         // The compute_matrix_sum function uses registers 16, 17 (secret registers)
         // but may have been compiled with only 8 registers.
         // We need to ensure the register count is sufficient for the instructions.
-        let max_reg = func.instructions.iter()
+        let max_reg = func
+            .instructions
+            .iter()
             .filter_map(|instr| {
                 // Extract register numbers from instructions
                 match instr {
@@ -2987,12 +3157,20 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         // Ensure we have enough registers (add some padding for safety)
         let required_regs = max_reg + 1;
         if func.register_count < required_regs {
-            info!("    - {} (adjusting register_count from {} to {} based on instruction analysis)",
-                  func.name, func.register_count, required_regs.max(32));
+            info!(
+                "    - {} (adjusting register_count from {} to {} based on instruction analysis)",
+                func.name,
+                func.register_count,
+                required_regs.max(32)
+            );
             func.register_count = required_regs.max(32); // Use at least 32 registers for MPC programs
         } else {
-            info!("    - {} ({} instructions, {} registers)",
-                  func.name, func.instructions.len(), func.register_count);
+            info!(
+                "    - {} ({} instructions, {} registers)",
+                func.name,
+                func.instructions.len(),
+                func.register_count
+            );
         }
     }
 
@@ -3041,7 +3219,10 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     info!("=== Client Input Matrices ===");
     for (idx, matrix) in client_matrices_f64.iter().enumerate() {
         let client_id = 900 + idx as ClientId;
-        info!("Client {} matrix ({}x{}):", client_id, MATRIX_ROWS, MATRIX_COLS);
+        info!(
+            "Client {} matrix ({}x{}):",
+            client_id, MATRIX_ROWS, MATRIX_COLS
+        );
         for row in 0..MATRIX_ROWS {
             let row_values: Vec<String> = (0..MATRIX_COLS)
                 .map(|col| format!("{:8.2}", matrix[row * MATRIX_COLS + col]))
@@ -3082,7 +3263,10 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         .collect();
 
     info!("");
-    info!("=== Expected Federated Average Matrix (element-wise mean of {} clients) ===", client_count);
+    info!(
+        "=== Expected Federated Average Matrix (element-wise mean of {} clients) ===",
+        client_count
+    );
     for row in 0..MATRIX_ROWS {
         let row_values: Vec<String> = (0..MATRIX_COLS)
             .map(|col| format!("{:8.4}", expected_averages[row * MATRIX_COLS + col]))
@@ -3190,10 +3374,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                     *client_id,
                     local_shares,
                     MATRIX_SIZE,
-                    server
-                        .network
-                        .clone()
-                        .expect("network should be set"),
+                    server.network.clone().expect("network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -3314,7 +3495,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 
                 info!("");
                 info!("=== VM Mesh Bytecode Fixed-Point Integration Test SKIPPED ===");
-                info!("The bytecode file may need to be regenerated with compatible program logic.");
+                info!(
+                    "The bytecode file may need to be regenerated with compatible program logic."
+                );
                 return;
             }
         }
@@ -3346,14 +3529,20 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                 assert!(
                     diff < 0.0001,
                     "Party {} returned different float result: {} vs {}",
-                    pid, party_val.0, ref_val.0
+                    pid,
+                    party_val.0,
+                    ref_val.0
                 );
             }
             (Some(Value::Array(_)), Value::Array(_)) => {
                 // Arrays verified below with detailed comparison
             }
             _ => {
-                info!("  Party {} result type: {:?}", pid, std::mem::discriminant(val));
+                info!(
+                    "  Party {} result type: {:?}",
+                    pid,
+                    std::mem::discriminant(val)
+                );
             }
         }
     }
@@ -3456,7 +3645,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 ///    - Divides by num_clients
 ///    - Stores in result array
 /// 4. Returns the result array
-fn build_manual_federated_average_program(num_elements: usize) -> (Vec<Instruction>, HashMap<String, usize>) {
+fn build_manual_federated_average_program(
+    num_elements: usize,
+) -> (Vec<Instruction>, HashMap<String, usize>) {
     build_manual_federated_average_program_with_type(num_elements, false)
 }
 
@@ -3468,7 +3659,10 @@ fn build_manual_federated_average_program(num_elements: usize) -> (Vec<Instructi
 /// destination register, but with the same dest_reg for all reveals, only the last value survives.
 ///
 /// This function is kept for reference and testing single-element reveals.
-fn build_manual_federated_average_program_with_type(num_elements: usize, use_fixed_point: bool) -> (Vec<Instruction>, HashMap<String, usize>) {
+fn build_manual_federated_average_program_with_type(
+    num_elements: usize,
+    use_fixed_point: bool,
+) -> (Vec<Instruction>, HashMap<String, usize>) {
     let mut instructions = Vec::new();
     let mut labels = HashMap::new();
 
@@ -3498,7 +3692,9 @@ fn build_manual_federated_average_program_with_type(num_elements: usize, use_fix
     // ==========================================
 
     // Get number of clients
-    instructions.push(Instruction::CALL("ClientStore.get_number_clients".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.get_number_clients".to_string(),
+    ));
     instructions.push(Instruction::MOV(1, 0)); // reg1 = num_clients
 
     // Initialize constants

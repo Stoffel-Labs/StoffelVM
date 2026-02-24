@@ -100,7 +100,9 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     // reg17 = scratch for shares
 
     // Step 1: Get number of clients and initialize constants
-    instructions.push(Instruction::CALL("ClientStore.get_number_clients".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.get_number_clients".to_string(),
+    ));
     instructions.push(Instruction::MOV(1, 0)); // reg1 = num_clients
 
     instructions.push(Instruction::LDI(3, Value::I64(1))); // reg3 = 1
@@ -135,7 +137,9 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    ));
     instructions.push(Instruction::MOV(16, 0)); // reg16 = first share (accumulator)
 
     // Sum remaining clients for this element
@@ -151,7 +155,9 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     // Get share for current client, current element
     instructions.push(Instruction::PUSHARG(2)); // client_index
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    ));
     instructions.push(Instruction::MOV(17, 0)); // reg17 = share
 
     // Accumulate: reg16 += reg17
@@ -208,7 +214,9 @@ fn create_federated_average_binary() -> Vec<u8> {
 
     let binary = CompiledBinary::from_vm_functions(&[vm_function]);
     let mut buffer = Vec::new();
-    binary.serialize(&mut buffer).expect("Failed to serialize binary");
+    binary
+        .serialize(&mut buffer)
+        .expect("Failed to serialize binary");
     buffer
 }
 
@@ -319,7 +327,8 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         .collect();
 
     // Calculate expected element-wise averages
-    let expected_averages: Vec<f64> = element_sums.iter()
+    let expected_averages: Vec<f64> = element_sums
+        .iter()
         .map(|sum| sum / client_count as f64)
         .collect();
 
@@ -557,7 +566,9 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                         let computed_avg: f64 = match elem_val {
                             Value::I64(v) => *v as f64,
                             Value::Float(v) => v.0,
-                            other => panic!("Element {} has unexpected type: {:?}", elem_idx, other),
+                            other => {
+                                panic!("Element {} has unexpected type: {:?}", elem_idx, other)
+                            }
                         };
 
                         let expected = expected_averages[elem_idx];
@@ -569,7 +580,11 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                         assert!(
                             diff <= 0.01,
                             "Element [{},{}] mismatch: got {:.4}, expected {:.4} (diff {:.4})",
-                            row, col, computed_avg, expected, diff
+                            row,
+                            col,
+                            computed_avg,
+                            expected,
+                            diff
                         );
                         info!(
                             "  ✓ [{},{}] = {:.4} (expected {:.4})",
@@ -594,7 +609,11 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             Value::Array(id) => *id,
             _ => panic!("Expected array"),
         };
-        let arr = vm.state.object_store.get_array(array_id).expect("array exists");
+        let arr = vm
+            .state
+            .object_store
+            .get_array(array_id)
+            .expect("array exists");
         (0..MATRIX_SIZE)
             .map(|i| {
                 let idx = Value::I64((i + 1) as i64);
@@ -613,7 +632,11 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             Value::Array(id) => *id,
             _ => panic!("Expected array"),
         };
-        let arr = vm.state.object_store.get_array(array_id).expect("array exists");
+        let arr = vm
+            .state
+            .object_store
+            .get_array(array_id)
+            .expect("array exists");
         for (i, &ref_val) in reference_vals.iter().enumerate() {
             let idx = Value::I64((i + 1) as i64);
             let party_val: f64 = match arr.get(&idx).expect("element exists") {
@@ -625,7 +648,11 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             assert!(
                 diff < 0.0001,
                 "Party {} element {} mismatch: got {}, expected {} (diff {})",
-                pid, i, party_val, ref_val, diff
+                pid,
+                i,
+                party_val,
+                ref_val,
+                diff
             );
         }
         info!("  ✓ Party {} results match reference", pid);
@@ -646,5 +673,8 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         "Successfully computed federated average of {} matrices ({}x{}) from {} clients",
         client_count, MATRIX_ROWS, MATRIX_COLS, client_count
     );
-    info!("All {} parties computed identical element-wise averages", n_parties);
+    info!(
+        "All {} parties computed identical element-wise averages",
+        n_parties
+    );
 }

@@ -57,7 +57,6 @@ pub mod aba_fields {
     pub const TYPE_VALUE: &str = "AbaSession";
 }
 
-
 /// Helper module for Share object operations
 pub mod share_object {
     use super::share_fields;
@@ -267,22 +266,18 @@ pub fn register_mpc_builtins(vm: &mut VirtualMachine) {
     register_rbc_builtins(vm);
     register_aba_builtins(vm);
     #[cfg(feature = "adkg")]
-    register_adkg_builtins(vm);
+    register_avss_builtins(vm);
 }
 
 /// Register Share module builtins
 fn register_share_builtins(vm: &mut VirtualMachine) {
     // Share.from_clear - Create share from clear value (auto-detect type)
-    vm.register_foreign_function("Share.from_clear", |ctx| {
-        share_from_clear(ctx, None)
-    });
+    vm.register_foreign_function("Share.from_clear", |ctx| share_from_clear(ctx, None));
 
     // Share.from_clear_int - Create integer share with custom bit length
     vm.register_foreign_function("Share.from_clear_int", |ctx| {
         if ctx.args.len() < 2 {
-            return Err(
-                "Share.from_clear_int expects 2 arguments: value, bit_length".to_string(),
-            );
+            return Err("Share.from_clear_int expects 2 arguments: value, bit_length".to_string());
         }
         let bit_length = match &ctx.args[1] {
             Value::I64(n) if *n > 0 => *n as usize,
@@ -406,9 +401,15 @@ fn register_mpc_info_builtins(vm: &mut VirtualMachine) {
         use rand::RngCore;
         let mut bytes = vec![0u8; 32];
         rand::rng().fill_bytes(&mut bytes);
-        let arr_id = ctx.vm_state.object_store.create_array_with_capacity(bytes.len());
+        let arr_id = ctx
+            .vm_state
+            .object_store
+            .create_array_with_capacity(bytes.len());
         {
-            let arr = ctx.vm_state.object_store.get_array_mut(arr_id)
+            let arr = ctx
+                .vm_state
+                .object_store
+                .get_array_mut(arr_id)
                 .ok_or_else(|| "Failed to create result array".to_string())?;
             for (i, byte) in bytes.into_iter().enumerate() {
                 arr.set(Value::I64(i as i64), Value::U8(byte));
@@ -422,7 +423,9 @@ fn register_mpc_info_builtins(vm: &mut VirtualMachine) {
     vm.register_foreign_function("Mpc.rand_int", |_ctx| {
         use rand::Rng;
         if _ctx.args.is_empty() {
-            return Err("Mpc.rand_int expects 1 argument: bit_length (8, 16, 32, or 64)".to_string());
+            return Err(
+                "Mpc.rand_int expects 1 argument: bit_length (8, 16, 32, or 64)".to_string(),
+            );
         }
         let bit_length = match &_ctx.args[0] {
             Value::I64(n) if *n > 0 => *n as usize,
@@ -627,7 +630,6 @@ fn register_aba_builtins(vm: &mut VirtualMachine) {
     });
 }
 
-
 // ============================================================================
 // Share builtin implementations
 // ============================================================================
@@ -660,7 +662,12 @@ fn share_from_clear(
             }
             Value::Float(_) => ShareType::default_secret_fixed_point(),
             Value::Bool(_) => ShareType::boolean(),
-            _ => return Err(format!("Cannot create share from value type: {:?}", clear_value)),
+            _ => {
+                return Err(format!(
+                    "Cannot create share from value type: {:?}",
+                    clear_value
+                ))
+            }
         },
     };
 
@@ -674,9 +681,7 @@ fn share_from_clear(
         (ShareType::SecretInt { .. }, Value::U32(n)) => Value::I64(*n as i64),
         (ShareType::SecretInt { .. }, Value::U16(n)) => Value::I64(*n as i64),
         (ShareType::SecretInt { .. }, Value::U8(n)) => Value::I64(*n as i64),
-        (ShareType::SecretInt { bit_length }, Value::Bool(b)) if bit_length == 1 => {
-            Value::Bool(*b)
-        }
+        (ShareType::SecretInt { bit_length }, Value::Bool(b)) if bit_length == 1 => Value::Bool(*b),
         (ShareType::SecretFixedPoint { .. }, Value::Float(f)) => Value::Float(*f),
         (ShareType::SecretFixedPoint { .. }, Value::I64(n)) => {
             Value::Float(stoffel_vm_types::core_types::F64(*n as f64))
@@ -715,20 +720,13 @@ fn share_add(ctx: ForeignFunctionContext) -> Result<Value, String> {
 
     // Verify types match
     if ty1 != ty2 {
-        return Err(format!(
-            "Share type mismatch: {:?} vs {:?}",
-            ty1, ty2
-        ));
+        return Err(format!("Share type mismatch: {:?} vs {:?}", ty1, ty2));
     }
 
     // Perform addition using VM's share arithmetic
     let result_data = ctx.vm_state.secret_share_add(ty1, &data1, &data2)?;
 
-    let party_id = ctx
-        .vm_state
-        .mpc_engine()
-        .map(|e| e.party_id())
-        .unwrap_or(0);
+    let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
 
     let obj_id = share_object::create_share_object(
         &mut ctx.vm_state.object_store,
@@ -750,19 +748,12 @@ fn share_sub(ctx: ForeignFunctionContext) -> Result<Value, String> {
     let (ty2, data2) = share_object::extract_share_data(&ctx.vm_state.object_store, &ctx.args[1])?;
 
     if ty1 != ty2 {
-        return Err(format!(
-            "Share type mismatch: {:?} vs {:?}",
-            ty1, ty2
-        ));
+        return Err(format!("Share type mismatch: {:?} vs {:?}", ty1, ty2));
     }
 
     let result_data = ctx.vm_state.secret_share_sub(ty1, &data1, &data2)?;
 
-    let party_id = ctx
-        .vm_state
-        .mpc_engine()
-        .map(|e| e.party_id())
-        .unwrap_or(0);
+    let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
 
     let obj_id = share_object::create_share_object(
         &mut ctx.vm_state.object_store,
@@ -784,11 +775,7 @@ fn share_neg(ctx: ForeignFunctionContext) -> Result<Value, String> {
 
     let result_data = ctx.vm_state.secret_share_neg(ty, &data)?;
 
-    let party_id = ctx
-        .vm_state
-        .mpc_engine()
-        .map(|e| e.party_id())
-        .unwrap_or(0);
+    let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
 
     let obj_id = share_object::create_share_object(
         &mut ctx.vm_state.object_store,
@@ -817,11 +804,7 @@ fn share_add_scalar(ctx: ForeignFunctionContext) -> Result<Value, String> {
 
     let result_data = ctx.vm_state.secret_share_add_scalar(ty, &data, scalar)?;
 
-    let party_id = ctx
-        .vm_state
-        .mpc_engine()
-        .map(|e| e.party_id())
-        .unwrap_or(0);
+    let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
 
     let obj_id = share_object::create_share_object(
         &mut ctx.vm_state.object_store,
@@ -850,11 +833,7 @@ fn share_mul_scalar(ctx: ForeignFunctionContext) -> Result<Value, String> {
 
     let result_data = ctx.vm_state.secret_share_mul_scalar(ty, &data, scalar)?;
 
-    let party_id = ctx
-        .vm_state
-        .mpc_engine()
-        .map(|e| e.party_id())
-        .unwrap_or(0);
+    let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
 
     let obj_id = share_object::create_share_object(
         &mut ctx.vm_state.object_store,
@@ -885,10 +864,7 @@ fn share_mul(ctx: ForeignFunctionContext) -> Result<Value, String> {
     let (ty2, data2) = share_object::extract_share_data(&ctx.vm_state.object_store, &ctx.args[1])?;
 
     if ty1 != ty2 {
-        return Err(format!(
-            "Share type mismatch: {:?} vs {:?}",
-            ty1, ty2
-        ));
+        return Err(format!("Share type mismatch: {:?} vs {:?}", ty1, ty2));
     }
 
     // Perform MPC multiplication
@@ -999,7 +975,10 @@ fn share_batch_open(ctx: ForeignFunctionContext) -> Result<Value, String> {
     let revealed = engine.batch_open_shares(first_ty, &shares)?;
 
     // Create result array
-    let result_id = ctx.vm_state.object_store.create_array_with_capacity(revealed.len());
+    let result_id = ctx
+        .vm_state
+        .object_store
+        .create_array_with_capacity(revealed.len());
     let result_array = ctx
         .vm_state
         .object_store
@@ -1082,7 +1061,9 @@ fn share_interpolate_local(ctx: ForeignFunctionContext) -> Result<Value, String>
 
     for i in 0..len {
         let idx = Value::I64(i as i64);
-        let element = array.get(&idx).ok_or_else(|| format!("Missing element at index {}", i))?;
+        let element = array
+            .get(&idx)
+            .ok_or_else(|| format!("Missing element at index {}", i))?;
 
         let (ty, data) = share_object::extract_share_data(&ctx.vm_state.object_store, element)?;
 
@@ -1103,7 +1084,8 @@ fn share_interpolate_local(ctx: ForeignFunctionContext) -> Result<Value, String>
     let ty = share_type.unwrap();
 
     // Perform local interpolation
-    ctx.vm_state.secret_share_interpolate_local(ty, &shares_data)
+    ctx.vm_state
+        .secret_share_interpolate_local(ty, &shares_data)
 }
 
 /// Get share type as string
@@ -1132,17 +1114,16 @@ fn share_get_party_id(ctx: ForeignFunctionContext) -> Result<Value, String> {
             let party_id = ctx
                 .vm_state
                 .object_store
-                .get_field(&ctx.args[0], &Value::String(share_fields::PARTY_ID.to_string()))
+                .get_field(
+                    &ctx.args[0],
+                    &Value::String(share_fields::PARTY_ID.to_string()),
+                )
                 .ok_or_else(|| "Share object missing __party_id field".to_string())?;
             Ok(party_id)
         }
         Value::Share(_, _) => {
             // For raw shares, return current party ID
-            let party_id = ctx
-                .vm_state
-                .mpc_engine()
-                .map(|e| e.party_id())
-                .unwrap_or(0);
+            let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
             Ok(Value::I64(party_id as i64))
         }
         _ => Err("Expected Share object".to_string()),
@@ -1249,7 +1230,7 @@ fn share_open_exp(ctx: ForeignFunctionContext) -> Result<Value, String> {
 
 /// Field name constants for AVSS share objects
 #[cfg(feature = "adkg")]
-pub mod adkg_fields {
+pub mod avss_fields {
     pub const TYPE: &str = "__type";
     pub const KEY_NAME: &str = "__key_name";
     pub const SHARE_DATA: &str = "__share_data";
@@ -1260,8 +1241,8 @@ pub mod adkg_fields {
 
 /// Helper module for AVSS share object operations
 #[cfg(feature = "adkg")]
-pub mod adkg_object {
-    use super::adkg_fields;
+pub mod avss_object {
+    use super::avss_fields;
     use stoffel_vm_types::core_types::{ObjectStore, Value};
 
     /// Create a new AVSS share object in the object store
@@ -1289,8 +1270,8 @@ pub mod adkg_object {
         store
             .set_field(
                 &obj,
-                Value::String(adkg_fields::TYPE.to_string()),
-                Value::String(adkg_fields::TYPE_VALUE.to_string()),
+                Value::String(avss_fields::TYPE.to_string()),
+                Value::String(avss_fields::TYPE_VALUE.to_string()),
             )
             .unwrap();
 
@@ -1298,7 +1279,7 @@ pub mod adkg_object {
         store
             .set_field(
                 &obj,
-                Value::String(adkg_fields::KEY_NAME.to_string()),
+                Value::String(avss_fields::KEY_NAME.to_string()),
                 Value::String(key_name.to_string()),
             )
             .unwrap();
@@ -1315,7 +1296,7 @@ pub mod adkg_object {
         store
             .set_field(
                 &obj,
-                Value::String(adkg_fields::SHARE_DATA.to_string()),
+                Value::String(avss_fields::SHARE_DATA.to_string()),
                 Value::Array(share_array_id),
             )
             .unwrap();
@@ -1345,7 +1326,7 @@ pub mod adkg_object {
         store
             .set_field(
                 &obj,
-                Value::String(adkg_fields::COMMITMENTS.to_string()),
+                Value::String(avss_fields::COMMITMENTS.to_string()),
                 Value::Array(commitments_array_id),
             )
             .unwrap();
@@ -1354,7 +1335,7 @@ pub mod adkg_object {
         store
             .set_field(
                 &obj,
-                Value::String(adkg_fields::PARTY_ID.to_string()),
+                Value::String(avss_fields::PARTY_ID.to_string()),
                 Value::I64(party_id as i64),
             )
             .unwrap();
@@ -1366,8 +1347,8 @@ pub mod adkg_object {
     pub fn is_avss_share_object(store: &ObjectStore, value: &Value) -> bool {
         match value {
             Value::Object(_) => store
-                .get_field(value, &Value::String(adkg_fields::TYPE.to_string()))
-                .map(|v| v == Value::String(adkg_fields::TYPE_VALUE.to_string()))
+                .get_field(value, &Value::String(avss_fields::TYPE.to_string()))
+                .map(|v| v == Value::String(avss_fields::TYPE_VALUE.to_string()))
                 .unwrap_or(false),
             _ => false,
         }
@@ -1376,7 +1357,7 @@ pub mod adkg_object {
     /// Extract key name from an AVSS share object
     pub fn get_key_name(store: &ObjectStore, value: &Value) -> Result<String, String> {
         let key_name_field = store
-            .get_field(value, &Value::String(adkg_fields::KEY_NAME.to_string()))
+            .get_field(value, &Value::String(avss_fields::KEY_NAME.to_string()))
             .ok_or_else(|| "AVSS share object missing __key_name field".to_string())?;
 
         match key_name_field {
@@ -1388,9 +1369,13 @@ pub mod adkg_object {
     /// Extract commitment at a specific index from an AVSS share object
     ///
     /// Returns the commitment as bytes (serialized group element)
-    pub fn get_commitment(store: &ObjectStore, value: &Value, index: usize) -> Result<Vec<u8>, String> {
+    pub fn get_commitment(
+        store: &ObjectStore,
+        value: &Value,
+        index: usize,
+    ) -> Result<Vec<u8>, String> {
         let commitments_field = store
-            .get_field(value, &Value::String(adkg_fields::COMMITMENTS.to_string()))
+            .get_field(value, &Value::String(avss_fields::COMMITMENTS.to_string()))
             .ok_or_else(|| "AVSS share object missing __commitments field".to_string())?;
 
         let commitments_array_id = match commitments_field {
@@ -1438,7 +1423,7 @@ pub mod adkg_object {
     /// Get the number of commitments in an AVSS share object
     pub fn get_commitment_count(store: &ObjectStore, value: &Value) -> Result<usize, String> {
         let commitments_field = store
-            .get_field(value, &Value::String(adkg_fields::COMMITMENTS.to_string()))
+            .get_field(value, &Value::String(avss_fields::COMMITMENTS.to_string()))
             .ok_or_else(|| "AVSS share object missing __commitments field".to_string())?;
 
         let commitments_array_id = match commitments_field {
@@ -1456,7 +1441,7 @@ pub mod adkg_object {
 
 /// Register AVSS (Asynchronously Verifiable Secret Sharing) builtins
 #[cfg(feature = "adkg")]
-fn register_adkg_builtins(vm: &mut VirtualMachine) {
+fn register_avss_builtins(vm: &mut VirtualMachine) {
     // These builtins work on AVSS share objects stored in the VM
 
     // Avss.get_commitment - Get commitment at index from AVSS share
@@ -1466,7 +1451,7 @@ fn register_adkg_builtins(vm: &mut VirtualMachine) {
             return Err("Avss.get_commitment expects 2 arguments: avss_share, index".to_string());
         }
 
-        if !adkg_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+        if !avss_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
             return Err("First argument must be an AVSS share object".to_string());
         }
 
@@ -1476,9 +1461,13 @@ fn register_adkg_builtins(vm: &mut VirtualMachine) {
             _ => return Err("index must be a non-negative integer".to_string()),
         };
 
-        let commitment_bytes = adkg_object::get_commitment(&ctx.vm_state.object_store, &ctx.args[0], index)?;
+        let commitment_bytes =
+            avss_object::get_commitment(&ctx.vm_state.object_store, &ctx.args[0], index)?;
 
-        let arr_id = ctx.vm_state.object_store.create_array_with_capacity(commitment_bytes.len());
+        let arr_id = ctx
+            .vm_state
+            .object_store
+            .create_array_with_capacity(commitment_bytes.len());
         {
             let arr = ctx.vm_state.object_store.get_array_mut(arr_id).unwrap();
             for (i, byte) in commitment_bytes.into_iter().enumerate() {
@@ -1494,14 +1483,18 @@ fn register_adkg_builtins(vm: &mut VirtualMachine) {
             return Err("Avss.get_public_key expects 1 argument: avss_share".to_string());
         }
 
-        if !adkg_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+        if !avss_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
             return Err("Argument must be an AVSS share object".to_string());
         }
 
         // commitment[0] is the public key
-        let commitment_bytes = adkg_object::get_commitment(&ctx.vm_state.object_store, &ctx.args[0], 0)?;
+        let commitment_bytes =
+            avss_object::get_commitment(&ctx.vm_state.object_store, &ctx.args[0], 0)?;
 
-        let arr_id = ctx.vm_state.object_store.create_array_with_capacity(commitment_bytes.len());
+        let arr_id = ctx
+            .vm_state
+            .object_store
+            .create_array_with_capacity(commitment_bytes.len());
         {
             let arr = ctx.vm_state.object_store.get_array_mut(arr_id).unwrap();
             for (i, byte) in commitment_bytes.into_iter().enumerate() {
@@ -1517,11 +1510,11 @@ fn register_adkg_builtins(vm: &mut VirtualMachine) {
             return Err("Avss.get_key_name expects 1 argument: avss_share".to_string());
         }
 
-        if !adkg_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+        if !avss_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
             return Err("Argument must be an AVSS share object".to_string());
         }
 
-        let key_name = adkg_object::get_key_name(&ctx.vm_state.object_store, &ctx.args[0])?;
+        let key_name = avss_object::get_key_name(&ctx.vm_state.object_store, &ctx.args[0])?;
         Ok(Value::String(key_name))
     });
 
@@ -1531,11 +1524,11 @@ fn register_adkg_builtins(vm: &mut VirtualMachine) {
             return Err("Avss.commitment_count expects 1 argument: avss_share".to_string());
         }
 
-        if !adkg_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
+        if !avss_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
             return Err("Argument must be an AVSS share object".to_string());
         }
 
-        let count = adkg_object::get_commitment_count(&ctx.vm_state.object_store, &ctx.args[0])?;
+        let count = avss_object::get_commitment_count(&ctx.vm_state.object_store, &ctx.args[0])?;
         Ok(Value::I64(count as i64))
     });
 
@@ -1545,7 +1538,7 @@ fn register_adkg_builtins(vm: &mut VirtualMachine) {
             return Err("Avss.is_avss_share expects 1 argument: value".to_string());
         }
 
-        let is_avss = adkg_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]);
+        let is_avss = avss_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]);
         Ok(Value::Bool(is_avss))
     });
 }
@@ -1584,7 +1577,10 @@ mod tests {
         let share_id = share_object::create_share_object(&mut store, share_type, data, 0);
         let non_share_id = store.create_object();
 
-        assert!(share_object::is_share_object(&store, &Value::Object(share_id)));
+        assert!(share_object::is_share_object(
+            &store,
+            &Value::Object(share_id)
+        ));
         assert!(!share_object::is_share_object(
             &store,
             &Value::Object(non_share_id)

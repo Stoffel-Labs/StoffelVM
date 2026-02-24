@@ -1,8 +1,6 @@
 //! Bootnode-based discovery for StoffelVM over QUIC.
 //! Supports both direct connections and NAT traversal via ICE hole punching.
-use super::program_sync::{
-    send_ctrl as send_prog_ctrl, send_program_bytes, ProgramSyncMessage,
-};
+use super::program_sync::{send_ctrl as send_prog_ctrl, send_program_bytes, ProgramSyncMessage};
 use super::session::{derive_instance_id, SessionInfo, SessionMessage};
 use bincode;
 use serde::{Deserialize, Serialize};
@@ -321,9 +319,11 @@ pub async fn run_bootnode_with_config(
                                                 party_id
                                             );
                                             // For now, reject mismatched programs
-                                            let _ = send_ctrl(&*conn, &DiscoveryMessage::PeerLeft {
-                                                party_id,
-                                            }).await;
+                                            let _ = send_ctrl(
+                                                &*conn,
+                                                &DiscoveryMessage::PeerLeft { party_id },
+                                            )
+                                            .await;
                                             waiting_for_session = false;
                                             continue;
                                         }
@@ -344,7 +344,8 @@ pub async fn run_bootnode_with_config(
 
                                     if session_ready {
                                         let ps = pending.take().unwrap();
-                                        let instance_id = derive_instance_id(&ps.program_id, ps.nonce);
+                                        let instance_id =
+                                            derive_instance_id(&ps.program_id, ps.nonce);
                                         let parties: Vec<(PartyId, SocketAddr)> =
                                             ps.parties.into_iter().collect();
 
@@ -436,8 +437,7 @@ pub async fn run_bootnode_with_config(
                                     // Log and relay the exchange request
                                     eprintln!(
                                         "[bootnode] ICE exchange request from party {} to party {}",
-                                        from_party_id,
-                                        to_party_id
+                                        from_party_id, to_party_id
                                     );
                                     // Broadcast - the target party's task will handle it
                                     let req_msg = DiscoveryMessage::IceExchangeRequest {
@@ -469,7 +469,11 @@ pub async fn run_bootnode_with_config(
                             match sess {
                                 SessionMessage::SessionAnnounce(_) => { /* not expected from clients */
                                 }
-                                SessionMessage::SessionAck { party_id, instance_id, .. } => {
+                                SessionMessage::SessionAck {
+                                    party_id,
+                                    instance_id,
+                                    ..
+                                } => {
                                     eprintln!(
                                         "[bootnode] Received SessionAck from party {} for instance {}",
                                         party_id, instance_id
@@ -546,7 +550,11 @@ async fn add_node_and_connect(net: &mut QuicNetworkManager, party_id: PartyId, a
 
         eprintln!(
             "[peer-connect] Attempting to connect to party {} at {} (attempt {}/{}, timeout {:?})",
-            party_id, addr, attempt + 1, max_retries, timeout_duration
+            party_id,
+            addr,
+            attempt + 1,
+            max_retries,
+            timeout_duration
         );
 
         match tokio::time::timeout(timeout_duration, net.connect(addr)).await {
@@ -654,14 +662,20 @@ async fn add_node_and_connect_nat(
     }
 
     // Step 3: Wait for remote ICE candidates from the target party
-    eprintln!("[NAT] Waiting for ICE candidates from party {}...", target_party_id);
+    eprintln!(
+        "[NAT] Waiting for ICE candidates from party {}...",
+        target_party_id
+    );
 
     let ice_timeout = Duration::from_secs(30);
     let start = tokio::time::Instant::now();
 
     loop {
         if start.elapsed() > ice_timeout {
-            eprintln!("[NAT] Timeout waiting for ICE candidates from party {}", target_party_id);
+            eprintln!(
+                "[NAT] Timeout waiting for ICE candidates from party {}",
+                target_party_id
+            );
             add_node_and_connect_direct(net, target_party_id, target_addr).await;
             return;
         }
@@ -711,7 +725,9 @@ async fn add_node_and_connect_nat(
                                 Ok(Ok(_)) => {
                                     eprintln!(
                                         "[NAT] Successfully connected to party {} via {:?} at {}",
-                                        target_party_id, candidate.candidate_type, candidate.address
+                                        target_party_id,
+                                        candidate.candidate_type,
+                                        candidate.address
                                     );
                                     connected = true;
                                     break;
@@ -774,7 +790,11 @@ async fn add_node_and_connect_direct(
 
         eprintln!(
             "[peer-connect] Direct connect to party {} at {} (attempt {}/{}, timeout {:?})",
-            party_id, addr, attempt + 1, max_retries, timeout_duration
+            party_id,
+            addr,
+            attempt + 1,
+            max_retries,
+            timeout_duration
         );
 
         match tokio::time::timeout(timeout_duration, net.connect(addr)).await {
@@ -789,13 +809,18 @@ async fn add_node_and_connect_direct(
             Ok(Err(e)) => {
                 eprintln!(
                     "[peer-connect] Direct connection error to party {}: {} (attempt {}/{})",
-                    party_id, e, attempt + 1, max_retries
+                    party_id,
+                    e,
+                    attempt + 1,
+                    max_retries
                 );
             }
             Err(_) => {
                 eprintln!(
                     "[peer-connect] Direct connection timeout to party {} (attempt {}/{})",
-                    party_id, attempt + 1, max_retries
+                    party_id,
+                    attempt + 1,
+                    max_retries
                 );
             }
         }
@@ -963,10 +988,14 @@ pub async fn register_and_wait_for_session_with_program(
                     // - Lower-ID parties CONNECT to higher-ID parties
                     // - Higher-ID parties ACCEPT from lower-ID parties
                     // This avoids bidirectional connection races
-                    let higher_peers: Vec<_> = info.parties.iter()
+                    let higher_peers: Vec<_> = info
+                        .parties
+                        .iter()
                         .filter(|(pid, _)| *pid > my_party_id)
                         .collect();
-                    let n_expected_incoming = info.parties.iter()
+                    let n_expected_incoming = info
+                        .parties
+                        .iter()
                         .filter(|(pid, _)| *pid < my_party_id)
                         .count();
 
@@ -997,12 +1026,19 @@ pub async fn register_and_wait_for_session_with_program(
                             acceptor_party_id, n_expected_incoming
                         );
 
-                        while accepted < n_expected_incoming && accept_start.elapsed() < accept_timeout {
-                            match tokio::time::timeout(Duration::from_secs(10), acceptor.accept()).await {
+                        while accepted < n_expected_incoming
+                            && accept_start.elapsed() < accept_timeout
+                        {
+                            match tokio::time::timeout(Duration::from_secs(10), acceptor.accept())
+                                .await
+                            {
                                 Ok(Ok(conn)) => {
                                     eprintln!(
                                         "[party {}] Accepted connection from {} ({}/{})",
-                                        acceptor_party_id, conn.remote_address(), accepted + 1, n_expected_incoming
+                                        acceptor_party_id,
+                                        conn.remote_address(),
+                                        accepted + 1,
+                                        n_expected_incoming
                                     );
                                     accepted += 1;
                                 }
@@ -1017,7 +1053,10 @@ pub async fn register_and_wait_for_session_with_program(
                                     // Timeout, continue waiting
                                     eprintln!(
                                         "[party {}] Accept timeout, waiting for {} more ({}/{})",
-                                        acceptor_party_id, n_expected_incoming - accepted, accepted, n_expected_incoming
+                                        acceptor_party_id,
+                                        n_expected_incoming - accepted,
+                                        accepted,
+                                        n_expected_incoming
                                     );
                                 }
                             }
@@ -1036,12 +1075,22 @@ pub async fn register_and_wait_for_session_with_program(
                         // Use NAT-aware connection if NAT traversal is enabled
                         let use_nat = net.is_nat_traversal_enabled();
                         if use_nat {
-                            eprintln!("[party {}] Using NAT traversal for peer connections", my_party_id);
+                            eprintln!(
+                                "[party {}] Using NAT traversal for peer connections",
+                                my_party_id
+                            );
                         }
 
                         for (pid, addr) in &higher_peers {
                             if use_nat {
-                                add_node_and_connect_nat(net, my_party_id, **pid, **addr, &*bn_conn).await;
+                                add_node_and_connect_nat(
+                                    net,
+                                    my_party_id,
+                                    **pid,
+                                    **addr,
+                                    &*bn_conn,
+                                )
+                                .await;
                             } else {
                                 add_node_and_connect(net, **pid, **addr).await;
                             }
@@ -1060,39 +1109,50 @@ pub async fn register_and_wait_for_session_with_program(
                         Ok(Ok(n)) => {
                             eprintln!(
                                 "[party {}] Peer mesh established: {} outgoing, {} accepted",
-                                my_party_id, info.parties.len() - 1 - n_expected_incoming, n
+                                my_party_id,
+                                info.parties.len() - 1 - n_expected_incoming,
+                                n
                             );
                         }
                         Ok(Err(e)) => {
-                            eprintln!(
-                                "[party {}] Accept task error: {:?}",
-                                my_party_id, e
-                            );
+                            eprintln!("[party {}] Accept task error: {:?}", my_party_id, e);
                         }
                         Err(_) => {
-                            eprintln!(
-                                "[party {}] Accept task timed out",
-                                my_party_id
-                            );
+                            eprintln!("[party {}] Accept task timed out", my_party_id);
                         }
                     }
 
                     // Create loopback connection to self (required by MPC protocols)
                     // Some MPC operations send messages to self, requiring a connection entry
-                    let my_addr = info.parties.iter()
+                    let my_addr = info
+                        .parties
+                        .iter()
                         .find(|(pid, _)| *pid == my_party_id)
                         .map(|(_, addr)| *addr);
                     if let Some(addr) = my_addr {
-                        eprintln!("[party {}] Establishing loopback connection to self at {}", my_party_id, addr);
-                        match tokio::time::timeout(Duration::from_secs(5), net.connect(addr)).await {
+                        eprintln!(
+                            "[party {}] Establishing loopback connection to self at {}",
+                            my_party_id, addr
+                        );
+                        match tokio::time::timeout(Duration::from_secs(5), net.connect(addr)).await
+                        {
                             Ok(Ok(_)) => {
-                                eprintln!("[party {}] Loopback connection established", my_party_id);
+                                eprintln!(
+                                    "[party {}] Loopback connection established",
+                                    my_party_id
+                                );
                             }
                             Ok(Err(e)) => {
-                                eprintln!("[party {}] Loopback connection failed: {} (non-fatal)", my_party_id, e);
+                                eprintln!(
+                                    "[party {}] Loopback connection failed: {} (non-fatal)",
+                                    my_party_id, e
+                                );
                             }
                             Err(_) => {
-                                eprintln!("[party {}] Loopback connection timed out (non-fatal)", my_party_id);
+                                eprintln!(
+                                    "[party {}] Loopback connection timed out (non-fatal)",
+                                    my_party_id
+                                );
                             }
                         }
                     }

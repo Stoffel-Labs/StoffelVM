@@ -229,7 +229,11 @@ impl Array {
         }
 
         if truncated {
-            format!("[{}, ...({} more)]", parts.join(", "), self.length_hint - 10)
+            format!(
+                "[{}, ...({} more)]",
+                parts.join(", "),
+                self.length_hint - 10
+            )
         } else {
             format!("[{}]", parts.join(", "))
         }
@@ -550,7 +554,11 @@ impl Object {
         }
 
         if truncated {
-            format!("{{{}, ...({} more)}}", parts.join(", "), self.fields.len() - 10)
+            format!(
+                "{{{}, ...({} more)}}",
+                parts.join(", "),
+                self.fields.len() - 10
+            )
         } else {
             format!("{{{}}}", parts.join(", "))
         }

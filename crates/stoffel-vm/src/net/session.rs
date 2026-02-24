@@ -39,9 +39,7 @@ pub enum SessionMessage {
         instance_id: u64,
     },
     /// Sent by bootnode to indicate session is fully confirmed and ready to start
-    SessionStart {
-        instance_id: u64,
-    },
+    SessionStart { instance_id: u64 },
 }
 
 pub fn random_instance_id() -> u64 {

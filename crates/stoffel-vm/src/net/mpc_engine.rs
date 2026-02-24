@@ -47,9 +47,7 @@ pub trait MpcEngine: Send + Sync {
     /// Vector of revealed values in the same order as input shares
     fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
         // Default implementation: sequential fallback
-        shares.iter()
-            .map(|s| self.open_share(ty, s))
-            .collect()
+        shares.iter().map(|s| self.open_share(ty, s)).collect()
     }
 
     /// Generate random bytes as a secret-shared value.
@@ -121,22 +119,34 @@ pub trait MpcEngine: Send + Sync {
     }
 
     /// Whether this engine supports secure multiplication
-    fn supports_multiplication(&self) -> bool { false }
+    fn supports_multiplication(&self) -> bool {
+        false
+    }
 
     /// Whether this engine supports elliptic curve operations
-    fn supports_elliptic_curves(&self) -> bool { false }
+    fn supports_elliptic_curves(&self) -> bool {
+        false
+    }
 
     /// Whether this engine supports client input operations
-    fn supports_client_input(&self) -> bool { false }
+    fn supports_client_input(&self) -> bool {
+        false
+    }
 
     /// Whether this engine supports consensus (RBC/ABA)
-    fn supports_consensus(&self) -> bool { false }
+    fn supports_consensus(&self) -> bool {
+        false
+    }
 
     /// Try to obtain a reference to the consensus sub-trait, if supported.
-    fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> { None }
+    fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> {
+        None
+    }
 
     /// Try to obtain a reference to the client-ops sub-trait, if supported.
-    fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> { None }
+    fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> {
+        None
+    }
 
     /// Support downcasting for concrete engine types
     ///
@@ -287,8 +297,11 @@ pub trait AsyncMpcEngineConsensus: MpcEngineConsensus {
     async fn rbc_broadcast_async(&self, message: &[u8]) -> Result<u64, String>;
 
     /// Receive a reliable broadcast from a specific party (async)
-    async fn rbc_receive_async(&self, from_party: usize, timeout_ms: u64)
-        -> Result<Vec<u8>, String>;
+    async fn rbc_receive_async(
+        &self,
+        from_party: usize,
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>, String>;
 
     /// Receive a reliable broadcast from any party (async)
     async fn rbc_receive_any_async(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String>;
@@ -300,7 +313,11 @@ pub trait AsyncMpcEngineConsensus: MpcEngineConsensus {
     async fn aba_result_async(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String>;
 
     /// Propose and wait for agreement (async)
-    async fn aba_propose_and_wait_async(&self, value: bool, timeout_ms: u64) -> Result<bool, String> {
+    async fn aba_propose_and_wait_async(
+        &self,
+        value: bool,
+        timeout_ms: u64,
+    ) -> Result<bool, String> {
         let session_id = self.aba_propose_async(value).await?;
         self.aba_result_async(session_id, timeout_ms).await
     }

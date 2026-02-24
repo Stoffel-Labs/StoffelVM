@@ -12,7 +12,7 @@ use ark_std::UniformRand;
 use std::collections::HashMap;
 
 use crate::core_vm::VirtualMachine;
-use crate::mpc_builtins::adkg_object;
+use crate::mpc_builtins::avss_object;
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
@@ -34,10 +34,7 @@ fn setup_test_tracing() {
 
 /// Create a mock AVSS share for testing
 /// This simulates what the AVSS protocol would produce
-fn create_mock_avss_share(
-    party_id: usize,
-    threshold: usize,
-) -> (Vec<u8>, Vec<Vec<u8>>, G1) {
+fn create_mock_avss_share(party_id: usize, threshold: usize) -> (Vec<u8>, Vec<Vec<u8>>, G1) {
     use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
     use ark_std::test_rng;
 
@@ -92,7 +89,7 @@ fn test_avss_share_object_creation() {
     let (share_bytes, commitment_bytes, expected_public_key) =
         create_mock_avss_share(party_id, threshold);
 
-    let obj_id = adkg_object::create_avss_share_object(
+    let obj_id = avss_object::create_avss_share_object(
         &mut vm.state.object_store,
         key_name,
         share_bytes,
@@ -101,23 +98,21 @@ fn test_avss_share_object_creation() {
     );
 
     let obj = Value::Object(obj_id);
-    assert!(adkg_object::is_avss_share_object(
+    assert!(avss_object::is_avss_share_object(
         &vm.state.object_store,
         &obj
     ));
 
     // Verify key name
-    let retrieved_key_name =
-        adkg_object::get_key_name(&vm.state.object_store, &obj).unwrap();
+    let retrieved_key_name = avss_object::get_key_name(&vm.state.object_store, &obj).unwrap();
     assert_eq!(retrieved_key_name, key_name);
 
     // Verify commitment count
-    let count = adkg_object::get_commitment_count(&vm.state.object_store, &obj).unwrap();
+    let count = avss_object::get_commitment_count(&vm.state.object_store, &obj).unwrap();
     assert_eq!(count, commitment_bytes.len());
 
     // Verify public key (commitment[0])
-    let public_key_bytes =
-        adkg_object::get_commitment(&vm.state.object_store, &obj, 0).unwrap();
+    let public_key_bytes = avss_object::get_commitment(&vm.state.object_store, &obj, 0).unwrap();
     assert_eq!(public_key_bytes, commitment_bytes[0]);
 
     // Deserialize and verify it matches the expected public key
@@ -138,7 +133,7 @@ fn test_avss_builtins_via_vm() {
     let (share_bytes, commitment_bytes, _expected_public_key) =
         create_mock_avss_share(party_id, threshold);
 
-    let obj_id = adkg_object::create_avss_share_object(
+    let obj_id = avss_object::create_avss_share_object(
         &mut vm.state.object_store,
         "vm_test_key",
         share_bytes,
@@ -164,7 +159,11 @@ fn test_avss_builtins_via_vm() {
     vm.register_function(test_is_avss_share_fn);
 
     let result = vm.execute("test_is_avss_share").expect("Execution failed");
-    assert_eq!(result, Value::Bool(true), "Should recognize AVSS share object");
+    assert_eq!(
+        result,
+        Value::Bool(true),
+        "Should recognize AVSS share object"
+    );
 }
 
 /// Test Avss.get_public_key builtin
@@ -179,7 +178,7 @@ fn test_avss_get_public_key_builtin() {
     let (share_bytes, commitment_bytes, expected_public_key) =
         create_mock_avss_share(party_id, threshold);
 
-    let obj_id = adkg_object::create_avss_share_object(
+    let obj_id = avss_object::create_avss_share_object(
         &mut vm.state.object_store,
         "pk_test_key",
         share_bytes,
@@ -239,10 +238,9 @@ fn test_avss_get_commitment_builtin() {
     let party_id = 0usize;
     let threshold = 2; // This gives us 3 commitments (degree + 1)
 
-    let (share_bytes, commitment_bytes, _) =
-        create_mock_avss_share(party_id, threshold);
+    let (share_bytes, commitment_bytes, _) = create_mock_avss_share(party_id, threshold);
 
-    let obj_id = adkg_object::create_avss_share_object(
+    let obj_id = avss_object::create_avss_share_object(
         &mut vm.state.object_store,
         "commitment_test_key",
         share_bytes,
@@ -298,12 +296,11 @@ fn test_avss_commitment_count_builtin() {
     let party_id = 0usize;
     let threshold = 3; // This gives us 4 commitments (degree + 1)
 
-    let (share_bytes, commitment_bytes, _) =
-        create_mock_avss_share(party_id, threshold);
+    let (share_bytes, commitment_bytes, _) = create_mock_avss_share(party_id, threshold);
 
     let expected_count = commitment_bytes.len();
 
-    let obj_id = adkg_object::create_avss_share_object(
+    let obj_id = avss_object::create_avss_share_object(
         &mut vm.state.object_store,
         "count_test_key",
         share_bytes,
@@ -328,7 +325,9 @@ fn test_avss_commitment_count_builtin() {
 
     vm.register_function(get_count_fn);
 
-    let result = vm.execute("get_commitment_count").expect("Execution failed");
+    let result = vm
+        .execute("get_commitment_count")
+        .expect("Execution failed");
 
     assert_eq!(
         result,
@@ -347,10 +346,9 @@ fn test_avss_get_key_name_builtin() {
     let party_id = 0usize;
     let threshold = 1;
 
-    let (share_bytes, commitment_bytes, _) =
-        create_mock_avss_share(party_id, threshold);
+    let (share_bytes, commitment_bytes, _) = create_mock_avss_share(party_id, threshold);
 
-    let obj_id = adkg_object::create_avss_share_object(
+    let obj_id = avss_object::create_avss_share_object(
         &mut vm.state.object_store,
         key_name,
         share_bytes,
@@ -412,7 +410,7 @@ fn test_example_avss_public_key_program() {
         commitment_bytes[0].len()
     );
 
-    let avss_share_obj_id = adkg_object::create_avss_share_object(
+    let avss_share_obj_id = avss_object::create_avss_share_object(
         &mut vm.state.object_store,
         key_name,
         share_bytes,
@@ -569,8 +567,7 @@ fn test_e2e_5_parties_avss_public_key() {
         n_parties,
         threshold
     );
-    let (party_data, expected_public_key) =
-        simulate_avss_for_n_parties(n_parties, threshold);
+    let (party_data, expected_public_key) = simulate_avss_for_n_parties(n_parties, threshold);
 
     tracing::info!(
         "AVSS produced {} commitments per party",
@@ -583,7 +580,7 @@ fn test_e2e_5_parties_avss_public_key() {
     for (party_id, (share_bytes, commitment_bytes)) in party_data.into_iter().enumerate() {
         let mut vm = VirtualMachine::new();
 
-        let avss_share_id = adkg_object::create_avss_share_object(
+        let avss_share_id = avss_object::create_avss_share_object(
             &mut vm.state.object_store,
             "shared_key",
             share_bytes,
@@ -632,11 +629,15 @@ fn test_e2e_5_parties_avss_public_key() {
             other => panic!("Party {} got unexpected result: {:?}", party_id, other),
         };
 
-        let pk = G1::deserialize_compressed(&pk_bytes[..])
-            .expect("Failed to deserialize public key");
+        let pk =
+            G1::deserialize_compressed(&pk_bytes[..]).expect("Failed to deserialize public key");
 
         extracted_public_keys.push(pk);
-        tracing::info!("Party {} extracted public key ({} bytes)", party_id, pk_bytes.len());
+        tracing::info!(
+            "Party {} extracted public key ({} bytes)",
+            party_id,
+            pk_bytes.len()
+        );
     }
 
     tracing::info!("Step 4: Verifying all parties have consistent public key");
@@ -703,14 +704,13 @@ fn test_e2e_avss_with_input_output_clients() {
         input_client_ids
     );
 
-    let (party_data, expected_public_key) =
-        simulate_avss_for_n_parties(n_parties, threshold);
+    let (party_data, expected_public_key) = simulate_avss_for_n_parties(n_parties, threshold);
 
     let mut party_vms: Vec<VirtualMachine> = Vec::new();
     for (party_id, (share_bytes, commitment_bytes)) in party_data.into_iter().enumerate() {
         let mut vm = VirtualMachine::new();
 
-        let avss_share_id = adkg_object::create_avss_share_object(
+        let avss_share_id = avss_object::create_avss_share_object(
             &mut vm.state.object_store,
             "client_key",
             share_bytes,

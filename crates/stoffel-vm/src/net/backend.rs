@@ -18,7 +18,7 @@ impl std::str::FromStr for MpcBackendKind {
     ///
     /// Accepted values:
     /// - `"honeybadger"` or `"hb"` -> `HoneyBadger`
-    /// - `"adkg"` -> `Adkg`
+    /// - `"avss"` or `"adkg"` -> `Avss`
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             #[cfg(feature = "honeybadger")]
@@ -44,7 +44,7 @@ impl std::str::FromStr for MpcBackendKind {
 impl MpcBackendKind {
     /// Returns the default backend.
     ///
-    /// Prefers HoneyBadger when available, falls back to ADKG.
+    /// Prefers HoneyBadger when available, falls back to AVSS.
     pub fn default_backend() -> Self {
         #[cfg(feature = "honeybadger")]
         {
@@ -79,11 +79,15 @@ impl MpcBackendKind {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => true,
             #[cfg(feature = "adkg")]
-            MpcBackendKind::Avss => false,
+            MpcBackendKind::Avss => true,
         }
     }
 
-    /// Whether this backend supports elliptic curve operations.
+    /// Whether this backend is safe for elliptic curve operations.
+    ///
+    /// AVSS commitments use abelian groups (EC points) rather than field elements,
+    /// making it safe for EC operations like threshold signatures. HoneyBadger
+    /// commitments are field-only and not safe for direct EC operations.
     pub fn supports_elliptic_curves(&self) -> bool {
         match self {
             #[cfg(feature = "honeybadger")]
@@ -95,7 +99,7 @@ impl MpcBackendKind {
 
     /// Whether this backend supports client inputs.
     ///
-    /// Both backends support client inputs; in ADKG the client and server roles
+    /// Both backends support client inputs; in AVSS the client and server roles
     /// are unified (every party is also a client).
     pub fn supports_client_input(&self) -> bool {
         match self {
@@ -165,7 +169,10 @@ mod tests {
     #[test]
     #[cfg(feature = "honeybadger")]
     fn test_default_is_honeybadger() {
-        assert_eq!(MpcBackendKind::default_backend(), MpcBackendKind::HoneyBadger);
+        assert_eq!(
+            MpcBackendKind::default_backend(),
+            MpcBackendKind::HoneyBadger
+        );
     }
 
     #[test]
@@ -182,7 +189,7 @@ mod tests {
     fn test_avss_capabilities() {
         let avss = MpcBackendKind::Avss;
         assert!(avss.supports_general_mpc());
-        assert!(!avss.supports_multiplication());
+        assert!(avss.supports_multiplication());
         assert!(avss.supports_elliptic_curves());
         assert!(avss.supports_client_input());
     }

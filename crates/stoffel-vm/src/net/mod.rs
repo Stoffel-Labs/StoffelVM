@@ -2,9 +2,9 @@
 //! Networking module for peer-to-peer communication.
 
 #[cfg(feature = "adkg")]
-pub mod adkg_engine;
+pub mod avss_engine;
 #[cfg(feature = "adkg")]
-pub mod adkg_server;
+pub mod avss_server;
 pub mod backend;
 pub mod client_store;
 pub mod curve;

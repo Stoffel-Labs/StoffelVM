@@ -466,7 +466,10 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                         guard.clone()
                     }; // guard dropped here, mutex released
 
-                    if let Err(e) = client.process(data, sender_id, Arc::new(network_clone)).await {
+                    if let Err(e) = client
+                        .process(data, sender_id, Arc::new(network_clone))
+                        .await
+                    {
                         error!("Client {} failed to process message: {:?}", client_id, e);
                     }
 
@@ -618,7 +621,9 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
     }
 
     /// Stops the client and closes all connections, returning the MPC client
-    pub async fn stop(mut self) -> Result<HoneyBadgerMPCClient<F, Avid<HbSessionId>>, HoneyBadgerError> {
+    pub async fn stop(
+        mut self,
+    ) -> Result<HoneyBadgerMPCClient<F, Avid<HbSessionId>>, HoneyBadgerError> {
         info!("Stopping HoneyBadger QUIC client {}", self.client_id);
 
         // Send shutdown message to actor
@@ -721,7 +726,13 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     base_port: u16,
     config: HoneyBadgerQuicConfig,
     input_ids: Option<Vec<ClientId>>,
-) -> Result<(Vec<HoneyBadgerQuicServer<F>>, Vec<Receiver<(PartyId, Vec<u8>)>>), HoneyBadgerError> {
+) -> Result<
+    (
+        Vec<HoneyBadgerQuicServer<F>>,
+        Vec<Receiver<(PartyId, Vec<u8>)>>,
+    ),
+    HoneyBadgerError,
+> {
     let input_ids = input_ids.unwrap_or_default();
     let mut servers = Vec::new();
 
@@ -755,9 +766,15 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     let mut recv = Vec::new();
     for i in 0..n_parties {
         let (tx, rx) = mpsc::channel(1500);
-        let mut server =
-            HoneyBadgerQuicServer::new(i, addresses[i], mpc_opts.clone(), config.clone(), tx, input_ids.clone())
-                .await?;
+        let mut server = HoneyBadgerQuicServer::new(
+            i,
+            addresses[i],
+            mpc_opts.clone(),
+            config.clone(),
+            tx,
+            input_ids.clone(),
+        )
+        .await?;
         // Add all other servers as peers
         for j in 0..n_parties {
             if i != j {
@@ -808,7 +825,11 @@ mod tests {
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
         let instance_id = 99999;
         let base_port = 9200;
-        let session_id = SessionId::new(ProtocolType::Mul, SessionId::pack_slot24(0, 0, 0), instance_id as u32);
+        let session_id = SessionId::new(
+            ProtocolType::Mul,
+            SessionId::pack_slot24(0, 0, 0),
+            instance_id as u32,
+        );
         // Define client IDs before network setup (client IDs must be registered at setup time)
         // Client 100 is for input, client 200 is for output only
         let input_client_id: ClientId = 100;
@@ -872,7 +893,10 @@ mod tests {
 
             //Receiver for each node
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network = server
+                .network
+                .clone()
+                .expect("network should be set after start()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
@@ -968,13 +992,20 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, SessionId::pack_slot24(0, 0, 0), instance_id as u32);
+        let _session_id = SessionId::new(
+            ProtocolType::Ransha,
+            SessionId::pack_slot24(0, 0, 0),
+            instance_id as u32,
+        );
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
             .map(|(i, server)| {
                 let mut node_arc = server.node.clone();
-                let network_clone = server.network.clone().expect("network should be set after start()");
+                let network_clone = server
+                    .network
+                    .clone()
+                    .expect("network should be set after start()");
 
                 tokio::spawn(async move {
                     info!("[Server {}] Starting preprocessing...", i);
@@ -1023,7 +1054,12 @@ mod tests {
                 .node
                 .preprocess
                 .input
-                .init(input_client_id, local_shares, 2, server.network.clone().expect("network should be set"))
+                .init(
+                    input_client_id,
+                    local_shares,
+                    2,
+                    server.network.clone().expect("network should be set"),
+                )
                 .await
             {
                 Ok(_) => {}
@@ -1042,7 +1078,9 @@ mod tests {
             let net = servers[pid].network.clone().expect("network should be set");
 
             let (x_shares, y_shares) = {
-                let input_store = node.preprocess.input
+                let input_store = node
+                    .preprocess
+                    .input
                     .wait_for_all_inputs(std::time::Duration::from_secs(30))
                     .await
                     .expect("Failed to get client inputs");
@@ -1055,7 +1093,8 @@ mod tests {
 
             let handle = tokio::spawn(async move {
                 // mul() returns the result directly (via internal wait_for_result)
-                let result = node.mul(x_shares.clone(), y_shares.clone(), net.clone())
+                let result = node
+                    .mul(x_shares.clone(), y_shares.clone(), net.clone())
                     .await
                     .expect("mul failed");
                 (pid, result)
@@ -1078,7 +1117,8 @@ mod tests {
             let net = server.network.clone().expect("network should be set");
 
             // Find the result for this party from the collected mul results
-            let shares_mult_for_node = mul_results.iter()
+            let shares_mult_for_node = mul_results
+                .iter()
                 .find(|(pid, _)| *pid == i)
                 .map(|(_, shares)| shares.clone())
                 .expect(&format!("Result for party {} not found", i));
@@ -1115,7 +1155,7 @@ mod tests {
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
         let instance_id = 99999;
         let base_port = 9220; // Unique port range for test_client_input_only
-        // Define client IDs before network setup (client IDs must be registered at setup time)
+                              // Define client IDs before network setup (client IDs must be registered at setup time)
         let clientid: Vec<ClientId> = vec![100, 200];
         let input_values: Vec<Fr> = vec![Fr::from(10), Fr::from(20)];
 
@@ -1174,7 +1214,10 @@ mod tests {
 
             //Receiver for each node
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network = server
+                .network
+                .clone()
+                .expect("network should be set after start()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
@@ -1270,13 +1313,20 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, SessionId::pack_slot24(0, 0, 0), instance_id as u32);
+        let _session_id = SessionId::new(
+            ProtocolType::Ransha,
+            SessionId::pack_slot24(0, 0, 0),
+            instance_id as u32,
+        );
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
             .map(|(i, server)| {
                 let mut node_arc = server.node.clone();
-                let network_clone = server.network.clone().expect("network should be set after start()");
+                let network_clone = server
+                    .network
+                    .clone()
+                    .expect("network should be set after start()");
 
                 tokio::spawn(async move {
                     info!("[Server {}] Starting preprocessing...", i);
@@ -1324,7 +1374,12 @@ mod tests {
                 .node
                 .preprocess
                 .input
-                .init(clientid[0], local_shares, 2, server.network.clone().expect("network should be set"))
+                .init(
+                    clientid[0],
+                    local_shares,
+                    2,
+                    server.network.clone().expect("network should be set"),
+                )
                 .await
             {
                 Ok(_) => {}
@@ -1378,7 +1433,10 @@ mod tests {
 
             //Receiver for each node
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network = server
+                .network
+                .clone()
+                .expect("network should be set after start()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
@@ -1445,13 +1503,20 @@ mod tests {
         );
 
         let preprocessing_timeout = Duration::from_secs(30);
-        let _session_id = SessionId::new(ProtocolType::Ransha, SessionId::pack_slot24(0, 0, 0), instance_id as u32);
+        let _session_id = SessionId::new(
+            ProtocolType::Ransha,
+            SessionId::pack_slot24(0, 0, 0),
+            instance_id as u32,
+        );
         let preprocessing_handles: Vec<_> = servers
             .iter()
             .enumerate()
             .map(|(i, server)| {
                 let mut node_arc = server.node.clone();
-                let network_clone = server.network.clone().expect("network should be set after start()");
+                let network_clone = server
+                    .network
+                    .clone()
+                    .expect("network should be set after start()");
 
                 tokio::spawn(async move {
                     info!("[Server {}] Starting preprocessing...", i);

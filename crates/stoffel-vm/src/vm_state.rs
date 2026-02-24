@@ -19,11 +19,11 @@ use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
 use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rustc_hash::FxHashMap;
-use smallvec::{SmallVec, smallvec};
+use smallvec::{smallvec, SmallVec};
 use std::sync::Arc;
 use stoffel_vm_types::activations::{ActivationRecord, ActivationRecordPool};
 use stoffel_vm_types::core_types::{
-    Closure, F64, ForeignObjectStorage, ObjectStore, ShareType, Upvalue, Value,
+    Closure, ForeignObjectStorage, ObjectStore, ShareType, Upvalue, Value, F64,
 };
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::{Instruction, ResolvedInstruction};
@@ -420,7 +420,10 @@ impl VMState {
             self.current_instruction = ip;
 
             // Advance instruction pointer
-            self.activation_records.last_mut().unwrap().instruction_pointer += 1;
+            self.activation_records
+                .last_mut()
+                .unwrap()
+                .instruction_pointer += 1;
 
             // Trigger before-execution hook
             if hooks_enabled {
@@ -469,8 +472,7 @@ impl VMState {
 
         loop {
             // Execute one step
-            let step_result =
-                self.execute_step(initial_activation_depth, hooks_enabled)?;
+            let step_result = self.execute_step(initial_activation_depth, hooks_enabled)?;
 
             match step_result {
                 StepResult::Continue => {
@@ -538,7 +540,10 @@ impl VMState {
         self.current_instruction = ip;
 
         // Advance instruction pointer
-        self.activation_records.last_mut().unwrap().instruction_pointer += 1;
+        self.activation_records
+            .last_mut()
+            .unwrap()
+            .instruction_pointer += 1;
 
         // Trigger before-execution hook
         if hooks_enabled {
@@ -578,7 +583,10 @@ impl VMState {
     ///
     /// Returns Some(PendingMpcOperation) if the instruction needs MPC,
     /// None if it can be executed synchronously.
-    fn check_mpc_operation(&self, instruction: &Instruction) -> Result<Option<PendingMpcOperation>, String> {
+    fn check_mpc_operation(
+        &self,
+        instruction: &Instruction,
+    ) -> Result<Option<PendingMpcOperation>, String> {
         match instruction {
             Instruction::MUL(dest, src1, src2) => {
                 let record = self.activation_records.last().unwrap();
@@ -795,7 +803,8 @@ impl VMState {
         vm_function: &VMFunction,
     ) -> Result<Instruction, String> {
         if self.instruction_cache.is_empty() {
-            self.instruction_cache.extend(vm_function.instructions.iter().cloned());
+            self.instruction_cache
+                .extend(vm_function.instructions.iter().cloned());
         }
         Ok(self.instruction_cache[ip].clone())
     }
@@ -922,7 +931,12 @@ impl VMState {
 impl VMState {
     /// Execute LD instruction - Load from stack to register
     #[inline]
-    fn execute_ld(&mut self, dest_reg: usize, offset: i32, hooks_enabled: bool) -> Result<(), String> {
+    fn execute_ld(
+        &mut self,
+        dest_reg: usize,
+        offset: i32,
+        hooks_enabled: bool,
+    ) -> Result<(), String> {
         let value = {
             let record = self.activation_records.last().unwrap();
             let stack_len = record.stack.len() as i32;
@@ -937,7 +951,8 @@ impl VMState {
         if hooks_enabled {
             let old_value = record.registers[dest_reg].clone();
             record.registers[dest_reg] = value;
-            let event = HookEvent::RegisterWrite(dest_reg, old_value, record.registers[dest_reg].clone());
+            let event =
+                HookEvent::RegisterWrite(dest_reg, old_value, record.registers[dest_reg].clone());
             self.trigger_hook_with_snapshot(&event)?;
         } else {
             record.registers[dest_reg] = value;
@@ -947,7 +962,12 @@ impl VMState {
 
     /// Execute LDI instruction - Load immediate to register
     #[inline]
-    fn execute_ldi(&mut self, dest_reg: usize, value: Value, hooks_enabled: bool) -> Result<(), String> {
+    fn execute_ldi(
+        &mut self,
+        dest_reg: usize,
+        value: Value,
+        hooks_enabled: bool,
+    ) -> Result<(), String> {
         let record = self.activation_records.last_mut().unwrap();
         if hooks_enabled {
             let old_value = record.registers[dest_reg].clone();
@@ -961,7 +981,12 @@ impl VMState {
     }
 
     /// Execute MOV instruction - Move between registers (with secret sharing conversion)
-    fn execute_mov(&mut self, dest_reg: usize, src_reg: usize, hooks_enabled: bool) -> Result<(), String> {
+    fn execute_mov(
+        &mut self,
+        dest_reg: usize,
+        src_reg: usize,
+        hooks_enabled: bool,
+    ) -> Result<(), String> {
         // Determine what kind of conversion is needed and clone necessary data
         // We do this in a separate block to avoid borrow conflicts with reveal_share
         let (conversion_type, src_value_clone) = {
@@ -1041,7 +1066,9 @@ impl VMState {
                     .map_err(|e| format!("MPC input_share failed: {}", e))?;
                 Ok(Value::Share(ty, bytes))
             }
-            _ => Err("Only primitive types (Int, Float, Bool) can be converted to shares".to_string()),
+            _ => Err(
+                "Only primitive types (Int, Float, Bool) can be converted to shares".to_string(),
+            ),
         }
     }
 
@@ -1847,7 +1874,10 @@ impl VMState {
     #[inline]
     fn execute_jmp(&mut self, label: &str, use_resolved: bool, ip: usize) -> Result<(), String> {
         let target = self.resolve_jump_target(label, use_resolved, ip, "JMP")?;
-        self.activation_records.last_mut().unwrap().instruction_pointer = target;
+        self.activation_records
+            .last_mut()
+            .unwrap()
+            .instruction_pointer = target;
         Ok(())
     }
 
@@ -1856,7 +1886,10 @@ impl VMState {
     fn execute_jmpeq(&mut self, label: &str, use_resolved: bool, ip: usize) -> Result<(), String> {
         if self.activation_records.last().unwrap().compare_flag == 0 {
             let target = self.resolve_jump_target(label, use_resolved, ip, "JMPEQ")?;
-            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+            self.activation_records
+                .last_mut()
+                .unwrap()
+                .instruction_pointer = target;
         }
         Ok(())
     }
@@ -1866,7 +1899,10 @@ impl VMState {
     fn execute_jmpneq(&mut self, label: &str, use_resolved: bool, ip: usize) -> Result<(), String> {
         if self.activation_records.last().unwrap().compare_flag != 0 {
             let target = self.resolve_jump_target(label, use_resolved, ip, "JMPNEQ")?;
-            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+            self.activation_records
+                .last_mut()
+                .unwrap()
+                .instruction_pointer = target;
         }
         Ok(())
     }
@@ -1876,7 +1912,10 @@ impl VMState {
     fn execute_jmplt(&mut self, label: &str, use_resolved: bool, ip: usize) -> Result<(), String> {
         if self.activation_records.last().unwrap().compare_flag == -1 {
             let target = self.resolve_jump_target(label, use_resolved, ip, "JMPLT")?;
-            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+            self.activation_records
+                .last_mut()
+                .unwrap()
+                .instruction_pointer = target;
         }
         Ok(())
     }
@@ -1886,7 +1925,10 @@ impl VMState {
     fn execute_jmpgt(&mut self, label: &str, use_resolved: bool, ip: usize) -> Result<(), String> {
         if self.activation_records.last().unwrap().compare_flag == 1 {
             let target = self.resolve_jump_target(label, use_resolved, ip, "JMPGT")?;
-            self.activation_records.last_mut().unwrap().instruction_pointer = target;
+            self.activation_records
+                .last_mut()
+                .unwrap()
+                .instruction_pointer = target;
         }
         Ok(())
     }
@@ -1908,7 +1950,10 @@ impl VMState {
                 | ResolvedInstruction::JMPNEQ(target)
                 | ResolvedInstruction::JMPLT(target)
                 | ResolvedInstruction::JMPGT(target) => Ok(*target),
-                _ => Err(format!("Expected {} instruction, got {:?}", instr_name, resolved)),
+                _ => Err(format!(
+                    "Expected {} instruction, got {:?}",
+                    instr_name, resolved
+                )),
             }
         } else {
             let function_name = &self.activation_records.last().unwrap().function_name;
@@ -2015,9 +2060,9 @@ impl VMState {
         // Initialize upvalues
         let mut upvalues = Vec::with_capacity(vm_func.upvalues.len());
         for name in &vm_func.upvalues {
-            let value = self.find_upvalue(name).ok_or_else(|| {
-                format!("Could not find upvalue {} when calling function", name)
-            })?;
+            let value = self
+                .find_upvalue(name)
+                .ok_or_else(|| format!("Could not find upvalue {} when calling function", name))?;
             upvalues.push(Upvalue {
                 name: name.clone(),
                 value,
@@ -2227,7 +2272,11 @@ impl VMState {
         self.ensure_resolved(reg)?;
 
         let value = self.activation_records.last().unwrap().registers[reg].clone();
-        self.activation_records.last_mut().unwrap().stack.push(value.clone());
+        self.activation_records
+            .last_mut()
+            .unwrap()
+            .stack
+            .push(value.clone());
 
         if hooks_enabled {
             let event = HookEvent::StackPush(value);
@@ -2434,13 +2483,20 @@ impl VMState {
     }
 
     /// Load a client's input share as a fixed-point share from the global client store
-    pub fn load_client_share_fixed(&self, client_id: ClientId, index: usize) -> Result<Value, String> {
+    pub fn load_client_share_fixed(
+        &self,
+        client_id: ClientId,
+        index: usize,
+    ) -> Result<Value, String> {
         let share_bytes = self
             .client_store
             .get_client_share_bytes(client_id, index)
             .ok_or_else(|| format!("No share found for client {} at index {}", client_id, index))?;
 
-        Ok(Value::Share(ShareType::default_secret_fixed_point(), share_bytes))
+        Ok(Value::Share(
+            ShareType::default_secret_fixed_point(),
+            share_bytes,
+        ))
     }
 
     /// Load all of a client's input shares from the global client store
@@ -2639,7 +2695,10 @@ impl VMState {
             robust_shares.push(share);
         }
 
-        let n_parties = self.mpc_engine().map(|e| e.n_parties()).unwrap_or(shares.len());
+        let n_parties = self
+            .mpc_engine()
+            .map(|e| e.n_parties())
+            .unwrap_or(shares.len());
         let (_degree, secret) = RobustShare::recover_secret(&robust_shares, n_parties)
             .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
 
@@ -2658,23 +2717,57 @@ impl VMState {
         }
     }
 
-    fn secret_int_add_scalar(&self, _ty: ShareType, share_bytes: &[u8], scalar: i64) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_scalar_op_typed(share_bytes, scalar, |a, b| a + b))
+    fn secret_int_add_scalar(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        scalar: i64,
+    ) -> Result<Vec<u8>, String> {
+        dispatch_share_field!(
+            self,
+            share_scalar_op_typed(share_bytes, scalar, |a, b| a + b)
+        )
     }
 
-    fn secret_int_sub_scalar(&self, _ty: ShareType, share_bytes: &[u8], scalar: i64) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_scalar_op_typed(share_bytes, scalar, |a, b| a - b))
+    fn secret_int_sub_scalar(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        scalar: i64,
+    ) -> Result<Vec<u8>, String> {
+        dispatch_share_field!(
+            self,
+            share_scalar_op_typed(share_bytes, scalar, |a, b| a - b)
+        )
     }
 
-    fn scalar_sub_secret_int(&self, _ty: ShareType, scalar: i64, share_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    fn scalar_sub_secret_int(
+        &self,
+        _ty: ShareType,
+        scalar: i64,
+        share_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
         dispatch_share_field!(self, scalar_sub_share_typed(scalar, share_bytes))
     }
 
-    fn secret_int_mul_scalar(&self, _ty: ShareType, share_bytes: &[u8], scalar: i64) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_scalar_op_typed(share_bytes, scalar, |a, b| a * b))
+    fn secret_int_mul_scalar(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        scalar: i64,
+    ) -> Result<Vec<u8>, String> {
+        dispatch_share_field!(
+            self,
+            share_scalar_op_typed(share_bytes, scalar, |a, b| a * b)
+        )
     }
 
-    fn secret_int_div_scalar(&self, _ty: ShareType, share_bytes: &[u8], scalar: i64) -> Result<Vec<u8>, String> {
+    fn secret_int_div_scalar(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        scalar: i64,
+    ) -> Result<Vec<u8>, String> {
         dispatch_share_field!(self, share_div_scalar_typed(share_bytes, scalar))
     }
 
@@ -2684,7 +2777,10 @@ impl VMState {
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_scalar_op_typed(share_bytes, scalar, |a, b| a + b))
+        dispatch_share_field!(
+            self,
+            share_scalar_op_typed(share_bytes, scalar, |a, b| a + b)
+        )
     }
 
     fn secret_fixed_point_sub_scalar(
@@ -2693,7 +2789,10 @@ impl VMState {
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_scalar_op_typed(share_bytes, scalar, |a, b| a - b))
+        dispatch_share_field!(
+            self,
+            share_scalar_op_typed(share_bytes, scalar, |a, b| a - b)
+        )
     }
 
     fn scalar_sub_secret_fixed_point(
@@ -2711,7 +2810,10 @@ impl VMState {
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_scalar_op_typed(share_bytes, scalar, |a, b| a * b))
+        dispatch_share_field!(
+            self,
+            share_scalar_op_typed(share_bytes, scalar, |a, b| a * b)
+        )
     }
 
     fn secret_fixed_point_div_scalar(
@@ -2776,7 +2878,10 @@ impl VMState {
         lhs_bytes: &[u8],
         rhs_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_binary_op_typed(lhs_bytes, rhs_bytes, |a, b| a + b))
+        dispatch_share_field!(
+            self,
+            share_binary_op_typed(lhs_bytes, rhs_bytes, |a, b| a + b)
+        )
     }
 
     /// Subtract two secret shares (public wrapper for mpc_builtins)
@@ -2786,7 +2891,10 @@ impl VMState {
         lhs_bytes: &[u8],
         rhs_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_binary_op_typed(lhs_bytes, rhs_bytes, |a, b| a - b))
+        dispatch_share_field!(
+            self,
+            share_binary_op_typed(lhs_bytes, rhs_bytes, |a, b| a - b)
+        )
     }
 
     /// Negate a secret share (public wrapper for mpc_builtins)
