@@ -10,6 +10,8 @@ use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_TOTAL_BITS;
 use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_FRACTIONAL_BITS;
 #[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNodeOpts;
+#[cfg(feature = "honeybadger")]
+use std::time::Duration;
 
 #[cfg(feature = "honeybadger")]
 const DEFAULT_MIN_PARTIES: usize = 5;
@@ -17,6 +19,8 @@ const DEFAULT_MIN_PARTIES: usize = 5;
 const DEFAULT_THRESHOLD: usize = 1;
 #[cfg(feature = "honeybadger")]
 const DEFAULT_SECURITY_PARAMETER_K: usize = 8;
+#[cfg(feature = "honeybadger")]
+const DEFAULT_MPC_TIMEOUT_SECS: u64 = 60;
 
 #[cfg(feature = "honeybadger")]
 fn derive_prandbit_count(n_random_shares: usize) -> usize {
@@ -69,6 +73,7 @@ pub fn honeybadger_node_opts(
         n_prandint,
         l,
         k,
+        Duration::from_secs(DEFAULT_MPC_TIMEOUT_SECS),
     )
 }
 

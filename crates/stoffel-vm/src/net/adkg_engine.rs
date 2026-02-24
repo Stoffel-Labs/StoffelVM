@@ -390,9 +390,8 @@ where
         &self,
         msg: stoffelmpc_mpc::common::share::avss::AvssMessage<AvssSessionId>,
     ) -> Result<(), String> {
-        let sender_id = msg.sender_id;
         let mut node = self.avss_node.lock().await;
-        node.process(msg, sender_id)
+        node.process(msg)
             .await
             .map_err(|e| format!("AVSS process failed: {:?}", e))
     }
