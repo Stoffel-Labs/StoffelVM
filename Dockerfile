@@ -72,6 +72,9 @@ COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/client_mul.stflb
 COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
+# Copy coordinator keys
+COPY off-chain-keys /app/off-chain-keys
+
 # Default environment variables (can be overridden in docker-compose)
 ENV STOFFEL_BIND_ADDR="0.0.0.0:9000"
 ENV STOFFEL_N_PARTIES="5"
@@ -84,6 +87,10 @@ ENV STOFFEL_BOOTSTRAP_ADDR=""
 # NAT traversal settings (only effective if built with --features nat)
 ENV STOFFEL_ENABLE_NAT="false"
 ENV STOFFEL_STUN_SERVERS=""
+ENV STOFFEL_ETH_NODE_ADDR="ws://host.docker.internal:8545"
+ENV STOFFEL_COORD_ADDR=""
+ENV STOFFEL_WALLET_SK=""
+ENV STOFFEL_OFF_CHAIN_KEY=""
 
 # Expose ports for bootnode and party communication
 # Port 9000: bootnode coordination
