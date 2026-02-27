@@ -7,7 +7,7 @@
 pub enum MpcBackendKind {
     #[cfg(feature = "honeybadger")]
     HoneyBadger,
-    #[cfg(feature = "adkg")]
+    #[cfg(feature = "avss")]
     Avss,
 }
 
@@ -23,13 +23,13 @@ impl std::str::FromStr for MpcBackendKind {
         match s.to_lowercase().as_str() {
             #[cfg(feature = "honeybadger")]
             "honeybadger" | "hb" => Ok(MpcBackendKind::HoneyBadger),
-            #[cfg(feature = "adkg")]
+            #[cfg(feature = "avss")]
             "avss" | "adkg" => Ok(MpcBackendKind::Avss),
             other => {
                 let mut available = Vec::new();
                 #[cfg(feature = "honeybadger")]
                 available.push("honeybadger");
-                #[cfg(feature = "adkg")]
+                #[cfg(feature = "avss")]
                 available.push("avss");
                 Err(format!(
                     "Unknown MPC backend '{}'. Available: {}",
@@ -52,11 +52,11 @@ impl MpcBackendKind {
         }
         #[cfg(not(feature = "honeybadger"))]
         {
-            #[cfg(feature = "adkg")]
+            #[cfg(feature = "avss")]
             {
                 MpcBackendKind::Avss
             }
-            #[cfg(not(feature = "adkg"))]
+            #[cfg(not(feature = "avss"))]
             {
                 compile_error!("At least one MPC backend feature must be enabled");
             }
@@ -68,7 +68,7 @@ impl MpcBackendKind {
         match self {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => true,
-            #[cfg(feature = "adkg")]
+            #[cfg(feature = "avss")]
             MpcBackendKind::Avss => true,
         }
     }
@@ -78,7 +78,7 @@ impl MpcBackendKind {
         match self {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => true,
-            #[cfg(feature = "adkg")]
+            #[cfg(feature = "avss")]
             MpcBackendKind::Avss => true,
         }
     }
@@ -92,21 +92,22 @@ impl MpcBackendKind {
         match self {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => false,
-            #[cfg(feature = "adkg")]
+            #[cfg(feature = "avss")]
             MpcBackendKind::Avss => true,
         }
     }
 
-    /// Whether this backend supports client inputs.
+    /// Whether this backend supports standalone client input mode.
     ///
-    /// Both backends support client inputs; in AVSS the client and server roles
-    /// are unified (every party is also a client).
+    /// `stoffel-run --client` is currently implemented for HoneyBadger only.
+    /// AVSS requires each party to participate directly rather than using the
+    /// separate client flow.
     pub fn supports_client_input(&self) -> bool {
         match self {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => true,
-            #[cfg(feature = "adkg")]
-            MpcBackendKind::Avss => true,
+            #[cfg(feature = "avss")]
+            MpcBackendKind::Avss => false,
         }
     }
 
@@ -115,7 +116,7 @@ impl MpcBackendKind {
         match self {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => "honeybadger",
-            #[cfg(feature = "adkg")]
+            #[cfg(feature = "avss")]
             MpcBackendKind::Avss => "avss",
         }
     }
@@ -144,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "adkg")]
+    #[cfg(feature = "avss")]
     fn test_parse_avss() {
         assert_eq!(
             MpcBackendKind::from_str("avss").unwrap(),
@@ -185,13 +186,13 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "adkg")]
+    #[cfg(feature = "avss")]
     fn test_avss_capabilities() {
         let avss = MpcBackendKind::Avss;
         assert!(avss.supports_general_mpc());
         assert!(avss.supports_multiplication());
         assert!(avss.supports_elliptic_curves());
-        assert!(avss.supports_client_input());
+        assert!(!avss.supports_client_input());
     }
 
     #[test]

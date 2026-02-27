@@ -50,11 +50,11 @@ dashmap = "5"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [features]
-default = ["honeybadger", "adkg"]
+default = ["honeybadger", "avss"]
 honeybadger = []
-adkg = []
+avss = []
 hb_itest = ["honeybadger"]
-adkg_itest = ["adkg"]
+avss_itest = ["avss"]
 
 [dev-dependencies]
 criterion = { version = "0.6.0", features = ["html_reports"] }

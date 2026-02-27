@@ -16,6 +16,7 @@
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_ff::{FftField, PrimeField};
 use ark_std::rand::SeedableRng;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -109,6 +110,66 @@ where
     F: FftField + PrimeField + Send + Sync + 'static,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
+    #[inline]
+    fn decode_public_key_envelope(
+        authenticated_peer_id: Option<usize>,
+        payload: &[u8],
+        n_parties: usize,
+    ) -> Result<(usize, G), String> {
+        if payload.len() < 4 {
+            return Err(format!(
+                "Invalid PK message from peer {:?}: too short",
+                authenticated_peer_id
+            ));
+        }
+
+        let declared_sender =
+            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        if let Some(auth_id) = authenticated_peer_id {
+            // In stoffelnet, remote_party_id is optional and may be unset during early setup.
+            // If present and in protocol range, enforce sender binding to that identity.
+            if auth_id < n_parties && declared_sender != auth_id {
+                return Err(format!(
+                    "PK sender mismatch: authenticated peer {} declared {}",
+                    auth_id, declared_sender
+                ));
+            }
+        }
+
+        if declared_sender >= n_parties {
+            return Err(format!(
+                "Invalid declared sender {} (n={})",
+                declared_sender, n_parties
+            ));
+        }
+
+        let pk = G::deserialize_compressed(&payload[4..]).map_err(|e| {
+            format!(
+                "Failed to deserialize PK from authenticated peer {:?}: {:?}",
+                authenticated_peer_id, e
+            )
+        })?;
+        Ok((declared_sender, pk))
+    }
+
+    #[inline]
+    fn insert_public_key_once(
+        sender_id: usize,
+        pk: G,
+        n_parties: usize,
+        seen_senders: &mut HashSet<usize>,
+        pk_map: &mut [G],
+    ) -> bool {
+        if sender_id >= n_parties {
+            return false;
+        }
+        if !seen_senders.insert(sender_id) {
+            return false;
+        }
+        pk_map[sender_id] = pk;
+        true
+    }
+
     /// Creates a new AVSS QUIC server.
     ///
     /// Generates a fresh ECDH key pair for this party.
@@ -339,10 +400,12 @@ where
         pk_map[self.node_id] = self.pk_i;
 
         let mut received = 1usize; // Count ourselves
+        let mut seen_senders = HashSet::with_capacity(self.n);
+        seen_senders.insert(self.node_id);
         let deadline = std::time::Instant::now() + self.config.pk_exchange_timeout;
 
         // Create a channel for receiving PK exchange messages
-        let (pk_tx, mut pk_rx) = mpsc::channel::<(usize, G)>(self.n);
+        let (pk_tx, mut pk_rx) = mpsc::channel::<(Option<usize>, Vec<u8>)>(self.n);
 
         // Spawn receive tasks for each peer connection
         for (peer_id, conn) in &connections {
@@ -350,31 +413,20 @@ where
                 continue;
             }
             let peer_id = *peer_id;
+            let authenticated_peer_id = conn.remote_party_id();
             let tx = pk_tx.clone();
             let conn = conn.clone();
             tokio::spawn(async move {
                 match conn.receive().await {
                     Ok(data) => {
-                        if data.len() < 4 {
-                            error!("[AVSS] Invalid PK message from peer {}", peer_id);
-                            return;
-                        }
-                        let sender_id =
-                            u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                        match G::deserialize_compressed(&data[4..]) {
-                            Ok(pk) => {
-                                let _ = tx.send((sender_id, pk)).await;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[AVSS] Failed to deserialize PK from party {}: {:?}",
-                                    sender_id, e
-                                );
-                            }
-                        }
+                        let _ = tx.send((authenticated_peer_id, data)).await;
                     }
                     Err(e) => {
-                        error!("[AVSS] Failed to receive PK from peer {}: {}", peer_id, e);
+                        error!(
+                            "[AVSS] Failed to receive PK from authenticated peer {}: {}",
+                            authenticated_peer_id.unwrap_or(peer_id),
+                            e
+                        );
                     }
                 }
             });
@@ -392,14 +444,32 @@ where
             }
 
             match tokio::time::timeout(remaining, pk_rx.recv()).await {
-                Ok(Some((sender_id, pk))) => {
-                    if sender_id < self.n {
-                        pk_map[sender_id] = pk;
-                        received += 1;
-                        info!(
-                            "[AVSS] Party {} received PK from party {} ({}/{})",
-                            self.node_id, sender_id, received, self.n
-                        );
+                Ok(Some((authenticated_peer_id, data))) => {
+                    match Self::decode_public_key_envelope(authenticated_peer_id, &data, self.n) {
+                        Ok((sender_id, pk)) => {
+                            if !Self::insert_public_key_once(
+                                sender_id,
+                                pk,
+                                self.n,
+                                &mut seen_senders,
+                                &mut pk_map,
+                            ) {
+                                warn!(
+                                    "[AVSS] Party {} ignoring duplicate/out-of-range PK from party {}",
+                                    self.node_id, sender_id
+                                );
+                                continue;
+                            }
+
+                            received += 1;
+                            info!(
+                                "[AVSS] Party {} received PK from party {} ({}/{})",
+                                self.node_id, sender_id, received, self.n
+                            );
+                        }
+                        Err(e) => {
+                            warn!("[AVSS] Party {} rejecting PK message: {}", self.node_id, e);
+                        }
                     }
                 }
                 Ok(None) => {
@@ -526,5 +596,84 @@ where
         if let Some(task) = &self.accept_task {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_bls12_381::{Fr, G1Projective as G1};
+    use ark_ec::PrimeGroup;
+    use ark_serialize::CanonicalSerialize;
+
+    #[test]
+    fn test_decode_public_key_envelope_rejects_sender_mismatch() {
+        let pk = G1::generator();
+        let mut pk_bytes = Vec::new();
+        pk.serialize_compressed(&mut pk_bytes)
+            .expect("serialize pk");
+
+        let mut envelope = Vec::with_capacity(4 + pk_bytes.len());
+        envelope.extend_from_slice(&(1u32).to_le_bytes());
+        envelope.extend_from_slice(&pk_bytes);
+
+        let err = AvssQuicServer::<Fr, G1>::decode_public_key_envelope(Some(2), &envelope, 4)
+            .expect_err("mismatched sender must be rejected");
+        assert!(
+            err.contains("sender mismatch"),
+            "expected sender mismatch error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_public_key_envelope_accepts_unassigned_transport_party_id() {
+        let pk = G1::generator();
+        let mut pk_bytes = Vec::new();
+        pk.serialize_compressed(&mut pk_bytes)
+            .expect("serialize pk");
+
+        let mut envelope = Vec::with_capacity(4 + pk_bytes.len());
+        envelope.extend_from_slice(&(1u32).to_le_bytes());
+        envelope.extend_from_slice(&pk_bytes);
+
+        let (sender, decoded) =
+            AvssQuicServer::<Fr, G1>::decode_public_key_envelope(None, &envelope, 4)
+                .expect("valid message should decode without remote_party_id assignment");
+        assert_eq!(sender, 1);
+        assert_eq!(decoded, pk);
+    }
+
+    #[test]
+    fn test_insert_public_key_once_rejects_duplicates() {
+        let n = 4usize;
+        let mut seen = HashSet::new();
+        seen.insert(0usize);
+        let mut pk_map = vec![G1::default(); n];
+
+        let pk_first = G1::generator();
+        let accepted = AvssQuicServer::<Fr, G1>::insert_public_key_once(
+            1,
+            pk_first,
+            n,
+            &mut seen,
+            &mut pk_map,
+        );
+        assert!(accepted, "first key for sender should be accepted");
+        assert_eq!(pk_map[1], pk_first);
+
+        let pk_duplicate = G1::generator() + G1::generator();
+        let accepted_duplicate = AvssQuicServer::<Fr, G1>::insert_public_key_once(
+            1,
+            pk_duplicate,
+            n,
+            &mut seen,
+            &mut pk_map,
+        );
+        assert!(!accepted_duplicate, "duplicate sender must not be accepted");
+        assert_eq!(
+            pk_map[1], pk_first,
+            "duplicate must not overwrite stored PK"
+        );
     }
 }

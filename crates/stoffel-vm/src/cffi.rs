@@ -66,6 +66,10 @@ use stoffel_vm_types::core_types::{ShareType, Value, F64};
 #[cfg(feature = "honeybadger")]
 use stoffelnet::transports::quic::QuicNetworkManager;
 
+/// Maximum share buffer size accepted from FFI callers (1 MB).
+/// Prevents accidental or malicious oversized allocations from C/SDK code.
+const MAX_FFI_SHARE_LEN: usize = 1_048_576;
+
 /// Opaque pointer type for the VM
 pub type VMHandle = *mut c_void;
 
@@ -347,6 +351,11 @@ pub extern "C" fn stoffel_execute_with_args(
         Ok(s) => s,
         Err(_) => return -2,
     };
+
+    // Guard against unreasonable arg counts from C callers
+    if arg_count < 0 || arg_count > 1024 {
+        return -1;
+    }
 
     // Convert C args to Rust Values
     let mut rust_args = Vec::with_capacity(arg_count as usize);
@@ -896,6 +905,9 @@ pub extern "C" fn hb_engine_multiply_share_async(
         return HBEngineErrorCode::HBEngineNullPointer;
     }
 
+    if left_len > MAX_FFI_SHARE_LEN || right_len > MAX_FFI_SHARE_LEN {
+        return HBEngineErrorCode::HBEngineInvalidShareType;
+    }
     let engine = unsafe { &*(engine_ptr as *const Arc<HoneyBadgerMpcEngine>) };
     let left = unsafe { std::slice::from_raw_parts(left_ptr, left_len) };
     let right = unsafe { std::slice::from_raw_parts(right_ptr, right_len) };
@@ -945,6 +957,9 @@ pub extern "C" fn hb_engine_open_share(
         return HBEngineErrorCode::HBEngineNullPointer;
     }
 
+    if share_len > MAX_FFI_SHARE_LEN {
+        return HBEngineErrorCode::HBEngineInvalidShareType;
+    }
     let engine = unsafe { &*(engine_ptr as *const Arc<HoneyBadgerMpcEngine>) };
     let share_bytes = unsafe { std::slice::from_raw_parts(share_ptr, share_len) };
     let ty: ShareType = share_type.into();
@@ -1243,7 +1258,7 @@ mod hb_engine_tests {
 // (Asynchronously Verifiable Secret Sharing) engine.
 // ============================================================================
 
-#[cfg(feature = "adkg")]
+#[cfg(feature = "avss")]
 mod adkg_ffi {
     use super::*;
     use crate::net::avss_engine::{AvssMpcEngine, AvssOperations};
@@ -1252,8 +1267,44 @@ mod adkg_ffi {
     use ark_serialize::CanonicalDeserialize;
     use ark_std::rand::SeedableRng;
     use ark_std::UniformRand;
+    use std::future::Future;
     use std::sync::Arc;
     use stoffelnet::transports::quic::QuicNetworkManager;
+
+    fn block_on_avss_new<Fut, T>(fut: Fut) -> Result<T, ()>
+    where
+        Fut: Future<Output = Result<T, String>> + Send + 'static,
+        T: Send + 'static,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) =>
+            {
+                #[allow(deprecated)]
+                match handle.runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(|| handle.block_on(fut)).map_err(|_| ())
+                    }
+                    tokio::runtime::RuntimeFlavor::CurrentThread => std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|_| ())?;
+                        rt.block_on(fut).map_err(|_| ())
+                    })
+                    .join()
+                    .map_err(|_| ())?,
+                    _ => Err(()),
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| ())?;
+                rt.block_on(fut).map_err(|_| ())
+            }
+        }
+    }
 
     /// C-compatible curve configuration for AVSS.
     /// Variants are constructed by C/SDK callers via integer discriminants.
@@ -1343,20 +1394,15 @@ mod adkg_ffi {
             return Err(());
         }
 
-        // AvssMpcEngine::new is async; block on it from FFI context
-        let rt_handle = tokio::runtime::Handle::try_current().map_err(|_| ())?;
-        let engine = tokio::task::block_in_place(|| {
-            rt_handle.block_on(AvssMpcEngine::<Fr, G1>::new(
-                instance_id,
-                party_id,
-                n,
-                t,
-                net,
-                sk_i,
-                Arc::new(pk_map),
-            ))
-        })
-        .map_err(|_| ())?;
+        let engine = block_on_avss_new(AvssMpcEngine::<Fr, G1>::new(
+            instance_id,
+            party_id,
+            n,
+            t,
+            net,
+            sk_i,
+            Arc::new(pk_map),
+        ))?;
 
         let engine_arc: Arc<AvssMpcEngine<Fr, G1>> = engine;
         Ok(AvssFfiWrapper {
@@ -1389,20 +1435,15 @@ mod adkg_ffi {
             return Err(());
         }
 
-        // AvssMpcEngine::new is async; block on it from FFI context
-        let rt_handle = tokio::runtime::Handle::try_current().map_err(|_| ())?;
-        let engine = tokio::task::block_in_place(|| {
-            rt_handle.block_on(AvssMpcEngine::<Fr, G1>::new(
-                instance_id,
-                party_id,
-                n,
-                t,
-                net,
-                sk_i,
-                Arc::new(pk_map),
-            ))
-        })
-        .map_err(|_| ())?;
+        let engine = block_on_avss_new(AvssMpcEngine::<Fr, G1>::new(
+            instance_id,
+            party_id,
+            n,
+            t,
+            net,
+            sk_i,
+            Arc::new(pk_map),
+        ))?;
 
         let engine_arc: Arc<AvssMpcEngine<Fr, G1>> = engine;
         Ok(AvssFfiWrapper {
@@ -1435,19 +1476,15 @@ mod adkg_ffi {
             return Err(());
         }
 
-        let rt_handle = tokio::runtime::Handle::try_current().map_err(|_| ())?;
-        let engine = tokio::task::block_in_place(|| {
-            rt_handle.block_on(AvssMpcEngine::<Fr, G>::new(
-                instance_id,
-                party_id,
-                n,
-                t,
-                net,
-                sk_i,
-                Arc::new(pk_map),
-            ))
-        })
-        .map_err(|_| ())?;
+        let engine = block_on_avss_new(AvssMpcEngine::<Fr, G>::new(
+            instance_id,
+            party_id,
+            n,
+            t,
+            net,
+            sk_i,
+            Arc::new(pk_map),
+        ))?;
 
         let engine_arc: Arc<AvssMpcEngine<Fr, G>> = engine;
         Ok(AvssFfiWrapper {
@@ -1480,19 +1517,15 @@ mod adkg_ffi {
             return Err(());
         }
 
-        let rt_handle = tokio::runtime::Handle::try_current().map_err(|_| ())?;
-        let engine = tokio::task::block_in_place(|| {
-            rt_handle.block_on(AvssMpcEngine::<Fr, G>::new(
-                instance_id,
-                party_id,
-                n,
-                t,
-                net,
-                sk_i,
-                Arc::new(pk_map),
-            ))
-        })
-        .map_err(|_| ())?;
+        let engine = block_on_avss_new(AvssMpcEngine::<Fr, G>::new(
+            instance_id,
+            party_id,
+            n,
+            t,
+            net,
+            sk_i,
+            Arc::new(pk_map),
+        ))?;
 
         let engine_arc: Arc<AvssMpcEngine<Fr, G>> = engine;
         Ok(AvssFfiWrapper {
@@ -1757,6 +1790,11 @@ mod adkg_ffi {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use ark_bls12_381::G1Projective;
+        use ark_ec::PrimeGroup;
+        use ark_serialize::CanonicalSerialize;
+        use std::sync::Arc;
+        use stoffelnet::transports::quic::QuicNetworkManager;
 
         #[test]
         fn test_adkg_engine_new_null_network() {
@@ -1773,6 +1811,35 @@ mod adkg_ffi {
                 0,
             );
             assert!(engine.is_null());
+        }
+
+        #[test]
+        fn test_adkg_engine_new_without_tokio_runtime() {
+            let n = 4usize;
+            let net = Arc::new(QuicNetworkManager::new());
+            let mut pk_map_bytes = Vec::new();
+            vec![G1Projective::generator(); n]
+                .serialize_compressed(&mut pk_map_bytes)
+                .expect("serialize pk map");
+            let net_ptr = &net as *const Arc<QuicNetworkManager> as *mut c_void;
+
+            let engine = adkg_engine_new(
+                1,
+                0,
+                n,
+                1,
+                net_ptr,
+                CAdkgCurveConfig::Bls12_381,
+                std::ptr::null(),
+                0,
+                pk_map_bytes.as_ptr(),
+                pk_map_bytes.len(),
+            );
+            assert!(
+                !engine.is_null(),
+                "constructor should succeed without an ambient Tokio runtime"
+            );
+            adkg_engine_free(engine);
         }
 
         #[test]

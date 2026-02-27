@@ -2562,7 +2562,7 @@ impl VMState {
 
 macro_rules! dispatch_share_field {
     ($self:expr, $method:ident ( $($arg:expr),* )) => {
-        match $self.mpc_field_kind() {
+        match $self.mpc_field_kind()? {
             crate::net::curve::MpcFieldKind::Bls12_381Fr => {
                 $self.$method::<ark_bls12_381::Fr>($($arg),*)
             }
@@ -2577,12 +2577,13 @@ macro_rules! dispatch_share_field {
 }
 
 impl VMState {
+    /// Returns the field kind of the active MPC engine.
     #[inline]
-    fn mpc_field_kind(&self) -> crate::net::curve::MpcFieldKind {
+    fn mpc_field_kind(&self) -> Result<crate::net::curve::MpcFieldKind, String> {
         self.mpc_engine
             .as_ref()
             .map(|engine| engine.field_kind())
-            .unwrap_or(crate::net::curve::MpcFieldKind::Bls12_381Fr)
+            .ok_or_else(|| "MPC engine not configured".to_string())
     }
 
     #[inline]
@@ -2943,5 +2944,33 @@ impl VMState {
         }
 
         dispatch_share_field!(self, share_interpolate_local_typed(ty, shares))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_test_share_bls(value: i64, id: usize, degree: usize) -> Vec<u8> {
+        let share = RobustShare::new(ark_bls12_381::Fr::from(value as u64), id, degree);
+        let mut out = Vec::new();
+        share
+            .serialize_compressed(&mut out)
+            .expect("serialize test share");
+        out
+    }
+
+    #[test]
+    fn secret_share_add_without_engine_returns_error_not_panic() {
+        let vm = VMState::new();
+        let lhs = encode_test_share_bls(3, 1, 1);
+        let rhs = encode_test_share_bls(5, 1, 1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vm.secret_share_add(ShareType::secret_int(64), &lhs, &rhs)
+        }));
+
+        let call = result.expect("secret_share_add should not panic without MPC engine");
+        assert!(call.is_err());
     }
 }

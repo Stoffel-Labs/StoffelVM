@@ -265,7 +265,7 @@ pub fn register_mpc_builtins(vm: &mut VirtualMachine) {
     register_mpc_info_builtins(vm);
     register_rbc_builtins(vm);
     register_aba_builtins(vm);
-    #[cfg(feature = "adkg")]
+    #[cfg(feature = "avss")]
     register_avss_builtins(vm);
 }
 
@@ -1229,7 +1229,7 @@ fn share_open_exp(ctx: ForeignFunctionContext) -> Result<Value, String> {
 }
 
 /// Field name constants for AVSS share objects
-#[cfg(feature = "adkg")]
+#[cfg(feature = "avss")]
 pub mod avss_fields {
     pub const TYPE: &str = "__type";
     pub const KEY_NAME: &str = "__key_name";
@@ -1240,7 +1240,7 @@ pub mod avss_fields {
 }
 
 /// Helper module for AVSS share object operations
-#[cfg(feature = "adkg")]
+#[cfg(feature = "avss")]
 pub mod avss_object {
     use super::avss_fields;
     use stoffel_vm_types::core_types::{ObjectStore, Value};
@@ -1440,7 +1440,7 @@ pub mod avss_object {
 }
 
 /// Register AVSS (Asynchronously Verifiable Secret Sharing) builtins
-#[cfg(feature = "adkg")]
+#[cfg(feature = "avss")]
 fn register_avss_builtins(vm: &mut VirtualMachine) {
     // These builtins work on AVSS share objects stored in the VM
 

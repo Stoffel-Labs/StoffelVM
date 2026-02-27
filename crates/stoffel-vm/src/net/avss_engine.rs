@@ -20,11 +20,11 @@ use crate::net::mpc_engine::MpcEngine;
 use ark_ec::CurveGroup;
 use ark_ff::{FftField, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_std::rand::SeedableRng;
+use ark_std::rand::{Rng, SeedableRng};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -106,6 +106,8 @@ where
     stored_shares: Arc<Mutex<BTreeMap<String, FeldmanShamirShare<F, G>>>>,
     /// Session counter for generating unique session IDs
     session_counter: Arc<Mutex<u64>>,
+    /// Counter used to deterministically coordinate local clear->share conversion.
+    input_share_counter: AtomicU64,
     ready: AtomicBool,
     /// This party's AVSS ECDH key used for payload confidentiality.
     /// Transport identity/authentication is handled separately by TLS.
@@ -164,10 +166,66 @@ where
             adkg_node: Arc::new(Mutex::new(adkg_node)),
             stored_shares: Arc::new(Mutex::new(BTreeMap::new())),
             session_counter: Arc::new(Mutex::new(0)),
+            input_share_counter: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             _sk_i: sk_i,
             _marker: PhantomData,
         }))
+    }
+
+    #[inline]
+    fn mix64(mut x: u64) -> u64 {
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^= x >> 33;
+        x
+    }
+
+    #[inline]
+    fn derive_session_slot24(instance_id: u64, party_id: usize) -> u32 {
+        let seed = instance_id ^ ((party_id as u64).rotate_left(17));
+        (Self::mix64(seed) as u32) & 0x00ff_ffff
+    }
+
+    #[inline]
+    fn derive_input_share_slot24(instance_id: u64, dealer_id: usize) -> u32 {
+        // Keep input-share sessions in a dedicated slot namespace to avoid collisions
+        // with other AVSS rounds that use derive_session_slot24().
+        let seed = instance_id ^ ((dealer_id as u64).rotate_left(29)) ^ 0x4953_4841_5245_5f53; // "ISHARE_S"
+        (Self::mix64(seed) as u32) & 0x00ff_ffff
+    }
+
+    fn allocate_input_share_session(&self) -> Result<(usize, AvssSessionId), String> {
+        let round = self.input_share_counter.fetch_add(1, Ordering::SeqCst);
+        let dealer_id = (round as usize) % self.n.max(1);
+        let round_u32 = u32::try_from(round)
+            .map_err(|_| "AVSS input_share counter overflowed u32".to_string())?;
+        let slot24 = Self::derive_input_share_slot24(self.instance_id, dealer_id);
+        Ok((
+            dealer_id,
+            AvssSessionId::new(AvssProtocolType::Avss, slot24, round_u32),
+        ))
+    }
+
+    async fn run_input_share_round(
+        &self,
+        dealer_id: usize,
+        session_id: AvssSessionId,
+        secret: F,
+    ) -> Result<FeldmanShamirShare<F, G>, String> {
+        if self.party_id == dealer_id {
+            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+            let mut node = self.adkg_node.lock().await;
+            node.share_gen_avss
+                .avss
+                .init(vec![secret], session_id, &mut rng, self.net.clone())
+                .await
+                .map_err(|e| format!("AVSS input_share init failed: {:?}", e))?;
+        }
+
+        self.wait_for_share(session_id).await
     }
 
     /// Start the engine and mark it ready
@@ -257,8 +315,11 @@ where
             let mut counter = self.session_counter.lock().await;
             let id = *counter;
             *counter += 1;
-            let slot24 = AvssSessionId::pack_slot24(self.instance_id as u8, self.party_id as u8, 0);
-            AvssSessionId::new(AvssProtocolType::Avss, slot24, id as u32)
+            let id = u32::try_from(id).map_err(|_| {
+                "AVSS session counter overflowed u32; cannot allocate new session".to_string()
+            })?;
+            let slot24 = Self::derive_session_slot24(self.instance_id, self.party_id);
+            AvssSessionId::new(AvssProtocolType::Avss, slot24, id)
         };
 
         // Run AVSS init through the inner share_gen_avss node
@@ -463,12 +524,15 @@ where
     /// Create AVSS shares for a secret value (generates Feldman-verifiable shares for all parties).
     ///
     /// Returns this party's share.
-    fn create_avss_share(&self, secret: F) -> Result<FeldmanShamirShare<F, G>, String> {
+    fn create_avss_share_with_rng<R: Rng>(
+        &self,
+        secret: F,
+        rng: &mut R,
+    ) -> Result<FeldmanShamirShare<F, G>, String> {
         use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
-        let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
 
         // Generate random polynomial with p(0) = secret
-        let mut poly = DensePolynomial::<F>::rand(self.t, &mut rng);
+        let mut poly = DensePolynomial::<F>::rand(self.t, rng);
         poly[0] = secret;
 
         // Compute Feldman commitments: C_j = g * c_j
@@ -488,6 +552,28 @@ where
         let (_, secret) = FeldmanShamirShare::<F, G>::recover_secret(shares, n)
             .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
         Ok(secret)
+    }
+
+    /// Convert a reconstructed field element to the appropriate [`Value`] for a given share type.
+    fn field_to_value(ty: ShareType, secret: F) -> Result<Value, String> {
+        let value = match ty {
+            ShareType::SecretInt { .. } if ty.is_boolean() => Value::Bool(!secret.is_zero()),
+            ShareType::SecretInt { .. } => {
+                let bigint = secret.into_bigint();
+                let limbs = bigint.as_ref();
+                Value::I64(limbs[0] as i64)
+            }
+            ShareType::SecretFixedPoint { precision } => {
+                let bigint = secret.into_bigint();
+                let limbs = bigint.as_ref();
+                let scaled_value = limbs[0] as i64;
+                let f = precision.f();
+                let scale = (1u64 << f) as f64;
+                let float_value = scaled_value as f64 / scale;
+                Value::Float(F64(float_value))
+            }
+        };
+        Ok(value)
     }
 }
 
@@ -565,7 +651,32 @@ where
             _ => return Err("Unsupported type for input_share".to_string()),
         };
 
-        let share = self.create_avss_share(secret)?;
+        let (dealer_id, session_id) = self.allocate_input_share_session()?;
+        let share = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                #[allow(deprecated)]
+                {
+                    match handle.runtime_flavor() {
+                        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(
+                            || handle.block_on(self.run_input_share_round(dealer_id, session_id, secret)),
+                        ),
+                        tokio::runtime::RuntimeFlavor::CurrentThread => Err(
+                            "AVSS input_share called from a single-thread Tokio runtime; synchronous waiting is unsupported in this context".to_string(),
+                        ),
+                        _ => Err(
+                            "AVSS input_share called from an unsupported Tokio runtime flavor".to_string(),
+                        ),
+                    }
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
+                rt.block_on(self.run_input_share_round(dealer_id, session_id, secret))
+            }
+        }?;
         Self::encode_feldman_share(&share)
     }
 
@@ -597,19 +708,6 @@ where
     }
 
     fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
-        #[derive(Default, Clone)]
-        struct OpenAccumulator {
-            shares: Vec<Vec<u8>>,
-            party_ids: Vec<usize>,
-            result: Option<Value>,
-        }
-
-        static REGISTRY: once_cell::sync::Lazy<
-            parking_lot::Mutex<std::collections::HashMap<(u64, usize, String), OpenAccumulator>>,
-        > = once_cell::sync::Lazy::new(
-            || parking_lot::Mutex::new(std::collections::HashMap::new()),
-        );
-
         let type_key = match ty {
             ShareType::SecretInt { bit_length } => format!("avss-int-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
@@ -618,102 +716,26 @@ where
         };
 
         let required = self.t + 1;
-        let mut my_sequence: Option<usize> = None;
+        let n = self.n;
 
-        loop {
-            let mut reg = REGISTRY.lock();
-
-            if my_sequence.is_none() {
-                let mut seq = 0;
-                loop {
-                    let key = (self.instance_id, seq, type_key.clone());
-                    let entry = reg.entry(key).or_default();
-
-                    if !entry.party_ids.contains(&self.party_id) {
-                        entry.shares.push(share_bytes.to_vec());
-                        entry.party_ids.push(self.party_id);
-                        my_sequence = Some(seq);
-                        break;
-                    }
-                    seq += 1;
-                }
-            }
-
-            let seq = my_sequence.unwrap();
-            let key = (self.instance_id, seq, type_key.clone());
-            let entry = reg.get_mut(&key).unwrap();
-
-            if let Some(result) = entry.result.clone() {
-                return Ok(result);
-            }
-
-            if entry.shares.len() >= required {
-                let collected: Vec<_> = entry.shares.iter().take(required).cloned().collect();
+        crate::net::open_registry::open_share_via_registry(
+            self.instance_id,
+            self.party_id,
+            &type_key,
+            share_bytes,
+            required,
+            |collected| {
                 let mut shares: Vec<FeldmanShamirShare<F, G>> = Vec::with_capacity(collected.len());
-                for bytes in &collected {
+                for bytes in collected {
                     shares.push(Self::decode_feldman_share(bytes)?);
                 }
-
-                let secret = Self::reconstruct_secret(&shares, self.n)?;
-
-                let value = match ty {
-                    ShareType::SecretInt { .. } if ty.is_boolean() => {
-                        Value::Bool(!secret.is_zero())
-                    }
-                    ShareType::SecretInt { .. } => {
-                        let bigint = secret.into_bigint();
-                        let limbs = bigint.as_ref();
-                        Value::I64(limbs[0] as i64)
-                    }
-                    ShareType::SecretFixedPoint { precision } => {
-                        let bigint = secret.into_bigint();
-                        let limbs = bigint.as_ref();
-                        let scaled_value = limbs[0] as i64;
-                        let f = precision.f();
-                        let scale = (1u64 << f) as f64;
-                        let float_value = scaled_value as f64 / scale;
-                        Value::Float(F64(float_value))
-                    }
-                };
-                entry.result = Some(value.clone());
-                return Ok(value);
-            }
-
-            drop(reg);
-            std::thread::sleep(Duration::from_millis(5));
-        }
+                let secret = Self::reconstruct_secret(&shares, n)?;
+                Self::field_to_value(ty, secret)
+            },
+        )
     }
 
     fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
-        if shares.is_empty() {
-            return Ok(vec![]);
-        }
-
-        #[derive(Clone)]
-        struct BatchOpenAccumulator {
-            shares_per_position: Vec<Vec<Vec<u8>>>,
-            party_ids: Vec<usize>,
-            results: Option<Vec<Value>>,
-        }
-
-        impl BatchOpenAccumulator {
-            fn new(batch_size: usize) -> Self {
-                Self {
-                    shares_per_position: vec![Vec::new(); batch_size],
-                    party_ids: Vec::new(),
-                    results: None,
-                }
-            }
-        }
-
-        static BATCH_REGISTRY: once_cell::sync::Lazy<
-            parking_lot::Mutex<
-                std::collections::HashMap<(u64, usize, String, usize), BatchOpenAccumulator>,
-            >,
-        > = once_cell::sync::Lazy::new(
-            || parking_lot::Mutex::new(std::collections::HashMap::new()),
-        );
-
         let type_key = match ty {
             ShareType::SecretInt { bit_length } => format!("avss-batch-int-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
@@ -721,89 +743,26 @@ where
             }
         };
 
-        let batch_size = shares.len();
         let required = self.t + 1;
-        let mut my_sequence: Option<usize> = None;
+        let n = self.n;
 
-        loop {
-            let mut reg = BATCH_REGISTRY.lock();
-
-            if my_sequence.is_none() {
-                let mut seq = 0;
-                loop {
-                    let key = (self.instance_id, seq, type_key.clone(), batch_size);
-                    let entry = reg
-                        .entry(key)
-                        .or_insert_with(|| BatchOpenAccumulator::new(batch_size));
-
-                    if !entry.party_ids.contains(&self.party_id) {
-                        for (pos, share_bytes) in shares.iter().enumerate() {
-                            entry.shares_per_position[pos].push(share_bytes.clone());
-                        }
-                        entry.party_ids.push(self.party_id);
-                        my_sequence = Some(seq);
-                        break;
-                    }
-                    seq += 1;
+        crate::net::open_registry::batch_open_via_registry(
+            self.instance_id,
+            self.party_id,
+            &type_key,
+            shares,
+            required,
+            |collected, pos| {
+                let mut decoded_shares: Vec<FeldmanShamirShare<F, G>> =
+                    Vec::with_capacity(collected.len());
+                for bytes in collected {
+                    decoded_shares.push(Self::decode_feldman_share(bytes)?);
                 }
-            }
-
-            let seq = my_sequence.unwrap();
-            let key = (self.instance_id, seq, type_key.clone(), batch_size);
-            let entry = reg.get_mut(&key).unwrap();
-
-            if let Some(results) = entry.results.clone() {
-                return Ok(results);
-            }
-
-            if entry.party_ids.len() >= required {
-                let mut results = Vec::with_capacity(batch_size);
-
-                for pos in 0..batch_size {
-                    let collected: Vec<_> = entry.shares_per_position[pos]
-                        .iter()
-                        .take(required)
-                        .cloned()
-                        .collect();
-
-                    let mut decoded_shares: Vec<FeldmanShamirShare<F, G>> =
-                        Vec::with_capacity(collected.len());
-                    for bytes in &collected {
-                        decoded_shares.push(Self::decode_feldman_share(bytes)?);
-                    }
-
-                    let secret = Self::reconstruct_secret(&decoded_shares, self.n)
-                        .map_err(|e| format!("batch reconstruct_secret pos {}: {}", pos, e))?;
-
-                    let value = match ty {
-                        ShareType::SecretInt { .. } if ty.is_boolean() => {
-                            Value::Bool(!secret.is_zero())
-                        }
-                        ShareType::SecretInt { .. } => {
-                            let bigint = secret.into_bigint();
-                            let limbs = bigint.as_ref();
-                            Value::I64(limbs[0] as i64)
-                        }
-                        ShareType::SecretFixedPoint { precision } => {
-                            let bigint = secret.into_bigint();
-                            let limbs = bigint.as_ref();
-                            let scaled_value = limbs[0] as i64;
-                            let f = precision.f();
-                            let scale = (1u64 << f) as f64;
-                            let float_value = scaled_value as f64 / scale;
-                            Value::Float(F64(float_value))
-                        }
-                    };
-                    results.push(value);
-                }
-
-                entry.results = Some(results.clone());
-                return Ok(results);
-            }
-
-            drop(reg);
-            std::thread::sleep(Duration::from_millis(5));
-        }
+                let secret = Self::reconstruct_secret(&decoded_shares, n)
+                    .map_err(|e| format!("batch reconstruct_secret pos {}: {}", pos, e))?;
+                Self::field_to_value(ty, secret)
+            },
+        )
     }
 
     fn shutdown(&self) {
@@ -998,7 +957,9 @@ mod tests {
     use ark_ec::PrimeGroup;
     use ark_ff::UniformRand;
     use ark_std::test_rng;
+    use std::sync::Arc;
     use stoffelmpc_mpc::common::share::avss::verify_feldman;
+    use stoffelnet::transports::quic::QuicNetworkManager;
 
     #[test]
     fn test_feldman_share_serialization() {
@@ -1120,6 +1081,22 @@ mod tests {
         let pk = vec![10, 11, 12];
         registry_store_public_key(instance_id, session_id, pk.clone());
         assert_eq!(registry_get_public_key(instance_id, session_id), Some(pk));
+    }
+
+    #[test]
+    fn test_session_slot24_uses_full_instance_party_domains() {
+        let base = Bls12381AvssMpcEngine::derive_session_slot24(1, 2);
+        let high_bits_changed = Bls12381AvssMpcEngine::derive_session_slot24(257, 258);
+        let very_high_bits_changed = Bls12381AvssMpcEngine::derive_session_slot24(1u64 << 40, 2);
+
+        assert_ne!(
+            base, high_bits_changed,
+            "slot24 must not collapse instance/party IDs that differ outside low 8 bits"
+        );
+        assert_ne!(
+            base, very_high_bits_changed,
+            "slot24 must include high instance-id bits in domain separation"
+        );
     }
 
     /// Helper to generate Feldman shares for testing
@@ -1320,6 +1297,52 @@ mod tests {
         assert_eq!(
             recovered, secret,
             "Reconstructed secret should match original"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_avss_input_share_session_allocation_is_consistent_across_parties() {
+        let n = 4usize;
+        let t = 1usize;
+        let instance_id = 77u64;
+
+        let net = Arc::new(QuicNetworkManager::new());
+        let pk_map = Arc::new(vec![G1::generator(); n]);
+
+        let e0 = AvssMpcEngine::<Fr, G1>::new(
+            instance_id,
+            0,
+            n,
+            t,
+            net.clone(),
+            Fr::from(11u64),
+            pk_map.clone(),
+        )
+        .await
+        .expect("engine0");
+        let e1 = AvssMpcEngine::<Fr, G1>::new(instance_id, 1, n, t, net, Fr::from(13u64), pk_map)
+            .await
+            .expect("engine1");
+
+        let (dealer0, sid0) = e0.allocate_input_share_session().expect("session0");
+        let (dealer1, sid1) = e1.allocate_input_share_session().expect("session1");
+        assert_eq!(dealer0, dealer1, "dealer selection must be deterministic");
+        assert_eq!(
+            sid0.as_u64(),
+            sid1.as_u64(),
+            "session ids must match across parties for the same input_share round"
+        );
+
+        let (dealer0_next, sid0_next) = e0.allocate_input_share_session().expect("session0-next");
+        let (dealer1_next, sid1_next) = e1.allocate_input_share_session().expect("session1-next");
+        assert_eq!(
+            dealer0_next, dealer1_next,
+            "dealer selection must stay aligned across rounds"
+        );
+        assert_eq!(
+            sid0_next.as_u64(),
+            sid1_next.as_u64(),
+            "session ids must stay aligned across rounds"
         );
     }
 }

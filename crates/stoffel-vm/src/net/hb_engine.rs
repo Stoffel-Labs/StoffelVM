@@ -535,6 +535,21 @@ where
         value.into_bigint().as_ref().first().copied().unwrap_or(0) as i64
     }
 
+    /// Convert a reconstructed field element to the appropriate [`Value`] for a given share type.
+    fn field_to_value(ty: ShareType, secret: F) -> Value {
+        match ty {
+            ShareType::SecretInt { .. } if ty.is_boolean() => Value::Bool(!secret.is_zero()),
+            ShareType::SecretInt { .. } => Value::I64(Self::field_to_i64(secret)),
+            ShareType::SecretFixedPoint { precision } => {
+                let scaled_value = Self::field_to_i64(secret);
+                let f = precision.f();
+                let scale = (1u64 << f) as f64;
+                let float_value = scaled_value as f64 / scale;
+                Value::Float(F64(float_value))
+            }
+        }
+    }
+
     fn encode_share(share: &RobustShare<F>) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         share
@@ -694,260 +709,70 @@ where
     }
 
     fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
-        // In-process aggregator using a global registry of shares; reconstruct when 2t+1 are present.
-        // Each open operation gets a unique session ID to prevent different values being mixed together.
-        //
-        // CRITICAL: All parties must agree on which accumulator to use for each open operation.
-        // We achieve this by having each party find the first accumulator (by sequence number)
-        // that they haven't contributed to yet. Since all parties execute the same bytecode
-        // in the same order, they will all converge on the same accumulator for each open.
-        #[derive(Default, Clone)]
-        struct OpenAccumulator {
-            shares: Vec<Vec<u8>>,
-            party_ids: Vec<usize>, // Track which parties have contributed
-            result: Option<Value>,
-        }
-
-        // Registry: maps (instance_id, sequence, type_string) to accumulator
-        static REGISTRY: once_cell::sync::Lazy<
-            parking_lot::Mutex<std::collections::HashMap<(u64, usize, String), OpenAccumulator>>,
-        > = once_cell::sync::Lazy::new(
-            || parking_lot::Mutex::new(std::collections::HashMap::new()),
-        );
-
         let type_key = match ty {
-            ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
+            ShareType::SecretInt { bit_length } => format!("hb-int-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
-                format!("fixed-{}-{}", precision.k(), precision.f())
+                format!("hb-fixed-{}-{}", precision.k(), precision.f())
             }
         };
 
         let required = 2 * self.t + 1;
-        let mut my_sequence: Option<usize> = None;
+        let n = self.n;
 
-        loop {
-            let mut reg = REGISTRY.lock();
-
-            // If we haven't contributed yet, find the right accumulator
-            if my_sequence.is_none() {
-                // Find the first sequence number where this party hasn't contributed
-                let mut seq = 0;
-                loop {
-                    let key = (self.instance_id, seq, type_key.clone());
-                    let entry = reg.entry(key).or_insert_with(OpenAccumulator::default);
-
-                    if !entry.party_ids.contains(&self.party_id) {
-                        // This party hasn't contributed here yet - use this accumulator
-                        entry.shares.push(share_bytes.to_vec());
-                        entry.party_ids.push(self.party_id);
-                        my_sequence = Some(seq);
-                        break;
-                    }
-                    seq += 1;
-                }
-            }
-
-            let seq = my_sequence.unwrap();
-            let key = (self.instance_id, seq, type_key.clone());
-            let entry = reg.get_mut(&key).unwrap();
-
-            // Check if result is ready
-            if let Some(result) = entry.result.clone() {
-                return Ok(result);
-            }
-
-            // Check if we have enough shares to reconstruct
-            if entry.shares.len() >= required {
-                let collected: Vec<_> = entry.shares.iter().take(required).cloned().collect();
+        crate::net::open_registry::open_share_via_registry(
+            self.instance_id,
+            self.party_id,
+            &type_key,
+            share_bytes,
+            required,
+            |collected| {
                 let mut shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
-                for bytes in &collected {
+                for bytes in collected {
                     shares.push(Self::decode_share(bytes)?);
                 }
 
-                // Debug: log share IDs, degrees, and values being used for reconstruction
                 tracing::info!(
-                    "open_share reconstruction: n={}, t={}, required={}, shares.len()={}",
-                    self.n,
-                    self.t,
+                    "open_share reconstruction: n={}, required={}, shares.len()={}",
+                    n,
                     required,
                     shares.len()
                 );
 
-                // Sort shares by ID for interpolation debugging
-                let mut sorted_shares = shares.clone();
-                sorted_shares.sort_by_key(|s| s.id);
-
-                for (i, share) in sorted_shares.iter().enumerate() {
-                    tracing::info!(
-                        "  sorted_share[{}]: id={}, degree={}, value={:?}",
-                        i,
-                        share.id,
-                        share.degree,
-                        share.share[0].into_bigint().as_ref() // All limbs of the share value
-                    );
-                }
-
-                let (_deg, secret) = RobustShare::recover_secret(&shares, self.n)
+                let (_deg, secret) = RobustShare::recover_secret(&shares, n)
                     .map_err(|e| format!("recover_secret: {:?}", e))?;
-                let value = match ty {
-                    ShareType::SecretInt { .. } if ty.is_boolean() => {
-                        use ark_ff::Zero;
-                        Value::Bool(!secret.is_zero())
-                    }
-                    ShareType::SecretInt { .. } => Value::I64(Self::field_to_i64(secret)),
-                    ShareType::SecretFixedPoint { precision } => {
-                        let scaled_value = Self::field_to_i64(secret);
-                        // Convert from fixed-point scaled integer back to f64
-                        let f = precision.f();
-                        let scale = (1u64 << f) as f64;
-                        let float_value = scaled_value as f64 / scale;
-                        Value::Float(F64(float_value))
-                    }
-                };
-                entry.result = Some(value.clone());
-                return Ok(value);
-            }
-
-            drop(reg);
-            std::thread::sleep(Duration::from_millis(5));
-        }
+                Ok(Self::field_to_value(ty, secret))
+            },
+        )
     }
 
     fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
-        if shares.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Batch accumulator: collects shares from all parties for all positions in a batch
-        #[derive(Clone)]
-        struct BatchOpenAccumulator {
-            batch_size: usize,
-            // shares_per_position[pos][contribution_idx] = share_bytes from some party
-            shares_per_position: Vec<Vec<Vec<u8>>>,
-            // Which parties have contributed to this batch
-            party_ids: Vec<usize>,
-            // Cached results once computed
-            results: Option<Vec<Value>>,
-        }
-
-        impl BatchOpenAccumulator {
-            fn new(batch_size: usize) -> Self {
-                Self {
-                    batch_size,
-                    shares_per_position: vec![Vec::new(); batch_size],
-                    party_ids: Vec::new(),
-                    results: None,
-                }
-            }
-        }
-
-        // Registry: maps (instance_id, batch_sequence, type_key, batch_size) to accumulator
-        static BATCH_REGISTRY: once_cell::sync::Lazy<
-            parking_lot::Mutex<
-                std::collections::HashMap<(u64, usize, String, usize), BatchOpenAccumulator>,
-            >,
-        > = once_cell::sync::Lazy::new(
-            || parking_lot::Mutex::new(std::collections::HashMap::new()),
-        );
-
         let type_key = match ty {
-            ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
+            ShareType::SecretInt { bit_length } => format!("hb-batch-int-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
-                format!("fixed-{}-{}", precision.k(), precision.f())
+                format!("hb-batch-fixed-{}-{}", precision.k(), precision.f())
             }
         };
 
-        let batch_size = shares.len();
         let required = 2 * self.t + 1;
-        let mut my_sequence: Option<usize> = None;
+        let n = self.n;
 
-        loop {
-            let mut reg = BATCH_REGISTRY.lock();
-
-            // If we haven't contributed yet, find the right batch accumulator
-            if my_sequence.is_none() {
-                let mut seq = 0;
-                loop {
-                    let key = (self.instance_id, seq, type_key.clone(), batch_size);
-                    let entry = reg
-                        .entry(key)
-                        .or_insert_with(|| BatchOpenAccumulator::new(batch_size));
-
-                    if !entry.party_ids.contains(&self.party_id) {
-                        // This party hasn't contributed to this batch yet
-                        // Add all shares for all positions
-                        for (pos, share_bytes) in shares.iter().enumerate() {
-                            entry.shares_per_position[pos].push(share_bytes.clone());
-                        }
-                        entry.party_ids.push(self.party_id);
-                        my_sequence = Some(seq);
-                        break;
-                    }
-                    seq += 1;
-                }
-            }
-
-            let seq = my_sequence.unwrap();
-            let key = (self.instance_id, seq, type_key.clone(), batch_size);
-            let entry = reg.get_mut(&key).unwrap();
-
-            // Check if results are ready
-            if let Some(results) = entry.results.clone() {
-                return Ok(results);
-            }
-
-            // Check if we have enough contributions from parties
-            if entry.party_ids.len() >= required {
-                // Reconstruct all positions in the batch
-                let mut results = Vec::with_capacity(batch_size);
-
-                for pos in 0..batch_size {
-                    let collected: Vec<_> = entry.shares_per_position[pos]
-                        .iter()
-                        .take(required)
-                        .cloned()
-                        .collect();
-
-                    let mut decoded_shares: Vec<RobustShare<F>> =
-                        Vec::with_capacity(collected.len());
-                    for bytes in &collected {
-                        decoded_shares.push(Self::decode_share(bytes)?);
-                    }
-
-                    let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, self.n)
-                        .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
-
-                    let value = match ty {
-                        ShareType::SecretInt { .. } if ty.is_boolean() => {
-                            use ark_ff::Zero;
-                            Value::Bool(!secret.is_zero())
-                        }
-                        ShareType::SecretInt { .. } => Value::I64(Self::field_to_i64(secret)),
-                        ShareType::SecretFixedPoint { precision } => {
-                            let scaled_value = Self::field_to_i64(secret);
-                            let f = precision.f();
-                            let scale = (1u64 << f) as f64;
-                            let float_value = scaled_value as f64 / scale;
-                            Value::Float(F64(float_value))
-                        }
-                    };
-                    results.push(value);
+        crate::net::open_registry::batch_open_via_registry(
+            self.instance_id,
+            self.party_id,
+            &type_key,
+            shares,
+            required,
+            |collected, pos| {
+                let mut decoded_shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
+                for bytes in collected {
+                    decoded_shares.push(Self::decode_share(bytes)?);
                 }
 
-                tracing::info!(
-                    "batch_open_shares: reconstructed {} values in batch (instance={}, seq={})",
-                    batch_size,
-                    self.instance_id,
-                    seq
-                );
-
-                entry.results = Some(results.clone());
-                return Ok(results);
-            }
-
-            drop(reg);
-            std::thread::sleep(Duration::from_millis(5));
-        }
+                let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, n)
+                    .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
+                Ok(Self::field_to_value(ty, secret))
+            },
+        )
     }
 
     fn shutdown(&self) {
@@ -1228,8 +1053,8 @@ where
 struct RbcRegistry {
     /// Maps (instance_id, session_id, from_party) to message bytes
     messages: std::collections::HashMap<(u64, u64, usize), Vec<u8>>,
-    /// Session counter for generating unique session IDs
-    session_counter: u64,
+    /// Tracks deliveries to receivers: (instance_id, receiver_party, from_party, session_id).
+    delivered: std::collections::HashSet<(u64, usize, usize, u64)>,
 }
 
 /// Registry for ABA sessions - maps (instance_id, session_id) to agreement state
@@ -1239,8 +1064,6 @@ struct AbaRegistry {
     proposals: std::collections::HashMap<(u64, u64, usize), bool>,
     /// Maps (instance_id, session_id) to agreed result once consensus is reached
     results: std::collections::HashMap<(u64, u64), bool>,
-    /// Session counter for generating unique session IDs
-    session_counter: u64,
 }
 
 static RBC_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<RbcRegistry>> =
@@ -1257,9 +1080,16 @@ where
     fn rbc_broadcast(&self, message: &[u8]) -> Result<u64, String> {
         let mut registry = RBC_REGISTRY.lock();
 
-        // Generate a unique session ID
-        let session_id = registry.session_counter;
-        registry.session_counter += 1;
+        // Assign the earliest session index this party has not used yet for this instance.
+        let mut session_id = 0u64;
+        while registry
+            .messages
+            .contains_key(&(self.instance_id, session_id, self.party_id))
+        {
+            session_id = session_id
+                .checked_add(1)
+                .ok_or_else(|| "RBC session id overflow".to_string())?;
+        }
 
         // Store the message for this party's broadcast
         let key = (self.instance_id, session_id, self.party_id);
@@ -1281,20 +1111,40 @@ where
 
         loop {
             {
-                let registry = RBC_REGISTRY.lock();
+                let mut registry = RBC_REGISTRY.lock();
 
-                // Look for a message from the specified party
-                // We need to find the session where from_party broadcast
-                for ((inst_id, _session_id, party), message) in registry.messages.iter() {
-                    if *inst_id == self.instance_id && *party == from_party {
-                        tracing::info!(
-                            instance_id = self.instance_id,
-                            from_party = from_party,
-                            message_len = message.len(),
-                            "RBC receive found message"
-                        );
-                        return Ok(message.clone());
+                // Deliver the next undelivered message from `from_party`, in session order.
+                let mut next: Option<(u64, Vec<u8>)> = None;
+                for ((inst_id, session_id, party), message) in registry.messages.iter() {
+                    if *inst_id != self.instance_id || *party != from_party {
+                        continue;
                     }
+                    let delivery_key = (self.instance_id, self.party_id, from_party, *session_id);
+                    if registry.delivered.contains(&delivery_key) {
+                        continue;
+                    }
+
+                    match next {
+                        Some((best_session, _)) if *session_id >= best_session => {}
+                        _ => next = Some((*session_id, message.clone())),
+                    }
+                }
+
+                if let Some((session_id, message)) = next {
+                    registry.delivered.insert((
+                        self.instance_id,
+                        self.party_id,
+                        from_party,
+                        session_id,
+                    ));
+                    tracing::info!(
+                        instance_id = self.instance_id,
+                        session_id = session_id,
+                        from_party = from_party,
+                        message_len = message.len(),
+                        "RBC receive delivered message"
+                    );
+                    return Ok(message);
                 }
             }
 
@@ -1312,28 +1162,41 @@ where
     fn rbc_receive_any(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
-        // Track which parties we've already received from
-        let mut received_from = std::collections::HashSet::new();
-
         loop {
             {
-                let registry = RBC_REGISTRY.lock();
+                let mut registry = RBC_REGISTRY.lock();
 
-                // Look for any message we haven't received yet
-                for ((inst_id, _session_id, party), message) in registry.messages.iter() {
-                    if *inst_id == self.instance_id
-                        && *party != self.party_id
-                        && !received_from.contains(party)
-                    {
-                        received_from.insert(*party);
-                        tracing::info!(
-                            instance_id = self.instance_id,
-                            from_party = *party,
-                            message_len = message.len(),
-                            "RBC receive_any found message"
-                        );
-                        return Ok((*party, message.clone()));
+                // Deliver the globally earliest undelivered message for this receiver.
+                // Tie-breaker is sender id for deterministic behavior.
+                let mut next: Option<(u64, usize, Vec<u8>)> = None;
+                for ((inst_id, session_id, party), message) in registry.messages.iter() {
+                    if *inst_id != self.instance_id || *party == self.party_id {
+                        continue;
                     }
+                    let delivery_key = (self.instance_id, self.party_id, *party, *session_id);
+                    if registry.delivered.contains(&delivery_key) {
+                        continue;
+                    }
+
+                    match next {
+                        Some((best_session, best_party, _))
+                            if (*session_id, *party) >= (best_session, best_party) => {}
+                        _ => next = Some((*session_id, *party, message.clone())),
+                    }
+                }
+
+                if let Some((session_id, party, message)) = next {
+                    registry
+                        .delivered
+                        .insert((self.instance_id, self.party_id, party, session_id));
+                    tracing::info!(
+                        instance_id = self.instance_id,
+                        session_id = session_id,
+                        from_party = party,
+                        message_len = message.len(),
+                        "RBC receive_any delivered message"
+                    );
+                    return Ok((party, message));
                 }
             }
 
@@ -1350,9 +1213,17 @@ where
     fn aba_propose(&self, value: bool) -> Result<u64, String> {
         let mut registry = ABA_REGISTRY.lock();
 
-        // Generate a unique session ID
-        let session_id = registry.session_counter;
-        registry.session_counter += 1;
+        // Assign the earliest session index this party has not proposed in yet.
+        // This keeps round indices aligned across parties despite asynchronous ordering.
+        let mut session_id = 0u64;
+        while registry
+            .proposals
+            .contains_key(&(self.instance_id, session_id, self.party_id))
+        {
+            session_id = session_id
+                .checked_add(1)
+                .ok_or_else(|| "ABA session id overflow".to_string())?;
+        }
 
         // Store this party's proposal
         let key = (self.instance_id, session_id, self.party_id);
@@ -1468,5 +1339,86 @@ where
 
     async fn aba_result_async(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
         self.aba_result(session_id, timeout_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn next_instance_id() -> u64 {
+        static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1_000_000);
+        NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn test_engine(
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+    ) -> Arc<HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>> {
+        HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::new(
+            instance_id,
+            party_id,
+            n,
+            t,
+            1,
+            1,
+            Arc::new(QuicNetworkManager::new()),
+            Vec::new(),
+        )
+        .expect("engine construction should succeed")
+    }
+
+    #[test]
+    fn aba_same_round_uses_shared_session_and_converges() {
+        let instance_id = next_instance_id();
+        let n = 4;
+        let t = 1;
+        let e0 = test_engine(instance_id, 0, n, t);
+        let e1 = test_engine(instance_id, 1, n, t);
+        let e2 = test_engine(instance_id, 2, n, t);
+        let e3 = test_engine(instance_id, 3, n, t);
+
+        let s0 = e0.aba_propose(true).expect("party 0 propose");
+        let s1 = e1.aba_propose(true).expect("party 1 propose");
+        let s2 = e2.aba_propose(true).expect("party 2 propose");
+        let s3 = e3.aba_propose(true).expect("party 3 propose");
+
+        assert_eq!(s0, s1, "same ABA round must share one session id");
+        assert_eq!(s1, s2, "same ABA round must share one session id");
+        assert_eq!(s2, s3, "same ABA round must share one session id");
+
+        let r0 = e0.aba_result(s0, 50).expect("party 0 agreement");
+        let r1 = e1.aba_result(s1, 50).expect("party 1 agreement");
+        let r2 = e2.aba_result(s2, 50).expect("party 2 agreement");
+        let r3 = e3.aba_result(s3, 50).expect("party 3 agreement");
+
+        assert!(r0 && r1 && r2 && r3, "all parties should decide true");
+    }
+
+    #[test]
+    fn rbc_receive_delivers_new_broadcast_each_call_in_order() {
+        let instance_id = next_instance_id();
+        let n = 4;
+        let t = 1;
+        let sender = test_engine(instance_id, 0, n, t);
+        let receiver = test_engine(instance_id, 1, n, t);
+
+        sender.rbc_broadcast(b"first").expect("broadcast first");
+        sender.rbc_broadcast(b"second").expect("broadcast second");
+
+        let first = receiver.rbc_receive(0, 50).expect("receive first");
+        let second = receiver.rbc_receive(0, 50).expect("receive second");
+
+        assert_eq!(
+            first, b"first",
+            "first receive should return first broadcast"
+        );
+        assert_eq!(
+            second, b"second",
+            "second receive should return second broadcast"
+        );
     }
 }

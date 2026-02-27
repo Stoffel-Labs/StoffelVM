@@ -63,7 +63,7 @@ impl MpcCurveConfig {
         match backend {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => true,
-            #[cfg(feature = "adkg")]
+            #[cfg(feature = "avss")]
             MpcBackendKind::Avss => true,
         }
     }
@@ -164,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "adkg")]
+    #[cfg(feature = "avss")]
     fn avss_curve_compatibility() {
         assert!(MpcCurveConfig::Bls12_381
             .validate_for_backend(MpcBackendKind::Avss)

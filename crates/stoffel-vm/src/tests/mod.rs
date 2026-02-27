@@ -1,6 +1,6 @@
-#[cfg(feature = "adkg_itest")]
+#[cfg(feature = "avss_itest")]
 pub mod avss_e2e_integration;
-#[cfg(feature = "adkg")]
+#[cfg(feature = "avss")]
 pub mod avss_integration;
 #[cfg(feature = "hb_itest")]
 pub mod dkg_primitives;

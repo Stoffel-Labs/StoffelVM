@@ -15,7 +15,7 @@ use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
 use stoffel_vm::core_vm::VirtualMachine;
-#[cfg(feature = "adkg")]
+#[cfg(feature = "avss")]
 use stoffel_vm::net::avss_server::{
     AvssQuicConfig, Bls12381AvssServer, Bn254AvssServer, Curve25519AvssServer, Ed25519AvssServer,
 };
@@ -73,6 +73,79 @@ fn parse_inputs_as_field<F: PrimeField>(inputs_str: &str) -> Vec<F> {
             F::from(val as u64)
         })
         .collect()
+}
+
+/// Connect to all MPC servers with retry logic, spawning a receive loop per connection.
+#[cfg(feature = "honeybadger")]
+async fn connect_to_all_servers(
+    network: &Arc<tokio::sync::Mutex<QuicNetworkManager>>,
+    server_addrs: &[SocketAddr],
+    msg_tx: mpsc::Sender<(usize, Vec<u8>)>,
+) {
+    let max_retries = 10;
+    let retry_delay = Duration::from_millis(500);
+
+    for (party_id, &addr) in server_addrs.iter().enumerate() {
+        let mut retry_count = 0;
+
+        loop {
+            eprintln!(
+                "[client] Connecting to server {} at {} (attempt {}/{})",
+                party_id,
+                addr,
+                retry_count + 1,
+                max_retries
+            );
+
+            let connection_result = {
+                let mut net = network.lock().await;
+                net.connect_as_client(addr).await
+            };
+
+            match connection_result {
+                Ok(connection) => {
+                    eprintln!("[client] Connected to server {} at {}", party_id, addr);
+                    let tx = msg_tx.clone();
+                    let peer = party_id;
+                    tokio::spawn(async move {
+                        loop {
+                            match connection.receive().await {
+                                Ok(data) => {
+                                    if let Err(e) = tx.send((peer, data)).await {
+                                        eprintln!("[client] Failed to forward message: {:?}", e);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[client] Connection to server {} closed: {}",
+                                        peer, e
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    break;
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count >= max_retries {
+                        eprintln!(
+                            "[client] Failed to connect to server {} at {} after {} attempts: {}",
+                            party_id, addr, retry_count, e
+                        );
+                        exit(21);
+                    }
+                    eprintln!(
+                        "[client] Connection attempt {} failed: {}, retrying...",
+                        retry_count, e
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "honeybadger")]
@@ -781,79 +854,7 @@ async fn main() {
 
         // Connect to all servers as a client
         eprintln!("[client] Connecting to {} servers...", server_addrs.len());
-        for (party_id, &addr) in server_addrs.iter().enumerate() {
-            let mut retry_count = 0;
-            let max_retries = 10;
-            let retry_delay = Duration::from_millis(500);
-
-            loop {
-                eprintln!(
-                    "[client] Connecting to server {} at {} (attempt {}/{})",
-                    party_id,
-                    addr,
-                    retry_count + 1,
-                    max_retries
-                );
-
-                let connection_result = {
-                    let mut net = network.lock().await;
-                    net.connect_as_client(addr).await
-                };
-
-                match connection_result {
-                    Ok(connection) => {
-                        eprintln!("[client] Connected to server {} at {}", party_id, addr);
-
-                        // Spawn message handler for this connection
-                        let tx = msg_tx.clone();
-                        let client_tag = "client".to_string();
-                        let peer = party_id;
-
-                        tokio::spawn(async move {
-                            loop {
-                                match connection.receive().await {
-                                    Ok(data) => {
-                                        if let Err(e) = tx.send((peer, data)).await {
-                                            eprintln!(
-                                                "[{}] Failed to forward message: {:?}",
-                                                client_tag, e
-                                            );
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[{}] Connection to server closed: {}",
-                                            client_tag, e
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        break;
-                    }
-                    Err(e) => {
-                        retry_count += 1;
-                        if retry_count >= max_retries {
-                            eprintln!(
-                                "[client] Failed to connect to server {} at {} after {} attempts: {}",
-                                party_id,
-                                addr,
-                                retry_count,
-                                e
-                            );
-                            exit(21);
-                        }
-                        eprintln!(
-                            "[client] Connection attempt {} failed: {}, retrying...",
-                            retry_count, e
-                        );
-                        tokio::time::sleep(retry_delay).await;
-                    }
-                }
-            }
-        }
+        connect_to_all_servers(&network, &server_addrs, msg_tx.clone()).await;
 
         // Derive client identity from transport/TLS public key hash
         let cid = {
@@ -960,8 +961,7 @@ async fn main() {
         }
     }
 
-    #[cfg(all(feature = "honeybadger", feature = "adkg"))]
-    if expected_client_count.is_some() && !matches!(backend_kind, MpcBackendKind::HoneyBadger) {
+    if expected_client_count.is_some() && !backend_kind.supports_client_input() {
         eprintln!(
             "Error: {} backend does not support --expected-client-count",
             backend_kind.name()
@@ -1450,7 +1450,7 @@ async fn main() {
                 );
             }
 
-            #[cfg(feature = "adkg")]
+            #[cfg(feature = "avss")]
             MpcBackendKind::Avss => {
                 eprintln!(
                     "[party {}] Setting up AVSS backend (curve: {})...",

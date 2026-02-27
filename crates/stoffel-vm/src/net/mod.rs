@@ -1,9 +1,9 @@
 // src/net/mod.rs
 //! Networking module for peer-to-peer communication.
 
-#[cfg(feature = "adkg")]
+#[cfg(feature = "avss")]
 pub mod avss_engine;
-#[cfg(feature = "adkg")]
+#[cfg(feature = "avss")]
 pub mod avss_server;
 pub mod backend;
 pub mod client_store;
@@ -17,6 +17,7 @@ pub mod mpc;
 pub mod mpc_engine;
 #[cfg(feature = "honeybadger")]
 pub mod mpc_runner;
+pub mod open_registry;
 pub mod p2p;
 pub mod program_sync;
 pub mod session;
@@ -42,6 +43,12 @@ pub use hb_server::{
 // Re-export MpcRunner for convenient VM+MPC orchestration
 #[cfg(feature = "honeybadger")]
 pub use mpc_runner::{MpcRunner, MpcRunnerBuilder, MpcRunnerConfig};
+// Re-export AVSS QUIC server types
+#[cfg(feature = "avss")]
+pub use avss_server::{
+    AvssQuicConfig, AvssQuicServer, Bls12381AvssServer, Bn254AvssServer, Curve25519AvssServer,
+    Ed25519AvssServer,
+};
 // Re-export discovery helpers
 pub use discovery::{
     bootstrap_with_bootnode, register_and_wait_for_session,
