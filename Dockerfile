@@ -73,7 +73,7 @@ COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # Copy coordinator keys
-COPY off-chain-keys /app/off-chain-keys
+COPY ids /app/ids
 
 # Default environment variables (can be overridden in docker-compose)
 ENV STOFFEL_BIND_ADDR="0.0.0.0:9000"
@@ -89,8 +89,10 @@ ENV STOFFEL_ENABLE_NAT="false"
 ENV STOFFEL_STUN_SERVERS=""
 ENV STOFFEL_ETH_NODE_ADDR="ws://host.docker.internal:8545"
 ENV STOFFEL_COORD_ADDR=""
+ENV STOFFEL_RPC_ADDR=""
 ENV STOFFEL_WALLET_SK=""
-ENV STOFFEL_OFF_CHAIN_KEY=""
+ENV STOFFEL_KEY=""
+ENV STOFFEL_CERT=""
 
 # Expose ports for bootnode and party communication
 # Port 9000: bootnode coordination

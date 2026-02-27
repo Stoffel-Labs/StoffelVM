@@ -23,6 +23,22 @@ use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
 use tokio::sync::mpsc;
 
+use std::str::FromStr;
+use std::fs;
+use serde::{Serialize, Deserialize};
+use stoffel_mpc_coordinator::on_chain as coordinator;
+use stoffel_mpc_coordinator::Coordinator;
+//use stoffel_mpc_coordinator::off_chain as coordinator;
+//use stoffel_mpc_coordinator::{Coordinator};
+use alloy::{
+    providers::{Provider, ProviderBuilder, WsConnect},
+    signers::local::PrivateKeySigner,
+    network::EthereumWallet,
+};
+use alloy_primitives::{U256, Address, Signature, Bytes};
+use std::collections::HashMap;
+use dashmap::DashMap;
+
 // Use a Tokio runtime for async operations
 #[tokio::main]
 async fn main() {
@@ -30,7 +46,6 @@ async fn main() {
 
     if raw_args.is_empty() {
         // Allow bootnode-only mode without program path
-        print_usage_and_exit();
     }
 
     let mut path_opt: Option<String> = None;
@@ -43,16 +58,24 @@ async fn main() {
     let mut as_leader = false;
     let mut as_client = false;
     let mut bind_addr: Option<SocketAddr> = None;
+    let mut rpc_addr: Option<(String, u16)> = None;
     let mut party_id: Option<usize> = None;
     let mut bootstrap_addr: Option<SocketAddr> = None;
     let mut n_parties: Option<usize> = None;
     let mut threshold: Option<usize> = None;
     let mut client_id: Option<usize> = None;
     let mut client_inputs: Option<String> = None;
-    let mut expected_clients: Option<String> = None;
+    let mut expected_clients: Vec<String> = Vec::new();
     let mut enable_nat: bool = false;
     let mut stun_servers: Vec<SocketAddr> = Vec::new();
-    let mut server_addrs: Vec<SocketAddr> = Vec::new();
+    let mut server_addrs: Vec<(String, u16)> = Vec::new();
+    let mut node_ids: Vec<Address> = Vec::new();
+    let mut eth_node_addr: Option<String> = None;
+    let mut contract_addr: Option<Address> = None;
+    let mut coord_addr: Option<String> = None;
+    let mut wallet_sk: Option<String> = None;
+    let mut key_der: Option<Vec<u8>> = None;
+    let mut cert_der: Option<Vec<u8>> = None;
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -78,7 +101,7 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--bootstrap") {
         } else if let Some(_rest) = arg.strip_prefix("--n-parties") {
         } else if let Some(_rest) = arg.strip_prefix("--threshold") {
-        } else if let Some(_rest) = arg.strip_prefix("--client-id") {
+        //} else if let Some(_rest) = arg.strip_prefix("--client-id") {
         } else if let Some(_rest) = arg.strip_prefix("--inputs") {
         } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
         } else if let Some(_rest) = arg.strip_prefix("--stun-servers") {
@@ -108,6 +131,14 @@ async fn main() {
                     bind_addr = Some(v.parse().expect("Invalid --bind addr"));
                 }
             }
+            "--rpc-bind" => {
+                if let Some(v) = args_iter.next() {
+                    let s = v.trim();
+                    let (addr, port_str) = s.rsplit_once(":").expect("invalid network address");
+                    let port = port_str.parse::<u16>().ok().expect("invalid port number");
+                    rpc_addr = Some((addr.to_string(), port))
+                }
+            }
             "--party-id" => {
                 if let Some(v) = args_iter.next() {
                     party_id = Some(v.parse().expect("Invalid --party-id"));
@@ -128,11 +159,11 @@ async fn main() {
                     threshold = Some(v.parse().expect("Invalid --threshold"));
                 }
             }
-            "--client-id" => {
-                if let Some(v) = args_iter.next() {
-                    client_id = Some(v.parse().expect("Invalid --client-id"));
-                }
-            }
+            //"--client-id" => {
+            //    if let Some(v) = args_iter.next() {
+            //        client_id = Some(v.parse().expect("Invalid --client-id"));
+            //    }
+            //}
             "--inputs" => {
                 if let Some(v) = args_iter.next() {
                     client_inputs = Some(v);
@@ -140,7 +171,12 @@ async fn main() {
             }
             "--expected-clients" => {
                 if let Some(v) = args_iter.next() {
-                    expected_clients = Some(v);
+                    expected_clients = v
+                        .split(',')
+                        .map(|s| {
+                            String::from(s.trim())
+                        })
+                        .collect();
                 }
             }
             "--stun-servers" => {
@@ -161,14 +197,54 @@ async fn main() {
                 if let Some(v) = args_iter.next() {
                     server_addrs = v
                         .split(',')
-                        .filter_map(|s| {
+                        .map(|s| {
                             let s = s.trim();
-                            s.parse::<SocketAddr>().ok().or_else(|| {
-                                eprintln!("Warning: Invalid server address '{}', skipping", s);
-                                None
-                            })
+                            let (addr, port_str) = s.rsplit_once(":").expect("invalid network address");
+                            let port = port_str.parse::<u16>().ok().expect("invalid port number");
+                            (addr.to_string(), port)
                         })
                         .collect();
+                }
+            }
+            "--node-ids" => {
+                if let Some(v) = args_iter.next() {
+                    node_ids = v
+                        .split(',')
+                        .map(|s| {
+                            let s = s.trim();
+                            Address::from_str(&s).expect("invalid node Ethereum address")
+                        })
+                        .collect();
+                }
+            }
+            "--eth-node" => {
+                if let Some(v) = args_iter.next() {
+                    eth_node_addr = Some(v);
+                }
+            }
+            "--on-chain-coord" => {
+                if let Some(v) = args_iter.next() {
+                    contract_addr = Some(Address::from_str(&v).expect("invalid smart contract address"));
+                }
+            }
+            "--off-chain-coord" => {
+                if let Some(v) = args_iter.next() {
+                    coord_addr = Some(v);
+                }
+            }
+            "--wallet-sk" => {
+                if let Some(v) = args_iter.next() {
+                    wallet_sk = Some(v);
+                }
+            }
+            "--key" => {
+                if let Some(v) = args_iter.next() {
+                    key_der = Some(fs::read(v).expect("failed to read key file"));
+                }
+            }
+            "--cert" => {
+                if let Some(v) = args_iter.next() {
+                    cert_der = Some(fs::read(v).expect("failed to read certificate file"));
                 }
             }
             _ => {}
@@ -191,12 +267,16 @@ async fn main() {
         return;
     }
 
+    let provider = stoffel_mpc_coordinator::on_chain::ws_connect(&eth_node_addr.unwrap(), &wallet_sk.clone().unwrap()).await;
+    let mut coord = stoffel_mpc_coordinator::on_chain::setup_coord(provider, contract_addr.unwrap()).await;
+    let signer = PrivateKeySigner::from_str(&wallet_sk.unwrap()).unwrap();
+
     // Client mode: connect to MPC servers and provide inputs
     if as_client {
-        let cid = client_id.unwrap_or_else(|| {
-            eprintln!("Error: --client-id is required in client mode");
-            exit(2);
-        });
+        //let cid = client_id.unwrap_or_else(|| {
+        //    eprintln!("Error: --client-id is required in client mode");
+        //    exit(2);
+        //});
 
         let n = n_parties.unwrap_or_else(|| {
             eprintln!("Error: --n-parties is required in client mode");
@@ -237,7 +317,7 @@ async fn main() {
 
         eprintln!(
             "[client {}] Client mode (n={}, t={}, {} inputs, {} servers)",
-            cid, n, t, input_len, server_addrs.len()
+            signer.address(), n, t, input_len, server_addrs.len()
         );
 
         // Install crypto provider for quinn/rustls
@@ -245,143 +325,164 @@ async fn main() {
             .install_default()
             .expect("install rustls crypto");
 
-        // Create the MPC client
-        // Instance ID 0 is fine for client - it doesn't participate in the instance negotiation
-        let instance_id = 0u32;
-        let mut mpc_client = match HoneyBadgerMPCClient::<Fr, Avid>::new(
-            cid,
-            n,
-            t,
-            instance_id,
-            input_values.clone(),
-            input_len,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[client {}] Failed to create MPC client: {:?}", cid, e);
-                exit(20);
-            }
-        };
+        coord.wait_for_pp().await.unwrap();
+        coord.wait_for_input_mask_init().await.unwrap();
 
-        // Create network manager for client connections
-        let network = Arc::new(tokio::sync::Mutex::new(QuicNetworkManager::new()));
+        assert_eq!(input_values.len(), 1);
+        let indices = coord.obtain_mask_indices(input_values.len() as u64).await.expect("obtaining mask indices failed");
+        println!("CLIENT: obtained index {}", indices[0]);
 
-        // Add all server addresses as nodes (party IDs 0 to n-1)
-        for (party_id, &addr) in server_addrs.iter().enumerate() {
-            network.lock().await.add_node_with_party_id(party_id, addr);
-            eprintln!("[client {}] Added server party {} at {}", cid, party_id, addr);
-        }
+        let base_nonce = coord.base_nonce().await;
+        let sig = stoffel_mpc_coordinator::on_chain::generate_client_sig(base_nonce, indices[0], signer.clone()).await;
 
-        // Create channel for receiving messages
-        let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(1000);
+        let node_rpc_client = stoffel_mpc_coordinator::on_chain::node_rpc::NodeRPCClient::start_rpc_client(t, server_addrs.clone(), cert_der.unwrap(), key_der.unwrap()).await;
+        let mask = node_rpc_client.receive_mask_share(sig.into(), signer.address()).await;
 
-        // Connect to all servers as a client
-        eprintln!("[client {}] Connecting to {} servers...", cid, server_addrs.len());
-        for (party_id, &addr) in server_addrs.iter().enumerate() {
-            let mut retry_count = 0;
-            let max_retries = 10;
-            let retry_delay = Duration::from_millis(500);
+        coord.wait_for_input().await.unwrap();
 
-            loop {
-                eprintln!("[client {}] Connecting to server {} at {} (attempt {}/{})",
-                         cid, party_id, addr, retry_count + 1, max_retries);
+        let masked_input = mask + input_values[0];
+        coord.send_masked_input(Fr::from(masked_input), indices[0]).await.unwrap();
 
-                let connection_result = {
-                    let mut net = network.lock().await;
-                    net.connect_as_client(addr, cid).await
-                };
+        coord.wait_for_mpc().await.unwrap();
+        coord.wait_for_outputs().await.unwrap();
 
-                match connection_result {
-                    Ok(connection) => {
-                        eprintln!("[client {}] Connected to server {} at {}", cid, party_id, addr);
+        //// Create the MPC client
+        //// Instance ID 0 is fine for client - it doesn't participate in the instance negotiation
+        //let instance_id = 0u32;
+        //let mut mpc_client = match HoneyBadgerMPCClient::<Fr, Avid>::new(
+        //    cid,
+        //    n,
+        //    t,
+        //    instance_id,
+        //    input_values.clone(),
+        //    input_len,
+        //) {
+        //    Ok(c) => c,
+        //    Err(e) => {
+        //        eprintln!("[client {}] Failed to create MPC client: {:?}", cid, e);
+        //        exit(20);
+        //    }
+        //};
 
-                        // Spawn message handler for this connection
-                        let tx = msg_tx.clone();
-                        let client_id = cid;
+        //// Create network manager for client connections
+        //let network = Arc::new(tokio::sync::Mutex::new(QuicNetworkManager::new()));
 
-                        tokio::spawn(async move {
-                            loop {
-                                match connection.receive().await {
-                                    Ok(data) => {
-                                        if let Err(e) = tx.send(data).await {
-                                            eprintln!("[client {}] Failed to forward message: {:?}", client_id, e);
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[client {}] Connection to server closed: {}", client_id, e);
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        break;
-                    }
-                    Err(e) => {
-                        retry_count += 1;
-                        if retry_count >= max_retries {
-                            eprintln!("[client {}] Failed to connect to server {} at {} after {} attempts: {}",
-                                     cid, party_id, addr, retry_count, e);
-                            exit(21);
-                        }
-                        eprintln!("[client {}] Connection attempt {} failed: {}, retrying...", cid, retry_count, e);
-                        tokio::time::sleep(retry_delay).await;
-                    }
-                }
-            }
-        }
+        //// Add all server addresses as nodes (party IDs 0 to n-1)
+        //for (party_id, &addr) in server_addrs.iter().enumerate() {
+        //    network.lock().await.add_node_with_party_id(party_id, addr);
+        //    eprintln!("[client {}] Added server party {} at {}", cid, party_id, addr);
+        //}
 
-        eprintln!("[client {}] Connected to all servers, starting input protocol...", cid);
+        //// Create channel for receiving messages
+        //let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(1000);
 
-        // Spawn a task to process incoming messages
-        // The client receives mask shares from servers and broadcasts masked inputs
-        // Once the broadcast is complete, the client's job is done
-        let network_for_process = network.clone();
-        let client_id_for_task = cid;
-        let process_handle = tokio::spawn(async move {
-            let mut messages_processed = 0;
-            while let Some(data) = msg_rx.recv().await {
-                // Clone network and drop lock before processing
-                let network_clone = {
-                    let guard = network_for_process.lock().await;
-                    (*guard).clone()
-                };
+        //// Connect to all servers as a client
+        //eprintln!("[client {}] Connecting to {} servers...", cid, server_addrs.len());
+        //for (party_id, &addr) in server_addrs.iter().enumerate() {
+        //    let mut retry_count = 0;
+        //    let max_retries = 10;
+        //    let retry_delay = Duration::from_millis(500);
 
-                if let Err(e) = mpc_client.process(data, Arc::new(network_clone)).await {
-                    eprintln!("[client {}] Failed to process message: {:?}", client_id_for_task, e);
-                }
+        //    loop {
+        //        eprintln!("[client {}] Connecting to server {} at {} (attempt {}/{})",
+        //                 cid, party_id, addr, retry_count + 1, max_retries);
 
-                messages_processed += 1;
+        //        let connection_result = {
+        //            let mut net = network.lock().await;
+        //            net.connect_as_client(addr, cid).await
+        //        };
 
-                // The client has done its job once it processes messages from all servers
-                // and broadcasts its masked inputs. We give it some time to complete.
-                if messages_processed >= n {
-                    eprintln!("[client {}] Processed {} messages, input submission likely complete",
-                             client_id_for_task, messages_processed);
-                    // Give some time for any final messages
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    break;
-                }
-            }
-            eprintln!("[client {}] Message processing complete ({} messages)",
-                     client_id_for_task, messages_processed);
-        });
+        //        match connection_result {
+        //            Ok(connection) => {
+        //                eprintln!("[client {}] Connected to server {} at {}", cid, party_id, addr);
 
-        // Wait for input protocol to complete with timeout
-        let timeout_duration = Duration::from_secs(120);
-        match tokio::time::timeout(timeout_duration, process_handle).await {
-            Ok(Ok(_)) => {
-                eprintln!("[client {}] Successfully submitted inputs to MPC network", cid);
-            }
-            Ok(Err(e)) => {
-                eprintln!("[client {}] Input task error: {:?}", cid, e);
-                exit(22);
-            }
-            Err(_) => {
-                eprintln!("[client {}] Timeout waiting for input protocol to complete", cid);
-                exit(23);
-            }
-        }
+        //                // Spawn message handler for this connection
+        //                let tx = msg_tx.clone();
+        //                let client_id = cid;
+
+        //                tokio::spawn(async move {
+        //                    loop {
+        //                        match connection.receive().await {
+        //                            Ok(data) => {
+        //                                if let Err(e) = tx.send(data).await {
+        //                                    eprintln!("[client {}] Failed to forward message: {:?}", client_id, e);
+        //                                    break;
+        //                                }
+        //                            }
+        //                            Err(e) => {
+        //                                eprintln!("[client {}] Connection to server closed: {}", client_id, e);
+        //                                break;
+        //                            }
+        //                        }
+        //                    }
+        //                });
+        //                break;
+        //            }
+        //            Err(e) => {
+        //                retry_count += 1;
+        //                if retry_count >= max_retries {
+        //                    eprintln!("[client {}] Failed to connect to server {} at {} after {} attempts: {}",
+        //                             cid, party_id, addr, retry_count, e);
+        //                    exit(21);
+        //                }
+        //                eprintln!("[client {}] Connection attempt {} failed: {}, retrying...", cid, retry_count, e);
+        //                tokio::time::sleep(retry_delay).await;
+        //            }
+        //        }
+        //    }
+        //}
+
+        //eprintln!("[client {}] Connected to all servers, starting input protocol...", cid);
+
+        //// Spawn a task to process incoming messages
+        //// The client receives mask shares from servers and broadcasts masked inputs
+        //// Once the broadcast is complete, the client's job is done
+        //let network_for_process = network.clone();
+        //let client_id_for_task = cid;
+        //let process_handle = tokio::spawn(async move {
+        //    let mut messages_processed = 0;
+        //    while let Some(data) = msg_rx.recv().await {
+        //        // Clone network and drop lock before processing
+        //        let network_clone = {
+        //            let guard = network_for_process.lock().await;
+        //            (*guard).clone()
+        //        };
+
+        //        if let Err(e) = mpc_client.process(data, Arc::new(network_clone)).await {
+        //            eprintln!("[client {}] Failed to process message: {:?}", client_id_for_task, e);
+        //        }
+
+        //        messages_processed += 1;
+
+        //        // The client has done its job once it processes messages from all servers
+        //        // and broadcasts its masked inputs. We give it some time to complete.
+        //        if messages_processed >= n {
+        //            eprintln!("[client {}] Processed {} messages, input submission likely complete",
+        //                     client_id_for_task, messages_processed);
+        //            // Give some time for any final messages
+        //            tokio::time::sleep(Duration::from_secs(2)).await;
+        //            break;
+        //        }
+        //    }
+        //    eprintln!("[client {}] Message processing complete ({} messages)",
+        //             client_id_for_task, messages_processed);
+        //});
+
+        //// Wait for input protocol to complete with timeout
+        //let timeout_duration = Duration::from_secs(120);
+        //match tokio::time::timeout(timeout_duration, process_handle).await {
+        //    Ok(Ok(_)) => {
+        //        eprintln!("[client {}] Successfully submitted inputs to MPC network", cid);
+        //    }
+        //    Ok(Err(e)) => {
+        //        eprintln!("[client {}] Input task error: {:?}", cid, e);
+        //        exit(22);
+        //    }
+        //    Err(_) => {
+        //        eprintln!("[client {}] Timeout waiting for input protocol to complete", cid);
+        //        exit(23);
+        //    }
+        //}
 
         return;
     }
@@ -414,6 +515,9 @@ async fn main() {
         rustls::crypto::ring::default_provider()
             .install_default()
             .expect("install rustls crypto");
+
+        // Grant party roles to MPC nodes
+        coord.grant_roles(node_ids).await.unwrap();
 
         // Must have program path
         if path_opt.is_none() {
@@ -504,6 +608,7 @@ async fn main() {
     } else if let Some(bootnode) = bootstrap_addr {
         // Regular party mode: connect to external bootnode
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
+
         let my_id = party_id.unwrap_or(0usize);
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -589,6 +694,10 @@ async fn main() {
             exit(2);
         }
     }
+
+    // Start JSON-RPC server on nodes
+    let mut node_rpc = stoffel_mpc_coordinator::on_chain::node_rpc::NodeRPCServer::start(&(rpc_addr.clone().unwrap().0),
+        rpc_addr.unwrap().1, coord.coord(), cert_der.unwrap(), key_der.unwrap()).await;
 
     // Load compiled binary from a file path
     let load_path: String = if let Some(p) = path_opt.clone() {
@@ -778,23 +887,16 @@ async fn main() {
         );
 
         // Parse expected client IDs (comma-separated)
-        let input_ids: Vec<ClientId> = expected_clients
-            .as_ref()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|id| id.trim().parse::<ClientId>().ok())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let input_ids: Vec<Address> = expected_clients.iter().map(|s| {
+            Address::from_str(&s).expect("invalid node Ethereum address")
+        }).collect();
 
-        if !input_ids.is_empty() {
-            eprintln!(
-                "[party {}] Expecting inputs from {} clients: {:?}",
-                my_id,
-                input_ids.len(),
-                input_ids
-            );
-        }
+        eprintln!(
+            "[party {}] Expecting inputs from {} clients: {:?}",
+            my_id,
+            input_ids.len(),
+            input_ids
+        );
 
         // Debug: print established connections
         let connections = net.get_all_connections().await;
@@ -812,11 +914,13 @@ async fn main() {
         let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
 
         // Create the MPC node directly with expected client IDs
+        // TODO: since we do not use the input subprotocol from mpc-protocols, we pass an empty
+        // list of input IDs to the node here. this is ugly, fix this!
         let mut mpc_node = match <HoneyBadgerMPCNode<Fr, Avid> as MPCProtocol<
             Fr,
             RobustShare<Fr>,
             QuicNetworkManager,
-        >>::setup(my_id, mpc_opts, input_ids.clone())
+        >>::setup(my_id, mpc_opts, vec![])
         {
             Ok(node) => node,
             Err(e) => {
@@ -858,6 +962,12 @@ async fn main() {
         let engine =
             HoneyBadgerMpcEngine::from_existing_node(instance_id, my_id, n, t, net.clone(), mpc_node.clone());
 
+        if as_leader {
+            coord.trigger_pp().await.unwrap();
+        }
+
+        coord.wait_for_pp().await.unwrap();
+
         // Run preprocessing
         eprintln!("[party {}] Starting MPC preprocessing...", my_id);
         if let Err(e) = engine.preprocess().await {
@@ -866,148 +976,218 @@ async fn main() {
         }
         eprintln!("[party {}] MPC preprocessing complete", my_id);
 
-        // If we have expected clients, start client accept loop and wait for connections
-        if !input_ids.is_empty() {
-            eprintln!("[party {}] Waiting for {} clients to connect...", my_id, input_ids.len());
+        // TODO: input_ids.len() is used for the number of inputs here, will need sth more flexible
+        // once clients can have multiple inputs
 
-            // Spawn client accept loop - this will accept incoming client connections
-            // and register them in the network's client_connections
-            // We need a mutable copy for accept(), but client_connections is shared via Arc<DashMap>
-            let mut accept_net = (*net).clone();
-            let expected_client_ids = input_ids.clone();
-            let accept_party_id = my_id;
-            let accept_mpc_node = mpc_node.clone();
-            let net_for_processing = net.clone();
-
-            tokio::spawn(async move {
-                eprintln!("[party {}] Client accept loop started", accept_party_id);
-                loop {
-                    // Accept incoming connection (this blocks until a connection arrives)
-                    match accept_net.accept().await {
-                        Ok(connection) => {
-                            // Connection is automatically registered by stoffelnet
-                            // based on the ROLE:CLIENT:{id} handshake
-                            eprintln!("[party {}] Accepted a client connection", accept_party_id);
-
-                            // Spawn a handler for this client's messages
-                            let client_mpc_node = accept_mpc_node.clone();
-                            let client_net = net_for_processing.clone();
-                            tokio::spawn(async move {
-                                loop {
-                                    match connection.receive().await {
-                                        Ok(data) => {
-                                            // Process the message through the MPC node
-                                            if let Err(e) = client_mpc_node.clone().process(data, client_net.clone()).await {
-                                                eprintln!("[party] Failed to process client message: {:?}", e);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[party] Client connection closed: {}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("[party {}] Accept error: {}", accept_party_id, e);
-                            // Don't break - keep accepting
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-            });
-
-            // Wait for all expected clients to connect with timeout
-            let connect_timeout = Duration::from_secs(60);
-            let check_interval = Duration::from_millis(500);
-            let start = std::time::Instant::now();
-
-            loop {
-                let connected_clients: Vec<ClientId> = net.clients();
-                let connected_count = connected_clients.iter()
-                    .filter(|&cid| expected_client_ids.contains(cid))
-                    .count();
-
-                eprintln!("[party {}] {} of {} expected clients connected: {:?}",
-                         my_id, connected_count, expected_client_ids.len(), connected_clients);
-
-                if connected_count >= expected_client_ids.len() {
-                    eprintln!("[party {}] All expected clients connected!", my_id);
-                    break;
-                }
-
-                if start.elapsed() > connect_timeout {
-                    eprintln!("[party {}] Timeout waiting for clients. Connected: {:?}, Expected: {:?}",
-                             my_id, connected_clients, expected_client_ids);
-                    exit(15);
-                }
-
-                tokio::time::sleep(check_interval).await;
+        let mask_shares = match mpc_node
+            .preprocessing_material
+            .lock()
+            .await
+            .take_random_shares(input_ids.len())
+        {
+            Ok(shares) => shares,
+            Err(e) => {
+                eprintln!("[party {}] Not enough random shares: {:?}", my_id, e);
+                exit(15);
             }
+        };
 
-            eprintln!("[party {}] Initializing InputServer for {} clients...", my_id, input_ids.len());
+        // make shares available to MPC clients
+        for i in 0..input_ids.len() {
+            node_rpc.add_mask_share(i as u64, mask_shares[i].clone()).await;
+        }
 
-            // Initialize input server for each expected client
-            // Each client needs random shares for their inputs (assume 1 input per client for now)
-            for &cid in &input_ids {
-                // Take random shares from preprocessing material
-                let local_shares = match mpc_node
-                    .preprocessing_material
-                    .lock()
-                    .await
-                    .take_random_shares(1) // 1 input per client
-                {
-                    Ok(shares) => shares,
-                    Err(e) => {
-                        eprintln!("[party {}] Not enough random shares for client {}: {:?}", my_id, cid, e);
-                        exit(15);
-                    }
-                };
+        if as_leader {
+            coord.init_input_masks().await.unwrap();
+        }
 
-                if let Err(e) = mpc_node
-                    .preprocess
-                    .input
-                    .init(cid, local_shares, 1, net.clone())
-                    .await
-                {
-                    eprintln!("[party {}] Failed to init InputServer for client {}: {:?}", my_id, cid, e);
-                    exit(15);
-                }
-                eprintln!("[party {}] InputServer initialized for client {}", my_id, cid);
+        coord.wait_for_input_mask_init().await.unwrap();
+        let client_to_index = coord.wait_for_indices(input_ids.len() as u64).await.unwrap();
+        for (c, i) in client_to_index {
+            println!("NODE: client {:?} reserved index {}", c, i);
+            node_rpc.add_reserved_index(c, i).await;
+        }
+
+        for input_id in input_ids.iter() {
+            // TODO: a malicious client can make this stall forever. add a timeout!
+            if coord.wait_for_client_auth(*input_id).await.unwrap() {
+                node_rpc.add_auth_status(*input_id, true).await;
+                println!("NODE: client {:?} authenticated successfully", input_id);
+            } else {
+                panic!();
             }
+        }
 
-            // Wait for all client inputs with timeout
-            eprintln!("[party {}] Waiting for client inputs (timeout: 60s)...", my_id);
-            let client_inputs = match mpc_node
-                .preprocess
-                .input
-                .wait_for_all_inputs(Duration::from_secs(60))
-                .await
-            {
-                Ok(inputs) => inputs,
-                Err(e) => {
-                    eprintln!("[party {}] Failed to receive client inputs: {:?}", my_id, e);
-                    exit(16);
-                }
-            };
+        if as_leader {
+            coord.trigger_input().await.unwrap();
+        }
 
-            eprintln!(
-                "[party {}] Received inputs from {} clients",
-                my_id,
-                client_inputs.len()
-            );
+        coord.wait_for_input().await.unwrap();
+        let client_inputs = coord.wait_for_inputs(input_ids.len() as u64, mask_shares).await.unwrap();
 
-            // Store client inputs in the VM's client store
-            for (cid, shares) in client_inputs {
-                vm.state.client_store().store_client_input(cid, shares);
-                eprintln!("[party {}] Stored inputs for client {}", my_id, cid);
+        for (cid, input_shares) in &client_inputs {
+            assert_eq!(input_shares.len(), 1);
+            for input_share in input_shares {
+                println!("NODE: client {:?} has input share {}", cid, input_share.share[0]);
             }
+        }
+
+        //// If we have expected clients, start client accept loop and wait for connections
+        //if !input_ids.is_empty() {
+        //    eprintln!("[party {}] Waiting for {} clients to connect...", my_id, input_ids.len());
+
+        //    // Spawn client accept loop - this will accept incoming client connections
+        //    // and register them in the network's client_connections
+        //    // We need a mutable copy for accept(), but client_connections is shared via Arc<DashMap>
+        //    let mut accept_net = (*net).clone();
+        //    let expected_client_ids = input_ids.clone();
+        //    let accept_party_id = my_id;
+        //    let accept_mpc_node = mpc_node.clone();
+        //    let net_for_processing = net.clone();
+
+        //    tokio::spawn(async move {
+        //        eprintln!("[party {}] Client accept loop started", accept_party_id);
+        //        loop {
+        //            // Accept incoming connection (this blocks until a connection arrives)
+        //            match accept_net.accept().await {
+        //                Ok(connection) => {
+        //                    // Connection is automatically registered by stoffelnet
+        //                    // based on the ROLE:CLIENT:{id} handshake
+        //                    eprintln!("[party {}] Accepted a client connection", accept_party_id);
+
+        //                    // Spawn a handler for this client's messages
+        //                    let client_mpc_node = accept_mpc_node.clone();
+        //                    let client_net = net_for_processing.clone();
+        //                    tokio::spawn(async move {
+        //                        loop {
+        //                            match connection.receive().await {
+        //                                Ok(data) => {
+        //                                    // Process the message through the MPC node
+        //                                    if let Err(e) = client_mpc_node.clone().process(data, client_net.clone()).await {
+        //                                        eprintln!("[party] Failed to process client message: {:?}", e);
+        //                                    }
+        //                                }
+        //                                Err(e) => {
+        //                                    eprintln!("[party] Client connection closed: {}", e);
+        //                                    break;
+        //                                }
+        //                            }
+        //                        }
+        //                    });
+        //                }
+        //                Err(e) => {
+        //                    eprintln!("[party {}] Accept error: {}", accept_party_id, e);
+        //                    // Don't break - keep accepting
+        //                    tokio::time::sleep(Duration::from_millis(100)).await;
+        //                }
+        //            }
+        //        }
+        //    });
+
+        //    // Wait for all expected clients to connect with timeout
+        //    let connect_timeout = Duration::from_secs(60);
+        //    let check_interval = Duration::from_millis(500);
+        //    let start = std::time::Instant::now();
+
+        //    loop {
+        //        let connected_clients: Vec<ClientId> = net.clients();
+        //        let connected_count = connected_clients.iter()
+        //            .filter(|&cid| expected_client_ids.contains(cid))
+        //            .count();
+
+        //        eprintln!("[party {}] {} of {} expected clients connected: {:?}",
+        //                 my_id, connected_count, expected_client_ids.len(), connected_clients);
+
+        //        if connected_count >= expected_client_ids.len() {
+        //            eprintln!("[party {}] All expected clients connected!", my_id);
+        //            break;
+        //        }
+
+        //        if start.elapsed() > connect_timeout {
+        //            eprintln!("[party {}] Timeout waiting for clients. Connected: {:?}, Expected: {:?}",
+        //                     my_id, connected_clients, expected_client_ids);
+        //            exit(15);
+        //        }
+
+        //        tokio::time::sleep(check_interval).await;
+        //    }
+
+        //    eprintln!("[party {}] Initializing InputServer for {} clients...", my_id, input_ids.len());
+
+        //    // Initialize input server for each expected client
+        //    // Each client needs random shares for their inputs (assume 1 input per client for now)
+        //    for &cid in &input_ids {
+        //        // Take random shares from preprocessing material
+        //        let local_shares = match mpc_node
+        //            .preprocessing_material
+        //            .lock()
+        //            .await
+        //            .take_random_shares(1) // 1 input per client
+        //        {
+        //            Ok(shares) => shares,
+        //            Err(e) => {
+        //                eprintln!("[party {}] Not enough random shares for client {}: {:?}", my_id, cid, e);
+        //                exit(15);
+        //            }
+        //        };
+
+        //        if let Err(e) = mpc_node
+        //            .preprocess
+        //            .input
+        //            .init(cid, local_shares, 1, net.clone())
+        //            .await
+        //        {
+        //            eprintln!("[party {}] Failed to init InputServer for client {}: {:?}", my_id, cid, e);
+        //            exit(15);
+        //        }
+        //        eprintln!("[party {}] InputServer initialized for client {}", my_id, cid);
+        //    }
+
+        //    // Wait for all client inputs with timeout
+        //    eprintln!("[party {}] Waiting for client inputs (timeout: 60s)...", my_id);
+        //    let client_inputs = match mpc_node
+        //        .preprocess
+        //        .input
+        //        .wait_for_all_inputs(Duration::from_secs(60))
+        //        .await
+        //    {
+        //        Ok(inputs) => inputs,
+        //        Err(e) => {
+        //            eprintln!("[party {}] Failed to receive client inputs: {:?}", my_id, e);
+        //            exit(16);
+        //        }
+        //    };
+
+        //    eprintln!(
+        //        "[party {}] Received inputs from {} clients",
+        //        my_id,
+        //        client_inputs.len()
+        //    );
+        // }
+
+        // TODO: here we need to translate the identity of clients towards the coordinator
+        // to the identity towards of clients towards nodes:
+        // on-chain: Eth address to public key
+        // off-chain: same identity towards coordinator and nodes (public key), so no translation
+        // needed
+        // since we use the stoffelnet version without authentication here, we simply assign each
+        // address an index here
+
+        // Store client inputs in the VM's client store
+        for (i, (cid, shares)) in client_inputs.into_iter().enumerate() {
+            vm.state.client_store().store_client_input(i, shares);
+            eprintln!("[party {}] Stored inputs for client {} ({})", my_id, i, cid);
         }
 
         vm.state.set_mpc_engine(engine);
         eprintln!("[party {}] MPC engine set, starting VM execution...", my_id);
     }
+
+    if as_leader {
+        coord.trigger_mpc().await.unwrap();
+    }
+
+    coord.wait_for_mpc().await.unwrap();
 
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
 
@@ -1020,6 +1200,16 @@ async fn main() {
             eprintln!("Execution error in '{}': {}", agreed_entry, err);
             exit(4);
         }
+    }
+
+    if as_leader {
+        coord.trigger_outputs().await.unwrap();
+    }
+
+    coord.wait_for_outputs().await.unwrap();
+
+    if as_leader {
+        coord.finalize().await.unwrap();
     }
 }
 

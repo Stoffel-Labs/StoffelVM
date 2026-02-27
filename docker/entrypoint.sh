@@ -72,15 +72,17 @@ build_command() {
     if [ "${STOFFEL_ROLE}" = "client" ]; then
         # Client mode: connect to servers and submit inputs
         cmd="${cmd} --client"
-        cmd="${cmd} --client-id ${STOFFEL_CLIENT_ID}"
+        #cmd="${cmd} --client-id ${STOFFEL_CLIENT_ID}"
         cmd="${cmd} --inputs ${STOFFEL_INPUTS}"
         cmd="${cmd} --servers ${STOFFEL_SERVERS}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD:-1}"
 	cmd="${cmd} --eth-node ${STOFFEL_ETH_NODE_ADDR}"
-	cmd="${cmd} --coordinator ${STOFFEL_COORD_ADDR}"
+	#cmd="${cmd} --off-chain-coord ${STOFFEL_COORD_ADDR}"
+	cmd="${cmd} --on-chain-coord ${STOFFEL_COORD_ADDR}"
 	cmd="${cmd} --wallet-sk ${STOFFEL_WALLET_SK}"
-	cmd="${cmd} --off-chain-key ${STOFFEL_OFF_CHAIN_KEY}"
+	cmd="${cmd} --key ${STOFFEL_KEY}"
+	cmd="${cmd} --cert ${STOFFEL_CERT}"
         echo "$cmd"
         return
     fi
@@ -92,28 +94,42 @@ build_command() {
         # Leader mode: runs bootnode + party 0
         cmd="${cmd} --leader"
         cmd="${cmd} --bind ${STOFFEL_BIND_ADDR}"
+        cmd="${cmd} --rpc-bind ${STOFFEL_RPC_ADDR}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
+	cmd="${cmd} --eth-node ${STOFFEL_ETH_NODE_ADDR}"
+	#cmd="${cmd} --off-chain-coord ${STOFFEL_COORD_ADDR}"
+	cmd="${cmd} --on-chain-coord ${STOFFEL_COORD_ADDR}"
+	cmd="${cmd} --wallet-sk ${STOFFEL_WALLET_SK}"
+	cmd="${cmd} --key ${STOFFEL_KEY}"
+	cmd="${cmd} --cert ${STOFFEL_CERT}"
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD}"
+	cmd="${cmd} --node-ids ${STOFFEL_NODE_IDS}"
     elif [ "${STOFFEL_ROLE}" = "bootnode" ]; then
         # Bootnode-only mode (no program execution)
         cmd="/app/stoffel-run --bootnode"
         cmd="${cmd} --bind ${STOFFEL_BIND_ADDR}"
+        cmd="${cmd} --rpc-bind ${STOFFEL_RPC_ADDR}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
 	cmd="${cmd} --eth-node ${STOFFEL_ETH_NODE_ADDR}"
-	cmd="${cmd} --coordinator ${STOFFEL_COORD_ADDR}"
+	#cmd="${cmd} --off-chain-coord ${STOFFEL_COORD_ADDR}"
+	cmd="${cmd} --on-chain-coord ${STOFFEL_COORD_ADDR}"
 	cmd="${cmd} --wallet-sk ${STOFFEL_WALLET_SK}"
-	cmd="${cmd} --off-chain-key ${STOFFEL_OFF_CHAIN_KEY}"
+	cmd="${cmd} --key ${STOFFEL_KEY}"
+	cmd="${cmd} --cert ${STOFFEL_CERT}"
     else
         # Regular party mode
+        cmd="${cmd} --bind ${STOFFEL_BIND_ADDR}"
+        cmd="${cmd} --rpc-bind ${STOFFEL_RPC_ADDR}"
+        cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
+	cmd="${cmd} --eth-node ${STOFFEL_ETH_NODE_ADDR}"
+	#cmd="${cmd} --off-chain-coord ${STOFFEL_COORD_ADDR}"
+	cmd="${cmd} --on-chain-coord ${STOFFEL_COORD_ADDR}"
+	cmd="${cmd} --wallet-sk ${STOFFEL_WALLET_SK}"
+	cmd="${cmd} --key ${STOFFEL_KEY}"
+	cmd="${cmd} --cert ${STOFFEL_CERT}"
         cmd="${cmd} --party-id ${STOFFEL_PARTY_ID}"
         cmd="${cmd} --bootstrap ${STOFFEL_BOOTSTRAP_ADDR}"
-        cmd="${cmd} --bind ${STOFFEL_BIND_ADDR}"
-        cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD}"
-	cmd="${cmd} --eth-node ${STOFFEL_ETH_NODE_ADDR}"
-	cmd="${cmd} --coordinator ${STOFFEL_COORD_ADDR}"
-	cmd="${cmd} --wallet-sk ${STOFFEL_WALLET_SK}"
-	cmd="${cmd} --off-chain-key ${STOFFEL_OFF_CHAIN_KEY}"
     fi
 
     # Add expected clients if specified (for leader and party modes)

@@ -43,6 +43,8 @@ blake3 = "1.5.4"
 hex = "0.4"
 dirs = "5"
 dashmap = "5"
+alloy = "1.7.3"
+alloy-primitives = "1.5.7"
 
 [features]
 hb_itest = []
