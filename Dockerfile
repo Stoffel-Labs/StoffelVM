@@ -93,6 +93,7 @@ ENV STOFFEL_RPC_ADDR=""
 ENV STOFFEL_WALLET_SK=""
 ENV STOFFEL_KEY=""
 ENV STOFFEL_CERT=""
+ENV STOFFEL_TIMESTAMP=""
 
 # Expose ports for bootnode and party communication
 # Port 9000: bootnode coordination

@@ -45,6 +45,7 @@ dirs = "5"
 dashmap = "5"
 alloy = "1.7.3"
 alloy-primitives = "1.5.7"
+x509-parser = "0.18.1"
 
 [features]
 hb_itest = []

@@ -26,10 +26,7 @@ use tokio::sync::mpsc;
 use std::str::FromStr;
 use std::fs;
 use serde::{Serialize, Deserialize};
-use stoffel_mpc_coordinator::on_chain as coordinator;
 use stoffel_mpc_coordinator::Coordinator;
-//use stoffel_mpc_coordinator::off_chain as coordinator;
-//use stoffel_mpc_coordinator::{Coordinator};
 use alloy::{
     providers::{Provider, ProviderBuilder, WsConnect},
     signers::local::PrivateKeySigner,
@@ -38,6 +35,7 @@ use alloy::{
 use alloy_primitives::{U256, Address, Signature, Bytes};
 use std::collections::HashMap;
 use dashmap::DashMap;
+use x509_parser::prelude::*;
 
 // Use a Tokio runtime for async operations
 #[tokio::main]
@@ -72,10 +70,11 @@ async fn main() {
     let mut node_ids: Vec<Address> = Vec::new();
     let mut eth_node_addr: Option<String> = None;
     let mut contract_addr: Option<Address> = None;
-    let mut coord_addr: Option<String> = None;
+    let mut coord_addr: Option<(String, u16)> = None;
     let mut wallet_sk: Option<String> = None;
     let mut key_der: Option<Vec<u8>> = None;
     let mut cert_der: Option<Vec<u8>> = None;
+    let mut timestamp: Option<u64> = None;
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -229,7 +228,10 @@ async fn main() {
             }
             "--off-chain-coord" => {
                 if let Some(v) = args_iter.next() {
-                    coord_addr = Some(v);
+                    let s = v.trim();
+                    let (addr, port_str) = s.rsplit_once(":").expect("invalid network address");
+                    let port = port_str.parse::<u16>().ok().expect("invalid port number");
+                    coord_addr = Some((addr.to_string(), port));
                 }
             }
             "--wallet-sk" => {
@@ -247,18 +249,23 @@ async fn main() {
                     cert_der = Some(fs::read(v).expect("failed to read certificate file"));
                 }
             }
+            "--timestamp" => {
+                if let Some(v) = args_iter.next() {
+                    timestamp = Some(v.parse::<u64>().unwrap());
+                }
+            }
             _ => {}
         }
     }
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls crypto");
 
     // Bootnode-only mode (no program execution)
     if as_bootnode && !as_leader {
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:9000".parse().unwrap());
         eprintln!("Starting bootnode on {}", bind);
-        // Install crypto provider for quinn/rustls
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("install rustls crypto");
         // Pass expected parties if specified, so bootnode waits for all before announcing session
         if let Err(e) = run_bootnode_with_config(bind, n_parties).await {
             eprintln!("Bootnode error: {}", e);
@@ -267,9 +274,7 @@ async fn main() {
         return;
     }
 
-    let provider = stoffel_mpc_coordinator::on_chain::ws_connect(&eth_node_addr.unwrap(), &wallet_sk.clone().unwrap()).await;
-    let mut coord = stoffel_mpc_coordinator::on_chain::setup_coord(provider, contract_addr.unwrap()).await;
-    let signer = PrivateKeySigner::from_str(&wallet_sk.unwrap()).unwrap();
+    let mut coord = stoffel_mpc_coordinator::off_chain::OffChainCoordinator::start_rpc_client(&(coord_addr.clone().unwrap().0), coord_addr.clone().unwrap().1, timestamp.unwrap(), cert_der.clone().unwrap(), key_der.clone().unwrap()).await;
 
     // Client mode: connect to MPC servers and provide inputs
     if as_client {
@@ -277,6 +282,13 @@ async fn main() {
         //    eprintln!("Error: --client-id is required in client mode");
         //    exit(2);
         //});
+        let cid = {
+            let cert_der = cert_der.clone().unwrap();
+            let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
+                .expect("Failed to parse X.509 certificate DER");
+            parsed_cert.public_key()
+                .subject_public_key.data.as_ref().to_vec()
+        };
 
         let n = n_parties.unwrap_or_else(|| {
             eprintln!("Error: --n-parties is required in client mode");
@@ -316,27 +328,22 @@ async fn main() {
         }
 
         eprintln!(
-            "[client {}] Client mode (n={}, t={}, {} inputs, {} servers)",
-            signer.address(), n, t, input_len, server_addrs.len()
+            "[client {:?}] Client mode (n={}, t={}, {} inputs, {} servers)",
+            cid, n, t, input_len, server_addrs.len()
         );
-
-        // Install crypto provider for quinn/rustls
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("install rustls crypto");
 
         coord.wait_for_pp().await.unwrap();
         coord.wait_for_input_mask_init().await.unwrap();
 
         assert_eq!(input_values.len(), 1);
         let indices = coord.obtain_mask_indices(input_values.len() as u64).await.expect("obtaining mask indices failed");
-        println!("CLIENT: obtained index {}", indices[0]);
+        println!("client [{:?}] obtained index {}", cid, indices[0]);
 
-        let base_nonce = coord.base_nonce().await;
-        let sig = stoffel_mpc_coordinator::on_chain::generate_client_sig(base_nonce, indices[0], signer.clone()).await;
+        //let base_nonce = coord.base_nonce().await;
+        //let sig = stoffel_mpc_coordinator::on_chain::generate_client_sig(base_nonce, indices[0], signer.clone()).await;
 
-        let node_rpc_client = stoffel_mpc_coordinator::on_chain::node_rpc::NodeRPCClient::start_rpc_client(t, server_addrs.clone(), cert_der.unwrap(), key_der.unwrap()).await;
-        let mask = node_rpc_client.receive_mask_share(sig.into(), signer.address()).await;
+        let node_rpc_client = stoffel_mpc_coordinator::off_chain::node_rpc::NodeRPCClient::start_rpc_client(t, server_addrs.clone(), cert_der.unwrap(), key_der.unwrap()).await;
+        let mask = node_rpc_client.receive_mask_share().await;
 
         coord.wait_for_input().await.unwrap();
 
@@ -511,13 +518,8 @@ async fn main() {
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:9000".parse().unwrap());
         let my_id = party_id.unwrap_or(0usize);
 
-        // Install crypto provider for quinn/rustls
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("install rustls crypto");
-
         // Grant party roles to MPC nodes
-        coord.grant_roles(node_ids).await.unwrap();
+        //coord.grant_roles(node_ids).await.unwrap();
 
         // Must have program path
         if path_opt.is_none() {
@@ -610,9 +612,6 @@ async fn main() {
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
 
         let my_id = party_id.unwrap_or(0usize);
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("install rustls crypto");
 
         // Must have program path in party mode
         if path_opt.is_none() {
@@ -696,8 +695,8 @@ async fn main() {
     }
 
     // Start JSON-RPC server on nodes
-    let mut node_rpc = stoffel_mpc_coordinator::on_chain::node_rpc::NodeRPCServer::start(&(rpc_addr.clone().unwrap().0),
-        rpc_addr.unwrap().1, coord.coord(), cert_der.unwrap(), key_der.unwrap()).await;
+    let mut node_rpc = stoffel_mpc_coordinator::off_chain::node_rpc::NodeRPCServer::start(&(rpc_addr.clone().unwrap().0),
+        rpc_addr.unwrap().1, cert_der.unwrap(), key_der.unwrap()).await;
 
     // Load compiled binary from a file path
     let load_path: String = if let Some(p) = path_opt.clone() {
@@ -887,8 +886,12 @@ async fn main() {
         );
 
         // Parse expected client IDs (comma-separated)
-        let input_ids: Vec<Address> = expected_clients.iter().map(|s| {
-            Address::from_str(&s).expect("invalid node Ethereum address")
+        let input_ids: Vec<Vec<u8>> = expected_clients.iter().map(|s| {
+            let cert_der = fs::read(s).expect("failed to read certificate file");
+            let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
+                .expect("Failed to parse X.509 certificate DER");
+            parsed_cert.public_key()
+                .subject_public_key.data.as_ref().to_vec()
         }).collect();
 
         eprintln!(
@@ -966,7 +969,9 @@ async fn main() {
             coord.trigger_pp().await.unwrap();
         }
 
+        println!("Waiting for preprocessing to start...");
         coord.wait_for_pp().await.unwrap();
+        println!("Preprocessing started...");
 
         // Run preprocessing
         eprintln!("[party {}] Starting MPC preprocessing...", my_id);
@@ -1001,28 +1006,32 @@ async fn main() {
             coord.init_input_masks().await.unwrap();
         }
 
+        println!("Waiting for input mask init...");
         coord.wait_for_input_mask_init().await.unwrap();
+        println!("Input mask init done");
         let client_to_index = coord.wait_for_indices(input_ids.len() as u64).await.unwrap();
         for (c, i) in client_to_index {
             println!("NODE: client {:?} reserved index {}", c, i);
             node_rpc.add_reserved_index(c, i).await;
         }
 
-        for input_id in input_ids.iter() {
-            // TODO: a malicious client can make this stall forever. add a timeout!
-            if coord.wait_for_client_auth(*input_id).await.unwrap() {
-                node_rpc.add_auth_status(*input_id, true).await;
-                println!("NODE: client {:?} authenticated successfully", input_id);
-            } else {
-                panic!();
-            }
-        }
+        //for input_id in input_ids.iter() {
+        //    // TODO: a malicious client can make this stall forever. add a timeout!
+        //    if coord.wait_for_client_auth(*input_id).await.unwrap() {
+        //        node_rpc.add_auth_status(*input_id, true).await;
+        //        println!("NODE: client {:?} authenticated successfully", input_id);
+        //    } else {
+        //        panic!();
+        //    }
+        //}
 
         if as_leader {
             coord.trigger_input().await.unwrap();
         }
 
+        println!("Waiting for input start...");
         coord.wait_for_input().await.unwrap();
+        println!("Waiting for input done");
         let client_inputs = coord.wait_for_inputs(input_ids.len() as u64, mask_shares).await.unwrap();
 
         for (cid, input_shares) in &client_inputs {
@@ -1176,7 +1185,7 @@ async fn main() {
         // Store client inputs in the VM's client store
         for (i, (cid, shares)) in client_inputs.into_iter().enumerate() {
             vm.state.client_store().store_client_input(i, shares);
-            eprintln!("[party {}] Stored inputs for client {} ({})", my_id, i, cid);
+            eprintln!("[party {}] Stored inputs for client {} ({:?})", my_id, i, cid);
         }
 
         vm.state.set_mpc_engine(engine);
