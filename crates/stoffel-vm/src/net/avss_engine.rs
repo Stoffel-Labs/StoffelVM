@@ -35,6 +35,7 @@ use stoffelmpc_mpc::avss_mpc::{
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::{MPCProtocol, ProtocolSessionId, SecretSharingScheme};
+use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -111,8 +112,9 @@ where
     ready: AtomicBool,
     /// This party's AVSS ECDH key used for payload confidentiality.
     /// Transport identity/authentication is handled separately by TLS.
-    /// Stored for potential node re-creation; read by the inner `AdkgNode`.
-    _sk_i: F,
+    /// Retained for potential node re-creation; read by the inner `AdkgNode`.
+    #[allow(dead_code)]
+    sk_i: F,
     _marker: PhantomData<G>,
 }
 
@@ -141,6 +143,8 @@ where
         pk_map: Arc<Vec<G>>,
     ) -> Result<Arc<Self>, String> {
         // Create the AdkgNode via MPCProtocol::setup
+        let instance_id_u32 = u32::try_from(instance_id)
+            .map_err(|_| format!("instance_id {} exceeds u32", instance_id))?;
         let opts = AdkgNodeOpts::new(
             n,
             t,
@@ -148,7 +152,7 @@ where
             DEFAULT_N_TRIPLES,
             sk_i,
             pk_map,
-            instance_id as u32,
+            instance_id_u32,
         );
         let adkg_node = <AdkgNode<F, Avid<AvssSessionId>, G> as MPCProtocol<
             F,
@@ -168,7 +172,7 @@ where
             session_counter: Arc::new(Mutex::new(0)),
             input_share_counter: AtomicU64::new(0),
             ready: AtomicBool::new(false),
-            _sk_i: sk_i,
+            sk_i,
             _marker: PhantomData,
         }))
     }
@@ -226,6 +230,71 @@ where
         }
 
         self.wait_for_share(session_id).await
+    }
+
+    async fn run_multiply_round(
+        adkg_node: Arc<Mutex<AdkgNode<F, Avid<AvssSessionId>, G>>>,
+        net: Arc<QuicNetworkManager>,
+        left_share_bytes: Vec<u8>,
+        right_share_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        let left_share = Self::decode_feldman_share(&left_share_bytes)?;
+        let right_share = Self::decode_feldman_share(&right_share_bytes)?;
+
+        let result = {
+            let mut node = adkg_node.lock().await;
+            node.mul(vec![left_share], vec![right_share], net)
+                .await
+                .map_err(|e| format!("Multiplication failed: {:?}", e))?
+        };
+
+        let product = result
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Multiplication returned no result".to_string())?;
+        Self::encode_feldman_share(&product)
+    }
+
+    async fn broadcast_open_registry_payload(&self, payload: Vec<u8>) -> Result<(), String> {
+        for peer_id in 0..self.n {
+            if peer_id == self.party_id {
+                continue;
+            }
+            self.net
+                .send(peer_id, &payload)
+                .await
+                .map_err(|e| format!("Failed to send open payload to party {}: {}", peer_id, e))?;
+        }
+        Ok(())
+    }
+
+    fn broadcast_open_registry_payload_sync(&self, payload: Vec<u8>) -> Result<(), String> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                #[allow(deprecated)]
+                {
+                    match handle.runtime_flavor() {
+                        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(
+                            || handle.block_on(self.broadcast_open_registry_payload(payload)),
+                        ),
+                        tokio::runtime::RuntimeFlavor::CurrentThread => Err(
+                            "AVSS open operation called from a single-thread Tokio runtime; synchronous waiting is unsupported in this context".to_string(),
+                        ),
+                        _ => Err(
+                            "AVSS open operation called from an unsupported Tokio runtime flavor"
+                                .to_string(),
+                        ),
+                    }
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
+                rt.block_on(self.broadcast_open_registry_payload(payload))
+            }
+        }
     }
 
     /// Start the engine and mark it ready
@@ -380,7 +449,8 @@ where
                 ));
             }
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // TODO: Replace polling with tokio::sync::Notify for immediate wakeup
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -430,7 +500,8 @@ where
                 ));
             }
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // TODO: Replace polling with tokio::sync::Notify for immediate wakeup
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -554,6 +625,13 @@ where
         Ok(secret)
     }
 
+    #[inline]
+    fn field_from_i64(value: i64) -> F {
+        // Keep signed encoding aligned with reveal/open decode paths
+        // (which read the low limb as an i64).
+        F::from(value as u64)
+    }
+
     /// Convert a reconstructed field element to the appropriate [`Value`] for a given share type.
     fn field_to_value(ty: ShareType, secret: F) -> Result<Value, String> {
         let value = match ty {
@@ -625,7 +703,7 @@ where
 
     fn input_share(&self, ty: ShareType, clear: &Value) -> Result<Vec<u8>, String> {
         let secret = match (ty, clear) {
-            (ShareType::SecretInt { .. }, Value::I64(v)) => F::from(*v as u64),
+            (ShareType::SecretInt { .. }, Value::I64(v)) => Self::field_from_i64(*v),
             (
                 ShareType::SecretInt {
                     bit_length: BOOLEAN_SECRET_INT_BITS,
@@ -642,11 +720,7 @@ where
                 let f = precision.f();
                 let scale = (1u64 << f) as f64;
                 let scaled_value = (fp.0 * scale) as i64;
-                if scaled_value >= 0 {
-                    F::from(scaled_value as u64)
-                } else {
-                    -F::from((-scaled_value) as u64)
-                }
+                Self::field_from_i64(scaled_value)
             }
             _ => return Err("Unsupported type for input_share".to_string()),
         };
@@ -681,30 +755,64 @@ where
     }
 
     fn multiply_share(&self, _ty: ShareType, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
-        let left_share = Self::decode_feldman_share(left)?;
-        let right_share = Self::decode_feldman_share(right)?;
+        let left_share_bytes = left.to_vec();
+        let right_share_bytes = right.to_vec();
 
-        // Use tokio runtime to run async mul
-        let rt_handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| "No tokio runtime available for multiply")?;
-
-        let adkg_node = self.adkg_node.clone();
-        let net = self.net.clone();
-
-        let result = tokio::task::block_in_place(|| {
-            rt_handle.block_on(async {
-                let mut node = adkg_node.lock().await;
-                node.mul(vec![left_share], vec![right_share], net)
-                    .await
-                    .map_err(|e| format!("Multiplication failed: {:?}", e))
-            })
-        })?;
-
-        let product = result
-            .into_iter()
-            .next()
-            .ok_or("Multiplication returned no result")?;
-        Self::encode_feldman_share(&product)
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                #[allow(deprecated)]
+                {
+                    match handle.runtime_flavor() {
+                        tokio::runtime::RuntimeFlavor::MultiThread => {
+                            tokio::task::block_in_place(|| {
+                                handle.block_on(Self::run_multiply_round(
+                                    self.adkg_node.clone(),
+                                    self.net.clone(),
+                                    left_share_bytes.clone(),
+                                    right_share_bytes.clone(),
+                                ))
+                            })
+                        }
+                        tokio::runtime::RuntimeFlavor::CurrentThread => {
+                            let adkg_node = self.adkg_node.clone();
+                            let net = self.net.clone();
+                            let left_share_bytes = left_share_bytes.clone();
+                            let right_share_bytes = right_share_bytes.clone();
+                            std::thread::spawn(move || -> Result<Vec<u8>, String> {
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
+                                rt.block_on(Self::run_multiply_round(
+                                    adkg_node,
+                                    net,
+                                    left_share_bytes,
+                                    right_share_bytes,
+                                ))
+                            })
+                            .join()
+                            .map_err(|_| "AVSS multiply worker thread panicked".to_string())?
+                        }
+                        _ => Err(
+                            "AVSS multiply_share called from an unsupported Tokio runtime flavor"
+                                .to_string(),
+                        ),
+                    }
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
+                rt.block_on(Self::run_multiply_round(
+                    self.adkg_node.clone(),
+                    self.net.clone(),
+                    left_share_bytes,
+                    right_share_bytes,
+                ))
+            }
+        }
     }
 
     fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
@@ -714,6 +822,14 @@ where
                 format!("avss-fixed-{}-{}", precision.k(), precision.f())
             }
         };
+
+        let wire_message = crate::net::open_registry::encode_single_share_wire_message(
+            self.instance_id,
+            &type_key,
+            self.party_id,
+            share_bytes,
+        )?;
+        self.broadcast_open_registry_payload_sync(wire_message)?;
 
         let required = self.t + 1;
         let n = self.n;
@@ -742,6 +858,14 @@ where
                 format!("avss-batch-fixed-{}-{}", precision.k(), precision.f())
             }
         };
+
+        let wire_message = crate::net::open_registry::encode_batch_share_wire_message(
+            self.instance_id,
+            &type_key,
+            self.party_id,
+            shares,
+        )?;
+        self.broadcast_open_registry_payload_sync(wire_message)?;
 
         let required = self.t + 1;
         let n = self.n;
@@ -786,7 +910,8 @@ where
     }
 
     fn supports_elliptic_curves(&self) -> bool {
-        true
+        // `open_share_in_exp` is not implemented for AVSS yet.
+        false
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -888,7 +1013,10 @@ where
 // Registry for coordinating AVSS sessions across parties
 // ============================================================================
 
-/// Global registry for AVSS share coordination (for in-process multi-party testing)
+/// Global registry for AVSS share coordination (for in-process multi-party testing).
+///
+/// Only compiled for tests and integration test feature gates; not used in production.
+#[cfg(any(test, feature = "avss_itest"))]
 #[derive(Default)]
 struct AvssRegistry {
     /// Maps (instance_id, session_id, party_id) to serialized share
@@ -897,10 +1025,12 @@ struct AvssRegistry {
     public_keys: std::collections::HashMap<(u64, u64), Vec<u8>>,
 }
 
+#[cfg(any(test, feature = "avss_itest"))]
 static AVSS_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<AvssRegistry>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(AvssRegistry::default()));
 
 /// Store a share in the global registry (for testing)
+#[cfg(any(test, feature = "avss_itest"))]
 pub fn registry_store_share(
     instance_id: u64,
     session_id: u64,
@@ -914,6 +1044,7 @@ pub fn registry_store_share(
 }
 
 /// Get all shares for a session from the registry (for testing)
+#[cfg(any(test, feature = "avss_itest"))]
 pub fn registry_get_shares(instance_id: u64, session_id: u64) -> Vec<(usize, Vec<u8>)> {
     let registry = AVSS_REGISTRY.lock();
     registry
@@ -930,6 +1061,7 @@ pub fn registry_get_shares(instance_id: u64, session_id: u64) -> Vec<(usize, Vec
 }
 
 /// Store agreed public key in registry
+#[cfg(any(test, feature = "avss_itest"))]
 pub fn registry_store_public_key(instance_id: u64, session_id: u64, pk_bytes: Vec<u8>) {
     let mut registry = AVSS_REGISTRY.lock();
     registry
@@ -938,6 +1070,7 @@ pub fn registry_store_public_key(instance_id: u64, session_id: u64, pk_bytes: Ve
 }
 
 /// Get public key from registry
+#[cfg(any(test, feature = "avss_itest"))]
 pub fn registry_get_public_key(instance_id: u64, session_id: u64) -> Option<Vec<u8>> {
     let registry = AVSS_REGISTRY.lock();
     registry
@@ -1230,6 +1363,33 @@ mod tests {
             Bls12381AvssMpcEngine::encode_feldman_share(&shares[party_id]).expect("encode failed");
         let decoded = Bls12381AvssMpcEngine::decode_feldman_share(&bytes).expect("decode failed");
         assert_eq!(decoded.feldmanshare.id, shares[party_id].feldmanshare.id);
+    }
+
+    #[test]
+    fn test_avss_fixed_point_negative_encoding_roundtrip() {
+        let ty = ShareType::default_secret_fixed_point();
+        let precision = match ty {
+            ShareType::SecretFixedPoint { precision } => precision,
+            _ => unreachable!(),
+        };
+        let f = precision.f();
+        let scale = (1u64 << f) as f64;
+
+        // Choose a power-of-two denominator so this is exactly representable.
+        let clear = -3.25f64;
+        let scaled = (clear * scale) as i64;
+        let encoded = Bls12381AvssMpcEngine::field_from_i64(scaled);
+        let decoded = Bls12381AvssMpcEngine::field_to_value(ty, encoded).expect("decode value");
+
+        match decoded {
+            Value::Float(v) => assert!(
+                (v.0 - clear).abs() < 1e-12,
+                "expected {}, got {}",
+                clear,
+                v.0
+            ),
+            other => panic!("expected Value::Float, got {:?}", other),
+        }
     }
 
     #[test]

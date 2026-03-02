@@ -190,6 +190,34 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                     loop {
                                         match connection.receive().await {
                                             Ok(data) => {
+                                                let sender_id =
+                                                    connection.remote_party_id().unwrap_or(usize::MAX);
+                                                match crate::net::open_registry::try_handle_wire_message(
+                                                    sender_id, &data,
+                                                ) {
+                                                    Ok(true) => continue,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Node {} failed to handle open wire message from {}: {}",
+                                                            conn_node_id, sender_id, e
+                                                        );
+                                                        continue;
+                                                    }
+                                                    Ok(false) => {}
+                                                }
+                                                match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                                                    sender_id, &data,
+                                                ) {
+                                                    Ok(true) => continue,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Node {} failed to handle open_exp wire message from {}: {}",
+                                                            conn_node_id, sender_id, e
+                                                        );
+                                                        continue;
+                                                    }
+                                                    Ok(false) => {}
+                                                }
                                                 info!("[HB-QUIC] Node {} received {} bytes from {}", conn_node_id, data.len(), connection.remote_address());
                                                 if let Err(e) = txx.send(data).await {
                                                     error!("Node {} failed to handle message: {:?}", conn_node_id, e);
@@ -265,6 +293,35 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                             loop {
                                 match connection.receive().await {
                                     Ok(data) => {
+                                        match crate::net::open_registry::try_handle_wire_message(
+                                            pid_for_task,
+                                            &data,
+                                        ) {
+                                            Ok(true) => continue,
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to handle open wire message from peer {}: {}",
+                                                    pid_for_task, e
+                                                );
+                                                continue;
+                                            }
+                                            Ok(false) => {}
+                                        }
+                                        match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                                            pid_for_task,
+                                            &data,
+                                        ) {
+                                            Ok(true) => continue,
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to handle open_exp wire message from peer {}: {}",
+                                                    pid_for_task, e
+                                                );
+                                                continue;
+                                            }
+                                            Ok(false) => {}
+                                        }
+
                                         if let Err(e) = txx.send(data).await {
                                             error!(
                                                 "Failed to handle message from peer {}: {:?}",
@@ -374,6 +431,34 @@ pub async fn spawn_receive_loops(
                     loop {
                         match connection.receive().await {
                             Ok(data) => {
+                                match crate::net::open_registry::try_handle_wire_message(
+                                    sender_id, &data,
+                                ) {
+                                    Ok(true) => continue,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[party {}] Failed to handle open wire message from {}: {}",
+                                            conn_node_id, sender_id, e
+                                        );
+                                        continue;
+                                    }
+                                    Ok(false) => {}
+                                }
+
+                                match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                                    sender_id, &data,
+                                ) {
+                                    Ok(true) => continue,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[party {}] Failed to handle open_exp wire message from {}: {}",
+                                            conn_node_id, sender_id, e
+                                        );
+                                        continue;
+                                    }
+                                    Ok(false) => {}
+                                }
+
                                 if let Err(e) = txx.send((sender_id, data)).await {
                                     eprintln!(
                                         "[party {}] Failed to forward server message from {}: {:?}",

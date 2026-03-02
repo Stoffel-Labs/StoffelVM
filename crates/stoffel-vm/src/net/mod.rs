@@ -30,7 +30,7 @@ pub use p2p::{
 
 // Re-export backend selection
 pub use backend::MpcBackendKind;
-pub use curve::{MpcCurveConfig, MpcFieldKind};
+pub use curve::{field_from_i64, field_to_i64, MpcCurveConfig, MpcFieldKind};
 
 // Re-export MPC helpers (HB-specific helpers gated)
 #[cfg(feature = "honeybadger")]

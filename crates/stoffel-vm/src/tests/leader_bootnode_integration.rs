@@ -28,6 +28,7 @@ use crate::net::program_id_from_bytes;
 use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
 };
+use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
 use stoffel_vm_types::compiled_binary::CompiledBinary;
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
@@ -44,30 +45,6 @@ const FIXED_POINT_SCALE: i64 = 1 << FIXED_POINT_FRACTIONAL_BITS;
 
 // Number of registers used by the program
 const PROGRAM_REGISTERS: usize = 24;
-
-fn init_crypto_provider() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-    });
-}
-
-fn setup_test_tracing() {
-    use std::sync::Once;
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let subscriber = FmtSubscriber::builder()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-            .with_test_writer()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-}
 
 /// Build a federated averaging program that computes element-wise averages.
 ///
@@ -353,6 +330,22 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
 
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
                 if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }

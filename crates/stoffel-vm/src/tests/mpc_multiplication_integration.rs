@@ -602,8 +602,10 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                     Err(e) => {
                         retry_count += 1;
                         if retry_count >= self.config.max_connection_retries {
-                            error!("Client {} failed to connect to server {} at {} after {} attempts: {}",
-                                  self.client_id, i, address, retry_count, e);
+                            error!(
+                                "Client {} failed to connect to server {} at {} after {} attempts: {}",
+                                self.client_id, i, address, retry_count, e
+                            );
                             return Err(HoneyBadgerError::NetworkError(NetworkError::Timeout));
                         }
 
@@ -796,20 +798,11 @@ mod tests {
     use super::*;
     use ark_bls12_381::Fr;
     use ark_std::rand::SeedableRng;
-    use std::sync::Once;
     use std::time::Duration;
     use stoffelmpc_mpc::common::ProtocolSessionId;
     use stoffelmpc_mpc::honeybadger::{ProtocolType, SessionId};
-    use tracing_subscriber::EnvFilter;
 
-    static INIT: Once = Once::new();
-    fn init_crypto_provider() {
-        INIT.call_once(|| {
-            if rustls::crypto::CryptoProvider::get_default().is_none() {
-                let _ = rustls::crypto::ring::default_provider().install_default();
-            }
-        });
-    }
+    use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
 
     #[tokio::test]
     async fn test_preprocessing_client_mul() {
@@ -900,6 +893,24 @@ mod tests {
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
+                    match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                        Ok(true) => continue,
+                        Err(e) => {
+                            tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                            continue;
+                        }
+                        Ok(false) => {}
+                    }
+                    match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                        sender_id, &raw_msg,
+                    ) {
+                        Ok(true) => continue,
+                        Err(e) => {
+                            tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                            continue;
+                        }
+                        Ok(false) => {}
+                    }
                     if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                         tracing::error!("Node {i} failed to process message: {e:?}");
                     }
@@ -1221,6 +1232,24 @@ mod tests {
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
+                    match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                        Ok(true) => continue,
+                        Err(e) => {
+                            tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                            continue;
+                        }
+                        Ok(false) => {}
+                    }
+                    match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                        sender_id, &raw_msg,
+                    ) {
+                        Ok(true) => continue,
+                        Err(e) => {
+                            tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                            continue;
+                        }
+                        Ok(false) => {}
+                    }
                     if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                         tracing::error!("Node {i} failed to process message: {e:?}");
                     }
@@ -1440,6 +1469,24 @@ mod tests {
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
+                    match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                        Ok(true) => continue,
+                        Err(e) => {
+                            tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                            continue;
+                        }
+                        Ok(false) => {}
+                    }
+                    match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                        sender_id, &raw_msg,
+                    ) {
+                        Ok(true) => continue,
+                        Err(e) => {
+                            tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                            continue;
+                        }
+                        Ok(false) => {}
+                    }
                     if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                         tracing::error!("Node {i} failed to process message: {e:?}");
                     }
@@ -1605,22 +1652,5 @@ mod tests {
         assert!(all_succeeded, "Preprocessing failed on one or more servers");
 
         info!("=== Preprocessing-Only Test PASSED ===");
-    }
-
-    // Helper function for test tracing setup
-    fn setup_test_tracing() {
-        use std::sync::Once;
-        use tracing_subscriber::FmtSubscriber;
-
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let subscriber = FmtSubscriber::builder()
-                .with_env_filter(
-                    EnvFilter::from_default_env().add_directive("debug".parse().unwrap()),
-                )
-                .with_test_writer()
-                .finish();
-            let _ = tracing::subscriber::set_global_default(subscriber);
-        });
     }
 }

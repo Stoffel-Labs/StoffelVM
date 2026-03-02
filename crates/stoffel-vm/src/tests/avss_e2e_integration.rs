@@ -35,6 +35,7 @@ use tracing::{error, info, warn};
 use crate::core_vm::VirtualMachine;
 use crate::mpc_builtins::avss_object;
 use crate::net::avss_engine::AvssMpcEngine;
+use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
 
 // ---------------------------------------------------------------------------
 // SimplePartyNetwork — party-id-based Network adapter
@@ -190,30 +191,6 @@ fn build_simple_network(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn init_crypto_provider() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-    });
-}
-
-fn setup_test_tracing() {
-    use std::sync::Once;
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let subscriber = FmtSubscriber::builder()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-            .with_test_writer()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-}
 
 /// A test AVSS node that owns a network manager, channel, and ECDH keypair.
 struct AvssTestNode {
@@ -530,6 +507,17 @@ fn spawn_avss_message_processors(
         tokio::spawn(async move {
             let mut rx = rx;
             while let Some((sender_id, data)) = rx.recv().await {
+                match crate::net::open_registry::try_handle_wire_message(sender_id, &data) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        error!(
+                            "[AVSS] Node {} failed to handle open wire message from {}: {}",
+                            node_id, sender_id, e
+                        );
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
                 match engine
                     .process_wrapped_message_with_network(sender_id, &data, simple_net.clone())
                     .await
@@ -782,7 +770,8 @@ async fn test_avss_e2e_vm_public_key_extraction() {
             share_bytes,
             commitment_bytes,
             party_id,
-        );
+        )
+        .unwrap();
 
         // Build a VM program that extracts the public key
         let main_fn = VMFunction::new(

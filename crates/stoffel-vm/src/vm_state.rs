@@ -16,10 +16,12 @@
 use crate::foreign_functions::{ForeignFunctionContext, Function};
 use crate::net::client_store::ClientInputStore;
 use crate::runtime_hooks::{HookContext, HookEvent, HookManager};
-use ark_ff::PrimeField;
+use ark_ec::CurveGroup;
+use ark_ff::{FftField, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rustc_hash::FxHashMap;
 use smallvec::{smallvec, SmallVec};
+use std::io::Cursor;
 use std::sync::Arc;
 use stoffel_vm_types::activations::{ActivationRecord, ActivationRecordPool};
 use stoffel_vm_types::core_types::{
@@ -27,6 +29,7 @@ use stoffel_vm_types::core_types::{
 };
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::{Instruction, ResolvedInstruction};
+use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::SecretSharingScheme;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelnet::network_utils::ClientId;
@@ -118,22 +121,46 @@ impl RevealBatcher {
             return Ok(vec![]);
         }
 
-        // Group by share type - for now assume all same type (typical case)
-        // TODO: Support mixed types by grouping and batching separately
-        let first_type = self.pending[0].share_type;
+        // Group by share type so mixed-type queues do not decode under the wrong type.
+        let mut grouped_indices: Vec<(ShareType, Vec<usize>)> = Vec::new();
+        for (idx, queued) in self.pending.iter().enumerate() {
+            if let Some((_, indices)) = grouped_indices
+                .iter_mut()
+                .find(|(share_type, _)| *share_type == queued.share_type)
+            {
+                indices.push(idx);
+            } else {
+                grouped_indices.push((queued.share_type, vec![idx]));
+            }
+        }
 
-        let shares: Vec<Vec<u8>> = self.pending.iter().map(|r| r.share_data.clone()).collect();
+        let mut revealed_by_index: Vec<Option<Value>> = vec![None; self.pending.len()];
+        for (share_type, indices) in grouped_indices {
+            let shares: Vec<Vec<u8>> = indices
+                .iter()
+                .map(|idx| self.pending[*idx].share_data.clone())
+                .collect();
+            let revealed = engine.batch_open_shares(share_type, &shares)?;
+            if revealed.len() != indices.len() {
+                return Err(format!(
+                    "Batch reveal count mismatch for {:?}: got {}, expected {}",
+                    share_type,
+                    revealed.len(),
+                    indices.len()
+                ));
+            }
+            for (pos, value) in revealed.into_iter().enumerate() {
+                revealed_by_index[indices[pos]] = Some(value);
+            }
+        }
 
-        // Batch reveal!
-        let revealed = engine.batch_open_shares(first_type, &shares)?;
-
-        // Build results with register destinations
-        let results: Vec<(usize, Value)> = self
-            .pending
-            .iter()
-            .zip(revealed)
-            .map(|(queued, value)| (queued.dest_reg, value))
-            .collect();
+        let mut results = Vec::with_capacity(self.pending.len());
+        for (idx, queued) in self.pending.iter().enumerate() {
+            let value = revealed_by_index[idx]
+                .take()
+                .ok_or_else(|| format!("Missing batched reveal result at index {}", idx))?;
+            results.push((queued.dest_reg, value));
+        }
 
         self.pending.clear();
         Ok(results)
@@ -1240,12 +1267,12 @@ impl VMState {
             }
             // Share + Scalar (offline - local computation)
             (Value::Share(ty @ ShareType::SecretInt { .. }, data), Value::I64(scalar)) => {
-                tracing::info!("ADD Share+Scalar: scalar={}", scalar);
+                tracing::trace!("ADD Share+Scalar");
                 let bytes = self.secret_share_add_scalar(*ty, data, *scalar)?;
                 Value::Share(*ty, bytes)
             }
             (Value::I64(scalar), Value::Share(ty @ ShareType::SecretInt { .. }, data)) => {
-                tracing::info!("ADD Scalar+Share: scalar={}", scalar);
+                tracing::trace!("ADD Scalar+Share");
                 let bytes = self.secret_share_add_scalar(*ty, data, *scalar)?;
                 Value::Share(*ty, bytes)
             }
@@ -1535,15 +1562,15 @@ impl VMState {
                 }
                 Value::Float(F64(a.0 / b.0))
             }
-            // Share / Share (online division) - TODO: requires MPC protocol
+            // Share / Share (online division) - not supported by MPC protocol
             (
                 Value::Share(ShareType::SecretInt { .. }, _data1),
                 Value::Share(ShareType::SecretInt { .. }, _data2),
-            ) => todo!("Share / Share division requires MPC protocol"),
+            ) => return Err("Share/Share division is not supported on secret shares".to_string()),
             (
                 Value::Share(ShareType::SecretFixedPoint { .. }, _data1),
                 Value::Share(ShareType::SecretFixedPoint { .. }, _data2),
-            ) => todo!("Share / Share division requires MPC protocol"),
+            ) => return Err("Share/Share division is not supported on secret shares".to_string()),
             // Share / Scalar (offline - local computation via field inverse)
             (Value::Share(ty @ ShareType::SecretInt { .. }, data), Value::I64(scalar)) => {
                 let bytes = self.secret_share_div_scalar(*ty, data, *scalar)?;
@@ -1632,15 +1659,15 @@ impl VMState {
                 }
                 Value::U64(a % *b)
             }
-            // Share % Share (online modulo) - TODO
+            // Share % Share (online modulo) - not supported by MPC protocol
             (
                 Value::Share(ShareType::SecretInt { .. }, _data1),
                 Value::Share(ShareType::SecretInt { .. }, _data2),
-            ) => todo!(),
+            ) => return Err("Share/Share modulo is not supported on secret shares".to_string()),
             (
                 Value::Share(ShareType::SecretFixedPoint { .. }, _data1),
                 Value::Share(ShareType::SecretFixedPoint { .. }, _data2),
-            ) => todo!(),
+            ) => return Err("Share/Share modulo is not supported on secret shares".to_string()),
             _ => return Err("Type error in MOD operation".to_string()),
         };
 
@@ -1673,11 +1700,11 @@ impl VMState {
         let result_value = match (src1, src2) {
             (Value::I64(a), Value::I64(b)) => Value::I64(a & b),
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
-            // Share & Share - TODO
+            // Share & Share - not supported by MPC protocol
             (
                 Value::Share(ShareType::SecretInt { .. }, _data1),
                 Value::Share(ShareType::SecretInt { .. }, _data2),
-            ) => todo!(),
+            ) => return Err("Bitwise AND is not supported on secret shares".to_string()),
             _ => return Err("Type error in AND operation".to_string()),
         };
 
@@ -1710,11 +1737,11 @@ impl VMState {
         let result_value = match (src1, src2) {
             (Value::I64(a), Value::I64(b)) => Value::I64(a | b),
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
-            // Share | Share - TODO
+            // Share | Share - not supported by MPC protocol
             (
                 Value::Share(ShareType::SecretInt { .. }, _data1),
                 Value::Share(ShareType::SecretInt { .. }, _data2),
-            ) => todo!(),
+            ) => return Err("Bitwise OR is not supported on secret shares".to_string()),
             _ => return Err("Type error in OR operation".to_string()),
         };
 
@@ -1747,11 +1774,11 @@ impl VMState {
         let result_value = match (src1, src2) {
             (Value::I64(a), Value::I64(b)) => Value::I64(a ^ b),
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(a ^ b),
-            // Share ^ Share - TODO
+            // Share ^ Share - not supported by MPC protocol
             (
                 Value::Share(ShareType::SecretInt { .. }, _data1),
                 Value::Share(ShareType::SecretInt { .. }, _data2),
-            ) => todo!(),
+            ) => return Err("Bitwise XOR is not supported on secret shares".to_string()),
             _ => return Err("Type error in XOR operation".to_string()),
         };
 
@@ -1782,8 +1809,10 @@ impl VMState {
         let result_value = match src {
             Value::I64(a) => Value::I64(!a),
             Value::Bool(a) => Value::Bool(!a),
-            // ~Share - TODO
-            Value::Share(ShareType::SecretInt { .. }, _data) => todo!(),
+            // ~Share - not supported by MPC protocol
+            Value::Share(ShareType::SecretInt { .. }, _data) => {
+                return Err("Bitwise NOT is not supported on secret shares".to_string())
+            }
             _ => return Err("Type error in NOT operation".to_string()),
         };
 
@@ -1815,8 +1844,10 @@ impl VMState {
 
         let result_value = match (src, amount) {
             (Value::I64(a), Value::I64(b)) => Value::I64(a << b),
-            // Share << Int - TODO
-            (Value::Share(ShareType::SecretInt { .. }, _data), Value::I64(_b)) => todo!(),
+            // Share << Int - not supported by MPC protocol
+            (Value::Share(ShareType::SecretInt { .. }, _data), Value::I64(_b)) => {
+                return Err("Left shift is not supported on secret shares".to_string())
+            }
             _ => return Err("Type error in SHL operation".to_string()),
         };
 
@@ -1848,8 +1879,10 @@ impl VMState {
 
         let result_value = match (src, amount) {
             (Value::I64(a), Value::I64(b)) => Value::I64(a >> b),
-            // Share >> Int - TODO
-            (Value::Share(ShareType::SecretInt { .. }, _data), Value::I64(_b)) => todo!(),
+            // Share >> Int - not supported by MPC protocol
+            (Value::Share(ShareType::SecretInt { .. }, _data), Value::I64(_b)) => {
+                return Err("Right shift is not supported on secret shares".to_string())
+            }
             _ => return Err("Type error in SHR operation".to_string()),
         };
 
@@ -2479,6 +2512,7 @@ impl VMState {
             .get_client_share_bytes(client_id, index)
             .ok_or_else(|| format!("No share found for client {} at index {}", client_id, index))?;
 
+        // TODO: The client store doesn't carry type metadata, so we assume 64-bit secret int.
         Ok(Value::Share(ShareType::secret_int(64), share_bytes))
     }
 
@@ -2508,6 +2542,7 @@ impl VMState {
 
         Ok(shares
             .into_iter()
+            // TODO: The client store doesn't carry type metadata, so we assume 64-bit secret int.
             .map(|share_bytes| Value::Share(ShareType::secret_int(64), share_bytes))
             .collect())
     }
@@ -2560,17 +2595,50 @@ impl VMState {
 // Secret Share Helpers
 // ============================================================================
 
-macro_rules! dispatch_share_field {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalShareFormat {
+    Robust,
+    Feldman,
+}
+
+enum DecodedShare<F, G>
+where
+    F: FftField + PrimeField,
+    G: CurveGroup<ScalarField = F>,
+{
+    Robust(RobustShare<F>),
+    Feldman(FeldmanShamirShare<F, G>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ShareBinaryOp {
+    Add,
+    Sub,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ShareUnaryOp {
+    Neg,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ShareScalarOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+macro_rules! dispatch_share_curve {
     ($self:expr, $method:ident ( $($arg:expr),* )) => {
         match $self.mpc_field_kind()? {
             crate::net::curve::MpcFieldKind::Bls12_381Fr => {
-                $self.$method::<ark_bls12_381::Fr>($($arg),*)
+                $self.$method::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>($($arg),*)
             }
             crate::net::curve::MpcFieldKind::Bn254Fr => {
-                $self.$method::<ark_bn254::Fr>($($arg),*)
+                $self.$method::<ark_bn254::Fr, ark_bn254::G1Projective>($($arg),*)
             }
             crate::net::curve::MpcFieldKind::Curve25519Fr => {
-                $self.$method::<ark_curve25519::Fr>($($arg),*)
+                $self.$method::<ark_curve25519::Fr, ark_curve25519::EdwardsProjective>($($arg),*)
             }
         }
     };
@@ -2588,21 +2656,42 @@ impl VMState {
 
     #[inline]
     fn field_from_i64<F: PrimeField>(value: i64) -> F {
-        // Preserve two's-complement-style roundtripping used by open/reveal paths.
-        F::from(value as u64)
+        crate::net::curve::field_from_i64(value)
     }
 
     #[inline]
     fn field_to_i64<F: PrimeField>(value: F) -> i64 {
-        value.into_bigint().as_ref().first().copied().unwrap_or(0) as i64
+        crate::net::curve::field_to_i64(value)
     }
 
-    fn decode_share_bytes_typed<F: PrimeField>(bytes: &[u8]) -> Result<RobustShare<F>, String> {
-        RobustShare::<F>::deserialize_compressed(bytes)
-            .map_err(|e| format!("Failed to decode share bytes: {}", e))
+    #[inline]
+    fn scale_fixed_point_scalar(fractional_bits: usize, scalar: i64) -> Result<i64, String> {
+        let scale = 1i128
+            .checked_shl(fractional_bits as u32)
+            .ok_or_else(|| "Fixed-point scale overflow".to_string())?;
+        let scaled = (scalar as i128)
+            .checked_mul(scale)
+            .ok_or_else(|| "Fixed-point scalar overflow".to_string())?;
+        i64::try_from(scaled).map_err(|_| "Fixed-point scalar exceeds i64 range".to_string())
     }
 
-    fn encode_share_bytes_typed<F: PrimeField>(share: &RobustShare<F>) -> Result<Vec<u8>, String> {
+    fn decode_exact_typed<T: CanonicalDeserialize>(
+        bytes: &[u8],
+        type_name: &str,
+    ) -> Result<T, String> {
+        let mut cursor = Cursor::new(bytes);
+        let decoded = T::deserialize_compressed(&mut cursor)
+            .map_err(|e| format!("Failed to decode {}: {}", type_name, e))?;
+        if cursor.position() != bytes.len() as u64 {
+            return Err(format!(
+                "Failed to decode {}: trailing bytes in payload",
+                type_name
+            ));
+        }
+        Ok(decoded)
+    }
+
+    fn encode_share_bytes_typed<T: CanonicalSerialize>(share: &T) -> Result<Vec<u8>, String> {
         let mut encoded = Vec::new();
         share
             .serialize_compressed(&mut encoded)
@@ -2610,102 +2699,265 @@ impl VMState {
         Ok(encoded)
     }
 
-    fn share_binary_op_typed<F>(
+    fn format_name(format: LocalShareFormat) -> &'static str {
+        match format {
+            LocalShareFormat::Robust => "RobustShare",
+            LocalShareFormat::Feldman => "FeldmanShamirShare",
+        }
+    }
+
+    fn decode_share_bytes_typed<F, G>(bytes: &[u8]) -> Result<DecodedShare<F, G>, String>
+    where
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
+    {
+        let feldman_err =
+            match Self::decode_exact_typed::<FeldmanShamirShare<F, G>>(bytes, "FeldmanShamirShare")
+            {
+                Ok(share) => return Ok(DecodedShare::Feldman(share)),
+                Err(err) => err,
+            };
+
+        let robust_err = match Self::decode_exact_typed::<RobustShare<F>>(bytes, "RobustShare") {
+            Ok(share) => return Ok(DecodedShare::Robust(share)),
+            Err(err) => err,
+        };
+
+        Err(format!(
+            "Failed to decode share bytes: {}; {}",
+            feldman_err, robust_err
+        ))
+    }
+
+    fn share_binary_op_typed<F, G>(
         &self,
         lhs_bytes: &[u8],
         rhs_bytes: &[u8],
-        op: fn(F, F) -> F,
+        op: ShareBinaryOp,
     ) -> Result<Vec<u8>, String>
     where
-        F: PrimeField,
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
     {
-        let lhs = Self::decode_share_bytes_typed::<F>(lhs_bytes)?;
-        let rhs = Self::decode_share_bytes_typed::<F>(rhs_bytes)?;
+        let lhs = Self::decode_share_bytes_typed::<F, G>(lhs_bytes)?;
+        let rhs = Self::decode_share_bytes_typed::<F, G>(rhs_bytes)?;
 
-        if lhs.id != rhs.id || lhs.degree != rhs.degree {
-            return Err("Share metadata mismatch (id/degree)".to_string());
+        match (lhs, rhs) {
+            (DecodedShare::Robust(lhs), DecodedShare::Robust(rhs)) => {
+                if lhs.id != rhs.id || lhs.degree != rhs.degree {
+                    return Err("Share metadata mismatch (id/degree)".to_string());
+                }
+
+                let value = match op {
+                    ShareBinaryOp::Add => lhs.share[0] + rhs.share[0],
+                    ShareBinaryOp::Sub => lhs.share[0] - rhs.share[0],
+                };
+                let new_share = RobustShare::new(value, lhs.id, lhs.degree);
+                Self::encode_share_bytes_typed(&new_share)
+            }
+            (DecodedShare::Feldman(lhs), DecodedShare::Feldman(rhs)) => {
+                let new_share = match op {
+                    ShareBinaryOp::Add => {
+                        (lhs + rhs).map_err(|e| format!("Failed to add Feldman shares: {:?}", e))?
+                    }
+                    ShareBinaryOp::Sub => (lhs - rhs)
+                        .map_err(|e| format!("Failed to subtract Feldman shares: {:?}", e))?,
+                };
+                Self::encode_share_bytes_typed(&new_share)
+            }
+            (DecodedShare::Robust(_), DecodedShare::Feldman(_)) => Err(format!(
+                "Share format mismatch: left is {}, right is {}",
+                Self::format_name(LocalShareFormat::Robust),
+                Self::format_name(LocalShareFormat::Feldman)
+            )),
+            (DecodedShare::Feldman(_), DecodedShare::Robust(_)) => Err(format!(
+                "Share format mismatch: left is {}, right is {}",
+                Self::format_name(LocalShareFormat::Feldman),
+                Self::format_name(LocalShareFormat::Robust)
+            )),
         }
-
-        let new_share = RobustShare::new(op(lhs.share[0], rhs.share[0]), lhs.id, lhs.degree);
-        Self::encode_share_bytes_typed(&new_share)
     }
 
-    fn share_unary_op_typed<F>(&self, share_bytes: &[u8], op: fn(F) -> F) -> Result<Vec<u8>, String>
+    fn share_unary_op_typed<F, G>(
+        &self,
+        share_bytes: &[u8],
+        op: ShareUnaryOp,
+    ) -> Result<Vec<u8>, String>
     where
-        F: PrimeField,
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
     {
-        let share = Self::decode_share_bytes_typed::<F>(share_bytes)?;
-        let new_share = RobustShare::new(op(share.share[0]), share.id, share.degree);
-        Self::encode_share_bytes_typed(&new_share)
+        let share = Self::decode_share_bytes_typed::<F, G>(share_bytes)?;
+        match share {
+            DecodedShare::Robust(share) => {
+                let value = match op {
+                    ShareUnaryOp::Neg => -share.share[0],
+                };
+                let new_share = RobustShare::new(value, share.id, share.degree);
+                Self::encode_share_bytes_typed(&new_share)
+            }
+            DecodedShare::Feldman(share) => {
+                let scalar = match op {
+                    ShareUnaryOp::Neg => -F::from(1u64),
+                };
+                let new_share = (share * scalar)
+                    .map_err(|e| format!("Failed to negate Feldman share: {:?}", e))?;
+                Self::encode_share_bytes_typed(&new_share)
+            }
+        }
     }
 
-    fn share_scalar_op_typed<F>(
+    fn share_scalar_op_typed<F, G>(
         &self,
         share_bytes: &[u8],
         scalar: i64,
-        op: fn(F, F) -> F,
+        op: ShareScalarOp,
     ) -> Result<Vec<u8>, String>
     where
-        F: PrimeField,
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
     {
-        let share = Self::decode_share_bytes_typed::<F>(share_bytes)?;
+        let share = Self::decode_share_bytes_typed::<F, G>(share_bytes)?;
         let scalar_f = Self::field_from_i64::<F>(scalar);
-        let new_share = RobustShare::new(op(share.share[0], scalar_f), share.id, share.degree);
-        Self::encode_share_bytes_typed(&new_share)
+        match share {
+            DecodedShare::Robust(share) => {
+                let value = match op {
+                    ShareScalarOp::Add => share.share[0] + scalar_f,
+                    ShareScalarOp::Sub => share.share[0] - scalar_f,
+                    ShareScalarOp::Mul => share.share[0] * scalar_f,
+                };
+                let new_share = RobustShare::new(value, share.id, share.degree);
+                Self::encode_share_bytes_typed(&new_share)
+            }
+            DecodedShare::Feldman(share) => {
+                let new_share = match op {
+                    ShareScalarOp::Add => (share + scalar_f)
+                        .map_err(|e| format!("Failed to add scalar to Feldman share: {:?}", e))?,
+                    ShareScalarOp::Sub => (share - scalar_f).map_err(|e| {
+                        format!("Failed to subtract scalar from Feldman share: {:?}", e)
+                    })?,
+                    ShareScalarOp::Mul => (share * scalar_f).map_err(|e| {
+                        format!("Failed to multiply Feldman share by scalar: {:?}", e)
+                    })?,
+                };
+                Self::encode_share_bytes_typed(&new_share)
+            }
+        }
     }
 
-    fn scalar_sub_share_typed<F>(&self, scalar: i64, share_bytes: &[u8]) -> Result<Vec<u8>, String>
+    fn scalar_sub_share_typed<F, G>(
+        &self,
+        scalar: i64,
+        share_bytes: &[u8],
+    ) -> Result<Vec<u8>, String>
     where
-        F: PrimeField,
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
     {
-        let share = Self::decode_share_bytes_typed::<F>(share_bytes)?;
+        let share = Self::decode_share_bytes_typed::<F, G>(share_bytes)?;
         let scalar_f = Self::field_from_i64::<F>(scalar);
-        let new_share = RobustShare::new(scalar_f - share.share[0], share.id, share.degree);
-        Self::encode_share_bytes_typed(&new_share)
+        match share {
+            DecodedShare::Robust(share) => {
+                let new_share = RobustShare::new(scalar_f - share.share[0], share.id, share.degree);
+                Self::encode_share_bytes_typed(&new_share)
+            }
+            DecodedShare::Feldman(share) => {
+                let negated = (share * -F::from(1u64))
+                    .map_err(|e| format!("Failed to negate Feldman share: {:?}", e))?;
+                let new_share = (negated + scalar_f).map_err(|e| {
+                    format!("Failed to subtract Feldman share from scalar: {:?}", e)
+                })?;
+                Self::encode_share_bytes_typed(&new_share)
+            }
+        }
     }
 
-    fn share_div_scalar_typed<F>(&self, share_bytes: &[u8], scalar: i64) -> Result<Vec<u8>, String>
+    fn share_div_scalar_typed<F, G>(
+        &self,
+        share_bytes: &[u8],
+        scalar: i64,
+    ) -> Result<Vec<u8>, String>
     where
-        F: PrimeField,
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
     {
         if scalar == 0 {
             return Err("Division by zero".to_string());
         }
 
-        let share = Self::decode_share_bytes_typed::<F>(share_bytes)?;
+        let share = Self::decode_share_bytes_typed::<F, G>(share_bytes)?;
         let scalar_f = Self::field_from_i64::<F>(scalar);
         let scalar_inv = scalar_f
             .inverse()
             .ok_or_else(|| "Scalar has no inverse in field".to_string())?;
-        let new_share = RobustShare::new(share.share[0] * scalar_inv, share.id, share.degree);
-        Self::encode_share_bytes_typed(&new_share)
+        match share {
+            DecodedShare::Robust(share) => {
+                let new_share =
+                    RobustShare::new(share.share[0] * scalar_inv, share.id, share.degree);
+                Self::encode_share_bytes_typed(&new_share)
+            }
+            DecodedShare::Feldman(share) => {
+                let new_share = (share * scalar_inv)
+                    .map_err(|e| format!("Failed to divide Feldman share by scalar: {:?}", e))?;
+                Self::encode_share_bytes_typed(&new_share)
+            }
+        }
     }
 
-    fn share_interpolate_local_typed<F>(
+    fn share_interpolate_local_typed<F, G>(
         &self,
         ty: ShareType,
         shares: &[Vec<u8>],
     ) -> Result<Value, String>
     where
-        F: PrimeField,
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
     {
         let mut robust_shares: Vec<RobustShare<F>> = Vec::with_capacity(shares.len());
+        let mut feldman_shares: Vec<FeldmanShamirShare<F, G>> = Vec::with_capacity(shares.len());
+        let mut format = None;
         for (i, share_bytes) in shares.iter().enumerate() {
-            let share = Self::decode_share_bytes_typed::<F>(share_bytes)
+            let share = Self::decode_share_bytes_typed::<F, G>(share_bytes)
                 .map_err(|e| format!("Failed to decode share at index {}: {}", i, e))?;
-            robust_shares.push(share);
+            match share {
+                DecodedShare::Robust(share) => {
+                    if format == Some(LocalShareFormat::Feldman) {
+                        return Err("Share format mismatch in interpolation input".to_string());
+                    }
+                    format = Some(LocalShareFormat::Robust);
+                    robust_shares.push(share);
+                }
+                DecodedShare::Feldman(share) => {
+                    if format == Some(LocalShareFormat::Robust) {
+                        return Err("Share format mismatch in interpolation input".to_string());
+                    }
+                    format = Some(LocalShareFormat::Feldman);
+                    feldman_shares.push(share);
+                }
+            }
         }
 
         let n_parties = self
             .mpc_engine()
             .map(|e| e.n_parties())
             .unwrap_or(shares.len());
-        let (_degree, secret) = RobustShare::recover_secret(&robust_shares, n_parties)
-            .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
+        let secret = match format {
+            Some(LocalShareFormat::Robust) => {
+                let (_degree, secret) = RobustShare::recover_secret(&robust_shares, n_parties)
+                    .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
+                secret
+            }
+            Some(LocalShareFormat::Feldman) => {
+                let (_degree, secret) =
+                    FeldmanShamirShare::recover_secret(&feldman_shares, n_parties)
+                        .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
+                secret
+            }
+            None => return Err("Cannot interpolate from empty shares array".to_string()),
+        };
 
         match ty {
             ShareType::SecretInt { bit_length } if bit_length == 1 => {
-                use ark_ff::Zero;
                 Ok(Value::Bool(!secret.is_zero()))
             }
             ShareType::SecretInt { .. } => Ok(Value::I64(Self::field_to_i64(secret))),
@@ -2724,9 +2976,9 @@ impl VMState {
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(
+        dispatch_share_curve!(
             self,
-            share_scalar_op_typed(share_bytes, scalar, |a, b| a + b)
+            share_scalar_op_typed(share_bytes, scalar, ShareScalarOp::Add)
         )
     }
 
@@ -2736,9 +2988,9 @@ impl VMState {
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(
+        dispatch_share_curve!(
             self,
-            share_scalar_op_typed(share_bytes, scalar, |a, b| a - b)
+            share_scalar_op_typed(share_bytes, scalar, ShareScalarOp::Sub)
         )
     }
 
@@ -2748,7 +3000,7 @@ impl VMState {
         scalar: i64,
         share_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, scalar_sub_share_typed(scalar, share_bytes))
+        dispatch_share_curve!(self, scalar_sub_share_typed(scalar, share_bytes))
     }
 
     fn secret_int_mul_scalar(
@@ -2757,9 +3009,9 @@ impl VMState {
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(
+        dispatch_share_curve!(
             self,
-            share_scalar_op_typed(share_bytes, scalar, |a, b| a * b)
+            share_scalar_op_typed(share_bytes, scalar, ShareScalarOp::Mul)
         )
     }
 
@@ -2769,40 +3021,55 @@ impl VMState {
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_div_scalar_typed(share_bytes, scalar))
+        dispatch_share_curve!(self, share_div_scalar_typed(share_bytes, scalar))
     }
 
     fn secret_fixed_point_add_scalar(
         &self,
-        _ty: ShareType,
+        ty: ShareType,
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(
+        let precision = match ty {
+            ShareType::SecretFixedPoint { precision } => precision,
+            _ => return Err("Expected fixed-point share type".to_string()),
+        };
+        let scaled_scalar = Self::scale_fixed_point_scalar(precision.f(), scalar)?;
+        dispatch_share_curve!(
             self,
-            share_scalar_op_typed(share_bytes, scalar, |a, b| a + b)
+            share_scalar_op_typed(share_bytes, scaled_scalar, ShareScalarOp::Add)
         )
     }
 
     fn secret_fixed_point_sub_scalar(
         &self,
-        _ty: ShareType,
+        ty: ShareType,
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(
+        let precision = match ty {
+            ShareType::SecretFixedPoint { precision } => precision,
+            _ => return Err("Expected fixed-point share type".to_string()),
+        };
+        let scaled_scalar = Self::scale_fixed_point_scalar(precision.f(), scalar)?;
+        dispatch_share_curve!(
             self,
-            share_scalar_op_typed(share_bytes, scalar, |a, b| a - b)
+            share_scalar_op_typed(share_bytes, scaled_scalar, ShareScalarOp::Sub)
         )
     }
 
     fn scalar_sub_secret_fixed_point(
         &self,
-        _ty: ShareType,
+        ty: ShareType,
         scalar: i64,
         share_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, scalar_sub_share_typed(scalar, share_bytes))
+        let precision = match ty {
+            ShareType::SecretFixedPoint { precision } => precision,
+            _ => return Err("Expected fixed-point share type".to_string()),
+        };
+        let scaled_scalar = Self::scale_fixed_point_scalar(precision.f(), scalar)?;
+        dispatch_share_curve!(self, scalar_sub_share_typed(scaled_scalar, share_bytes))
     }
 
     fn secret_fixed_point_mul_scalar(
@@ -2811,9 +3078,9 @@ impl VMState {
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(
+        dispatch_share_curve!(
             self,
-            share_scalar_op_typed(share_bytes, scalar, |a, b| a * b)
+            share_scalar_op_typed(share_bytes, scalar, ShareScalarOp::Mul)
         )
     }
 
@@ -2823,7 +3090,7 @@ impl VMState {
         share_bytes: &[u8],
         scalar: i64,
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_div_scalar_typed(share_bytes, scalar))
+        dispatch_share_curve!(self, share_div_scalar_typed(share_bytes, scalar))
     }
 
     fn secret_share_sub_scalar(
@@ -2872,16 +3139,20 @@ impl VMState {
     // Public Share Arithmetic Methods (for mpc_builtins)
     // ============================================================================
 
-    /// Add two secret shares (public wrapper for mpc_builtins)
+    /// Add two secret shares (public wrapper for mpc_builtins).
+    ///
+    /// `_ty` is currently unused because share format is auto-detected from
+    /// the serialized bytes. It is kept for forward-compatibility when typed
+    /// dispatch is needed (e.g. different field sizes per ShareType).
     pub fn secret_share_add(
         &self,
         _ty: ShareType,
         lhs_bytes: &[u8],
         rhs_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(
+        dispatch_share_curve!(
             self,
-            share_binary_op_typed(lhs_bytes, rhs_bytes, |a, b| a + b)
+            share_binary_op_typed(lhs_bytes, rhs_bytes, ShareBinaryOp::Add)
         )
     }
 
@@ -2892,15 +3163,15 @@ impl VMState {
         lhs_bytes: &[u8],
         rhs_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(
+        dispatch_share_curve!(
             self,
-            share_binary_op_typed(lhs_bytes, rhs_bytes, |a, b| a - b)
+            share_binary_op_typed(lhs_bytes, rhs_bytes, ShareBinaryOp::Sub)
         )
     }
 
     /// Negate a secret share (public wrapper for mpc_builtins)
     pub fn secret_share_neg(&self, _ty: ShareType, share_bytes: &[u8]) -> Result<Vec<u8>, String> {
-        dispatch_share_field!(self, share_unary_op_typed(share_bytes, |a| -a))
+        dispatch_share_curve!(self, share_unary_op_typed(share_bytes, ShareUnaryOp::Neg))
     }
 
     /// Add scalar to a secret share (public wrapper for mpc_builtins)
@@ -2943,13 +3214,126 @@ impl VMState {
             return Err("Cannot interpolate from empty shares array".to_string());
         }
 
-        dispatch_share_field!(self, share_interpolate_local_typed(ty, shares))
+        dispatch_share_curve!(self, share_interpolate_local_typed(ty, shares))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::curve::MpcFieldKind;
+    use crate::net::mpc_engine::MpcEngine;
+    use std::sync::{Arc, Mutex};
+
+    struct DummyFieldEngine;
+
+    impl MpcEngine for DummyFieldEngine {
+        fn protocol_name(&self) -> &'static str {
+            "dummy"
+        }
+        fn instance_id(&self) -> u64 {
+            0
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn start(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn input_share(&self, _ty: ShareType, _clear: &Value) -> Result<Vec<u8>, String> {
+            Err("not implemented".to_string())
+        }
+        fn multiply_share(
+            &self,
+            _ty: ShareType,
+            _left: &[u8],
+            _right: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            Err("not implemented".to_string())
+        }
+        fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> Result<Value, String> {
+            Err("not implemented".to_string())
+        }
+        fn shutdown(&self) {}
+        fn party_id(&self) -> usize {
+            0
+        }
+        fn n_parties(&self) -> usize {
+            3
+        }
+        fn threshold(&self) -> usize {
+            1
+        }
+        fn field_kind(&self) -> MpcFieldKind {
+            MpcFieldKind::Bls12_381Fr
+        }
+    }
+
+    #[derive(Default)]
+    struct MockBatchEngine {
+        calls: Mutex<Vec<(ShareType, usize)>>,
+    }
+
+    impl MpcEngine for MockBatchEngine {
+        fn protocol_name(&self) -> &'static str {
+            "mock-batch"
+        }
+        fn instance_id(&self) -> u64 {
+            0
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn start(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn input_share(&self, _ty: ShareType, _clear: &Value) -> Result<Vec<u8>, String> {
+            Err("not implemented".to_string())
+        }
+        fn multiply_share(
+            &self,
+            _ty: ShareType,
+            _left: &[u8],
+            _right: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            Err("not implemented".to_string())
+        }
+        fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> Result<Value, String> {
+            Err("not implemented".to_string())
+        }
+        fn batch_open_shares(
+            &self,
+            ty: ShareType,
+            shares: &[Vec<u8>],
+        ) -> Result<Vec<Value>, String> {
+            self.calls.lock().unwrap().push((ty, shares.len()));
+            let values = shares
+                .iter()
+                .map(|bytes| match ty {
+                    ShareType::SecretInt { .. } => {
+                        Value::I64(bytes.first().copied().unwrap_or(0) as i64)
+                    }
+                    ShareType::SecretFixedPoint { .. } => {
+                        Value::Float(F64(bytes.first().copied().unwrap_or(0) as f64 + 0.5))
+                    }
+                })
+                .collect();
+            Ok(values)
+        }
+        fn shutdown(&self) {}
+        fn party_id(&self) -> usize {
+            0
+        }
+        fn n_parties(&self) -> usize {
+            3
+        }
+        fn threshold(&self) -> usize {
+            1
+        }
+        fn field_kind(&self) -> MpcFieldKind {
+            MpcFieldKind::Bls12_381Fr
+        }
+    }
 
     fn encode_test_share_bls(value: i64, id: usize, degree: usize) -> Vec<u8> {
         let share = RobustShare::new(ark_bls12_381::Fr::from(value as u64), id, degree);
@@ -2972,5 +3356,157 @@ mod tests {
 
         let call = result.expect("secret_share_add should not panic without MPC engine");
         assert!(call.is_err());
+    }
+
+    #[test]
+    fn fixed_point_scalar_ops_use_scaled_domain_units() {
+        let mut vm = VMState::new();
+        vm.set_mpc_engine(Arc::new(DummyFieldEngine));
+
+        let ty = ShareType::default_secret_fixed_point();
+        let precision = match ty {
+            ShareType::SecretFixedPoint { precision } => precision,
+            _ => unreachable!(),
+        };
+
+        let base = encode_test_share_bls(0, 1, 1);
+        let added = vm
+            .secret_share_add_scalar(ty, &base, 1)
+            .expect("fixed-point add scalar");
+        let added_share =
+            RobustShare::<ark_bls12_381::Fr>::deserialize_compressed(added.as_slice())
+                .expect("deserialize added share");
+
+        let scaled_one = VMState::scale_fixed_point_scalar(precision.f(), 1).expect("scaled one");
+        assert_eq!(
+            added_share.share[0],
+            ark_bls12_381::Fr::from(scaled_one as u64),
+            "fixed-point add must add one full fixed-point unit, not one LSB"
+        );
+
+        let subtracted = vm
+            .secret_share_sub_scalar(ty, &added, 1)
+            .expect("fixed-point sub scalar");
+        let subtracted_share =
+            RobustShare::<ark_bls12_381::Fr>::deserialize_compressed(subtracted.as_slice())
+                .expect("deserialize subtracted share");
+        assert_eq!(
+            subtracted_share.share[0],
+            ark_bls12_381::Fr::from(0u64),
+            "subtracting the same scalar should round-trip to original value"
+        );
+
+        let scalar_minus = vm
+            .scalar_sub_secret_share(ty, 1, &base)
+            .expect("scalar minus fixed-point share");
+        let scalar_minus_share =
+            RobustShare::<ark_bls12_381::Fr>::deserialize_compressed(scalar_minus.as_slice())
+                .expect("deserialize scalar-minus share");
+        assert_eq!(
+            scalar_minus_share.share[0],
+            ark_bls12_381::Fr::from(scaled_one as u64),
+            "scalar-share subtraction must use fixed-point scaled scalar"
+        );
+    }
+
+    #[test]
+    fn reveal_batcher_flush_groups_mixed_share_types() {
+        let mut batcher = RevealBatcher::new();
+        let engine = MockBatchEngine::default();
+        let fixed_ty = ShareType::default_secret_fixed_point();
+
+        batcher.queue(ShareType::secret_int(64), vec![10], 1);
+        batcher.queue(fixed_ty, vec![7], 2);
+        batcher.queue(ShareType::secret_int(64), vec![11], 3);
+
+        let results = batcher.flush(&engine).expect("mixed flush should succeed");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], (1, Value::I64(10)));
+        assert_eq!(results[1], (2, Value::Float(F64(7.5))));
+        assert_eq!(results[2], (3, Value::I64(11)));
+
+        let calls = engine.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            2,
+            "mixed reveals should be split into two batches"
+        );
+        assert_eq!(calls[0], (ShareType::secret_int(64), 2));
+        assert_eq!(calls[1], (fixed_ty, 1));
+    }
+
+    #[test]
+    fn secret_share_add_supports_feldman_encoded_shares() {
+        use ark_bls12_381::G1Projective;
+        use ark_ec::PrimeGroup;
+        use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
+
+        fn encode_test_feldman_share_bls(value: i64, id: usize, degree: usize) -> Vec<u8> {
+            let value_fr = ark_bls12_381::Fr::from(value as u64);
+            let commitment = G1Projective::generator() * value_fr;
+            let share = FeldmanShamirShare::new(value_fr, id, degree, vec![commitment])
+                .expect("create Feldman share");
+            let mut out = Vec::new();
+            share
+                .serialize_compressed(&mut out)
+                .expect("serialize Feldman share");
+            out
+        }
+
+        let mut vm = VMState::new();
+        vm.set_mpc_engine(Arc::new(DummyFieldEngine));
+
+        let lhs = encode_test_feldman_share_bls(3, 1, 0);
+        let rhs = encode_test_feldman_share_bls(5, 1, 0);
+
+        let result = vm
+            .secret_share_add(ShareType::secret_int(64), &lhs, &rhs)
+            .expect("Feldman-encoded shares should support local share add");
+        let decoded =
+            FeldmanShamirShare::<ark_bls12_381::Fr, G1Projective>::deserialize_compressed(
+                result.as_slice(),
+            )
+            .expect("result must preserve Feldman share wire format");
+        assert_eq!(decoded.feldmanshare.share[0], ark_bls12_381::Fr::from(8u64));
+        assert_eq!(
+            decoded.commitments[0],
+            G1Projective::generator() * ark_bls12_381::Fr::from(8u64)
+        );
+    }
+
+    #[test]
+    fn secret_share_interpolate_local_supports_feldman_encoded_shares() {
+        use ark_bls12_381::G1Projective;
+        use ark_ec::PrimeGroup;
+        use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
+
+        fn encode(share: FeldmanShamirShare<ark_bls12_381::Fr, G1Projective>) -> Vec<u8> {
+            let mut out = Vec::new();
+            share
+                .serialize_compressed(&mut out)
+                .expect("serialize Feldman share");
+            out
+        }
+
+        let mut vm = VMState::new();
+        vm.set_mpc_engine(Arc::new(DummyFieldEngine));
+
+        let commitments = vec![
+            G1Projective::generator() * ark_bls12_381::Fr::from(5u64),
+            G1Projective::generator() * ark_bls12_381::Fr::from(2u64),
+        ];
+        let share_1 =
+            FeldmanShamirShare::new(ark_bls12_381::Fr::from(7u64), 1, 1, commitments.clone())
+                .expect("create share 1");
+        let share_2 = FeldmanShamirShare::new(ark_bls12_381::Fr::from(9u64), 2, 1, commitments)
+            .expect("create share 2");
+
+        let opened = vm
+            .secret_share_interpolate_local(
+                ShareType::secret_int(64),
+                &[encode(share_1), encode(share_2)],
+            )
+            .expect("interpolate Feldman shares");
+        assert_eq!(opened, Value::I64(5));
     }
 }

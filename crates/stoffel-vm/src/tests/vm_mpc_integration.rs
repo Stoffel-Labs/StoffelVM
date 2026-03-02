@@ -22,36 +22,11 @@ use crate::core_vm::VirtualMachine;
 use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
 };
+use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
 use std::collections::HashMap;
 use stoffel_vm_types::core_types::{ShareType, Value};
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
-
-/// Helper to initialize crypto provider
-fn init_crypto_provider() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-    });
-}
-
-/// Helper for test tracing setup
-fn setup_test_tracing() {
-    use std::sync::Once;
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let subscriber = FmtSubscriber::builder()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-            .with_test_writer()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-}
 
 // Use a multi-thread runtime to allow synchronous bridges inside the VM's MPC engine
 #[tokio::test(flavor = "multi_thread")]
@@ -106,6 +81,22 @@ async fn test_vm_mpc_multiplication_integration() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
                 if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }

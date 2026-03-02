@@ -7,6 +7,21 @@ use std::any::Any;
 use stoffel_vm_types::core_types::{ShareType, Value};
 use stoffelnet::network_utils::ClientId;
 
+bitflags::bitflags! {
+    /// Capability flags advertised by an [`MpcEngine`] implementation.
+    ///
+    /// Engines return these from [`MpcEngine::capabilities()`]. The individual
+    /// `supports_*()` convenience methods delegate to this bitfield.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MpcCapabilities: u32 {
+        const MULTIPLICATION   = 0b0000_0001;
+        const ELLIPTIC_CURVES  = 0b0000_0010;
+        const CLIENT_INPUT     = 0b0000_0100;
+        const CONSENSUS        = 0b0000_1000;
+        const OPEN_IN_EXP      = 0b0001_0000;
+    }
+}
+
 /// Core MPC engine trait for synchronous VM operations
 ///
 /// This trait provides the synchronous interface used by the VM during execution.
@@ -72,6 +87,11 @@ pub trait MpcEngine: Send + Sync {
         Err("open_share_in_exp not implemented for this engine".to_string())
     }
 
+    /// Whether this engine supports `open_share_in_exp`.
+    fn supports_open_share_in_exp(&self) -> bool {
+        self.capabilities().contains(MpcCapabilities::OPEN_IN_EXP)
+    }
+
     /// Send output share(s) to a specific client for private reconstruction
     ///
     /// Unlike `open_share` which reveals to all parties, this sends this party's
@@ -118,24 +138,34 @@ pub trait MpcEngine: Send + Sync {
         self.curve_config().field_kind()
     }
 
+    /// Advertise which optional operations this engine supports.
+    ///
+    /// The default is empty (no optional capabilities). Implementations should
+    /// override this to set the appropriate flags.
+    fn capabilities(&self) -> MpcCapabilities {
+        MpcCapabilities::empty()
+    }
+
     /// Whether this engine supports secure multiplication
     fn supports_multiplication(&self) -> bool {
-        false
+        self.capabilities()
+            .contains(MpcCapabilities::MULTIPLICATION)
     }
 
     /// Whether this engine supports elliptic curve operations
     fn supports_elliptic_curves(&self) -> bool {
-        false
+        self.capabilities()
+            .contains(MpcCapabilities::ELLIPTIC_CURVES)
     }
 
     /// Whether this engine supports client input operations
     fn supports_client_input(&self) -> bool {
-        false
+        self.capabilities().contains(MpcCapabilities::CLIENT_INPUT)
     }
 
     /// Whether this engine supports consensus (RBC/ABA)
     fn supports_consensus(&self) -> bool {
-        false
+        self.capabilities().contains(MpcCapabilities::CONSENSUS)
     }
 
     /// Try to obtain a reference to the consensus sub-trait, if supported.

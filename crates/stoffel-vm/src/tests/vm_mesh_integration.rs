@@ -32,33 +32,10 @@ use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
     HoneyBadgerQuicServer,
 };
+use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
-
-fn init_crypto_provider() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-    });
-}
-
-fn setup_test_tracing() {
-    use std::sync::Once;
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let subscriber = FmtSubscriber::builder()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-            .with_test_writer()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-}
 
 // Use a multi-thread Tokio runtime to allow synchronous bridges inside the VM's MPC engine
 // (the engine uses block_in_place + block_on to wait for async MPC ops when called from sync VM code)
@@ -141,6 +118,22 @@ async fn test_vm_mesh_full_integration() {
 
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
                 if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
@@ -460,6 +453,22 @@ async fn test_vm_mesh_average_salary_integration() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
                 if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
@@ -881,6 +890,22 @@ async fn test_vm_mesh_large_preprocessing() {
 
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
                 if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
@@ -1130,6 +1155,22 @@ async fn test_vm_mesh_output_client_integration() {
 
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
                 if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
@@ -1566,6 +1607,22 @@ async fn test_vm_mesh_matrix_average_integration() {
 
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
                 if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
@@ -2108,6 +2165,22 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
 
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
                 if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
@@ -3291,6 +3364,22 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
                 if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
@@ -3482,7 +3571,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                 // For now, we'll skip this test if the bytecode doesn't work
                 // This allows us to test that the bytecode loading infrastructure works
                 // even if the specific bytecode program has issues
-                info!("Note: Bytecode execution failed. This may indicate the .stflb file needs to be regenerated.");
+                info!(
+                    "Note: Bytecode execution failed. This may indicate the .stflb file needs to be regenerated."
+                );
                 info!("Error details: {}", e);
 
                 // Cleanup and return early

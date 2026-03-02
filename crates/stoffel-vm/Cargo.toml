@@ -48,6 +48,7 @@ hex = "0.4"
 dirs = "5"
 dashmap = "5"
 tokio-util = { version = "0.7", features = ["rt"] }
+bitflags = "2"
 
 [features]
 default = ["honeybadger", "avss"]

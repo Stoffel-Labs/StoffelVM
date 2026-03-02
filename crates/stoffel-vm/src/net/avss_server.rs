@@ -126,8 +126,11 @@ where
         let declared_sender =
             u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
         if let Some(auth_id) = authenticated_peer_id {
-            // In stoffelnet, remote_party_id is optional and may be unset during early setup.
-            // If present and in protocol range, enforce sender binding to that identity.
+            // Security model: TLS mutual authentication prevents unauthorized connections.
+            // The `auth_id >= n_parties` bypass handles early setup before party-ID mapping
+            // is established (e.g., bootstrap phase where stoffelnet assigns temporary IDs
+            // outside the protocol range). Once the mapping is set (`auth_id < n_parties`),
+            // we enforce that the declared sender matches the authenticated transport identity.
             if auth_id < n_parties && declared_sender != auth_id {
                 return Err(format!(
                     "PK sender mismatch: authenticated peer {} declared {}",
@@ -339,11 +342,12 @@ where
                     Err(e) => {
                         retry_count += 1;
                         if retry_count >= self.config.max_connection_retries {
-                            warn!(
+                            let msg = format!(
                                 "[AVSS] Node {} failed to connect to peer {} after {} attempts: {}",
                                 self.node_id, peer_id, retry_count, e
                             );
-                            break;
+                            error!("{}", msg);
+                            return Err(msg);
                         }
                         info!(
                             "[AVSS] Node {} attempt {} to peer {} failed: {}",
@@ -549,6 +553,7 @@ where
             let conn = conn.clone();
             let net_clone = net.clone();
             let shutdown_token = self.shutdown_token.clone();
+            let authenticated_sender_id = conn.remote_party_id().unwrap_or(peer_id);
 
             tokio::spawn(async move {
                 loop {
@@ -560,14 +565,28 @@ where
                         result = conn.receive() => {
                             match result {
                                 Ok(data) => {
+                                    match crate::net::open_registry::try_handle_wire_message(authenticated_sender_id, &data) {
+                                        Ok(true) => {
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "[AVSS] Failed to handle open wire message from {}: {}",
+                                                authenticated_sender_id, e
+                                            );
+                                            continue;
+                                        }
+                                        Ok(false) => {}
+                                    }
+
                                     // Route raw bytes to the AVSS node with sender_id
-                                    if let Err(e) = engine.process_wrapped_message_with_network(peer_id, &data, net_clone.clone()).await {
+                                    if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {
                                         // May fail to process non-protocol messages; forward as raw bytes
                                         let _ = tx.send(data).await;
                                         if !e.contains("deserialize") && !e.contains("process failed") {
                                             error!(
                                                 "[AVSS] Party failed to process message from {}: {}",
-                                                peer_id, e
+                                                authenticated_sender_id, e
                                             );
                                         }
                                     }

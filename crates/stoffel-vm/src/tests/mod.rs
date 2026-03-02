@@ -9,6 +9,7 @@ pub mod leader_bootnode_integration;
 #[cfg(feature = "hb_itest")]
 pub mod mpc_multiplication_integration;
 pub mod p2p_integration;
+pub mod test_utils;
 #[cfg(feature = "hb_itest")]
 pub mod vm_mesh_integration;
 #[cfg(feature = "hb_itest")]

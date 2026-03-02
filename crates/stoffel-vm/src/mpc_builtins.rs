@@ -1152,6 +1152,13 @@ fn share_open_exp(ctx: ForeignFunctionContext) -> Result<Value, String> {
         return Err("MPC engine not ready".to_string());
     }
 
+    if !engine.supports_open_share_in_exp() {
+        return Err(format!(
+            "MPC backend '{}' does not support Share.open_exp",
+            engine.protocol_name()
+        ));
+    }
+
     let (ty, data) = share_object::extract_share_data(&ctx.vm_state.object_store, &ctx.args[0])?;
 
     let curve_name = match &ctx.args[1] {
@@ -1262,7 +1269,7 @@ pub mod avss_object {
         share_data: Vec<u8>,
         commitment_bytes: Vec<Vec<u8>>,
         party_id: usize,
-    ) -> usize {
+    ) -> Result<usize, String> {
         let id = store.create_object();
         let obj = Value::Object(id);
 
@@ -1273,7 +1280,7 @@ pub mod avss_object {
                 Value::String(avss_fields::TYPE.to_string()),
                 Value::String(avss_fields::TYPE_VALUE.to_string()),
             )
-            .unwrap();
+            .map_err(|e| format!("failed to set AVSS type tag: {}", e))?;
 
         // Set key name
         store
@@ -1282,13 +1289,15 @@ pub mod avss_object {
                 Value::String(avss_fields::KEY_NAME.to_string()),
                 Value::String(key_name.to_string()),
             )
-            .unwrap();
+            .map_err(|e| format!("failed to set AVSS key name: {}", e))?;
 
         // Set share data as bytes (using a binary representation)
         // We'll store it as an array of U8 values
         let share_array_id = store.create_array_with_capacity(share_data.len());
         {
-            let arr = store.get_array_mut(share_array_id).unwrap();
+            let arr = store
+                .get_array_mut(share_array_id)
+                .ok_or_else(|| "failed to get share data array".to_string())?;
             for (i, byte) in share_data.into_iter().enumerate() {
                 arr.set(Value::I64(i as i64), Value::U8(byte));
             }
@@ -1299,26 +1308,29 @@ pub mod avss_object {
                 Value::String(avss_fields::SHARE_DATA.to_string()),
                 Value::Array(share_array_id),
             )
-            .unwrap();
+            .map_err(|e| format!("failed to set AVSS share data: {}", e))?;
 
         // Set commitments as array of byte arrays
         let commitment_arr_ids: Vec<usize> = commitment_bytes
             .into_iter()
-            .map(|commitment| {
+            .enumerate()
+            .map(|(idx, commitment)| {
                 let commitment_arr_id = store.create_array_with_capacity(commitment.len());
-                {
-                    let commitment_arr = store.get_array_mut(commitment_arr_id).unwrap();
-                    for (j, byte) in commitment.into_iter().enumerate() {
-                        commitment_arr.set(Value::I64(j as i64), Value::U8(byte));
-                    }
+                let commitment_arr = store
+                    .get_array_mut(commitment_arr_id)
+                    .ok_or_else(|| format!("failed to get commitment array at index {}", idx))?;
+                for (j, byte) in commitment.into_iter().enumerate() {
+                    commitment_arr.set(Value::I64(j as i64), Value::U8(byte));
                 }
-                commitment_arr_id
+                Ok(commitment_arr_id)
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
 
         let commitments_array_id = store.create_array_with_capacity(commitment_arr_ids.len());
         {
-            let arr = store.get_array_mut(commitments_array_id).unwrap();
+            let arr = store
+                .get_array_mut(commitments_array_id)
+                .ok_or_else(|| "failed to get commitments array".to_string())?;
             for (i, commitment_arr_id) in commitment_arr_ids.into_iter().enumerate() {
                 arr.set(Value::I64(i as i64), Value::Array(commitment_arr_id));
             }
@@ -1329,7 +1341,7 @@ pub mod avss_object {
                 Value::String(avss_fields::COMMITMENTS.to_string()),
                 Value::Array(commitments_array_id),
             )
-            .unwrap();
+            .map_err(|e| format!("failed to set AVSS commitments: {}", e))?;
 
         // Set party ID
         store
@@ -1338,9 +1350,9 @@ pub mod avss_object {
                 Value::String(avss_fields::PARTY_ID.to_string()),
                 Value::I64(party_id as i64),
             )
-            .unwrap();
+            .map_err(|e| format!("failed to set AVSS party ID: {}", e))?;
 
-        id
+        Ok(id)
     }
 
     /// Check if a value is an AVSS share object
@@ -1546,6 +1558,57 @@ fn register_avss_builtins(vm: &mut VirtualMachine) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_vm::VirtualMachine;
+    use crate::net::curve::MpcFieldKind;
+    use crate::net::mpc_engine::MpcEngine;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use stoffel_vm_types::functions::VMFunction;
+    use stoffel_vm_types::instructions::Instruction;
+
+    struct NoOpenExpEngine;
+
+    impl MpcEngine for NoOpenExpEngine {
+        fn protocol_name(&self) -> &'static str {
+            "no-open-exp"
+        }
+        fn instance_id(&self) -> u64 {
+            0
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn start(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn input_share(&self, _ty: ShareType, _clear: &Value) -> Result<Vec<u8>, String> {
+            Err("not implemented".to_string())
+        }
+        fn multiply_share(
+            &self,
+            _ty: ShareType,
+            _left: &[u8],
+            _right: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            Err("not implemented".to_string())
+        }
+        fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> Result<Value, String> {
+            Err("not implemented".to_string())
+        }
+        fn shutdown(&self) {}
+        fn party_id(&self) -> usize {
+            0
+        }
+        fn n_parties(&self) -> usize {
+            3
+        }
+        fn threshold(&self) -> usize {
+            1
+        }
+        fn field_kind(&self) -> MpcFieldKind {
+            MpcFieldKind::Bls12_381Fr
+        }
+    }
 
     #[test]
     fn test_share_object_creation() {
@@ -1590,5 +1653,47 @@ mod tests {
             &Value::Share(share_type, vec![])
         ));
         assert!(!share_object::is_share_object(&store, &Value::I64(42)));
+    }
+
+    #[test]
+    fn share_open_exp_rejects_engine_without_support() {
+        let mut vm = VirtualMachine::new();
+        register_mpc_builtins(&mut vm);
+        vm.state.set_mpc_engine(Arc::new(NoOpenExpEngine));
+
+        let share_id = share_object::create_share_object(
+            &mut vm.state.object_store,
+            ShareType::secret_int(64),
+            vec![1, 2, 3, 4],
+            0,
+        );
+
+        let fn_call = VMFunction::new(
+            "test_share_open_exp".to_string(),
+            vec![],
+            Vec::new(),
+            None,
+            4,
+            vec![
+                Instruction::LDI(0, Value::Object(share_id)),
+                Instruction::LDI(1, Value::String("bls12-381-g1".to_string())),
+                Instruction::PUSHARG(0),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Share.open_exp".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        );
+        vm.register_function(fn_call);
+
+        let err = vm
+            .execute("test_share_open_exp")
+            .expect_err("Share.open_exp should fail for engines without exponent-open support");
+
+        assert!(
+            err.contains("does not support Share.open_exp"),
+            "expected capability error, got: {}",
+            err
+        );
     }
 }

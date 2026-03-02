@@ -8,7 +8,9 @@ use ark_ec::{CurveGroup, PrimeGroup};
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
+use serde::{Deserialize, Serialize};
 use std::any::TypeId;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -19,7 +21,7 @@ use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS, F6
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode};
-use stoffelnet::network_utils::ClientId;
+use stoffelnet::network_utils::{ClientId, Network};
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
 
@@ -27,6 +29,98 @@ use tokio::sync::Mutex;
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 type RBCImpl = Avid<HbSessionId>;
+
+const EXP_OPEN_WIRE_PREFIX: &[u8; 4] = b"XOP1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpOpenWireMessage {
+    instance_id: u64,
+    sender_party_id: usize,
+    share_id: usize,
+    partial_point: Vec<u8>,
+}
+
+#[derive(Default, Clone)]
+struct ExpOpenAccumulator {
+    partial_points: Vec<(usize, Vec<u8>)>, // (share_id, serialized affine point)
+    party_ids: Vec<usize>,
+    result: Option<Vec<u8>>,
+    /// Set when `result` is first cached; used for eviction.
+    result_cached_at: Option<std::time::Instant>,
+}
+
+/// Completed entries older than this are evicted on the next insertion.
+const EXP_EVICTION_AGE: Duration = Duration::from_secs(60);
+
+static EXP_REGISTRY: once_cell::sync::Lazy<
+    parking_lot::Mutex<HashMap<(u64, usize), ExpOpenAccumulator>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Notified after every insertion into [`EXP_REGISTRY`].
+static EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
+    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+
+/// Clear the exponentiation-domain open registry. Useful between test cases.
+pub(crate) fn clear_exp_registry() {
+    EXP_REGISTRY.lock().clear();
+}
+
+fn insert_remote_exp_partial(
+    instance_id: u64,
+    sender_party_id: usize,
+    share_id: usize,
+    partial_point: Vec<u8>,
+) {
+    let mut reg = EXP_REGISTRY.lock();
+    // Evict completed entries older than EXP_EVICTION_AGE.
+    let now = std::time::Instant::now();
+    reg.retain(|_, acc| {
+        acc.result_cached_at
+            .is_none_or(|t| now.duration_since(t) < EXP_EVICTION_AGE)
+    });
+    let mut seq = 0usize;
+    loop {
+        let key = (instance_id, seq);
+        let entry = reg.entry(key).or_default();
+        if !entry.party_ids.contains(&sender_party_id) {
+            entry.partial_points.push((share_id, partial_point));
+            entry.party_ids.push(sender_party_id);
+            break;
+        }
+        seq += 1;
+    }
+    drop(reg);
+    EXP_NOTIFY.notify_waiters();
+}
+
+pub(crate) fn try_handle_open_exp_wire_message(
+    authenticated_sender_id: usize,
+    payload: &[u8],
+) -> Result<bool, String> {
+    if payload.len() < EXP_OPEN_WIRE_PREFIX.len()
+        || &payload[..EXP_OPEN_WIRE_PREFIX.len()] != EXP_OPEN_WIRE_PREFIX
+    {
+        return Ok(false);
+    }
+
+    let message: ExpOpenWireMessage = bincode::deserialize(&payload[EXP_OPEN_WIRE_PREFIX.len()..])
+        .map_err(|e| format!("deserialize open-exp payload: {}", e))?;
+
+    if authenticated_sender_id != usize::MAX && message.sender_party_id != authenticated_sender_id {
+        return Err(format!(
+            "open-exp sender mismatch: transport={} payload={}",
+            authenticated_sender_id, message.sender_party_id
+        ));
+    }
+
+    insert_remote_exp_partial(
+        message.instance_id,
+        message.sender_party_id,
+        message.share_id,
+        message.partial_point,
+    );
+    Ok(true)
+}
 
 /// HoneyBadger-backed MPC engine that integrates with the VM.
 /// This wraps a real HoneyBadgerMPCNode and provides MPC operations
@@ -379,11 +473,74 @@ where
         Self::encode_share(&shares[0])
     }
 
-    /// Reveal a share in the exponent using in-process registry coordination.
+    fn encode_open_exp_wire_message(
+        instance_id: u64,
+        sender_party_id: usize,
+        share_id: usize,
+        partial_point: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let payload = ExpOpenWireMessage {
+            instance_id,
+            sender_party_id,
+            share_id,
+            partial_point: partial_point.to_vec(),
+        };
+        let encoded = bincode::serialize(&payload)
+            .map_err(|e| format!("serialize open-exp payload: {}", e))?;
+        let mut out = Vec::with_capacity(EXP_OPEN_WIRE_PREFIX.len() + encoded.len());
+        out.extend_from_slice(EXP_OPEN_WIRE_PREFIX);
+        out.extend_from_slice(&encoded);
+        Ok(out)
+    }
+
+    async fn broadcast_open_exp_payload(&self, payload: Vec<u8>) -> Result<(), String> {
+        for peer_id in 0..self.n {
+            if peer_id == self.party_id {
+                continue;
+            }
+            self.net.send(peer_id, &payload).await.map_err(|e| {
+                format!(
+                    "Failed to send open-exp payload to party {}: {}",
+                    peer_id, e
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn broadcast_open_exp_payload_sync(&self, payload: Vec<u8>) -> Result<(), String> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                #[allow(deprecated)]
+                {
+                    match handle.runtime_flavor() {
+                        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(
+                            || handle.block_on(self.broadcast_open_exp_payload(payload)),
+                        ),
+                        tokio::runtime::RuntimeFlavor::CurrentThread => Err(
+                            "open_share_in_exp called from a single-thread Tokio runtime; synchronous waiting is unsupported in this context".to_string(),
+                        ),
+                        _ => Err(
+                            "open_share_in_exp called from an unsupported Tokio runtime flavor"
+                                .to_string(),
+                        ),
+                    }
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
+                rt.block_on(self.broadcast_open_exp_payload(payload))
+            }
+        }
+    }
+
+    /// Reveal a share in the exponent using transport-backed contribution exchange.
     ///
-    /// Each party computes `share_value * generator` and contributes its partial
-    /// point. When enough partial points are collected, Lagrange-in-the-exponent
-    /// interpolation reconstructs `[secret] * generator`.
+    /// Each party computes `share_value * generator`, broadcasts its partial point,
+    /// and reconstructs `[secret] * generator` once `2t+1` contributions are available.
     pub fn open_share_in_exp_impl(
         &self,
         _ty: ShareType,
@@ -407,37 +564,39 @@ where
             .serialize_compressed(&mut partial_bytes)
             .map_err(|e| format!("serialize partial point: {}", e))?;
 
-        // In-process accumulator for open_share_in_exp
-        #[derive(Default, Clone)]
-        struct ExpOpenAccumulator {
-            partial_points: Vec<(usize, Vec<u8>)>, // (share_id, serialized G1Affine)
-            party_ids: Vec<usize>,
-            result: Option<Vec<u8>>,
-        }
-
-        static EXP_REGISTRY: once_cell::sync::Lazy<
-            parking_lot::Mutex<std::collections::HashMap<(u64, usize), ExpOpenAccumulator>>,
-        > = once_cell::sync::Lazy::new(
-            || parking_lot::Mutex::new(std::collections::HashMap::new()),
-        );
+        let wire_message = Self::encode_open_exp_wire_message(
+            self.instance_id,
+            self.party_id,
+            share.id,
+            &partial_bytes,
+        )?;
+        self.broadcast_open_exp_payload_sync(wire_message)?;
 
         let required = 2 * self.t + 1;
-        let mut my_sequence: Option<usize> = None;
+        let instance_id = self.instance_id;
+        let party_id = self.party_id;
+        let n = self.n;
 
-        loop {
+        // Closure that checks the registry and returns the result or reconstructs.
+        // Returns Ok(Some(bytes)) when done, Ok(None) when more contributions needed.
+        let try_check = |my_sequence: &mut Option<usize>,
+                         partial_bytes: &[u8],
+                         share_id: usize|
+         -> Result<Option<Vec<u8>>, String> {
             let mut reg = EXP_REGISTRY.lock();
 
-            // Find the right accumulator (same pattern as open_share)
             if my_sequence.is_none() {
                 let mut seq = 0;
                 loop {
-                    let key = (self.instance_id, seq);
+                    let key = (instance_id, seq);
                     let entry = reg.entry(key).or_insert_with(ExpOpenAccumulator::default);
 
-                    if !entry.party_ids.contains(&self.party_id) {
-                        entry.partial_points.push((share.id, partial_bytes.clone()));
-                        entry.party_ids.push(self.party_id);
-                        my_sequence = Some(seq);
+                    if !entry.party_ids.contains(&party_id) {
+                        entry
+                            .partial_points
+                            .push((share_id, partial_bytes.to_vec()));
+                        entry.party_ids.push(party_id);
+                        *my_sequence = Some(seq);
                         break;
                     }
                     seq += 1;
@@ -445,15 +604,13 @@ where
             }
 
             let seq = my_sequence.unwrap();
-            let key = (self.instance_id, seq);
+            let key = (instance_id, seq);
             let entry = reg.get_mut(&key).unwrap();
 
-            // Check if result is ready
             if let Some(result) = entry.result.clone() {
-                return Ok(result);
+                return Ok(Some(result));
             }
 
-            // Check if we have enough partial points
             if entry.partial_points.len() >= required {
                 let collected: Vec<(usize, Vec<u8>)> = entry
                     .partial_points
@@ -462,20 +619,14 @@ where
                     .cloned()
                     .collect();
 
-                // Decode partial points
                 let mut points: Vec<(usize, G)> = Vec::with_capacity(collected.len());
-                for (share_id, bytes) in &collected {
+                for (sid, bytes) in &collected {
                     let pt = <G as CurveGroup>::Affine::deserialize_compressed(&bytes[..])
                         .map_err(|e| format!("deserialize partial point: {}", e))?;
-                    points.push((*share_id, pt.into()));
+                    points.push((*sid, pt.into()));
                 }
 
-                // Lagrange interpolation in the exponent at x=0
-                // λ_i(0) = Π_{j≠i} (-x_j) / (x_i - x_j)
-                //
-                // RobustShare uses FFT evaluation domain (roots of unity).
-                // Share with id=i is evaluated at domain.element(i) = ω^i.
-                let domain = GeneralEvaluationDomain::<F>::new(self.n)
+                let domain = GeneralEvaluationDomain::<F>::new(n)
                     .ok_or_else(|| "No suitable FFT domain".to_string())?;
                 let eval_points: Vec<(usize, F)> = points
                     .iter()
@@ -485,14 +636,12 @@ where
                 let mut result = G::zero();
                 for (i, (_id_i, pt_i)) in points.iter().enumerate() {
                     let x_i = eval_points[i].1;
-                    // Compute Lagrange coefficient at x=0
                     let mut lambda = F::from(1u64);
                     for (j, _) in points.iter().enumerate() {
                         if i == j {
                             continue;
                         }
                         let x_j = eval_points[j].1;
-                        // λ_i *= (0 - x_j) / (x_i - x_j) = (-x_j) / (x_i - x_j)
                         let num = -x_j;
                         let den = x_i - x_j;
                         lambda *= num
@@ -503,7 +652,6 @@ where
                     result += *pt_i * lambda;
                 }
 
-                // Serialize the result
                 let mut result_bytes = Vec::new();
                 result
                     .into_affine()
@@ -511,11 +659,60 @@ where
                     .map_err(|e| format!("serialize result: {}", e))?;
 
                 entry.result = Some(result_bytes.clone());
-                return Ok(result_bytes);
+                entry.result_cached_at = Some(std::time::Instant::now());
+                return Ok(Some(result_bytes));
             }
 
-            drop(reg);
-            std::thread::sleep(Duration::from_millis(5));
+            Ok(None)
+        };
+
+        // Use async Notify when a multi-thread tokio runtime is available.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let deadline =
+                            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+                        let mut my_sequence: Option<usize> = None;
+
+                        loop {
+                            let notified = EXP_NOTIFY.notified();
+
+                            if let Some(result) =
+                                try_check(&mut my_sequence, &partial_bytes, share.id)?
+                            {
+                                return Ok(result);
+                            }
+
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(format!(
+                                    "Timeout waiting for open_share_in_exp contributions"
+                                ));
+                            }
+
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep_until(deadline) => {}
+                            }
+                        }
+                    })
+                });
+            }
+        }
+
+        // Polling fallback.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut my_sequence: Option<usize> = None;
+        loop {
+            if let Some(result) = try_check(&mut my_sequence, &partial_bytes, share.id)? {
+                return Ok(result);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "Timeout waiting for open_share_in_exp contributions"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -524,24 +721,13 @@ where
             .map_err(|e| format!("Tokio runtime not available: {}", e))
     }
 
-    #[inline]
-    fn field_from_i64(value: i64) -> F {
-        // Keep conversion consistent with reveal decoding (low-limb -> i64).
-        F::from(value as u64)
-    }
-
-    #[inline]
-    fn field_to_i64(value: F) -> i64 {
-        value.into_bigint().as_ref().first().copied().unwrap_or(0) as i64
-    }
-
     /// Convert a reconstructed field element to the appropriate [`Value`] for a given share type.
     fn field_to_value(ty: ShareType, secret: F) -> Value {
         match ty {
             ShareType::SecretInt { .. } if ty.is_boolean() => Value::Bool(!secret.is_zero()),
-            ShareType::SecretInt { .. } => Value::I64(Self::field_to_i64(secret)),
+            ShareType::SecretInt { .. } => Value::I64(crate::net::curve::field_to_i64(secret)),
             ShareType::SecretFixedPoint { precision } => {
-                let scaled_value = Self::field_to_i64(secret);
+                let scaled_value = crate::net::curve::field_to_i64(secret);
                 let f = precision.f();
                 let scale = (1u64 << f) as f64;
                 let float_value = scaled_value as f64 / scale;
@@ -631,7 +817,7 @@ where
         match (ty, clear) {
             (ShareType::SecretInt { .. }, Value::I64(v)) => {
                 let secret = F::from(*v as u64);
-                let mut rng = ark_std::test_rng();
+                let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
                 let my = &shares[self.party_id];
@@ -644,7 +830,7 @@ where
                 Value::Bool(b),
             ) => {
                 let secret = if *b { F::from(1u64) } else { F::from(0u64) };
-                let mut rng = ark_std::test_rng();
+                let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
                 let my = &shares[self.party_id];
@@ -656,8 +842,8 @@ where
                 let f = precision.f();
                 let scale = (1u64 << f) as f64;
                 let scaled_value = (fp.0 * scale) as i64;
-                let secret = Self::field_from_i64(scaled_value);
-                let mut rng = ark_std::test_rng();
+                let secret = crate::net::curve::field_from_i64(scaled_value);
+                let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
                 let my = &shares[self.party_id];
@@ -805,14 +991,12 @@ where
         }
     }
 
-    fn supports_multiplication(&self) -> bool {
-        true
-    }
-    fn supports_client_input(&self) -> bool {
-        true
-    }
-    fn supports_consensus(&self) -> bool {
-        true
+    fn capabilities(&self) -> crate::net::mpc_engine::MpcCapabilities {
+        use crate::net::mpc_engine::MpcCapabilities;
+        MpcCapabilities::MULTIPLICATION
+            | MpcCapabilities::OPEN_IN_EXP
+            | MpcCapabilities::CLIENT_INPUT
+            | MpcCapabilities::CONSENSUS
     }
 
     fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> {
@@ -1069,8 +1253,16 @@ struct AbaRegistry {
 static RBC_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<RbcRegistry>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(RbcRegistry::default()));
 
+/// Notified after every insertion into [`RBC_REGISTRY`].
+static RBC_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
+    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+
 static ABA_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<AbaRegistry>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(AbaRegistry::default()));
+
+/// Notified after every insertion into [`ABA_REGISTRY`].
+static ABA_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
+    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
 
 impl<F, G> MpcEngineConsensus for HoneyBadgerMpcEngine<F, G>
 where
@@ -1094,6 +1286,9 @@ where
         // Store the message for this party's broadcast
         let key = (self.instance_id, session_id, self.party_id);
         registry.messages.insert(key, message.to_vec());
+        drop(registry);
+
+        RBC_NOTIFY.notify_waiters();
 
         tracing::info!(
             instance_id = self.instance_id,
@@ -1107,106 +1302,158 @@ where
     }
 
     fn rbc_receive(&self, from_party: usize, timeout_ms: u64) -> Result<Vec<u8>, String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let instance_id = self.instance_id;
+        let party_id = self.party_id;
 
-        loop {
-            {
-                let mut registry = RBC_REGISTRY.lock();
-
-                // Deliver the next undelivered message from `from_party`, in session order.
-                let mut next: Option<(u64, Vec<u8>)> = None;
-                for ((inst_id, session_id, party), message) in registry.messages.iter() {
-                    if *inst_id != self.instance_id || *party != from_party {
-                        continue;
-                    }
-                    let delivery_key = (self.instance_id, self.party_id, from_party, *session_id);
-                    if registry.delivered.contains(&delivery_key) {
-                        continue;
-                    }
-
-                    match next {
-                        Some((best_session, _)) if *session_id >= best_session => {}
-                        _ => next = Some((*session_id, message.clone())),
-                    }
+        let try_deliver = || -> Option<Vec<u8>> {
+            let mut registry = RBC_REGISTRY.lock();
+            let mut next: Option<(u64, Vec<u8>)> = None;
+            for ((inst_id, session_id, party), message) in registry.messages.iter() {
+                if *inst_id != instance_id || *party != from_party {
+                    continue;
                 }
-
-                if let Some((session_id, message)) = next {
-                    registry.delivered.insert((
-                        self.instance_id,
-                        self.party_id,
-                        from_party,
-                        session_id,
-                    ));
-                    tracing::info!(
-                        instance_id = self.instance_id,
-                        session_id = session_id,
-                        from_party = from_party,
-                        message_len = message.len(),
-                        "RBC receive delivered message"
-                    );
-                    return Ok(message);
+                let delivery_key = (instance_id, party_id, from_party, *session_id);
+                if registry.delivered.contains(&delivery_key) {
+                    continue;
+                }
+                match next {
+                    Some((best_session, _)) if *session_id >= best_session => {}
+                    _ => next = Some((*session_id, message.clone())),
                 }
             }
+            if let Some((session_id, message)) = next {
+                registry
+                    .delivered
+                    .insert((instance_id, party_id, from_party, session_id));
+                tracing::info!(
+                    instance_id = instance_id,
+                    session_id = session_id,
+                    from_party = from_party,
+                    message_len = message.len(),
+                    "RBC receive delivered message"
+                );
+                return Some(message);
+            }
+            None
+        };
 
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let deadline = tokio::time::Instant::now()
+                            + tokio::time::Duration::from_millis(timeout_ms);
+                        loop {
+                            let notified = RBC_NOTIFY.notified();
+                            if let Some(msg) = try_deliver() {
+                                return Ok(msg);
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(format!(
+                                    "RBC receive timeout waiting for message from party {}",
+                                    from_party
+                                ));
+                            }
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep_until(deadline) => {}
+                            }
+                        }
+                    })
+                });
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(msg) = try_deliver() {
+                return Ok(msg);
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
                     "RBC receive timeout waiting for message from party {}",
                     from_party
                 ));
             }
-
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
     fn rbc_receive_any(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let instance_id = self.instance_id;
+        let party_id = self.party_id;
 
-        loop {
-            {
-                let mut registry = RBC_REGISTRY.lock();
-
-                // Deliver the globally earliest undelivered message for this receiver.
-                // Tie-breaker is sender id for deterministic behavior.
-                let mut next: Option<(u64, usize, Vec<u8>)> = None;
-                for ((inst_id, session_id, party), message) in registry.messages.iter() {
-                    if *inst_id != self.instance_id || *party == self.party_id {
-                        continue;
-                    }
-                    let delivery_key = (self.instance_id, self.party_id, *party, *session_id);
-                    if registry.delivered.contains(&delivery_key) {
-                        continue;
-                    }
-
-                    match next {
-                        Some((best_session, best_party, _))
-                            if (*session_id, *party) >= (best_session, best_party) => {}
-                        _ => next = Some((*session_id, *party, message.clone())),
-                    }
+        let try_deliver = || -> Option<(usize, Vec<u8>)> {
+            let mut registry = RBC_REGISTRY.lock();
+            let mut next: Option<(u64, usize, Vec<u8>)> = None;
+            for ((inst_id, session_id, party), message) in registry.messages.iter() {
+                if *inst_id != instance_id || *party == party_id {
+                    continue;
                 }
-
-                if let Some((session_id, party, message)) = next {
-                    registry
-                        .delivered
-                        .insert((self.instance_id, self.party_id, party, session_id));
-                    tracing::info!(
-                        instance_id = self.instance_id,
-                        session_id = session_id,
-                        from_party = party,
-                        message_len = message.len(),
-                        "RBC receive_any delivered message"
-                    );
-                    return Ok((party, message));
+                let delivery_key = (instance_id, party_id, *party, *session_id);
+                if registry.delivered.contains(&delivery_key) {
+                    continue;
+                }
+                match next {
+                    Some((best_session, best_party, _))
+                        if (*session_id, *party) >= (best_session, best_party) => {}
+                    _ => next = Some((*session_id, *party, message.clone())),
                 }
             }
+            if let Some((session_id, party, message)) = next {
+                registry
+                    .delivered
+                    .insert((instance_id, party_id, party, session_id));
+                tracing::info!(
+                    instance_id = instance_id,
+                    session_id = session_id,
+                    from_party = party,
+                    message_len = message.len(),
+                    "RBC receive_any delivered message"
+                );
+                return Some((party, message));
+            }
+            None
+        };
 
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let deadline = tokio::time::Instant::now()
+                            + tokio::time::Duration::from_millis(timeout_ms);
+                        loop {
+                            let notified = RBC_NOTIFY.notified();
+                            if let Some(result) = try_deliver() {
+                                return Ok(result);
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(
+                                    "RBC receive_any timeout waiting for message from any party"
+                                        .to_string(),
+                                );
+                            }
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep_until(deadline) => {}
+                            }
+                        }
+                    })
+                });
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(result) = try_deliver() {
+                return Ok(result);
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(
                     "RBC receive_any timeout waiting for message from any party".to_string()
                 );
             }
-
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -1228,6 +1475,9 @@ where
         // Store this party's proposal
         let key = (self.instance_id, session_id, self.party_id);
         registry.proposals.insert(key, value);
+        drop(registry);
+
+        ABA_NOTIFY.notify_waiters();
 
         tracing::info!(
             instance_id = self.instance_id,
@@ -1241,70 +1491,95 @@ where
     }
 
     fn aba_result(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-        let required = 2 * self.t + 1; // Need 2t+1 proposals for agreement
+        let instance_id = self.instance_id;
+        let required = 2 * self.t + 1;
 
-        loop {
-            {
-                let mut registry = ABA_REGISTRY.lock();
+        let try_check = || -> Option<bool> {
+            let mut registry = ABA_REGISTRY.lock();
 
-                // Check if result is already computed
-                if let Some(&result) = registry.results.get(&(self.instance_id, session_id)) {
-                    return Ok(result);
-                }
+            if let Some(&result) = registry.results.get(&(instance_id, session_id)) {
+                return Some(result);
+            }
 
-                // Count proposals for this session
-                let mut true_count = 0usize;
-                let mut false_count = 0usize;
+            let mut true_count = 0usize;
+            let mut false_count = 0usize;
 
-                for ((inst_id, sess_id, _party), &proposal) in registry.proposals.iter() {
-                    if *inst_id == self.instance_id && *sess_id == session_id {
-                        if proposal {
-                            true_count += 1;
-                        } else {
-                            false_count += 1;
-                        }
+            for ((inst_id, sess_id, _party), &proposal) in registry.proposals.iter() {
+                if *inst_id == instance_id && *sess_id == session_id {
+                    if proposal {
+                        true_count += 1;
+                    } else {
+                        false_count += 1;
                     }
-                }
-
-                // ABA agreement rule: if 2t+1 parties agree on a value, that's the result
-                if true_count >= required {
-                    registry
-                        .results
-                        .insert((self.instance_id, session_id), true);
-                    tracing::info!(
-                        instance_id = self.instance_id,
-                        session_id = session_id,
-                        result = true,
-                        true_count = true_count,
-                        "ABA agreement reached"
-                    );
-                    return Ok(true);
-                }
-
-                if false_count >= required {
-                    registry
-                        .results
-                        .insert((self.instance_id, session_id), false);
-                    tracing::info!(
-                        instance_id = self.instance_id,
-                        session_id = session_id,
-                        result = false,
-                        false_count = false_count,
-                        "ABA agreement reached"
-                    );
-                    return Ok(false);
                 }
             }
 
+            if true_count >= required {
+                registry.results.insert((instance_id, session_id), true);
+                tracing::info!(
+                    instance_id = instance_id,
+                    session_id = session_id,
+                    result = true,
+                    true_count = true_count,
+                    "ABA agreement reached"
+                );
+                return Some(true);
+            }
+
+            if false_count >= required {
+                registry.results.insert((instance_id, session_id), false);
+                tracing::info!(
+                    instance_id = instance_id,
+                    session_id = session_id,
+                    result = false,
+                    false_count = false_count,
+                    "ABA agreement reached"
+                );
+                return Some(false);
+            }
+
+            None
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let deadline = tokio::time::Instant::now()
+                            + tokio::time::Duration::from_millis(timeout_ms);
+                        loop {
+                            let notified = ABA_NOTIFY.notified();
+                            if let Some(result) = try_check() {
+                                return Ok(result);
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(format!(
+                                    "ABA result timeout waiting for agreement on session {}",
+                                    session_id
+                                ));
+                            }
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep_until(deadline) => {}
+                            }
+                        }
+                    })
+                });
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(result) = try_check() {
+                return Ok(result);
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
                     "ABA result timeout waiting for agreement on session {}",
                     session_id
                 ));
             }
-
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }

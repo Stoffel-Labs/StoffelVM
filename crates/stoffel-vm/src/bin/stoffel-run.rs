@@ -70,7 +70,7 @@ fn parse_inputs_as_field<F: PrimeField>(inputs_str: &str) -> Vec<F> {
                 eprintln!("Invalid input value: {}", s);
                 exit(2);
             });
-            F::from(val as u64)
+            stoffel_vm::net::field_from_i64::<F>(val)
         })
         .collect()
 }
@@ -84,14 +84,15 @@ async fn connect_to_all_servers(
 ) {
     let max_retries = 10;
     let retry_delay = Duration::from_millis(500);
+    let mut connected_servers = Vec::with_capacity(server_addrs.len());
 
-    for (party_id, &addr) in server_addrs.iter().enumerate() {
+    for (server_idx, &addr) in server_addrs.iter().enumerate() {
         let mut retry_count = 0;
 
         loop {
             eprintln!(
                 "[client] Connecting to server {} at {} (attempt {}/{})",
-                party_id,
+                server_idx,
                 addr,
                 retry_count + 1,
                 max_retries
@@ -104,28 +105,8 @@ async fn connect_to_all_servers(
 
             match connection_result {
                 Ok(connection) => {
-                    eprintln!("[client] Connected to server {} at {}", party_id, addr);
-                    let tx = msg_tx.clone();
-                    let peer = party_id;
-                    tokio::spawn(async move {
-                        loop {
-                            match connection.receive().await {
-                                Ok(data) => {
-                                    if let Err(e) = tx.send((peer, data)).await {
-                                        eprintln!("[client] Failed to forward message: {:?}", e);
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "[client] Connection to server {} closed: {}",
-                                        peer, e
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    });
+                    eprintln!("[client] Connected to server {} at {}", server_idx, addr);
+                    connected_servers.push((addr, connection));
                     break;
                 }
                 Err(e) => {
@@ -133,7 +114,7 @@ async fn connect_to_all_servers(
                     if retry_count >= max_retries {
                         eprintln!(
                             "[client] Failed to connect to server {} at {} after {} attempts: {}",
-                            party_id, addr, retry_count, e
+                            server_idx, addr, retry_count, e
                         );
                         exit(21);
                     }
@@ -145,6 +126,68 @@ async fn connect_to_all_servers(
                 }
             }
         }
+    }
+
+    let (assigned_party_ids, local_party_id) = {
+        let net = network.lock().await;
+        let assigned = net.assign_party_ids();
+        let local = net.compute_local_party_id();
+        (assigned, local)
+    };
+    eprintln!(
+        "[client] Assigned authenticated party IDs for {} connections",
+        assigned_party_ids
+    );
+
+    let mut seen_peers = HashSet::new();
+    for (addr, connection) in connected_servers {
+        let authenticated_peer = connection.remote_party_id().unwrap_or_else(|| {
+            eprintln!(
+                "[client] Connected server {} has no authenticated party identity",
+                addr
+            );
+            exit(24);
+        });
+        let peer = local_party_id.map_or(authenticated_peer, |local_id| {
+            if authenticated_peer == local_id {
+                eprintln!(
+                    "[client] Connected server {} resolved to local authenticated identity {}",
+                    addr, authenticated_peer
+                );
+                exit(24);
+            }
+            if authenticated_peer > local_id {
+                authenticated_peer - 1
+            } else {
+                authenticated_peer
+            }
+        });
+
+        if !seen_peers.insert(peer) {
+            eprintln!(
+                "[client] Duplicate authenticated party identity {} detected for server {}",
+                peer, addr
+            );
+            exit(24);
+        }
+
+        let tx = msg_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match connection.receive().await {
+                    Ok(data) => {
+                        if let Err(e) = tx.send((peer, data)).await {
+                            eprintln!("[client] Failed to forward message: {:?}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[client] Connection to server {} closed: {}", peer, e);
+                        break;
+                    }
+                }
+            }
+        });
     }
 }
 

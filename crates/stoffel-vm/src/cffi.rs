@@ -51,7 +51,6 @@
 use std::ffi::{c_char, CStr, CString};
 use std::io::Cursor;
 use std::marker::PhantomPinned;
-use std::mem::ManuallyDrop;
 use std::os::raw::{c_int, c_void};
 use std::sync::{Arc, Mutex};
 
@@ -69,6 +68,39 @@ use stoffelnet::transports::quic::QuicNetworkManager;
 /// Maximum share buffer size accepted from FFI callers (1 MB).
 /// Prevents accidental or malicious oversized allocations from C/SDK code.
 const MAX_FFI_SHARE_LEN: usize = 1_048_576;
+
+/// Write a `Vec<u8>` result through FFI out-pointers using the boxed-slice pattern.
+///
+/// The Vec is shrunk to exact length via `into_boxed_slice()`, then leaked as a raw
+/// pointer. The caller must free with the corresponding `*_free_bytes` function which
+/// reconstructs the `Box<[u8]>`.
+///
+/// # Safety
+/// `result_ptr` and `result_len_ptr` must be valid, non-null, aligned pointers.
+unsafe fn write_ffi_result_bytes(
+    bytes: Vec<u8>,
+    result_ptr: *mut *mut u8,
+    result_len_ptr: *mut usize,
+) {
+    let boxed = bytes.into_boxed_slice();
+    let len = boxed.len();
+    let ptr = Box::into_raw(boxed) as *mut u8;
+    *result_ptr = ptr;
+    *result_len_ptr = len;
+}
+
+/// Free bytes previously allocated via [`write_ffi_result_bytes`].
+///
+/// Reconstructs the `Box<[u8]>` and drops it.
+///
+/// # Safety
+/// `ptr` must have been produced by `write_ffi_result_bytes` with the matching `len`,
+/// and must not have been freed already.
+unsafe fn free_ffi_result_bytes(ptr: *mut u8, len: usize) {
+    if !ptr.is_null() {
+        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
+    }
+}
 
 /// Opaque pointer type for the VM
 pub type VMHandle = *mut c_void;
@@ -300,12 +332,15 @@ pub extern "C" fn stoffel_execute(
     };
 
     match vm.execute(function_name) {
-        Ok(value) => {
-            unsafe {
-                *result = value_to_stoffel_value(&value);
+        Ok(value) => match value_to_stoffel_value(&value) {
+            Ok(converted) => {
+                unsafe {
+                    *result = converted;
+                }
+                0
             }
-            0
-        }
+            Err(_) => -4,
+        },
         Err(_) => -3,
     }
 }
@@ -368,12 +403,15 @@ pub extern "C" fn stoffel_execute_with_args(
     }
 
     match vm.execute_with_args(function_name, &rust_args) {
-        Ok(value) => {
-            unsafe {
-                *result = value_to_stoffel_value(&value);
+        Ok(value) => match value_to_stoffel_value(&value) {
+            Ok(converted) => {
+                unsafe {
+                    *result = converted;
+                }
+                0
             }
-            0
-        }
+            Err(_) => -5,
+        },
         Err(_) => -4,
     }
 }
@@ -389,8 +427,8 @@ impl CForeignFunctionWrapper {
         let c_args: Vec<StoffelValue> = ctx
             .args
             .iter()
-            .map(|arg| value_to_stoffel_value(arg))
-            .collect();
+            .map(value_to_stoffel_value)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut result = StoffelValue {
             value_type: StoffelValueType::Unit,
@@ -532,8 +570,12 @@ pub extern "C" fn stoffel_register_foreign_object(
     let value = vm.register_foreign_object(foreign_object);
 
     // Convert the result to a StoffelValue
+    let converted = match value_to_stoffel_value(&value) {
+        Ok(converted) => converted,
+        Err(_) => return -2,
+    };
     unsafe {
-        *result = value_to_stoffel_value(&value);
+        *result = converted;
     }
 
     0
@@ -573,8 +615,12 @@ pub extern "C" fn stoffel_create_string(
 
     let value = Value::String(rust_str.to_string());
 
+    let converted = match value_to_stoffel_value(&value) {
+        Ok(converted) => converted,
+        Err(_) => return -3,
+    };
     unsafe {
-        *result = value_to_stoffel_value(&value);
+        *result = converted;
     }
 
     0
@@ -588,55 +634,98 @@ pub extern "C" fn stoffel_create_string(
 ///
 /// # Returns
 ///
-/// A C-compatible StoffelValue
-fn value_to_stoffel_value(value: &Value) -> StoffelValue {
+/// A C-compatible StoffelValue or an error if no safe ABI conversion exists
+fn value_to_stoffel_value(value: &Value) -> Result<StoffelValue, String> {
     match value {
-        Value::Unit => StoffelValue {
+        Value::Unit => Ok(StoffelValue {
             value_type: StoffelValueType::Unit,
             data: StoffelValueData { int_val: 0 },
-        },
-        Value::I64(n) => StoffelValue {
+        }),
+        Value::I64(n) => Ok(StoffelValue {
             value_type: StoffelValueType::Int,
             data: StoffelValueData { int_val: *n },
-        },
-        Value::Float(f) => StoffelValue {
+        }),
+        Value::I32(n) => Ok(StoffelValue {
+            value_type: StoffelValueType::Int,
+            data: StoffelValueData {
+                int_val: i64::from(*n),
+            },
+        }),
+        Value::I16(n) => Ok(StoffelValue {
+            value_type: StoffelValueType::Int,
+            data: StoffelValueData {
+                int_val: i64::from(*n),
+            },
+        }),
+        Value::I8(n) => Ok(StoffelValue {
+            value_type: StoffelValueType::Int,
+            data: StoffelValueData {
+                int_val: i64::from(*n),
+            },
+        }),
+        Value::U8(n) => Ok(StoffelValue {
+            value_type: StoffelValueType::Int,
+            data: StoffelValueData {
+                int_val: i64::from(*n),
+            },
+        }),
+        Value::U16(n) => Ok(StoffelValue {
+            value_type: StoffelValueType::Int,
+            data: StoffelValueData {
+                int_val: i64::from(*n),
+            },
+        }),
+        Value::U32(n) => Ok(StoffelValue {
+            value_type: StoffelValueType::Int,
+            data: StoffelValueData {
+                int_val: i64::from(*n),
+            },
+        }),
+        Value::U64(n) => {
+            let int_val =
+                i64::try_from(*n).map_err(|_| format!("u64 value {n} exceeds C ABI int range"))?;
+            Ok(StoffelValue {
+                value_type: StoffelValueType::Int,
+                data: StoffelValueData { int_val },
+            })
+        }
+        Value::Float(f) => Ok(StoffelValue {
             value_type: StoffelValueType::Float,
             data: StoffelValueData { float_val: f.0 },
-        },
-        Value::Bool(b) => StoffelValue {
+        }),
+        Value::Bool(b) => Ok(StoffelValue {
             value_type: StoffelValueType::Bool,
             data: StoffelValueData { bool_val: *b },
-        },
+        }),
         Value::String(s) => {
             // Note: This creates a memory leak as we're not freeing the CString
             // In a real implementation, you would need to handle this properly
-            let c_string = CString::new(s.clone()).unwrap_or_default();
+            let c_string = CString::new(s.as_str())
+                .map_err(|_| "String contains interior null byte".to_string())?;
             let ptr = c_string.into_raw();
-            StoffelValue {
+            Ok(StoffelValue {
                 value_type: StoffelValueType::String,
                 data: StoffelValueData { string_val: ptr },
-            }
+            })
         }
-        Value::Object(id) => StoffelValue {
+        Value::Object(id) => Ok(StoffelValue {
             value_type: StoffelValueType::Object,
             data: StoffelValueData { object_id: *id },
-        },
-        Value::Array(id) => StoffelValue {
+        }),
+        Value::Array(id) => Ok(StoffelValue {
             value_type: StoffelValueType::Array,
             data: StoffelValueData { array_id: *id },
-        },
-        Value::Foreign(id) => StoffelValue {
+        }),
+        Value::Foreign(id) => Ok(StoffelValue {
             value_type: StoffelValueType::Foreign,
             data: StoffelValueData { foreign_id: *id },
-        },
-        Value::Closure(_) => StoffelValue {
+        }),
+        Value::Closure(_) => Ok(StoffelValue {
             value_type: StoffelValueType::Closure,
             data: StoffelValueData { closure_id: 0 }, // Simplified
-        },
-        _ => StoffelValue {
-            value_type: StoffelValueType::Unit,
-            data: StoffelValueData { int_val: 0 },
-        },
+        }),
+        Value::Share(_, _) => Err("Cannot convert secret share value to C ABI".to_string()),
+        Value::PendingReveal(_) => Err("Cannot convert pending reveal marker to C ABI".to_string()),
     }
 }
 
@@ -920,10 +1009,8 @@ pub extern "C" fn hb_engine_multiply_share_async(
 
     match rt.block_on(engine.multiply_share_async(ty, left, right)) {
         Ok(result) => {
-            let mut result = ManuallyDrop::new(result);
             unsafe {
-                *result_ptr = result.as_mut_ptr();
-                *result_len_ptr = result.len();
+                write_ffi_result_bytes(result, result_ptr, result_len_ptr);
             }
             HBEngineErrorCode::HBEngineSuccess
         }
@@ -967,8 +1054,12 @@ pub extern "C" fn hb_engine_open_share(
     // open_share is sync in the current implementation (uses global registry)
     match engine.open_share(ty, share_bytes) {
         Ok(value) => {
+            let converted = match value_to_stoffel_value(&value) {
+                Ok(converted) => converted,
+                Err(_) => return HBEngineErrorCode::HBEngineOpenShareFailed,
+            };
             unsafe {
-                *result_ptr = value_to_stoffel_value(&value);
+                *result_ptr = converted;
             }
             HBEngineErrorCode::HBEngineSuccess
         }
@@ -1093,10 +1184,8 @@ pub extern "C" fn hb_engine_get_client_shares(
                     return HBEngineErrorCode::HBEngineSerializationError;
                 }
             }
-            let mut bytes = ManuallyDrop::new(bytes);
             unsafe {
-                *result_ptr = bytes.as_mut_ptr();
-                *result_len_ptr = bytes.len();
+                write_ffi_result_bytes(bytes, result_ptr, result_len_ptr);
             }
             HBEngineErrorCode::HBEngineSuccess
         }
@@ -1169,10 +1258,8 @@ pub extern "C" fn hb_network_free(network_ptr: *mut HBNetworkOpaque) {
 /// Free bytes allocated by engine functions (e.g., multiply_share_async result)
 #[no_mangle]
 pub extern "C" fn hb_free_bytes(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() && len > 0 {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, len, len);
-        }
+    unsafe {
+        free_ffi_result_bytes(ptr, len);
     }
 }
 
@@ -1262,16 +1349,14 @@ mod hb_engine_tests {
 mod adkg_ffi {
     use super::*;
     use crate::net::avss_engine::{AvssMpcEngine, AvssOperations};
-    use crate::net::curve::MpcCurveConfig;
     use crate::net::mpc_engine::MpcEngine;
     use ark_serialize::CanonicalDeserialize;
     use ark_std::rand::SeedableRng;
-    use ark_std::UniformRand;
     use std::future::Future;
     use std::sync::Arc;
     use stoffelnet::transports::quic::QuicNetworkManager;
 
-    fn block_on_avss_new<Fut, T>(fut: Fut) -> Result<T, ()>
+    fn block_on_avss<Fut, T>(fut: Fut) -> Result<T, String>
     where
         Fut: Future<Output = Result<T, String>> + Send + 'static,
         T: Send + 'static,
@@ -1282,26 +1367,26 @@ mod adkg_ffi {
                 #[allow(deprecated)]
                 match handle.runtime_flavor() {
                     tokio::runtime::RuntimeFlavor::MultiThread => {
-                        tokio::task::block_in_place(|| handle.block_on(fut)).map_err(|_| ())
+                        tokio::task::block_in_place(|| handle.block_on(fut))
                     }
                     tokio::runtime::RuntimeFlavor::CurrentThread => std::thread::spawn(move || {
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
-                            .map_err(|_| ())?;
-                        rt.block_on(fut).map_err(|_| ())
+                            .map_err(|e| format!("failed to build tokio runtime: {}", e))?;
+                        rt.block_on(fut)
                     })
                     .join()
-                    .map_err(|_| ())?,
-                    _ => Err(()),
+                    .map_err(|_| "thread panicked in block_on_avss".to_string())?,
+                    _ => Err("unsupported tokio runtime flavor".to_string()),
                 }
             }
             Err(_) => {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|_| ())?;
-                rt.block_on(fut).map_err(|_| ())
+                    .map_err(|e| format!("failed to build tokio runtime: {}", e))?;
+                rt.block_on(fut)
             }
         }
     }
@@ -1319,13 +1404,13 @@ mod adkg_ffi {
     }
 
     impl CAdkgCurveConfig {
-        #[allow(dead_code)]
-        fn to_config(self) -> MpcCurveConfig {
-            match self {
-                CAdkgCurveConfig::Bls12_381 => MpcCurveConfig::Bls12_381,
-                CAdkgCurveConfig::Bn254 => MpcCurveConfig::Bn254,
-                CAdkgCurveConfig::Curve25519 => MpcCurveConfig::Curve25519,
-                CAdkgCurveConfig::Ed25519 => MpcCurveConfig::Ed25519,
+        fn from_ffi(value: u32) -> Option<Self> {
+            match value {
+                0 => Some(CAdkgCurveConfig::Bls12_381),
+                1 => Some(CAdkgCurveConfig::Bn254),
+                2 => Some(CAdkgCurveConfig::Curve25519),
+                3 => Some(CAdkgCurveConfig::Ed25519),
+                _ => None,
             }
         }
     }
@@ -1334,7 +1419,7 @@ mod adkg_ffi {
     /// The opaque pointer stores a `Box<AvssFfiWrapper>`.
     struct AvssFfiWrapper {
         engine: Arc<dyn MpcEngine>,
-        avss_ops: Arc<dyn AvssOperations>,
+        avss_ops: Arc<dyn AvssOperations + Send + Sync>,
     }
 
     /// Opaque pointer type for AvssMpcEngine
@@ -1370,7 +1455,55 @@ mod adkg_ffi {
         InvalidCurveConfig = 8,
     }
 
-    /// Helper: create engine for BLS12-381 and wrap it
+    /// Generic helper: deserialize keys, create an `AvssMpcEngine<F, G>`, and wrap it.
+    fn create_engine_inner<F, G>(
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        net: Arc<QuicNetworkManager>,
+        sk_bytes: &[u8],
+        pk_bytes: &[u8],
+    ) -> Result<AvssFfiWrapper, String>
+    where
+        F: crate::net::curve::SupportedMpcField + ark_std::UniformRand,
+        G: ark_ec::CurveGroup<ScalarField = F> + Send + Sync + 'static,
+    {
+        let sk_i: F = if sk_bytes.is_empty() {
+            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+            F::rand(&mut rng)
+        } else {
+            CanonicalDeserialize::deserialize_compressed(sk_bytes)
+                .map_err(|e| format!("failed to deserialize secret key: {}", e))?
+        };
+
+        let pk_map: Vec<G> = Vec::<G>::deserialize_compressed(pk_bytes)
+            .map_err(|e| format!("failed to deserialize public key map: {}", e))?;
+        if pk_map.len() != n {
+            return Err(format!(
+                "public key map length {} does not match n={}",
+                pk_map.len(),
+                n
+            ));
+        }
+
+        let engine = block_on_avss(AvssMpcEngine::<F, G>::new(
+            instance_id,
+            party_id,
+            n,
+            t,
+            net,
+            sk_i,
+            Arc::new(pk_map),
+        ))?;
+
+        let engine_arc: Arc<AvssMpcEngine<F, G>> = engine;
+        Ok(AvssFfiWrapper {
+            engine: engine_arc.clone() as Arc<dyn MpcEngine>,
+            avss_ops: engine_arc as Arc<dyn AvssOperations + Send + Sync>,
+        })
+    }
+
     fn create_bls12381_engine(
         instance_id: u64,
         party_id: usize,
@@ -1379,39 +1512,18 @@ mod adkg_ffi {
         net: Arc<QuicNetworkManager>,
         sk_bytes: &[u8],
         pk_bytes: &[u8],
-    ) -> Result<AvssFfiWrapper, ()> {
-        use ark_bls12_381::{Fr, G1Projective as G1};
-
-        let sk_i: Fr = if sk_bytes.is_empty() {
-            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-            Fr::rand(&mut rng)
-        } else {
-            CanonicalDeserialize::deserialize_compressed(sk_bytes).map_err(|_| ())?
-        };
-
-        let pk_map: Vec<G1> = Vec::<G1>::deserialize_compressed(pk_bytes).map_err(|_| ())?;
-        if pk_map.len() != n {
-            return Err(());
-        }
-
-        let engine = block_on_avss_new(AvssMpcEngine::<Fr, G1>::new(
+    ) -> Result<AvssFfiWrapper, String> {
+        create_engine_inner::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>(
             instance_id,
             party_id,
             n,
             t,
             net,
-            sk_i,
-            Arc::new(pk_map),
-        ))?;
-
-        let engine_arc: Arc<AvssMpcEngine<Fr, G1>> = engine;
-        Ok(AvssFfiWrapper {
-            engine: engine_arc.clone() as Arc<dyn MpcEngine>,
-            avss_ops: engine_arc as Arc<dyn AvssOperations>,
-        })
+            sk_bytes,
+            pk_bytes,
+        )
     }
 
-    /// Helper: create engine for BN254 and wrap it
     fn create_bn254_engine(
         instance_id: u64,
         party_id: usize,
@@ -1420,39 +1532,18 @@ mod adkg_ffi {
         net: Arc<QuicNetworkManager>,
         sk_bytes: &[u8],
         pk_bytes: &[u8],
-    ) -> Result<AvssFfiWrapper, ()> {
-        use ark_bn254::{Fr, G1Projective as G1};
-
-        let sk_i: Fr = if sk_bytes.is_empty() {
-            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-            Fr::rand(&mut rng)
-        } else {
-            CanonicalDeserialize::deserialize_compressed(sk_bytes).map_err(|_| ())?
-        };
-
-        let pk_map: Vec<G1> = Vec::<G1>::deserialize_compressed(pk_bytes).map_err(|_| ())?;
-        if pk_map.len() != n {
-            return Err(());
-        }
-
-        let engine = block_on_avss_new(AvssMpcEngine::<Fr, G1>::new(
+    ) -> Result<AvssFfiWrapper, String> {
+        create_engine_inner::<ark_bn254::Fr, ark_bn254::G1Projective>(
             instance_id,
             party_id,
             n,
             t,
             net,
-            sk_i,
-            Arc::new(pk_map),
-        ))?;
-
-        let engine_arc: Arc<AvssMpcEngine<Fr, G1>> = engine;
-        Ok(AvssFfiWrapper {
-            engine: engine_arc.clone() as Arc<dyn MpcEngine>,
-            avss_ops: engine_arc as Arc<dyn AvssOperations>,
-        })
+            sk_bytes,
+            pk_bytes,
+        )
     }
 
-    /// Helper: create engine for Curve25519 and wrap it
     fn create_curve25519_engine(
         instance_id: u64,
         party_id: usize,
@@ -1461,39 +1552,18 @@ mod adkg_ffi {
         net: Arc<QuicNetworkManager>,
         sk_bytes: &[u8],
         pk_bytes: &[u8],
-    ) -> Result<AvssFfiWrapper, ()> {
-        use ark_curve25519::{EdwardsProjective as G, Fr};
-
-        let sk_i: Fr = if sk_bytes.is_empty() {
-            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-            Fr::rand(&mut rng)
-        } else {
-            CanonicalDeserialize::deserialize_compressed(sk_bytes).map_err(|_| ())?
-        };
-
-        let pk_map: Vec<G> = Vec::<G>::deserialize_compressed(pk_bytes).map_err(|_| ())?;
-        if pk_map.len() != n {
-            return Err(());
-        }
-
-        let engine = block_on_avss_new(AvssMpcEngine::<Fr, G>::new(
+    ) -> Result<AvssFfiWrapper, String> {
+        create_engine_inner::<ark_curve25519::Fr, ark_curve25519::EdwardsProjective>(
             instance_id,
             party_id,
             n,
             t,
             net,
-            sk_i,
-            Arc::new(pk_map),
-        ))?;
-
-        let engine_arc: Arc<AvssMpcEngine<Fr, G>> = engine;
-        Ok(AvssFfiWrapper {
-            engine: engine_arc.clone() as Arc<dyn MpcEngine>,
-            avss_ops: engine_arc as Arc<dyn AvssOperations>,
-        })
+            sk_bytes,
+            pk_bytes,
+        )
     }
 
-    /// Helper: create engine for Ed25519 and wrap it
     fn create_ed25519_engine(
         instance_id: u64,
         party_id: usize,
@@ -1502,36 +1572,16 @@ mod adkg_ffi {
         net: Arc<QuicNetworkManager>,
         sk_bytes: &[u8],
         pk_bytes: &[u8],
-    ) -> Result<AvssFfiWrapper, ()> {
-        use ark_ed25519::{EdwardsProjective as G, Fr};
-
-        let sk_i: Fr = if sk_bytes.is_empty() {
-            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-            Fr::rand(&mut rng)
-        } else {
-            CanonicalDeserialize::deserialize_compressed(sk_bytes).map_err(|_| ())?
-        };
-
-        let pk_map: Vec<G> = Vec::<G>::deserialize_compressed(pk_bytes).map_err(|_| ())?;
-        if pk_map.len() != n {
-            return Err(());
-        }
-
-        let engine = block_on_avss_new(AvssMpcEngine::<Fr, G>::new(
+    ) -> Result<AvssFfiWrapper, String> {
+        create_engine_inner::<ark_ed25519::Fr, ark_ed25519::EdwardsProjective>(
             instance_id,
             party_id,
             n,
             t,
             net,
-            sk_i,
-            Arc::new(pk_map),
-        ))?;
-
-        let engine_arc: Arc<AvssMpcEngine<Fr, G>> = engine;
-        Ok(AvssFfiWrapper {
-            engine: engine_arc.clone() as Arc<dyn MpcEngine>,
-            avss_ops: engine_arc as Arc<dyn AvssOperations>,
-        })
+            sk_bytes,
+            pk_bytes,
+        )
     }
 
     /// Creates a new AVSS engine
@@ -1545,8 +1595,8 @@ mod adkg_ffi {
     /// * `curve_config` - Curve configuration (0 = BLS12-381, 1 = BN254, 2 = Curve25519, 3 = Ed25519)
     /// * `sk_bytes` - Secret key bytes (serialized Fr element), or null for random key
     /// * `sk_len` - Length of secret key bytes
-    /// * `pk_map_ptr` - Pointer to serialized public key map, or null
-    /// * `pk_map_len` - Length of public key map bytes
+    /// * `pk_map_ptr` - Pointer to serialized public key map (required, must not be null)
+    /// * `pk_map_len` - Length of public key map bytes (must be > 0)
     ///
     /// # Returns
     /// Pointer to opaque engine handle, or null on failure
@@ -1557,13 +1607,16 @@ mod adkg_ffi {
         n: usize,
         t: usize,
         network_ptr: *mut c_void,
-        curve_config: CAdkgCurveConfig,
+        curve_config: u32,
         sk_bytes: *const u8,
         sk_len: usize,
         pk_map_ptr: *const u8,
         pk_map_len: usize,
     ) -> *mut AdkgEngineOpaque {
-        if network_ptr.is_null() || pk_map_ptr.is_null() {
+        if network_ptr.is_null() {
+            return std::ptr::null_mut();
+        }
+        if pk_map_ptr.is_null() || pk_map_len == 0 {
             return std::ptr::null_mut();
         }
 
@@ -1581,6 +1634,11 @@ mod adkg_ffi {
 
         let pk_slice = unsafe { std::slice::from_raw_parts(pk_map_ptr, pk_map_len) };
 
+        let curve_config = match CAdkgCurveConfig::from_ffi(curve_config) {
+            Some(config) => config,
+            None => return std::ptr::null_mut(),
+        };
+
         let wrapper = match curve_config {
             CAdkgCurveConfig::Bls12_381 => {
                 create_bls12381_engine(instance_id, party_id, n, t, net, sk_slice, pk_slice)
@@ -1597,8 +1655,17 @@ mod adkg_ffi {
         };
 
         match wrapper {
-            Ok(w) => Box::into_raw(Box::new(w)) as *mut AdkgEngineOpaque,
-            Err(_) => std::ptr::null_mut(),
+            Ok(w) => {
+                if let Err(e) = w.engine.start() {
+                    eprintln!("adkg_engine_new: engine start failed: {}", e);
+                    return std::ptr::null_mut();
+                }
+                Box::into_raw(Box::new(w)) as *mut AdkgEngineOpaque
+            }
+            Err(e) => {
+                eprintln!("adkg_engine_new: {}", e);
+                std::ptr::null_mut()
+            }
         }
     }
 
@@ -1615,6 +1682,15 @@ mod adkg_ffi {
     /// Helper to get the wrapper from an opaque pointer
     unsafe fn get_wrapper<'a>(ptr: *mut AdkgEngineOpaque) -> &'a AvssFfiWrapper {
         &*(ptr as *const AvssFfiWrapper)
+    }
+
+    unsafe fn write_boxed_result_bytes(
+        bytes: Vec<u8>,
+        result_ptr: *mut *mut u8,
+        result_len_ptr: *mut usize,
+    ) {
+        // Delegate to the shared helper at module scope.
+        write_ffi_result_bytes(bytes, result_ptr, result_len_ptr);
     }
 
     /// Generates a new distributed share under the given key name
@@ -1644,17 +1720,11 @@ mod adkg_ffi {
             Err(_) => return AdkgEngineErrorCode::SerializationError,
         };
 
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(_) => return AdkgEngineErrorCode::RuntimeError,
-        };
-
-        match rt.block_on(wrapper.avss_ops.avss_generate_share(key_name_str)) {
+        let avss_ops = Arc::clone(&wrapper.avss_ops);
+        match block_on_avss(async move { avss_ops.avss_generate_share(key_name_str).await }) {
             Ok(share_bytes) => {
-                let mut bytes = ManuallyDrop::new(share_bytes);
                 unsafe {
-                    *result_ptr = bytes.as_mut_ptr();
-                    *result_len_ptr = bytes.len();
+                    write_boxed_result_bytes(share_bytes, result_ptr, result_len_ptr);
                 }
                 AdkgEngineErrorCode::Success
             }
@@ -1690,10 +1760,8 @@ mod adkg_ffi {
 
         match wrapper.avss_ops.avss_get_public_key(key_name_str) {
             Ok(bytes) => {
-                let mut bytes = ManuallyDrop::new(bytes);
                 unsafe {
-                    *result_ptr = bytes.as_mut_ptr();
-                    *result_len_ptr = bytes.len();
+                    write_boxed_result_bytes(bytes, result_ptr, result_len_ptr);
                 }
                 AdkgEngineErrorCode::Success
             }
@@ -1730,10 +1798,8 @@ mod adkg_ffi {
 
         match wrapper.avss_ops.avss_get_commitment(key_name_str, index) {
             Ok(bytes) => {
-                let mut bytes = ManuallyDrop::new(bytes);
                 unsafe {
-                    *result_ptr = bytes.as_mut_ptr();
-                    *result_len_ptr = bytes.len();
+                    write_boxed_result_bytes(bytes, result_ptr, result_len_ptr);
                 }
                 AdkgEngineErrorCode::Success
             }
@@ -1780,10 +1846,8 @@ mod adkg_ffi {
     /// Free bytes allocated by AVSS engine functions
     #[no_mangle]
     pub extern "C" fn adkg_free_bytes(ptr: *mut u8, len: usize) {
-        if !ptr.is_null() && len > 0 {
-            unsafe {
-                let _ = Vec::from_raw_parts(ptr, len, len);
-            }
+        unsafe {
+            free_ffi_result_bytes(ptr, len);
         }
     }
 
@@ -1804,13 +1868,61 @@ mod adkg_ffi {
                 5,
                 1,
                 std::ptr::null_mut(),
-                CAdkgCurveConfig::Bls12_381,
+                CAdkgCurveConfig::Bls12_381 as u32,
                 std::ptr::null(),
                 0,
                 std::ptr::null(),
                 0,
             );
             assert!(engine.is_null());
+        }
+
+        #[test]
+        fn test_adkg_engine_new_invalid_curve_config_rejected() {
+            let n = 4usize;
+            let net = Arc::new(QuicNetworkManager::new());
+            let mut pk_map_bytes = Vec::new();
+            vec![G1Projective::generator(); n]
+                .serialize_compressed(&mut pk_map_bytes)
+                .expect("serialize pk map");
+            let net_ptr = &net as *const Arc<QuicNetworkManager> as *mut c_void;
+
+            let engine = adkg_engine_new(
+                1,
+                0,
+                n,
+                1,
+                net_ptr,
+                99,
+                std::ptr::null(),
+                0,
+                pk_map_bytes.as_ptr(),
+                pk_map_bytes.len(),
+            );
+            assert!(engine.is_null(), "invalid curve config must be rejected");
+        }
+
+        #[test]
+        fn test_adkg_engine_new_null_pk_map_rejected() {
+            let net = Arc::new(QuicNetworkManager::new());
+            let net_ptr = &net as *const Arc<QuicNetworkManager> as *mut c_void;
+
+            let engine = adkg_engine_new(
+                1,
+                0,
+                4,
+                1,
+                net_ptr,
+                CAdkgCurveConfig::Bls12_381 as u32,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+            );
+            assert!(
+                engine.is_null(),
+                "constructor must reject null/empty public key map"
+            );
         }
 
         #[test]
@@ -1829,7 +1941,7 @@ mod adkg_ffi {
                 n,
                 1,
                 net_ptr,
-                CAdkgCurveConfig::Bls12_381,
+                CAdkgCurveConfig::Bls12_381 as u32,
                 std::ptr::null(),
                 0,
                 pk_map_bytes.as_ptr(),

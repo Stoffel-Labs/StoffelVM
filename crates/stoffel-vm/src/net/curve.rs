@@ -59,26 +59,12 @@ impl MpcCurveConfig {
         }
     }
 
-    pub fn supports_backend(self, backend: MpcBackendKind) -> bool {
-        match backend {
-            #[cfg(feature = "honeybadger")]
-            MpcBackendKind::HoneyBadger => true,
-            #[cfg(feature = "avss")]
-            MpcBackendKind::Avss => true,
-        }
-    }
-
-    pub fn validate_for_backend(self, backend: MpcBackendKind) -> Result<(), String> {
-        if self.supports_backend(backend) {
-            return Ok(());
-        }
-
-        let backend_name = backend.name();
-        Err(format!(
-            "MPC curve '{}' is not supported by backend '{}'",
-            self.name(),
-            backend_name
-        ))
+    /// Validate that this curve is compatible with the given backend.
+    ///
+    /// Currently all curves are supported by all backends. This is an extension
+    /// point for future backend-specific restrictions.
+    pub fn validate_for_backend(self, _backend: MpcBackendKind) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -128,6 +114,50 @@ impl SupportedMpcField for ark_curve25519::Fr {
     const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Curve25519;
 }
 
+/// Convert an `i64` to a field element.
+///
+/// Positive values map to `F::from(value as u64)`.
+/// Negative values map to `-F::from((-value) as u64)`, i.e. the field-additive
+/// inverse, which is correct for fields whose modulus exceeds `2^63`.
+#[inline]
+pub fn field_from_i64<F: ark_ff::PrimeField>(value: i64) -> F {
+    if value >= 0 {
+        F::from(value as u64)
+    } else {
+        -F::from((-value) as u64)
+    }
+}
+
+/// Convert a field element back to `i64`.
+///
+/// This is the inverse of [`field_from_i64`]. Elements in the lower half of the
+/// field (i.e. `bigint < (p-1)/2`) are returned as non-negative `i64`; elements
+/// in the upper half are interpreted as negative values.
+///
+/// Only correct when the original value was in `i64` range and the field modulus
+/// is much larger than `2^64`.
+#[inline]
+pub fn field_to_i64<F: ark_ff::PrimeField>(value: F) -> i64 {
+    let bigint = value.into_bigint();
+    let limbs = bigint.as_ref();
+    let raw = limbs.first().copied().unwrap_or(0);
+
+    // Check if the element is in the upper half of the field (i.e. represents a negative value).
+    // We do this by comparing with (p-1)/2.  For a negative value -x, the field
+    // representation is p - x, which is > (p-1)/2 when x > 0.
+    let neg = (-value).into_bigint();
+    let neg_raw = neg.as_ref().first().copied().unwrap_or(0);
+
+    // If the negation is smaller (fits in fewer limbs / smaller lowest limb),
+    // the original element was in the upper half → negative.
+    // We compare full bigints to be safe.
+    if !value.is_zero() && neg < bigint {
+        -(neg_raw as i64)
+    } else {
+        raw as i64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +191,47 @@ mod tests {
     #[test]
     fn reject_unknown_curve() {
         assert!(MpcCurveConfig::from_str("ristretto").is_err());
+    }
+
+    #[test]
+    fn field_from_i64_positive() {
+        type Fr = ark_bls12_381::Fr;
+        assert_eq!(field_from_i64::<Fr>(0), Fr::from(0u64));
+        assert_eq!(field_from_i64::<Fr>(1), Fr::from(1u64));
+        assert_eq!(field_from_i64::<Fr>(42), Fr::from(42u64));
+        assert_eq!(field_from_i64::<Fr>(i64::MAX), Fr::from(i64::MAX as u64));
+    }
+
+    #[test]
+    fn field_from_i64_negative() {
+        type Fr = ark_bls12_381::Fr;
+        // -1 in the field should equal the additive inverse of 1
+        assert_eq!(field_from_i64::<Fr>(-1), -Fr::from(1u64));
+        assert_eq!(field_from_i64::<Fr>(-42), -Fr::from(42u64));
+    }
+
+    #[test]
+    fn field_roundtrip_positive() {
+        type Fr = ark_bls12_381::Fr;
+        for v in [0i64, 1, 42, 1000, i64::MAX] {
+            assert_eq!(
+                field_to_i64(field_from_i64::<Fr>(v)),
+                v,
+                "roundtrip failed for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn field_roundtrip_negative() {
+        type Fr = ark_bls12_381::Fr;
+        for v in [-1i64, -42, -1000, i64::MIN + 1] {
+            assert_eq!(
+                field_to_i64(field_from_i64::<Fr>(v)),
+                v,
+                "roundtrip failed for {v}"
+            );
+        }
     }
 
     #[test]

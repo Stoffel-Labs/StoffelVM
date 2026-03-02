@@ -57,10 +57,18 @@ impl ClientInputStore {
         F: ark_ff::FftField,
     {
         let mut serialized = Vec::with_capacity(shares.len());
-        for share in shares {
+        for (i, share) in shares.into_iter().enumerate() {
             let mut bytes = Vec::new();
-            if share.serialize_compressed(&mut bytes).is_ok() {
-                serialized.push(bytes);
+            match share.serialize_compressed(&mut bytes) {
+                Ok(()) => serialized.push(bytes),
+                Err(e) => {
+                    tracing::warn!(
+                        client_id = client_id,
+                        share_index = i,
+                        "Failed to serialize RobustShare: {}",
+                        e
+                    );
+                }
             }
         }
         self.store_client_input_bytes(client_id, serialized);

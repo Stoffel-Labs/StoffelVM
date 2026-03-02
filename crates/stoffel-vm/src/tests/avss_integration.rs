@@ -13,24 +13,10 @@ use std::collections::HashMap;
 
 use crate::core_vm::VirtualMachine;
 use crate::mpc_builtins::avss_object;
+use crate::tests::test_utils::setup_test_tracing;
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
-
-/// Helper for test tracing setup
-fn setup_test_tracing() {
-    use std::sync::Once;
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let subscriber = FmtSubscriber::builder()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-            .with_test_writer()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-}
 
 /// Create a mock AVSS share for testing
 /// This simulates what the AVSS protocol would produce
@@ -95,7 +81,8 @@ fn test_avss_share_object_creation() {
         share_bytes,
         commitment_bytes.clone(),
         party_id,
-    );
+    )
+    .unwrap();
 
     let obj = Value::Object(obj_id);
     assert!(avss_object::is_avss_share_object(
@@ -139,7 +126,8 @@ fn test_avss_builtins_via_vm() {
         share_bytes,
         commitment_bytes.clone(),
         party_id,
-    );
+    )
+    .unwrap();
 
     let test_is_avss_share_fn = VMFunction::new(
         "test_is_avss_share".to_string(),
@@ -184,7 +172,8 @@ fn test_avss_get_public_key_builtin() {
         share_bytes,
         commitment_bytes.clone(),
         party_id,
-    );
+    )
+    .unwrap();
 
     let get_public_key_fn = VMFunction::new(
         "get_public_key".to_string(),
@@ -246,7 +235,8 @@ fn test_avss_get_commitment_builtin() {
         share_bytes,
         commitment_bytes.clone(),
         party_id,
-    );
+    )
+    .unwrap();
 
     let get_commitment_fn = VMFunction::new(
         "get_commitment_1".to_string(),
@@ -306,7 +296,8 @@ fn test_avss_commitment_count_builtin() {
         share_bytes,
         commitment_bytes,
         party_id,
-    );
+    )
+    .unwrap();
 
     let get_count_fn = VMFunction::new(
         "get_commitment_count".to_string(),
@@ -354,7 +345,8 @@ fn test_avss_get_key_name_builtin() {
         share_bytes,
         commitment_bytes,
         party_id,
-    );
+    )
+    .unwrap();
 
     let get_key_name_fn = VMFunction::new(
         "get_key_name".to_string(),
@@ -416,7 +408,8 @@ fn test_example_avss_public_key_program() {
         share_bytes,
         commitment_bytes,
         party_id,
-    );
+    )
+    .unwrap();
 
     tracing::info!("Created AVSS share object with ID: {}", avss_share_obj_id);
 
@@ -586,7 +579,8 @@ fn test_e2e_5_parties_avss_public_key() {
             share_bytes,
             commitment_bytes,
             party_id,
-        );
+        )
+        .unwrap();
 
         let extract_pk_fn = VMFunction::new(
             "get_avss_public_key".to_string(),
@@ -716,7 +710,8 @@ fn test_e2e_avss_with_input_output_clients() {
             share_bytes,
             commitment_bytes,
             party_id,
-        );
+        )
+        .unwrap();
 
         let main_fn = VMFunction::new(
             "main".to_string(),

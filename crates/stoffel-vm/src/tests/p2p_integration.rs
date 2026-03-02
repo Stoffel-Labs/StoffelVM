@@ -2,15 +2,13 @@
 //! Integration tests for QUIC-based peer-to-peer networking.
 
 use crate::net::{NetworkManager, PeerConnection, QuicNetworkManager};
+use crate::tests::test_utils::init_crypto_provider;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Duration};
-
-static INIT: Once = Once::new();
 
 /// Message sent from client to server
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,16 +28,6 @@ struct PongMessage {
     sent_at: u128,
     /// Sequence number from the original ping
     seq_num: u32,
-}
-
-pub(crate) fn init_crypto_provider() {
-    INIT.call_once(|| {
-        // If a provider is already installed, do nothing.
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            // Ignore error if another test installs it concurrently
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-    });
 }
 
 /// Get current time in milliseconds since epoch
