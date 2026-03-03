@@ -1256,6 +1256,47 @@ mod tests {
     }
 
     #[test]
+    fn test_avss_negative_fixed_point_roundtrip_mismatch_poc() {
+        let n = 4;
+        let t = 1;
+        let ty = ShareType::default_secret_fixed_point();
+        let precision = match ty {
+            ShareType::SecretFixedPoint { precision } => precision,
+            ShareType::SecretInt { .. } => unreachable!("expected fixed-point share type"),
+        };
+
+        let clear_value = -3.25_f64;
+        let scale = (1u64 << precision.f()) as f64;
+        let scaled_value = (clear_value * scale) as i64;
+        assert!(scaled_value < 0, "PoC requires a negative fixed-point value");
+
+        // Match the AVSS input_share convention for negative fixed-point inputs.
+        let secret = if scaled_value >= 0 {
+            Fr::from(scaled_value as u64)
+        } else {
+            -Fr::from((-scaled_value) as u64)
+        };
+
+        let shares = generate_feldman_shares(secret, n, t);
+        let subset: Vec<_> = shares.iter().take(t + 1).cloned().collect();
+        let recovered = Bls12381AvssMpcEngine::reconstruct_secret(&subset, n)
+            .expect("reconstruct_secret failed");
+
+        // Match the AVSS open_share convention used for fixed-point reveal.
+        let bigint = recovered.into_bigint();
+        let limbs = bigint.as_ref();
+        let revealed_scaled_value = limbs[0] as i64;
+        let revealed_value = revealed_scaled_value as f64 / scale;
+
+        assert!(
+            (revealed_value - clear_value).abs() > f64::EPSILON,
+            "PoC failed: value unexpectedly round-tripped. clear={}, revealed={}",
+            clear_value,
+            revealed_value
+        );
+    }
+
+    #[test]
     fn test_avss_input_share_reconstruction() {
         let n = 4;
         let t = 1;
