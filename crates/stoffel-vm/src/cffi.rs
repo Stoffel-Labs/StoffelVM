@@ -1757,6 +1757,9 @@ mod adkg_ffi {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use ark_bls12_381::G1Projective;
+        use ark_ec::PrimeGroup;
+        use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
         #[test]
         fn test_adkg_engine_new_null_network() {
@@ -1773,6 +1776,49 @@ mod adkg_ffi {
                 0,
             );
             assert!(engine.is_null());
+        }
+
+        #[test]
+        fn test_adkg_engine_new_valid_inputs_without_runtime_returns_null_poc() {
+            let n = 4usize;
+            let t = 1usize;
+
+            let net = Arc::new(QuicNetworkManager::new());
+            let network_ptr = Box::into_raw(Box::new(net.clone())) as *mut c_void;
+            assert!(!network_ptr.is_null(), "network pointer should be valid");
+
+            let pk_map: Vec<G1Projective> = (0..n).map(|_| G1Projective::generator()).collect();
+            let mut pk_bytes = Vec::new();
+            pk_map
+                .serialize_compressed(&mut pk_bytes)
+                .expect("serialize pk map");
+
+            let decoded_pk_map: Vec<G1Projective> =
+                Vec::<G1Projective>::deserialize_compressed(pk_bytes.as_slice())
+                    .expect("pk map should deserialize");
+            assert_eq!(decoded_pk_map.len(), n, "pk map length should match n");
+
+            // PoC: with valid inputs but no ambient Tokio runtime, creation currently fails.
+            let engine = adkg_engine_new(
+                42,
+                0,
+                n,
+                t,
+                network_ptr,
+                CAdkgCurveConfig::Bls12_381,
+                std::ptr::null(),
+                0,
+                pk_bytes.as_ptr(),
+                pk_bytes.len(),
+            );
+            assert!(
+                engine.is_null(),
+                "PoC expects null engine in non-Tokio host context"
+            );
+
+            unsafe {
+                let _ = Box::from_raw(network_ptr as *mut Arc<QuicNetworkManager>);
+            }
         }
 
         #[test]
