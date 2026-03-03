@@ -627,9 +627,7 @@ where
 
     #[inline]
     fn field_from_i64(value: i64) -> F {
-        // Keep signed encoding aligned with reveal/open decode paths
-        // (which read the low limb as an i64).
-        F::from(value as u64)
+        crate::net::curve::field_from_i64(value)
     }
 
     /// Convert a reconstructed field element to the appropriate [`Value`] for a given share type.
@@ -637,14 +635,10 @@ where
         let value = match ty {
             ShareType::SecretInt { .. } if ty.is_boolean() => Value::Bool(!secret.is_zero()),
             ShareType::SecretInt { .. } => {
-                let bigint = secret.into_bigint();
-                let limbs = bigint.as_ref();
-                Value::I64(limbs[0] as i64)
+                Value::I64(crate::net::curve::field_to_i64(secret))
             }
             ShareType::SecretFixedPoint { precision } => {
-                let bigint = secret.into_bigint();
-                let limbs = bigint.as_ref();
-                let scaled_value = limbs[0] as i64;
+                let scaled_value = crate::net::curve::field_to_i64(secret);
                 let f = precision.f();
                 let scale = (1u64 << f) as f64;
                 let float_value = scaled_value as f64 / scale;
@@ -1386,6 +1380,46 @@ mod tests {
                 (v.0 - clear).abs() < 1e-12,
                 "expected {}, got {}",
                 clear,
+                v.0
+            ),
+            other => panic!("expected Value::Float, got {:?}", other),
+        }
+    }
+
+    /// Verify that negative fixed-point values survive the full
+    /// encode → share → reconstruct → decode pipeline.
+    /// Regression test for the mismatch demonstrated in PR #31.
+    #[test]
+    fn test_avss_negative_fixed_point_share_reconstruct_roundtrip() {
+        let n = 4;
+        let t = 1;
+        let ty = ShareType::default_secret_fixed_point();
+        let precision = match ty {
+            ShareType::SecretFixedPoint { precision } => precision,
+            _ => unreachable!(),
+        };
+
+        let clear_value = -3.25_f64;
+        let scale = (1u64 << precision.f()) as f64;
+        let scaled_value = (clear_value * scale) as i64;
+
+        // Encode using the AVSS engine's field_from_i64 (now delegates to curve::field_from_i64).
+        let secret = Bls12381AvssMpcEngine::field_from_i64(scaled_value);
+
+        // Share and reconstruct
+        let shares = generate_feldman_shares(secret, n, t);
+        let subset: Vec<_> = shares.iter().take(t + 1).cloned().collect();
+        let recovered = Bls12381AvssMpcEngine::reconstruct_secret(&subset, n)
+            .expect("reconstruct_secret failed");
+
+        // Decode using field_to_value (now delegates to curve::field_to_i64).
+        let decoded = Bls12381AvssMpcEngine::field_to_value(ty, recovered).expect("decode value");
+
+        match decoded {
+            Value::Float(v) => assert!(
+                (v.0 - clear_value).abs() < 1e-12,
+                "negative fixed-point round-trip failed: expected {}, got {}",
+                clear_value,
                 v.0
             ),
             other => panic!("expected Value::Float, got {:?}", other),
