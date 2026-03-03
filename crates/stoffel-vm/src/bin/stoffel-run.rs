@@ -36,6 +36,9 @@ use alloy_primitives::{U256, Address, Signature, Bytes};
 use std::collections::HashMap;
 use dashmap::DashMap;
 use x509_parser::prelude::*;
+use stoffel_vm::core_types::Value;
+use stoffel_vm::core_types::ShareType;
+use stoffel_vm::vm_state::VMState;
 
 // Use a Tokio runtime for async operations
 #[tokio::main]
@@ -274,7 +277,19 @@ async fn main() {
         return;
     }
 
-    let mut coord = stoffel_mpc_coordinator::off_chain::OffChainCoordinator::start_rpc_client(&(coord_addr.clone().unwrap().0), coord_addr.clone().unwrap().1, timestamp.unwrap(), cert_der.clone().unwrap(), key_der.clone().unwrap()).await;
+    let n_outputs = 1;
+    let mut coord = stoffel_mpc_coordinator::off_chain::OffChainCoordinator::start_rpc_client(&(coord_addr.clone().unwrap().0), coord_addr.clone().unwrap().1, timestamp.unwrap(), threshold.unwrap() as u64, n_outputs, cert_der.clone().unwrap(), key_der.clone().unwrap()).await;
+    let mut input_ids: Option<Vec<Vec<u8>>> = None;
+
+    if !as_client {
+        input_ids = Some(expected_clients.iter().map(|s| {
+            let cert_der = fs::read(s).expect("failed to read certificate file");
+            let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
+                .expect("Failed to parse X.509 certificate DER");
+            parsed_cert.public_key()
+                .subject_public_key.data.as_ref().to_vec()
+        }).collect());
+    }
 
     // Client mode: connect to MPC servers and provide inputs
     if as_client {
@@ -343,7 +358,7 @@ async fn main() {
         //let sig = stoffel_mpc_coordinator::on_chain::generate_client_sig(base_nonce, indices[0], signer.clone()).await;
 
         let node_rpc_client = stoffel_mpc_coordinator::off_chain::node_rpc::NodeRPCClient::start_rpc_client(t, server_addrs.clone(), cert_der.unwrap(), key_der.unwrap()).await;
-        let mask = node_rpc_client.receive_mask_share().await;
+        let mask = node_rpc_client.receive_mask().await;
 
         coord.wait_for_input().await.unwrap();
 
@@ -352,6 +367,9 @@ async fn main() {
 
         coord.wait_for_mpc().await.unwrap();
         coord.wait_for_outputs().await.unwrap();
+
+        let outputs = coord.obtain_outputs().await.unwrap();
+        println!("outputs: {:?}", outputs);
 
         //// Create the MPC client
         //// Instance ID 0 is fine for client - it doesn't participate in the instance negotiation
@@ -872,6 +890,7 @@ async fn main() {
 
     // If in party mode, configure async HoneyBadger engine and preprocess
     if let Some(net) = net_opt.clone() {
+        let input_ids = input_ids.clone().unwrap();
         let my_id = party_id.unwrap_or(0usize);
         // Use session parameters (already agreed upon with bootnode)
         let n = session_n_parties.unwrap_or_else(|| net.parties().len());
@@ -884,15 +903,6 @@ async fn main() {
             "[party {}] Creating MPC engine: instance_id={}, n={}, t={}",
             my_id, instance_id, n, t
         );
-
-        // Parse expected client IDs (comma-separated)
-        let input_ids: Vec<Vec<u8>> = expected_clients.iter().map(|s| {
-            let cert_der = fs::read(s).expect("failed to read certificate file");
-            let (_remainder, parsed_cert) = X509Certificate::from_der(&cert_der)
-                .expect("Failed to parse X.509 certificate DER");
-            parsed_cert.public_key()
-                .subject_public_key.data.as_ref().to_vec()
-        }).collect();
 
         eprintln!(
             "[party {}] Expecting inputs from {} clients: {:?}",
@@ -1201,21 +1211,42 @@ async fn main() {
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
 
     // Execute entry function
-    match vm.execute(&agreed_entry) {
+    let result = match vm.execute(&agreed_entry) {
         Ok(result) => {
             println!("Program returned: {:?}", result);
+            result
         }
         Err(err) => {
             eprintln!("Execution error in '{}': {}", agreed_entry, err);
             exit(4);
         }
-    }
+    };
+
+    let output_share = match result {
+        Value::Share(ty, share_bytes) => {
+            assert!(matches!(ty, ShareType::SecretInt { .. }));
+            let secret = {
+                match VMState::secret_int_from_bytes(ty, &share_bytes) {
+                    Ok(secret) => { secret }
+                    Err(_) => { panic!(); }
+                }
+            };
+            secret.share().clone()
+        }
+        _ => { panic!(); }
+    };
+
 
     if as_leader {
         coord.trigger_outputs().await.unwrap();
     }
 
     coord.wait_for_outputs().await.unwrap();
+
+    // TODO: this sends to all clients; should be more specific
+    for cid in input_ids.unwrap().iter() {
+        coord.send_output_shares(cid.clone(), cid.clone(), vec![output_share.clone()]).await.unwrap();
+    }
 
     if as_leader {
         coord.finalize().await.unwrap();

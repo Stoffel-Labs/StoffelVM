@@ -2563,7 +2563,7 @@ impl VMState {
         Ok(encoded)
     }
 
-    fn secret_int_from_bytes(ty: ShareType, bytes: &[u8]) -> Result<SecretIntShare, String> {
+    pub fn secret_int_from_bytes(ty: ShareType, bytes: &[u8]) -> Result<SecretIntShare, String> {
         match ty {
             ShareType::SecretInt { bit_length } => {
                 let share = Self::decode_share_bytes(bytes)?;
