@@ -1617,7 +1617,7 @@ Flags:
   --bootstrap <addr:port> Bootnode address (party mode or client mode)
   --n-parties <usize>     Number of parties for MPC (required in party/leader/client mode)
   --threshold <usize>     Threshold t (default: 1)
-  --mpc-backend <name>    MPC backend: honeybadger (default) or adkg
+  --mpc-backend <name>    MPC backend: honeybadger (default) or avss
   --mpc-curve <name>      MPC curve: bls12-381 (default), bn254, curve25519, ed25519
   --inputs <values>       Comma-separated input values (client mode)
   --servers <addrs>       Comma-separated server addresses (client mode)

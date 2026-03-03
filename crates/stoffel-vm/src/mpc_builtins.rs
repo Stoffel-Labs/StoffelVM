@@ -420,14 +420,14 @@ fn register_mpc_info_builtins(vm: &mut VirtualMachine) {
 
     // Mpc.rand_int - Generate a random integer from a secure PRNG
     // Accepts bit_length: 8, 16, 32, or 64 — returns the corresponding unsigned int type
-    vm.register_foreign_function("Mpc.rand_int", |_ctx| {
+    vm.register_foreign_function("Mpc.rand_int", |ctx| {
         use rand::Rng;
-        if _ctx.args.is_empty() {
+        if ctx.args.is_empty() {
             return Err(
                 "Mpc.rand_int expects 1 argument: bit_length (8, 16, 32, or 64)".to_string(),
             );
         }
-        let bit_length = match &_ctx.args[0] {
+        let bit_length = match &ctx.args[0] {
             Value::I64(n) if *n > 0 => *n as usize,
             _ => return Err("bit_length must be a positive integer".to_string()),
         };
@@ -1481,7 +1481,11 @@ fn register_avss_builtins(vm: &mut VirtualMachine) {
             .object_store
             .create_array_with_capacity(commitment_bytes.len());
         {
-            let arr = ctx.vm_state.object_store.get_array_mut(arr_id).unwrap();
+            let arr = ctx
+                .vm_state
+                .object_store
+                .get_array_mut(arr_id)
+                .ok_or("failed to access commitment byte array")?;
             for (i, byte) in commitment_bytes.into_iter().enumerate() {
                 arr.set(Value::I64(i as i64), Value::U8(byte));
             }
@@ -1508,7 +1512,11 @@ fn register_avss_builtins(vm: &mut VirtualMachine) {
             .object_store
             .create_array_with_capacity(commitment_bytes.len());
         {
-            let arr = ctx.vm_state.object_store.get_array_mut(arr_id).unwrap();
+            let arr = ctx
+                .vm_state
+                .object_store
+                .get_array_mut(arr_id)
+                .ok_or("failed to access public key byte array")?;
             for (i, byte) in commitment_bytes.into_iter().enumerate() {
                 arr.set(Value::I64(i as i64), Value::U8(byte));
             }

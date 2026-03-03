@@ -191,7 +191,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                         match connection.receive().await {
                                             Ok(data) => {
                                                 let sender_id =
-                                                    connection.remote_party_id().unwrap_or(usize::MAX);
+                                                    connection.remote_party_id().unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
                                                 match crate::net::open_registry::try_handle_wire_message(
                                                     sender_id, &data,
                                                 ) {

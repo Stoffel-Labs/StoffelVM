@@ -1346,7 +1346,7 @@ mod hb_engine_tests {
 // ============================================================================
 
 #[cfg(feature = "avss")]
-mod adkg_ffi {
+mod avss_ffi {
     use super::*;
     use crate::net::avss_engine::{AvssMpcEngine, AvssOperations};
     use crate::net::mpc_engine::MpcEngine;

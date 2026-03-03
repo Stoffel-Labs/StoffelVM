@@ -17,6 +17,11 @@ use stoffel_vm_types::core_types::Value;
 /// Completed entries older than this are evicted on the next insertion.
 const EVICTION_AGE: Duration = Duration::from_secs(60);
 
+/// Sentinel value indicating the sender's party identity is unknown (e.g. an
+/// accepted inbound connection whose party ID has not been authenticated yet).
+/// When a sender ID equals this value, sender-validation checks are skipped.
+pub const UNKNOWN_SENDER_ID: usize = usize::MAX;
+
 // ---------------------------------------------------------------------------
 // Single-value open
 // ---------------------------------------------------------------------------
@@ -417,7 +422,7 @@ pub fn try_handle_wire_message(
             sender_party_id,
             share,
         } => {
-            if authenticated_sender_id != usize::MAX && sender_party_id != authenticated_sender_id {
+            if authenticated_sender_id != UNKNOWN_SENDER_ID && sender_party_id != authenticated_sender_id {
                 return Err(format!(
                     "open wire sender mismatch: transport={} payload={}",
                     authenticated_sender_id, sender_party_id
@@ -442,7 +447,7 @@ pub fn try_handle_wire_message(
             sender_party_id,
             shares,
         } => {
-            if authenticated_sender_id != usize::MAX && sender_party_id != authenticated_sender_id {
+            if authenticated_sender_id != UNKNOWN_SENDER_ID && sender_party_id != authenticated_sender_id {
                 return Err(format!(
                     "batch open wire sender mismatch: transport={} payload={}",
                     authenticated_sender_id, sender_party_id

@@ -106,7 +106,9 @@ pub(crate) fn try_handle_open_exp_wire_message(
     let message: ExpOpenWireMessage = bincode::deserialize(&payload[EXP_OPEN_WIRE_PREFIX.len()..])
         .map_err(|e| format!("deserialize open-exp payload: {}", e))?;
 
-    if authenticated_sender_id != usize::MAX && message.sender_party_id != authenticated_sender_id {
+    if authenticated_sender_id != crate::net::open_registry::UNKNOWN_SENDER_ID
+        && message.sender_party_id != authenticated_sender_id
+    {
         return Err(format!(
             "open-exp sender mismatch: transport={} payload={}",
             authenticated_sender_id, message.sender_party_id
@@ -816,7 +818,7 @@ where
         // Minimal support: ShareType::Int over Fr via direct embedding (u64 -> Fr).
         match (ty, clear) {
             (ShareType::SecretInt { .. }, Value::I64(v)) => {
-                let secret = F::from(*v as u64);
+                let secret = crate::net::curve::field_from_i64::<F>(*v);
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
@@ -917,7 +919,7 @@ where
                     shares.push(Self::decode_share(bytes)?);
                 }
 
-                tracing::info!(
+                tracing::debug!(
                     "open_share reconstruction: n={}, required={}, shares.len()={}",
                     n,
                     required,

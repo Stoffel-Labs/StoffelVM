@@ -190,7 +190,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                 // Spawn a task to handle this connection's messages
                                 let txx = tx.clone();
                                 let conn_node_id = node_id;
-                                let sender_id = connection.remote_party_id().unwrap_or(usize::MAX);
+                                let sender_id = connection.remote_party_id().unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
 
                                 info!("[HB-QUIC] Node {} spawning message handler for connection {}", conn_node_id, connection.remote_address());
                                 tokio::spawn(async move {
