@@ -38,6 +38,9 @@ use alloy::{
 use alloy_primitives::{U256, Address, Signature, Bytes};
 use std::collections::HashMap;
 use dashmap::DashMap;
+use stoffel_vm::core_types::Value;
+use stoffel_vm::core_types::ShareType;
+use stoffel_vm::vm_state::VMState;
 
 // Use a Tokio runtime for async operations
 #[tokio::main]
@@ -268,8 +271,20 @@ async fn main() {
     }
 
     let provider = stoffel_mpc_coordinator::on_chain::ws_connect(&eth_node_addr.unwrap(), &wallet_sk.clone().unwrap()).await;
-    let mut coord = stoffel_mpc_coordinator::on_chain::setup_coord(provider, contract_addr.unwrap()).await;
+    let mut coord = {
+        let key_der = if as_client { key_der.clone() } else { None };
+        stoffel_mpc_coordinator::on_chain::setup_coord(provider, contract_addr.unwrap(), threshold.unwrap() as u64, 1, key_der).await
+    };
     let signer = PrivateKeySigner::from_str(&wallet_sk.unwrap()).unwrap();
+
+    // Parse expected client IDs (comma-separated)
+    let input_ids: Option<Vec<_>> = if !as_client {
+        Some(expected_clients.iter().map(|s| {
+            Address::from_str(&s).expect("invalid node Ethereum address")
+        }).collect())
+    } else {
+        None
+    };
 
     // Client mode: connect to MPC servers and provide inputs
     if as_client {
@@ -336,7 +351,7 @@ async fn main() {
         let sig = stoffel_mpc_coordinator::on_chain::generate_client_sig(base_nonce, indices[0], signer.clone()).await;
 
         let node_rpc_client = stoffel_mpc_coordinator::on_chain::node_rpc::NodeRPCClient::start_rpc_client(t, server_addrs.clone(), cert_der.unwrap(), key_der.unwrap()).await;
-        let mask = node_rpc_client.receive_mask_share(sig.into(), signer.address()).await;
+        let mask = node_rpc_client.receive_mask(sig.into(), signer.address()).await;
 
         coord.wait_for_input().await.unwrap();
 
@@ -345,6 +360,9 @@ async fn main() {
 
         coord.wait_for_mpc().await.unwrap();
         coord.wait_for_outputs().await.unwrap();
+
+        let outputs = coord.obtain_outputs().await.unwrap();
+        println!("outputs: {:?}", outputs);
 
         //// Create the MPC client
         //// Instance ID 0 is fine for client - it doesn't participate in the instance negotiation
@@ -886,16 +904,11 @@ async fn main() {
             my_id, instance_id, n, t
         );
 
-        // Parse expected client IDs (comma-separated)
-        let input_ids: Vec<Address> = expected_clients.iter().map(|s| {
-            Address::from_str(&s).expect("invalid node Ethereum address")
-        }).collect();
-
         eprintln!(
             "[party {}] Expecting inputs from {} clients: {:?}",
             my_id,
-            input_ids.len(),
-            input_ids
+            input_ids.as_ref().unwrap().len(),
+            input_ids.as_ref().unwrap()
         );
 
         // Debug: print established connections
@@ -976,14 +989,14 @@ async fn main() {
         }
         eprintln!("[party {}] MPC preprocessing complete", my_id);
 
-        // TODO: input_ids.len() is used for the number of inputs here, will need sth more flexible
+        // TODO: input_ids.unwrap()len() is used for the number of inputs here, will need sth more flexible
         // once clients can have multiple inputs
 
         let mask_shares = match mpc_node
             .preprocessing_material
             .lock()
             .await
-            .take_random_shares(input_ids.len())
+            .take_random_shares(input_ids.clone().unwrap().len())
         {
             Ok(shares) => shares,
             Err(e) => {
@@ -993,7 +1006,7 @@ async fn main() {
         };
 
         // make shares available to MPC clients
-        for i in 0..input_ids.len() {
+        for i in 0..input_ids.as_ref().unwrap().len() {
             node_rpc.add_mask_share(i as u64, mask_shares[i].clone()).await;
         }
 
@@ -1002,13 +1015,13 @@ async fn main() {
         }
 
         coord.wait_for_input_mask_init().await.unwrap();
-        let client_to_index = coord.wait_for_indices(input_ids.len() as u64).await.unwrap();
+        let client_to_index = coord.wait_for_indices(input_ids.as_ref().unwrap().len() as u64).await.unwrap();
         for (c, i) in client_to_index {
             println!("NODE: client {:?} reserved index {}", c, i);
             node_rpc.add_reserved_index(c, i).await;
         }
 
-        for input_id in input_ids.iter() {
+        for input_id in input_ids.as_ref().unwrap().iter() {
             // TODO: a malicious client can make this stall forever. add a timeout!
             if coord.wait_for_client_auth(*input_id).await.unwrap() {
                 node_rpc.add_auth_status(*input_id, true).await;
@@ -1023,7 +1036,7 @@ async fn main() {
         }
 
         coord.wait_for_input().await.unwrap();
-        let client_inputs = coord.wait_for_inputs(input_ids.len() as u64, mask_shares).await.unwrap();
+        let client_inputs = coord.wait_for_inputs(input_ids.as_ref().unwrap().len() as u64, mask_shares).await.unwrap();
 
         for (cid, input_shares) in &client_inputs {
             assert_eq!(input_shares.len(), 1);
@@ -1191,16 +1204,32 @@ async fn main() {
 
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
 
-    // Execute entry function
-    match vm.execute(&agreed_entry) {
+     // Execute entry function
+    let result = match vm.execute(&agreed_entry) {
         Ok(result) => {
             println!("Program returned: {:?}", result);
+            result
         }
         Err(err) => {
             eprintln!("Execution error in '{}': {}", agreed_entry, err);
             exit(4);
         }
-    }
+    };
+
+    let output_share = match result {
+        Value::Share(ty, share_bytes) => {
+            assert!(matches!(ty, ShareType::SecretInt { .. }));
+            let secret = {
+                match VMState::secret_int_from_bytes(ty, &share_bytes) {
+                    Ok(secret) => { secret }
+                    Err(_) => { panic!(); }
+                }
+            };
+            secret.share().clone()
+        }
+        _ => { panic!(); }
+    };
+
 
     if as_leader {
         coord.trigger_outputs().await.unwrap();
@@ -1208,8 +1237,12 @@ async fn main() {
 
     coord.wait_for_outputs().await.unwrap();
 
-    if as_leader {
-        coord.finalize().await.unwrap();
+    let ids_and_addrs = node_rpc.ids_and_addrs().await;
+
+    // TODO: this sends to all clients; should be more specific
+    for client_addr in input_ids.as_ref().unwrap().iter() {
+        let id = &ids_and_addrs.iter().find(|(_, addr)| addr == client_addr).expect("client address not found in node RPC").0;
+        coord.send_output_shares(*client_addr, id.clone(), vec![output_share.clone()]).await.unwrap();
     }
 }
 
