@@ -634,9 +634,7 @@ where
     fn field_to_value(ty: ShareType, secret: F) -> Result<Value, String> {
         let value = match ty {
             ShareType::SecretInt { .. } if ty.is_boolean() => Value::Bool(!secret.is_zero()),
-            ShareType::SecretInt { .. } => {
-                Value::I64(crate::net::curve::field_to_i64(secret))
-            }
+            ShareType::SecretInt { .. } => Value::I64(crate::net::curve::field_to_i64(secret)),
             ShareType::SecretFixedPoint { precision } => {
                 let scaled_value = crate::net::curve::field_to_i64(secret);
                 let f = precision.f();

@@ -422,7 +422,9 @@ pub fn try_handle_wire_message(
             sender_party_id,
             share,
         } => {
-            if authenticated_sender_id != UNKNOWN_SENDER_ID && sender_party_id != authenticated_sender_id {
+            if authenticated_sender_id != UNKNOWN_SENDER_ID
+                && sender_party_id != authenticated_sender_id
+            {
                 return Err(format!(
                     "open wire sender mismatch: transport={} payload={}",
                     authenticated_sender_id, sender_party_id
@@ -447,7 +449,9 @@ pub fn try_handle_wire_message(
             sender_party_id,
             shares,
         } => {
-            if authenticated_sender_id != UNKNOWN_SENDER_ID && sender_party_id != authenticated_sender_id {
+            if authenticated_sender_id != UNKNOWN_SENDER_ID
+                && sender_party_id != authenticated_sender_id
+            {
                 return Err(format!(
                     "batch open wire sender mismatch: transport={} payload={}",
                     authenticated_sender_id, sender_party_id

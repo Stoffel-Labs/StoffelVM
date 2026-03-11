@@ -1626,6 +1626,10 @@ Flags:
                           (HoneyBadger only; ALPN handles routing, this controls coordination)
   -h, --help              Show this help
 
+Required environment:
+  STOFFEL_AUTH_TOKEN      Shared secret required by bootnode and all parties for
+                          authenticated discovery registration
+
 Multi-Party Execution:
   In party mode, all parties register with the bootnode and wait until
   all n-parties have joined. The bootnode then broadcasts a session with
@@ -1642,20 +1646,28 @@ Examples:
 
   # Multi-party execution (5 parties, threshold 1) - Leader mode (recommended)
   # Terminal 1: Leader (bootnode + party 0)
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --leader --bind 127.0.0.1:9000 --n-parties 5 --threshold 1
 
   # Terminals 2-5: Other parties
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --threshold 1
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 2 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9003 --n-parties 5 --threshold 1
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 3 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9004 --n-parties 5 --threshold 1
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 4 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9005 --n-parties 5 --threshold 1
 
   # Alternative: Separate bootnode (6 processes total)
   # Terminal 1: Bootnode only
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run --bootnode --bind 127.0.0.1:9000 --n-parties 5
 
   # Terminals 2-6: All parties
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 0 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9001 --n-parties 5 --threshold 1
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --threshold 1
   # ... etc
 

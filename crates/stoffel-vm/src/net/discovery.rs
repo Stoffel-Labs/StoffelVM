@@ -60,6 +60,8 @@ pub enum DiscoveryMessage {
     Register {
         party_id: PartyId,
         listen_addr: SocketAddr,
+        /// Optional shared secret for registration authentication
+        auth_token: Option<String>,
     },
     /// Register with session info - used when party wants to join a specific session
     RegisterWithSession {
@@ -71,6 +73,8 @@ pub enum DiscoveryMessage {
         threshold: usize,
         /// Optional program bytes - first party to provide these becomes the source
         program_bytes: Option<Vec<u8>>,
+        /// Optional shared secret for registration authentication
+        auth_token: Option<String>,
     },
     /// Request to fetch program bytes from bootnode
     ProgramFetchRequest {
@@ -121,6 +125,28 @@ struct PendingSession {
     nonce: u64,
 }
 
+fn discovery_auth_token_from_env() -> Option<String> {
+    std::env::var("STOFFEL_AUTH_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn required_discovery_auth_token(context: &str) -> Result<String, String> {
+    discovery_auth_token_from_env()
+        .ok_or_else(|| format!("STOFFEL_AUTH_TOKEN must be set for {}", context))
+}
+
+fn registration_token_is_valid(
+    required_auth_token: Option<&str>,
+    message_auth_token: Option<&str>,
+) -> bool {
+    match required_auth_token {
+        Some(expected) => message_auth_token == Some(expected),
+        None => true,
+    }
+}
+
 /// Bootnode: accepts party registrations and shares membership updates.
 /// Supports session-aware registration where parties specify the program they want to run.
 /// When enough parties register for the same session, bootnode broadcasts SessionAnnounce.
@@ -134,6 +160,16 @@ pub async fn run_bootnode(bind: SocketAddr) -> Result<(), String> {
 pub async fn run_bootnode_with_config(
     bind: SocketAddr,
     expected_parties: Option<usize>,
+) -> Result<(), String> {
+    let required_auth_token = required_discovery_auth_token("bootnode discovery registration")?;
+    eprintln!("[bootnode] Discovery registration authentication enabled");
+    run_bootnode_with_config_and_auth(bind, expected_parties, Some(required_auth_token)).await
+}
+
+async fn run_bootnode_with_config_and_auth(
+    bind: SocketAddr,
+    expected_parties: Option<usize>,
+    required_auth_token: Option<String>,
 ) -> Result<(), String> {
     let mut net = QuicNetworkManager::new();
     net.listen(bind).await?;
@@ -165,6 +201,7 @@ pub async fn run_bootnode_with_config(
         let mut session_rx = session_tx.subscribe();
         let ice_tx = ice_tx.clone();
         let mut ice_rx = ice_tx.subscribe();
+        let required_auth_token = required_auth_token.clone();
 
         tokio::spawn(async move {
             // Track if this connection registered for a session
@@ -216,7 +253,19 @@ pub async fn run_bootnode_with_config(
                                 DiscoveryMessage::Register {
                                     party_id,
                                     listen_addr,
+                                    auth_token: message_auth_token,
                                 } => {
+                                    if !registration_token_is_valid(
+                                        required_auth_token.as_deref(),
+                                        message_auth_token.as_deref(),
+                                    ) {
+                                        eprintln!(
+                                            "[bootnode] Rejected Register from party {} (invalid auth token)",
+                                            party_id
+                                        );
+                                        continue;
+                                    }
+
                                     // Track this connection's party_id for ICE relay
                                     my_party_id = Some(party_id);
 
@@ -250,7 +299,20 @@ pub async fn run_bootnode_with_config(
                                     n_parties,
                                     threshold,
                                     program_bytes,
+                                    auth_token: message_auth_token,
                                 } => {
+                                    if !registration_token_is_valid(
+                                        required_auth_token.as_deref(),
+                                        message_auth_token.as_deref(),
+                                    ) {
+                                        eprintln!(
+                                            "[bootnode] Rejected RegisterWithSession from party {} (invalid auth token)",
+                                            party_id
+                                        );
+                                        waiting_for_session = false;
+                                        continue;
+                                    }
+
                                     // Track this connection's party_id for ICE relay
                                     my_party_id = Some(party_id);
 
@@ -505,6 +567,7 @@ pub async fn bootstrap_with_bootnode(
     my_listen: SocketAddr,
 ) -> Result<(), String> {
     let bn_conn = net.connect(bootnode).await?;
+    let auth_token = required_discovery_auth_token("party discovery registration")?;
 
     // Register
     send_ctrl(
@@ -512,6 +575,7 @@ pub async fn bootstrap_with_bootnode(
         &DiscoveryMessage::Register {
             party_id: my_party_id,
             listen_addr: my_listen,
+            auth_token: Some(auth_token),
         },
     )
     .await?;
@@ -932,6 +996,7 @@ pub async fn register_and_wait_for_session_with_program(
     program_bytes: Option<Vec<u8>>,
 ) -> Result<SessionInfo, String> {
     let bn_conn = net.connect(bootnode).await?;
+    let auth_token = required_discovery_auth_token("session discovery registration")?;
 
     eprintln!(
         "[party {}] Registering with bootnode for session (program: {}, n={}, t={}, uploading={})",
@@ -951,6 +1016,7 @@ pub async fn register_and_wait_for_session_with_program(
         n_parties,
         threshold,
         program_bytes,
+        auth_token: Some(auth_token),
     };
     send_ctrl(&*bn_conn, &reg_msg).await?;
 
@@ -1179,5 +1245,306 @@ pub async fn register_and_wait_for_session_with_program(
                 continue;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        collections::HashMap,
+        net::{Ipv4Addr, SocketAddrV4, UdpSocket},
+        sync::Once,
+    };
+    use tokio::time::{sleep, timeout};
+
+    static INIT: Once = Once::new();
+
+    fn init_crypto_provider() {
+        INIT.call_once(|| {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("install rustls crypto provider");
+        });
+    }
+
+    fn reserve_local_addr() -> SocketAddr {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind UDP socket on localhost");
+        socket.local_addr().expect("get local socket address")
+    }
+
+    async fn recv_peer_list(conn: &dyn PeerConnection) -> Vec<(PartyId, SocketAddr)> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let now = tokio::time::Instant::now();
+            assert!(now < deadline, "timed out waiting for PeerList");
+            let remaining = deadline.duration_since(now);
+            let buf = timeout(remaining, conn.receive())
+                .await
+                .expect("timed out waiting for discovery response")
+                .expect("receive discovery response");
+            match bincode::deserialize::<DiscoveryMessage>(&buf)
+                .expect("deserialize discovery response")
+            {
+                DiscoveryMessage::PeerList { peers } => return peers,
+                _ => continue,
+            }
+        }
+    }
+
+    async fn recv_session_announce(conn: &dyn PeerConnection) -> SessionInfo {
+        let buf = timeout(Duration::from_secs(3), conn.receive())
+            .await
+            .expect("timed out waiting for session announcement")
+            .expect("receive session announcement");
+        match bincode::deserialize::<SessionMessage>(&buf).expect("deserialize session message") {
+            SessionMessage::SessionAnnounce(info) => info,
+            other => panic!("expected SessionAnnounce, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_register_can_overwrite_existing_party_entry() {
+        init_crypto_provider();
+        let bootnode_addr = reserve_local_addr();
+        let bootnode = tokio::spawn(run_bootnode_with_config_and_auth(bootnode_addr, None, None));
+        sleep(Duration::from_millis(100)).await;
+
+        let party_id = 7usize;
+        let honest_addr = reserve_local_addr();
+        let attacker_addr = reserve_local_addr();
+
+        let mut honest_net = QuicNetworkManager::new();
+        let honest_conn = honest_net
+            .connect(bootnode_addr)
+            .await
+            .expect("honest party connects to bootnode");
+        send_ctrl(
+            &*honest_conn,
+            &DiscoveryMessage::Register {
+                party_id,
+                listen_addr: honest_addr,
+                auth_token: None,
+            },
+        )
+        .await
+        .expect("honest registration succeeds");
+        let _ = recv_peer_list(&*honest_conn).await;
+
+        let mut attacker_net = QuicNetworkManager::new();
+        let attacker_conn = attacker_net
+            .connect(bootnode_addr)
+            .await
+            .expect("attacker connects to bootnode");
+        send_ctrl(
+            &*attacker_conn,
+            &DiscoveryMessage::Register {
+                party_id,
+                listen_addr: attacker_addr,
+                auth_token: None,
+            },
+        )
+        .await
+        .expect("attacker registration succeeds");
+        let _ = recv_peer_list(&*attacker_conn).await;
+
+        send_ctrl(&*honest_conn, &DiscoveryMessage::RequestPeers)
+            .await
+            .expect("request peers");
+        let peers = recv_peer_list(&*honest_conn).await;
+
+        let mapped_addr = peers
+            .iter()
+            .find(|(pid, _)| *pid == party_id)
+            .map(|(_, addr)| *addr);
+        assert_eq!(
+            mapped_addr,
+            Some(attacker_addr),
+            "without authentication, a second registration can overwrite an existing party entry"
+        );
+
+        bootnode.abort();
+        let _ = bootnode.await;
+    }
+
+    #[tokio::test]
+    async fn invalid_register_auth_token_cannot_overwrite_party_entry() {
+        init_crypto_provider();
+        let bootnode_addr = reserve_local_addr();
+        let auth_token = "shared-secret".to_string();
+        let bootnode = tokio::spawn(run_bootnode_with_config_and_auth(
+            bootnode_addr,
+            None,
+            Some(auth_token.clone()),
+        ));
+        sleep(Duration::from_millis(100)).await;
+
+        let party_id = 11usize;
+        let honest_addr = reserve_local_addr();
+        let attacker_addr = reserve_local_addr();
+
+        let mut honest_net = QuicNetworkManager::new();
+        let honest_conn = honest_net
+            .connect(bootnode_addr)
+            .await
+            .expect("honest party connects to bootnode");
+        send_ctrl(
+            &*honest_conn,
+            &DiscoveryMessage::Register {
+                party_id,
+                listen_addr: honest_addr,
+                auth_token: Some(auth_token.clone()),
+            },
+        )
+        .await
+        .expect("honest registration succeeds");
+        let _ = recv_peer_list(&*honest_conn).await;
+
+        let mut attacker_net = QuicNetworkManager::new();
+        let attacker_conn = attacker_net
+            .connect(bootnode_addr)
+            .await
+            .expect("attacker connects to bootnode");
+        send_ctrl(
+            &*attacker_conn,
+            &DiscoveryMessage::Register {
+                party_id,
+                listen_addr: attacker_addr,
+                auth_token: Some("bad-token".to_string()),
+            },
+        )
+        .await
+        .expect("attacker message is delivered");
+
+        // Allow bootnode task to process and reject attacker registration.
+        sleep(Duration::from_millis(100)).await;
+
+        send_ctrl(&*honest_conn, &DiscoveryMessage::RequestPeers)
+            .await
+            .expect("request peers");
+        let peers = recv_peer_list(&*honest_conn).await;
+
+        let mapped_addr = peers
+            .iter()
+            .find(|(pid, _)| *pid == party_id)
+            .map(|(_, addr)| *addr);
+        assert_eq!(
+            mapped_addr,
+            Some(honest_addr),
+            "invalid auth token must not overwrite existing party mapping"
+        );
+
+        bootnode.abort();
+        let _ = bootnode.await;
+    }
+
+    #[tokio::test]
+    async fn invalid_session_register_auth_token_cannot_poison_session_parties() {
+        init_crypto_provider();
+        let bootnode_addr = reserve_local_addr();
+        let auth_token = "session-secret".to_string();
+        let bootnode = tokio::spawn(run_bootnode_with_config_and_auth(
+            bootnode_addr,
+            Some(2),
+            Some(auth_token.clone()),
+        ));
+        sleep(Duration::from_millis(100)).await;
+
+        let program_id = [9u8; 32];
+        let entry = "main".to_string();
+        let honest_party0_addr = reserve_local_addr();
+        let honest_party1_addr = reserve_local_addr();
+        let attacker_addr = reserve_local_addr();
+
+        let mut party0_net = QuicNetworkManager::new();
+        let party0_conn = party0_net
+            .connect(bootnode_addr)
+            .await
+            .expect("party0 connects to bootnode");
+        send_ctrl(
+            &*party0_conn,
+            &DiscoveryMessage::RegisterWithSession {
+                party_id: 0,
+                listen_addr: honest_party0_addr,
+                program_id,
+                entry: entry.clone(),
+                n_parties: 2,
+                threshold: 1,
+                program_bytes: None,
+                auth_token: Some(auth_token.clone()),
+            },
+        )
+        .await
+        .expect("party0 registration succeeds");
+
+        let mut attacker_net = QuicNetworkManager::new();
+        let attacker_conn = attacker_net
+            .connect(bootnode_addr)
+            .await
+            .expect("attacker connects to bootnode");
+        send_ctrl(
+            &*attacker_conn,
+            &DiscoveryMessage::RegisterWithSession {
+                party_id: 0,
+                listen_addr: attacker_addr,
+                program_id,
+                entry: entry.clone(),
+                n_parties: 2,
+                threshold: 1,
+                program_bytes: None,
+                auth_token: Some("bad-token".to_string()),
+            },
+        )
+        .await
+        .expect("attacker registration message is delivered");
+
+        let mut party1_net = QuicNetworkManager::new();
+        let party1_conn = party1_net
+            .connect(bootnode_addr)
+            .await
+            .expect("party1 connects to bootnode");
+        send_ctrl(
+            &*party1_conn,
+            &DiscoveryMessage::RegisterWithSession {
+                party_id: 1,
+                listen_addr: honest_party1_addr,
+                program_id,
+                entry,
+                n_parties: 2,
+                threshold: 1,
+                program_bytes: None,
+                auth_token: Some(auth_token),
+            },
+        )
+        .await
+        .expect("party1 registration succeeds");
+
+        let party0_info = recv_session_announce(&*party0_conn).await;
+        let party1_info = recv_session_announce(&*party1_conn).await;
+
+        let party_map: HashMap<PartyId, SocketAddr> = party0_info.parties.iter().copied().collect();
+        assert_eq!(
+            party_map.get(&0),
+            Some(&honest_party0_addr),
+            "session should keep the authentic address for party 0"
+        );
+        assert_eq!(
+            party_map.get(&1),
+            Some(&honest_party1_addr),
+            "session should include party 1's authentic address"
+        );
+        assert!(
+            !party_map.values().any(|addr| *addr == attacker_addr),
+            "session party list must exclude attacker-controlled address"
+        );
+        assert_eq!(
+            party1_info.parties.len(),
+            2,
+            "all parties should observe the same two-party session"
+        );
+
+        bootnode.abort();
+        let _ = bootnode.await;
     }
 }

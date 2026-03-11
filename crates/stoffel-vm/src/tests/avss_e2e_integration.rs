@@ -283,7 +283,9 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
             loop {
                 match acceptor.accept().await {
                     Ok(connection) => {
-                        let sender_id = connection.remote_party_id().unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
+                        let sender_id = connection
+                            .remote_party_id()
+                            .unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
                         info!(
                             "[AVSS] Node {} accepted connection from {}",
                             node_id,

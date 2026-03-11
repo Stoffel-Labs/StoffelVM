@@ -115,6 +115,13 @@ pub(crate) fn try_handle_open_exp_wire_message(
         ));
     }
 
+    if message.share_id != message.sender_party_id {
+        return Err(format!(
+            "open-exp share_id mismatch: sender_party_id={} share_id={}",
+            message.sender_party_id, message.share_id
+        ));
+    }
+
     insert_remote_exp_partial(
         message.instance_id,
         message.sender_party_id,
@@ -1648,6 +1655,25 @@ mod tests {
         .expect("engine construction should succeed")
     }
 
+    fn open_exp_test_payload(
+        instance_id: u64,
+        sender_party_id: usize,
+        share_id: usize,
+        partial_point: Vec<u8>,
+    ) -> Vec<u8> {
+        let payload = ExpOpenWireMessage {
+            instance_id,
+            sender_party_id,
+            share_id,
+            partial_point,
+        };
+        let encoded = bincode::serialize(&payload).expect("serialize test payload");
+        let mut wire = Vec::with_capacity(EXP_OPEN_WIRE_PREFIX.len() + encoded.len());
+        wire.extend_from_slice(EXP_OPEN_WIRE_PREFIX);
+        wire.extend_from_slice(&encoded);
+        wire
+    }
+
     #[test]
     fn aba_same_round_uses_shared_session_and_converges() {
         let instance_id = next_instance_id();
@@ -1697,5 +1723,42 @@ mod tests {
             second, b"second",
             "second receive should return second broadcast"
         );
+    }
+
+    #[test]
+    fn open_exp_wire_rejects_mismatched_share_id() {
+        clear_exp_registry();
+        let instance_id = next_instance_id();
+        let payload = open_exp_test_payload(instance_id, 1, 0, vec![1, 2, 3, 4]);
+
+        let err = try_handle_open_exp_wire_message(1, &payload)
+            .expect_err("mismatched share_id must be rejected");
+        assert!(
+            err.contains("open-exp share_id mismatch"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            !EXP_REGISTRY.lock().contains_key(&(instance_id, 0)),
+            "rejected payload must not be inserted into the registry"
+        );
+    }
+
+    #[test]
+    fn open_exp_wire_accepts_matching_share_id() {
+        clear_exp_registry();
+        let instance_id = next_instance_id();
+        let payload = open_exp_test_payload(instance_id, 1, 1, vec![9, 8, 7, 6]);
+
+        let handled =
+            try_handle_open_exp_wire_message(1, &payload).expect("matching sender/share is valid");
+        assert!(handled, "open-exp prefix payload must be handled");
+
+        let reg = EXP_REGISTRY.lock();
+        let entry = reg
+            .get(&(instance_id, 0))
+            .expect("entry should be inserted for valid payload");
+        assert_eq!(entry.party_ids, vec![1]);
+        assert_eq!(entry.partial_points, vec![(1, vec![9, 8, 7, 6])]);
     }
 }

@@ -16,6 +16,12 @@ validate_env() {
         echo "Use STOFFEL_EXPECTED_CLIENT_COUNT instead."
         exit 2
     fi
+
+    if [ "${STOFFEL_ROLE}" != "client" ] && [ -z "${STOFFEL_AUTH_TOKEN:-}" ]; then
+        echo "ERROR: STOFFEL_AUTH_TOKEN must be set for ${STOFFEL_ROLE} mode."
+        echo "Bootnode and parties require authenticated discovery registration."
+        exit 2
+    fi
 }
 
 validate_env
@@ -39,6 +45,7 @@ echo "Program: ${STOFFEL_PROGRAM}"
 echo "Entry: ${STOFFEL_ENTRY}"
 echo "NAT Enabled: ${STOFFEL_ENABLE_NAT:-false}"
 echo "STUN Servers: ${STOFFEL_STUN_SERVERS:-N/A}"
+echo "Auth Token: $( [ -n "${STOFFEL_AUTH_TOKEN:-}" ] && echo "configured" || echo "not set" )"
 echo "=========================================="
 
 # Wait for a host:port to be available (UDP check for QUIC)

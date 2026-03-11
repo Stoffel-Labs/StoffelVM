@@ -30,6 +30,7 @@ services:
     hostname: party0
     environment:
       - STOFFEL_ROLE=leader
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=0
       - STOFFEL_BIND_ADDR=172.28.0.10:9000
       - STOFFEL_N_PARTIES=5
@@ -65,6 +66,7 @@ services:
     hostname: party1
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=1
       - STOFFEL_BIND_ADDR=172.28.0.11:9001
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
@@ -96,6 +98,7 @@ services:
     hostname: party2
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=2
       - STOFFEL_BIND_ADDR=172.28.0.12:9002
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
@@ -127,6 +130,7 @@ services:
     hostname: party3
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=3
       - STOFFEL_BIND_ADDR=172.28.0.13:9003
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
@@ -158,6 +162,7 @@ services:
     hostname: party4
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=4
       - STOFFEL_BIND_ADDR=172.28.0.14:9004
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
