@@ -396,7 +396,8 @@ fn register_mpc_info_builtins(vm: &mut VirtualMachine) {
         Ok(Value::I64(engine.instance_id() as i64))
     });
 
-    // Mpc.rand - Generate random bytes from a secure PRNG (32 bytes / 256 bits)
+    // Mpc.rand - Generate 32 cryptographically random bytes (local, not MPC)
+    // Note: rand 0.9 ThreadRng is backed by OsRng-seeded ChaCha (CSPRNG).
     vm.register_foreign_function("Mpc.rand", |ctx| {
         use rand::RngCore;
         let mut bytes = vec![0u8; 32];
@@ -418,8 +419,9 @@ fn register_mpc_info_builtins(vm: &mut VirtualMachine) {
         Ok(Value::Array(arr_id))
     });
 
-    // Mpc.rand_int - Generate a random integer from a secure PRNG
+    // Mpc.rand_int - Generate a cryptographically random integer (local, not MPC)
     // Accepts bit_length: 8, 16, 32, or 64 — returns the corresponding unsigned int type
+    // Note: rand 0.9 ThreadRng is backed by OsRng-seeded ChaCha (CSPRNG).
     vm.register_foreign_function("Mpc.rand_int", |ctx| {
         use rand::Rng;
         if ctx.args.is_empty() {
@@ -1486,37 +1488,6 @@ fn register_avss_builtins(vm: &mut VirtualMachine) {
                 .object_store
                 .get_array_mut(arr_id)
                 .ok_or("failed to access commitment byte array")?;
-            for (i, byte) in commitment_bytes.into_iter().enumerate() {
-                arr.set(Value::I64(i as i64), Value::U8(byte));
-            }
-        }
-        Ok(Value::Array(arr_id))
-    });
-
-    // Avss.get_public_key - Get the public key (commitment[0]) from AVSS share
-    vm.register_foreign_function("Avss.get_public_key", |ctx| {
-        if ctx.args.is_empty() {
-            return Err("Avss.get_public_key expects 1 argument: avss_share".to_string());
-        }
-
-        if !avss_object::is_avss_share_object(&ctx.vm_state.object_store, &ctx.args[0]) {
-            return Err("Argument must be an AVSS share object".to_string());
-        }
-
-        // commitment[0] is the public key
-        let commitment_bytes =
-            avss_object::get_commitment(&ctx.vm_state.object_store, &ctx.args[0], 0)?;
-
-        let arr_id = ctx
-            .vm_state
-            .object_store
-            .create_array_with_capacity(commitment_bytes.len());
-        {
-            let arr = ctx
-                .vm_state
-                .object_store
-                .get_array_mut(arr_id)
-                .ok_or("failed to access public key byte array")?;
             for (i, byte) in commitment_bytes.into_iter().enumerate() {
                 arr.set(Value::I64(i as i64), Value::U8(byte));
             }

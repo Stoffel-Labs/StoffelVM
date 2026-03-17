@@ -928,10 +928,8 @@ pub trait AvssOperations {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send + '_>>;
 
     /// Get commitment at index for a stored share (synchronous).
+    /// Index 0 is the public key.
     fn avss_get_commitment(&self, key_name: &str, index: usize) -> Result<Vec<u8>, String>;
-
-    /// Get the public key (commitment[0]) for a stored share.
-    fn avss_get_public_key(&self, key_name: &str) -> Result<Vec<u8>, String>;
 }
 
 impl<F, G> AvssOperations for AvssMpcEngine<F, G>
@@ -996,9 +994,6 @@ where
         }
     }
 
-    fn avss_get_public_key(&self, key_name: &str) -> Result<Vec<u8>, String> {
-        self.avss_get_commitment(key_name, 0)
-    }
 }
 
 // ============================================================================

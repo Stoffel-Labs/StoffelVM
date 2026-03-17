@@ -1684,15 +1684,6 @@ mod avss_ffi {
         &*(ptr as *const AvssFfiWrapper)
     }
 
-    unsafe fn write_boxed_result_bytes(
-        bytes: Vec<u8>,
-        result_ptr: *mut *mut u8,
-        result_len_ptr: *mut usize,
-    ) {
-        // Delegate to the shared helper at module scope.
-        write_ffi_result_bytes(bytes, result_ptr, result_len_ptr);
-    }
-
     /// Generates a new distributed share under the given key name
     ///
     /// Returns serialized share bytes via out parameters on success.
@@ -1724,7 +1715,7 @@ mod avss_ffi {
         match block_on_avss(async move { avss_ops.avss_generate_share(key_name_str).await }) {
             Ok(share_bytes) => {
                 unsafe {
-                    write_boxed_result_bytes(share_bytes, result_ptr, result_len_ptr);
+                    write_ffi_result_bytes(share_bytes, result_ptr, result_len_ptr);
                 }
                 AdkgEngineErrorCode::Success
             }
@@ -1758,10 +1749,10 @@ mod avss_ffi {
             Err(_) => return AdkgEngineErrorCode::SerializationError,
         };
 
-        match wrapper.avss_ops.avss_get_public_key(key_name_str) {
+        match wrapper.avss_ops.avss_get_commitment(key_name_str, 0) {
             Ok(bytes) => {
                 unsafe {
-                    write_boxed_result_bytes(bytes, result_ptr, result_len_ptr);
+                    write_ffi_result_bytes(bytes, result_ptr, result_len_ptr);
                 }
                 AdkgEngineErrorCode::Success
             }
@@ -1799,7 +1790,7 @@ mod avss_ffi {
         match wrapper.avss_ops.avss_get_commitment(key_name_str, index) {
             Ok(bytes) => {
                 unsafe {
-                    write_boxed_result_bytes(bytes, result_ptr, result_len_ptr);
+                    write_ffi_result_bytes(bytes, result_ptr, result_len_ptr);
                 }
                 AdkgEngineErrorCode::Success
             }

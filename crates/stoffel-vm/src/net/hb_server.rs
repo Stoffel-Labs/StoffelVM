@@ -406,12 +406,12 @@ pub async fn spawn_receive_loops(
             for (derived_id, connection) in scan_net.get_all_server_connections() {
                 let sender_id = connection.remote_party_id().unwrap_or(derived_id);
                 if sender_id >= n_parties {
-                    eprintln!(
-                        "[party {}] Skipping non-party server connection {} (sender_id={}, n_parties={})",
-                        node_id,
+                    tracing::debug!(
+                        party_id = node_id,
                         derived_id,
                         sender_id,
-                        n_parties
+                        n_parties,
+                        "Skipping non-party server connection"
                     );
                     continue;
                 }
@@ -421,10 +421,12 @@ pub async fn spawn_receive_loops(
                 }
 
                 let txx = scan_tx.clone();
-                let conn_node_id = node_id;
-                eprintln!(
-                    "[party {}] Spawning receive loop for server connection {} (sender_id={})",
-                    conn_node_id, derived_id, sender_id
+                let local_party_id = node_id;
+                tracing::info!(
+                    party_id = local_party_id,
+                    derived_id,
+                    sender_id,
+                    "Spawning receive loop for server connection"
                 );
 
                 tokio::spawn(async move {
@@ -436,9 +438,11 @@ pub async fn spawn_receive_loops(
                                 ) {
                                     Ok(true) => continue,
                                     Err(e) => {
-                                        eprintln!(
-                                            "[party {}] Failed to handle open wire message from {}: {}",
-                                            conn_node_id, sender_id, e
+                                        tracing::warn!(
+                                            party_id = local_party_id,
+                                            sender_id,
+                                            error = %e,
+                                            "Failed to handle open wire message"
                                         );
                                         continue;
                                     }
@@ -450,9 +454,11 @@ pub async fn spawn_receive_loops(
                                 ) {
                                     Ok(true) => continue,
                                     Err(e) => {
-                                        eprintln!(
-                                            "[party {}] Failed to handle open_exp wire message from {}: {}",
-                                            conn_node_id, sender_id, e
+                                        tracing::warn!(
+                                            party_id = local_party_id,
+                                            sender_id,
+                                            error = %e,
+                                            "Failed to handle open_exp wire message"
                                         );
                                         continue;
                                     }
@@ -460,17 +466,21 @@ pub async fn spawn_receive_loops(
                                 }
 
                                 if let Err(e) = txx.send((sender_id, data)).await {
-                                    eprintln!(
-                                        "[party {}] Failed to forward server message from {}: {:?}",
-                                        conn_node_id, sender_id, e
+                                    tracing::warn!(
+                                        party_id = local_party_id,
+                                        sender_id,
+                                        error = ?e,
+                                        "Failed to forward server message"
                                     );
                                     break;
                                 }
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "[party {}] Server connection {} closed: {}",
-                                    conn_node_id, sender_id, e
+                                tracing::info!(
+                                    party_id = local_party_id,
+                                    sender_id,
+                                    error = %e,
+                                    "Server connection closed"
                                 );
                                 break;
                             }
@@ -486,10 +496,11 @@ pub async fn spawn_receive_loops(
                 }
 
                 let txx = scan_tx.clone();
-                let conn_node_id = node_id;
-                eprintln!(
-                    "[party {}] Spawning receive loop for client connection {}",
-                    conn_node_id, client_id
+                let local_party_id = node_id;
+                tracing::info!(
+                    party_id = local_party_id,
+                    client_id,
+                    "Spawning receive loop for client connection"
                 );
 
                 tokio::spawn(async move {
@@ -497,17 +508,21 @@ pub async fn spawn_receive_loops(
                         match connection.receive().await {
                             Ok(data) => {
                                 if let Err(e) = txx.send((client_id, data)).await {
-                                    eprintln!(
-                                        "[party {}] Failed to forward client message from {}: {:?}",
-                                        conn_node_id, client_id, e
+                                    tracing::warn!(
+                                        party_id = local_party_id,
+                                        client_id,
+                                        error = ?e,
+                                        "Failed to forward client message"
                                     );
                                     break;
                                 }
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "[party {}] Client connection {} closed: {}",
-                                    conn_node_id, client_id, e
+                                tracing::info!(
+                                    party_id = local_party_id,
+                                    client_id,
+                                    error = %e,
+                                    "Client connection closed"
                                 );
                                 break;
                             }

@@ -97,10 +97,18 @@ impl ClientInputStore {
     {
         let share_bytes = self.get_client_input_bytes(client_id)?;
         let mut shares = Vec::with_capacity(share_bytes.len());
-        for bytes in share_bytes {
+        for (i, bytes) in share_bytes.iter().enumerate() {
             match RobustShare::<F>::deserialize_compressed(bytes.as_slice()) {
                 Ok(share) => shares.push(share),
-                Err(_) => return None,
+                Err(e) => {
+                    tracing::warn!(
+                        client_id = client_id,
+                        share_index = i,
+                        "Failed to deserialize RobustShare: {}",
+                        e
+                    );
+                    return None;
+                }
             }
         }
         Some(shares)

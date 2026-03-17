@@ -670,7 +670,7 @@ async fn test_avss_e2e_distributed_key_generation() {
 // ---------------------------------------------------------------------------
 
 /// End-to-end test: run AVSS over QUIC, then wire shares into VMs and
-/// extract the public key using the `Avss.get_public_key` builtin.
+/// extract the public key using `Avss.get_commitment` with index 0.
 ///
 /// This validates the full pipeline: network -> engine -> share -> VM -> result.
 #[tokio::test(flavor = "multi_thread")]
@@ -784,8 +784,10 @@ async fn test_avss_e2e_vm_public_key_extraction() {
             4,
             vec![
                 Instruction::LDI(0, Value::Object(obj_id)),
+                Instruction::LDI(1, Value::I64(0)), // commitment index 0 = public key
                 Instruction::PUSHARG(0),
-                Instruction::CALL("Avss.get_public_key".to_string()),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Avss.get_commitment".to_string()),
                 Instruction::RET(0),
             ],
             HashMap::new(),

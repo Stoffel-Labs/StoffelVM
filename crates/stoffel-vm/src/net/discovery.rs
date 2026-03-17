@@ -142,9 +142,24 @@ fn registration_token_is_valid(
     message_auth_token: Option<&str>,
 ) -> bool {
     match required_auth_token {
-        Some(expected) => message_auth_token == Some(expected),
+        Some(expected) => match message_auth_token {
+            Some(provided) => constant_time_eq(expected.as_bytes(), provided.as_bytes()),
+            None => false,
+        },
         None => true,
     }
+}
+
+/// Constant-time byte comparison to prevent timing attacks on auth tokens.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Bootnode: accepts party registrations and shares membership updates.

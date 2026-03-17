@@ -154,9 +154,9 @@ fn test_avss_builtins_via_vm() {
     );
 }
 
-/// Test Avss.get_public_key builtin
+/// Test that Avss.get_commitment(share, 0) returns the public key (commitment[0])
 #[test]
-fn test_avss_get_public_key_builtin() {
+fn test_avss_get_public_key_via_commitment_zero() {
     setup_test_tracing();
 
     let mut vm = VirtualMachine::new();
@@ -183,8 +183,10 @@ fn test_avss_get_public_key_builtin() {
         4,
         vec![
             Instruction::LDI(0, Value::Object(obj_id)),
+            Instruction::LDI(1, Value::I64(0)), // commitment index 0 = public key
             Instruction::PUSHARG(0),
-            Instruction::CALL("Avss.get_public_key".to_string()),
+            Instruction::PUSHARG(1),
+            Instruction::CALL("Avss.get_commitment".to_string()),
             Instruction::RET(0),
         ],
         HashMap::new(),
@@ -421,8 +423,10 @@ fn test_example_avss_public_key_program() {
         4,
         vec![
             Instruction::LDI(0, Value::Object(avss_share_obj_id)),
+            Instruction::LDI(1, Value::I64(0)), // commitment index 0 = public key
             Instruction::PUSHARG(0),
-            Instruction::CALL("Avss.get_public_key".to_string()),
+            Instruction::PUSHARG(1),
+            Instruction::CALL("Avss.get_commitment".to_string()),
             Instruction::RET(0),
         ],
         HashMap::new(),
@@ -590,8 +594,10 @@ fn test_e2e_5_parties_avss_public_key() {
             4,
             vec![
                 Instruction::LDI(0, Value::Object(avss_share_id)),
+                Instruction::LDI(1, Value::I64(0)), // commitment index 0 = public key
                 Instruction::PUSHARG(0),
-                Instruction::CALL("Avss.get_public_key".to_string()),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Avss.get_commitment".to_string()),
                 Instruction::RET(0),
             ],
             HashMap::new(),
@@ -721,8 +727,10 @@ fn test_e2e_avss_with_input_output_clients() {
             8,
             vec![
                 Instruction::LDI(0, Value::Object(avss_share_id)),
+                Instruction::LDI(1, Value::I64(0)), // commitment index 0 = public key
                 Instruction::PUSHARG(0),
-                Instruction::CALL("Avss.get_public_key".to_string()),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Avss.get_commitment".to_string()),
                 Instruction::RET(0),
             ],
             HashMap::new(),

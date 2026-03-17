@@ -106,9 +106,14 @@ pub(crate) fn try_handle_open_exp_wire_message(
     let message: ExpOpenWireMessage = bincode::deserialize(&payload[EXP_OPEN_WIRE_PREFIX.len()..])
         .map_err(|e| format!("deserialize open-exp payload: {}", e))?;
 
-    if authenticated_sender_id != crate::net::open_registry::UNKNOWN_SENDER_ID
-        && message.sender_party_id != authenticated_sender_id
-    {
+    if authenticated_sender_id == crate::net::open_registry::UNKNOWN_SENDER_ID {
+        tracing::warn!(
+            sender_party_id = message.sender_party_id,
+            "Rejecting open-exp wire message from unauthenticated connection"
+        );
+        return Err("open-exp wire rejected: sender identity not authenticated".to_string());
+    }
+    if message.sender_party_id != authenticated_sender_id {
         return Err(format!(
             "open-exp sender mismatch: transport={} payload={}",
             authenticated_sender_id, message.sender_party_id
@@ -612,9 +617,11 @@ where
                 }
             }
 
-            let seq = my_sequence.unwrap();
+            let seq = my_sequence.expect("sequence must be set after insertion");
             let key = (instance_id, seq);
-            let entry = reg.get_mut(&key).unwrap();
+            let entry = reg
+                .get_mut(&key)
+                .expect("exp registry entry must exist after insertion");
 
             if let Some(result) = entry.result.clone() {
                 return Ok(Some(result));

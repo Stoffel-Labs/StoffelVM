@@ -63,16 +63,6 @@ impl MpcBackendKind {
         }
     }
 
-    /// Whether this backend supports general MPC operations (input sharing, opening).
-    pub fn supports_general_mpc(&self) -> bool {
-        match self {
-            #[cfg(feature = "honeybadger")]
-            MpcBackendKind::HoneyBadger => true,
-            #[cfg(feature = "avss")]
-            MpcBackendKind::Avss => true,
-        }
-    }
-
     /// Whether this backend supports secure multiplication (requires Beaver triples).
     pub fn supports_multiplication(&self) -> bool {
         match self {
@@ -180,7 +170,6 @@ mod tests {
     #[cfg(feature = "honeybadger")]
     fn test_honeybadger_capabilities() {
         let hb = MpcBackendKind::HoneyBadger;
-        assert!(hb.supports_general_mpc());
         assert!(!hb.supports_elliptic_curves());
         assert!(hb.supports_client_input());
     }
@@ -189,7 +178,6 @@ mod tests {
     #[cfg(feature = "avss")]
     fn test_avss_capabilities() {
         let avss = MpcBackendKind::Avss;
-        assert!(avss.supports_general_mpc());
         assert!(avss.supports_multiplication());
         assert!(avss.supports_elliptic_curves());
         assert!(!avss.supports_client_input());
