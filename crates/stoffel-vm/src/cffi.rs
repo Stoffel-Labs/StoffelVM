@@ -1340,9 +1340,8 @@ mod hb_engine_tests {
 // ============================================================================
 // AVSS Engine FFI Types and Functions
 //
-// FFI function and type names use the `adkg_` / `Adkg` prefix for ABI
-// compatibility with existing C/SDK consumers. Internally, this is the AVSS
-// (Asynchronously Verifiable Secret Sharing) engine.
+// FFI export names keep the `adkg_` prefix for ABI compatibility with existing
+// C/SDK consumers. Internal Rust types use the `Avss` prefix.
 // ============================================================================
 
 #[cfg(feature = "avss")]
@@ -1396,20 +1395,20 @@ mod avss_ffi {
     #[repr(C)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[allow(dead_code)]
-    pub enum CAdkgCurveConfig {
+    pub enum CAvssCurveConfig {
         Bls12_381 = 0,
         Bn254 = 1,
         Curve25519 = 2,
         Ed25519 = 3,
     }
 
-    impl CAdkgCurveConfig {
+    impl CAvssCurveConfig {
         fn from_ffi(value: u32) -> Option<Self> {
             match value {
-                0 => Some(CAdkgCurveConfig::Bls12_381),
-                1 => Some(CAdkgCurveConfig::Bn254),
-                2 => Some(CAdkgCurveConfig::Curve25519),
-                3 => Some(CAdkgCurveConfig::Ed25519),
+                0 => Some(CAvssCurveConfig::Bls12_381),
+                1 => Some(CAvssCurveConfig::Bn254),
+                2 => Some(CAvssCurveConfig::Curve25519),
+                3 => Some(CAvssCurveConfig::Ed25519),
                 _ => None,
             }
         }
@@ -1424,7 +1423,7 @@ mod avss_ffi {
 
     /// Opaque pointer type for AvssMpcEngine
     #[repr(C)]
-    pub struct AdkgEngineOpaque {
+    pub struct AvssEngineOpaque {
         _data: (),
         _marker: core::marker::PhantomData<(*mut u8, PhantomPinned)>,
     }
@@ -1434,7 +1433,7 @@ mod avss_ffi {
     #[repr(C)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[allow(dead_code)]
-    pub enum AdkgEngineErrorCode {
+    pub enum AvssEngineErrorCode {
         /// Operation succeeded
         Success = 0,
         /// Null pointer provided
@@ -1612,7 +1611,7 @@ mod avss_ffi {
         sk_len: usize,
         pk_map_ptr: *const u8,
         pk_map_len: usize,
-    ) -> *mut AdkgEngineOpaque {
+    ) -> *mut AvssEngineOpaque {
         if network_ptr.is_null() {
             return std::ptr::null_mut();
         }
@@ -1634,22 +1633,22 @@ mod avss_ffi {
 
         let pk_slice = unsafe { std::slice::from_raw_parts(pk_map_ptr, pk_map_len) };
 
-        let curve_config = match CAdkgCurveConfig::from_ffi(curve_config) {
+        let curve_config = match CAvssCurveConfig::from_ffi(curve_config) {
             Some(config) => config,
             None => return std::ptr::null_mut(),
         };
 
         let wrapper = match curve_config {
-            CAdkgCurveConfig::Bls12_381 => {
+            CAvssCurveConfig::Bls12_381 => {
                 create_bls12381_engine(instance_id, party_id, n, t, net, sk_slice, pk_slice)
             }
-            CAdkgCurveConfig::Bn254 => {
+            CAvssCurveConfig::Bn254 => {
                 create_bn254_engine(instance_id, party_id, n, t, net, sk_slice, pk_slice)
             }
-            CAdkgCurveConfig::Curve25519 => {
+            CAvssCurveConfig::Curve25519 => {
                 create_curve25519_engine(instance_id, party_id, n, t, net, sk_slice, pk_slice)
             }
-            CAdkgCurveConfig::Ed25519 => {
+            CAvssCurveConfig::Ed25519 => {
                 create_ed25519_engine(instance_id, party_id, n, t, net, sk_slice, pk_slice)
             }
         };
@@ -1660,7 +1659,7 @@ mod avss_ffi {
                     eprintln!("adkg_engine_new: engine start failed: {}", e);
                     return std::ptr::null_mut();
                 }
-                Box::into_raw(Box::new(w)) as *mut AdkgEngineOpaque
+                Box::into_raw(Box::new(w)) as *mut AvssEngineOpaque
             }
             Err(e) => {
                 eprintln!("adkg_engine_new: {}", e);
@@ -1671,7 +1670,7 @@ mod avss_ffi {
 
     /// Frees an AVSS engine instance
     #[no_mangle]
-    pub extern "C" fn adkg_engine_free(engine_ptr: *mut AdkgEngineOpaque) {
+    pub extern "C" fn adkg_engine_free(engine_ptr: *mut AvssEngineOpaque) {
         if !engine_ptr.is_null() {
             unsafe {
                 let _ = Box::from_raw(engine_ptr as *mut AvssFfiWrapper);
@@ -1680,7 +1679,7 @@ mod avss_ffi {
     }
 
     /// Helper to get the wrapper from an opaque pointer
-    unsafe fn get_wrapper<'a>(ptr: *mut AdkgEngineOpaque) -> &'a AvssFfiWrapper {
+    unsafe fn get_wrapper<'a>(ptr: *mut AvssEngineOpaque) -> &'a AvssFfiWrapper {
         &*(ptr as *const AvssFfiWrapper)
     }
 
@@ -1690,17 +1689,17 @@ mod avss_ffi {
     /// Caller must free result bytes with adkg_free_bytes.
     #[no_mangle]
     pub extern "C" fn adkg_engine_generate_share(
-        engine_ptr: *mut AdkgEngineOpaque,
+        engine_ptr: *mut AvssEngineOpaque,
         key_name: *const c_char,
         result_ptr: *mut *mut u8,
         result_len_ptr: *mut usize,
-    ) -> AdkgEngineErrorCode {
+    ) -> AvssEngineErrorCode {
         if engine_ptr.is_null()
             || key_name.is_null()
             || result_ptr.is_null()
             || result_len_ptr.is_null()
         {
-            return AdkgEngineErrorCode::NullPointer;
+            return AvssEngineErrorCode::NullPointer;
         }
 
         let wrapper = unsafe { get_wrapper(engine_ptr) };
@@ -1708,7 +1707,7 @@ mod avss_ffi {
         let c_str = unsafe { CStr::from_ptr(key_name) };
         let key_name_str = match c_str.to_str() {
             Ok(s) => s.to_string(),
-            Err(_) => return AdkgEngineErrorCode::SerializationError,
+            Err(_) => return AvssEngineErrorCode::SerializationError,
         };
 
         let avss_ops = Arc::clone(&wrapper.avss_ops);
@@ -1717,9 +1716,9 @@ mod avss_ffi {
                 unsafe {
                     write_ffi_result_bytes(share_bytes, result_ptr, result_len_ptr);
                 }
-                AdkgEngineErrorCode::Success
+                AvssEngineErrorCode::Success
             }
-            Err(_) => AdkgEngineErrorCode::KeyGenFailed,
+            Err(_) => AvssEngineErrorCode::KeyGenFailed,
         }
     }
 
@@ -1728,17 +1727,17 @@ mod avss_ffi {
     /// Caller must free result bytes with adkg_free_bytes.
     #[no_mangle]
     pub extern "C" fn adkg_engine_get_public_key(
-        engine_ptr: *mut AdkgEngineOpaque,
+        engine_ptr: *mut AvssEngineOpaque,
         key_name: *const c_char,
         result_ptr: *mut *mut u8,
         result_len_ptr: *mut usize,
-    ) -> AdkgEngineErrorCode {
+    ) -> AvssEngineErrorCode {
         if engine_ptr.is_null()
             || key_name.is_null()
             || result_ptr.is_null()
             || result_len_ptr.is_null()
         {
-            return AdkgEngineErrorCode::NullPointer;
+            return AvssEngineErrorCode::NullPointer;
         }
 
         let wrapper = unsafe { get_wrapper(engine_ptr) };
@@ -1746,7 +1745,7 @@ mod avss_ffi {
         let c_str = unsafe { CStr::from_ptr(key_name) };
         let key_name_str = match c_str.to_str() {
             Ok(s) => s,
-            Err(_) => return AdkgEngineErrorCode::SerializationError,
+            Err(_) => return AvssEngineErrorCode::SerializationError,
         };
 
         match wrapper.avss_ops.avss_get_commitment(key_name_str, 0) {
@@ -1754,9 +1753,9 @@ mod avss_ffi {
                 unsafe {
                     write_ffi_result_bytes(bytes, result_ptr, result_len_ptr);
                 }
-                AdkgEngineErrorCode::Success
+                AvssEngineErrorCode::Success
             }
-            Err(_) => AdkgEngineErrorCode::SessionNotFound,
+            Err(_) => AvssEngineErrorCode::SessionNotFound,
         }
     }
 
@@ -1765,18 +1764,18 @@ mod avss_ffi {
     /// Caller must free result bytes with adkg_free_bytes.
     #[no_mangle]
     pub extern "C" fn adkg_engine_get_commitment(
-        engine_ptr: *mut AdkgEngineOpaque,
+        engine_ptr: *mut AvssEngineOpaque,
         key_name: *const c_char,
         index: usize,
         result_ptr: *mut *mut u8,
         result_len_ptr: *mut usize,
-    ) -> AdkgEngineErrorCode {
+    ) -> AvssEngineErrorCode {
         if engine_ptr.is_null()
             || key_name.is_null()
             || result_ptr.is_null()
             || result_len_ptr.is_null()
         {
-            return AdkgEngineErrorCode::NullPointer;
+            return AvssEngineErrorCode::NullPointer;
         }
 
         let wrapper = unsafe { get_wrapper(engine_ptr) };
@@ -1784,7 +1783,7 @@ mod avss_ffi {
         let c_str = unsafe { CStr::from_ptr(key_name) };
         let key_name_str = match c_str.to_str() {
             Ok(s) => s,
-            Err(_) => return AdkgEngineErrorCode::SerializationError,
+            Err(_) => return AvssEngineErrorCode::SerializationError,
         };
 
         match wrapper.avss_ops.avss_get_commitment(key_name_str, index) {
@@ -1792,15 +1791,15 @@ mod avss_ffi {
                 unsafe {
                     write_ffi_result_bytes(bytes, result_ptr, result_len_ptr);
                 }
-                AdkgEngineErrorCode::Success
+                AvssEngineErrorCode::Success
             }
-            Err(_) => AdkgEngineErrorCode::InvalidCommitmentIndex,
+            Err(_) => AvssEngineErrorCode::InvalidCommitmentIndex,
         }
     }
 
     /// Check if the engine is ready
     #[no_mangle]
-    pub extern "C" fn adkg_engine_is_ready(engine_ptr: *mut AdkgEngineOpaque) -> c_int {
+    pub extern "C" fn adkg_engine_is_ready(engine_ptr: *mut AvssEngineOpaque) -> c_int {
         if engine_ptr.is_null() {
             return 0;
         }
@@ -1814,7 +1813,7 @@ mod avss_ffi {
 
     /// Get the party ID
     #[no_mangle]
-    pub extern "C" fn adkg_engine_party_id(engine_ptr: *mut AdkgEngineOpaque) -> usize {
+    pub extern "C" fn adkg_engine_party_id(engine_ptr: *mut AvssEngineOpaque) -> usize {
         if engine_ptr.is_null() {
             return 0;
         }
@@ -1825,7 +1824,7 @@ mod avss_ffi {
     /// Get the protocol name (returns static string, do not free)
     #[no_mangle]
     pub extern "C" fn adkg_engine_protocol_name(
-        engine_ptr: *mut AdkgEngineOpaque,
+        engine_ptr: *mut AvssEngineOpaque,
     ) -> *const c_char {
         static PROTOCOL_NAME: &[u8] = b"avss\0";
         if engine_ptr.is_null() {
@@ -1859,7 +1858,7 @@ mod avss_ffi {
                 5,
                 1,
                 std::ptr::null_mut(),
-                CAdkgCurveConfig::Bls12_381 as u32,
+                CAvssCurveConfig::Bls12_381 as u32,
                 std::ptr::null(),
                 0,
                 std::ptr::null(),
@@ -1904,7 +1903,7 @@ mod avss_ffi {
                 4,
                 1,
                 net_ptr,
-                CAdkgCurveConfig::Bls12_381 as u32,
+                CAvssCurveConfig::Bls12_381 as u32,
                 std::ptr::null(),
                 0,
                 std::ptr::null(),
@@ -1932,7 +1931,7 @@ mod avss_ffi {
                 n,
                 1,
                 net_ptr,
-                CAdkgCurveConfig::Bls12_381 as u32,
+                CAvssCurveConfig::Bls12_381 as u32,
                 std::ptr::null(),
                 0,
                 pk_map_bytes.as_ptr(),

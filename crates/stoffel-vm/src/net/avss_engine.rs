@@ -30,7 +30,8 @@ use std::sync::{
 use std::time::Duration;
 use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS, F64};
 use stoffelmpc_mpc::avss_mpc::{
-    AdkgNode, AdkgNodeOpts, AvssSessionId, ProtocolType as AvssProtocolType,
+    AdkgNode as AvssMpcNode, AdkgNodeOpts as AvssMpcNodeOpts, AvssSessionId,
+    ProtocolType as AvssProtocolType,
 };
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
@@ -102,7 +103,7 @@ where
     t: usize,
     net: Arc<QuicNetworkManager>,
     /// Full AVSS MPC node (share gen, multiplication, preprocessing, message routing)
-    adkg_node: Arc<Mutex<AdkgNode<F, Avid<AvssSessionId>, G>>>,
+    avss_node: Arc<Mutex<AvssMpcNode<F, Avid<AvssSessionId>, G>>>,
     /// Generated Feldman shares indexed by user-defined key name
     stored_shares: Arc<Mutex<BTreeMap<String, FeldmanShamirShare<F, G>>>>,
     /// Session counter for generating unique session IDs
@@ -115,7 +116,7 @@ where
     share_notify: Arc<tokio::sync::Notify>,
     /// This party's AVSS ECDH key used for payload confidentiality.
     /// Transport identity/authentication is handled separately by TLS.
-    /// Retained for potential node re-creation; read by the inner `AdkgNode`.
+    /// Retained for potential node re-creation; read by the inner `AvssMpcNode`.
     #[allow(dead_code)]
     sk_i: F,
     _marker: PhantomData<G>,
@@ -145,10 +146,10 @@ where
         sk_i: F,
         pk_map: Arc<Vec<G>>,
     ) -> Result<Arc<Self>, String> {
-        // Create the AdkgNode via MPCProtocol::setup
+        // Create the AvssMpcNode via MPCProtocol::setup
         let instance_id_u32 = u32::try_from(instance_id)
             .map_err(|_| format!("instance_id {} exceeds u32", instance_id))?;
-        let opts = AdkgNodeOpts::new(
+        let opts = AvssMpcNodeOpts::new(
             n,
             t,
             DEFAULT_N_RANDOM_SHARES,
@@ -158,13 +159,13 @@ where
             instance_id_u32,
             std::time::Duration::from_secs(60),
         )
-        .map_err(|e| format!("Failed to create AdkgNodeOpts: {:?}", e))?;
-        let adkg_node = <AdkgNode<F, Avid<AvssSessionId>, G> as MPCProtocol<
+        .map_err(|e| format!("Failed to create AvssMpcNodeOpts: {:?}", e))?;
+        let avss_node = <AvssMpcNode<F, Avid<AvssSessionId>, G> as MPCProtocol<
             F,
             FeldmanShamirShare<F, G>,
             QuicNetworkManager,
         >>::setup(party_id, opts, vec![])
-        .map_err(|e| format!("Failed to create AdkgNode: {:?}", e))?;
+        .map_err(|e| format!("Failed to create AvssMpcNode: {:?}", e))?;
 
         Ok(Arc::new(Self {
             instance_id,
@@ -172,7 +173,7 @@ where
             n,
             t,
             net,
-            adkg_node: Arc::new(Mutex::new(adkg_node)),
+            avss_node: Arc::new(Mutex::new(avss_node)),
             stored_shares: Arc::new(Mutex::new(BTreeMap::new())),
             session_counter: Arc::new(Mutex::new(0)),
             input_share_counter: AtomicU64::new(0),
@@ -227,7 +228,7 @@ where
     ) -> Result<FeldmanShamirShare<F, G>, String> {
         if self.party_id == dealer_id {
             let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-            let mut node = self.adkg_node.lock().await;
+            let mut node = self.avss_node.lock().await;
             node.share_gen_avss
                 .avss
                 .init(vec![secret], session_id, &mut rng, self.net.clone())
@@ -239,7 +240,7 @@ where
     }
 
     async fn run_multiply_round(
-        adkg_node: Arc<Mutex<AdkgNode<F, Avid<AvssSessionId>, G>>>,
+        avss_node: Arc<Mutex<AvssMpcNode<F, Avid<AvssSessionId>, G>>>,
         net: Arc<QuicNetworkManager>,
         left_share_bytes: Vec<u8>,
         right_share_bytes: Vec<u8>,
@@ -248,7 +249,7 @@ where
         let right_share = Self::decode_feldman_share(&right_share_bytes)?;
 
         let result = {
-            let mut node = adkg_node.lock().await;
+            let mut node = avss_node.lock().await;
             node.mul(vec![left_share], vec![right_share], net)
                 .await
                 .map_err(|e| format!("Multiplication failed: {:?}", e))?
@@ -317,7 +318,7 @@ where
         }
 
         let share = {
-            let mut node = self.adkg_node.lock().await;
+            let mut node = self.avss_node.lock().await;
             node.rand(net)
                 .await
                 .map_err(|e| format!("AVSS rand failed: {:?}", e))?
@@ -375,7 +376,7 @@ where
         // Run AVSS init through the inner share_gen_avss node
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
         {
-            let mut node = self.adkg_node.lock().await;
+            let mut node = self.avss_node.lock().await;
             node.share_gen_avss
                 .avss
                 .init(vec![secret], session_id, &mut rng, net)
@@ -417,7 +418,7 @@ where
             let notified = self.share_notify.notified();
 
             {
-                let node = self.adkg_node.lock().await;
+                let node = self.avss_node.lock().await;
                 let shares = node.share_gen_avss.avss.shares.lock().await;
                 if let Some(Some(share_vec)) = shares.get(&session_id) {
                     if let Some(share) = share_vec.first() {
@@ -455,7 +456,7 @@ where
             let notified = self.share_notify.notified();
 
             {
-                let node = self.adkg_node.lock().await;
+                let node = self.avss_node.lock().await;
                 let shares = node.share_gen_avss.avss.shares.lock().await;
                 let stored = self.stored_shares.lock().await;
 
@@ -534,7 +535,7 @@ where
         data: &[u8],
         net: Arc<N>,
     ) -> Result<(), String> {
-        let mut node = self.adkg_node.lock().await;
+        let mut node = self.avss_node.lock().await;
         let result = node
             .process(sender_id, data.to_vec(), net)
             .await
@@ -706,12 +707,12 @@ where
     }
 
     fn multiply_share(&self, _ty: ShareType, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
-        let adkg_node = self.adkg_node.clone();
+        let avss_node = self.avss_node.clone();
         let net = self.net.clone();
         let left_bytes = left.to_vec();
         let right_bytes = right.to_vec();
 
-        let fut = Self::run_multiply_round(adkg_node, net, left_bytes, right_bytes);
+        let fut = Self::run_multiply_round(avss_node, net, left_bytes, right_bytes);
 
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {

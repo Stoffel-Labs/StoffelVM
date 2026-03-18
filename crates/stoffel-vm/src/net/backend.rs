@@ -93,7 +93,7 @@ impl MpcBackendKind {
     /// HoneyBadger supports a separate client role (`stoffel-run --client`) where
     /// external clients submit secret inputs to the MPC parties.
     ///
-    /// AVSS does not yet support this: the underlying `AdkgNode` protocol ignores
+    /// AVSS does not yet support this: the underlying `AvssMpcNode` protocol ignores
     /// `input_ids` during setup and has no `InputServer`/`OutputServer` equivalent.
     /// In the current AVSS design, each party provides its own inputs directly.
     pub fn supports_client_input(&self) -> bool {
