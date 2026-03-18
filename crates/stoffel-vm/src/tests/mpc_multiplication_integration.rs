@@ -467,7 +467,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                     }; // guard dropped here, mutex released
 
                     if let Err(e) = client
-                        .process(data, sender_id, Arc::new(network_clone))
+                        .process(sender_id, data, Arc::new(network_clone))
                         .await
                     {
                         error!("Client {} failed to process message: {:?}", client_id, e);
@@ -762,7 +762,8 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
         n_triples,
         n_random_shares,
         instance_id,
-    );
+    )
+    .expect("Failed to create HoneyBadger node options");
 
     // Create all servers
     let mut recv = Vec::new();
@@ -911,7 +912,7 @@ mod tests {
                         }
                         Ok(false) => {}
                     }
-                    if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                    if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                         tracing::error!("Node {i} failed to process message: {e:?}");
                     }
                 }
@@ -1250,7 +1251,7 @@ mod tests {
                         }
                         Ok(false) => {}
                     }
-                    if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                    if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                         tracing::error!("Node {i} failed to process message: {e:?}");
                     }
                 }
@@ -1487,7 +1488,7 @@ mod tests {
                         }
                         Ok(false) => {}
                     }
-                    if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                    if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                         tracing::error!("Node {i} failed to process message: {e:?}");
                     }
                 }

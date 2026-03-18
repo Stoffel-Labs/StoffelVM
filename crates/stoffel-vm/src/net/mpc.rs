@@ -43,6 +43,7 @@ pub fn default_node_opts(
         n_random_shares,
         instance_id,
     )
+    .expect("default_node_opts should never fail with valid defaults")
 }
 
 /// Build HoneyBadger node options, deriving ancillary preprocessing counts from existing inputs.
@@ -53,7 +54,7 @@ pub fn honeybadger_node_opts(
     n_triples: usize,
     n_random_shares: usize,
     instance_id: u64,
-) -> HoneyBadgerMPCNodeOpts {
+) -> Result<HoneyBadgerMPCNodeOpts, String> {
     let n_prandbit = 0;
     let n_prandint = 0;
     let l = DEFAULT_FIXED_POINT_TOTAL_BITS;
@@ -69,7 +70,9 @@ pub fn honeybadger_node_opts(
         n_prandint,
         l,
         k,
+        std::time::Duration::from_secs(60),
     )
+    .map_err(|e| format!("Failed to create HoneyBadger node options: {:?}", e))
 }
 
 /// Network envelope used on QUIC to distinguish control messages (like handshakes)

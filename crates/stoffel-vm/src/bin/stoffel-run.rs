@@ -372,7 +372,7 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
         };
 
         if let Err(e) = mpc_client
-            .process(data, sender_id, Arc::new(network_clone))
+            .process(sender_id, data, Arc::new(network_clone))
             .await
         {
             eprintln!("[client {}] Failed to process message: {:?}", cid, e);
@@ -473,7 +473,7 @@ where
 
     if let Some(expected_count) = expected_client_count {
         if expected_count == 0 {
-            return Err("--expected-client-count must be greater than 0".to_string());
+            return Err("--wait-for-clients count must be greater than 0".to_string());
         }
 
         eprintln!(
@@ -549,7 +549,11 @@ where
 
     let n_triples = 8;
     let n_random = 16;
-    let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
+    let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create MPC node options: {}", e);
+            std::process::exit(2);
+        });
 
     let mut mpc_node = <HoneyBadgerMPCNode<F, Avid<HbSessionId>> as MPCProtocol<
         F,
@@ -564,7 +568,7 @@ where
     tokio::spawn(async move {
         while let Some((sender_id, raw_msg)) = msg_rx.recv().await {
             if let Err(e) = processing_node
-                .process(raw_msg, sender_id, processing_net.clone())
+                .process(sender_id, raw_msg, processing_net.clone())
                 .await
             {
                 eprintln!(
@@ -680,7 +684,7 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--n-parties") {
         } else if let Some(_rest) = arg.strip_prefix("--threshold") {
         } else if let Some(_rest) = arg.strip_prefix("--inputs") {
-        } else if let Some(_rest) = arg.strip_prefix("--expected-client-count") {
+        } else if let Some(_rest) = arg.strip_prefix("--wait-for-clients") {
         } else if let Some(_rest) = arg.strip_prefix("--stun-servers") {
         } else if let Some(_rest) = arg.strip_prefix("--servers") {
         } else if let Some(_rest) = arg.strip_prefix("--mpc-backend") {
@@ -696,7 +700,12 @@ async fn main() {
     fail_removed_flag(
         &raw_args,
         "--expected-clients",
-        "Use `--expected-client-count <n>` instead.",
+        "Use `--wait-for-clients <n>` instead.",
+    );
+    fail_removed_flag(
+        &raw_args,
+        "--expected-client-count",
+        "Renamed to `--wait-for-clients <n>`.",
     );
     fail_removed_flag(
         &raw_args,
@@ -751,10 +760,10 @@ async fn main() {
                     client_inputs = Some(v);
                 }
             }
-            "--expected-client-count" => {
+            "--wait-for-clients" => {
                 if let Some(v) = args_iter.next() {
                     expected_client_count =
-                        Some(v.parse().expect("Invalid --expected-client-count"));
+                        Some(v.parse().expect("Invalid --wait-for-clients"));
                 }
             }
             "--stun-servers" => {
@@ -1006,7 +1015,7 @@ async fn main() {
 
     if expected_client_count.is_some() && !backend_kind.supports_client_input() {
         eprintln!(
-            "Error: {} backend does not support --expected-client-count",
+            "Error: {} backend does not support --wait-for-clients",
             backend_kind.name()
         );
         exit(2);
@@ -1621,7 +1630,7 @@ Flags:
   --mpc-curve <name>      MPC curve: bls12-381 (default), bn254, curve25519, ed25519
   --inputs <values>       Comma-separated input values (client mode)
   --servers <addrs>       Comma-separated server addresses (client mode)
-  --expected-client-count <n>
+  --wait-for-clients <n>
                           Number of client inputs to collect before starting computation
                           (HoneyBadger only; ALPN handles routing, this controls coordination)
   -h, --help              Show this help
@@ -1673,10 +1682,10 @@ Examples:
 
   # Multi-party execution with client inputs (transport-derived IDs)
   # Terminal 1: Leader with expected client count
-  stoffel-run program.stfbin main --leader --bind 127.0.0.1:9000 --n-parties 5 --threshold 1 --expected-client-count 2
+  stoffel-run program.stfbin main --leader --bind 127.0.0.1:9000 --n-parties 5 --threshold 1 --wait-for-clients 2
 
   # Terminals 2-5: Other parties (same expected-client-count)
-  stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --expected-client-count 2
+  stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --wait-for-clients 2
   # ... etc
 
   # Client mode: provide inputs to the MPC network

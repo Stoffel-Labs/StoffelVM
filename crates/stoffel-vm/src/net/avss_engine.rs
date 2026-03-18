@@ -110,6 +110,9 @@ where
     /// Counter used to deterministically coordinate local clear->share conversion.
     input_share_counter: AtomicU64,
     ready: AtomicBool,
+    /// Signaled after `process_wrapped_message` completes, waking `wait_for_share`
+    /// and `await_received_share` without polling.
+    share_notify: Arc<tokio::sync::Notify>,
     /// This party's AVSS ECDH key used for payload confidentiality.
     /// Transport identity/authentication is handled separately by TLS.
     /// Retained for potential node re-creation; read by the inner `AdkgNode`.
@@ -153,7 +156,9 @@ where
             sk_i,
             pk_map,
             instance_id_u32,
-        );
+            std::time::Duration::from_secs(60),
+        )
+        .map_err(|e| format!("Failed to create AdkgNodeOpts: {:?}", e))?;
         let adkg_node = <AdkgNode<F, Avid<AvssSessionId>, G> as MPCProtocol<
             F,
             FeldmanShamirShare<F, G>,
@@ -172,6 +177,7 @@ where
             session_counter: Arc::new(Mutex::new(0)),
             input_share_counter: AtomicU64::new(0),
             ready: AtomicBool::new(false),
+            share_notify: Arc::new(tokio::sync::Notify::new()),
             sk_i,
             _marker: PhantomData,
         }))
@@ -269,32 +275,7 @@ where
     }
 
     fn broadcast_open_registry_payload_sync(&self, payload: Vec<u8>) -> Result<(), String> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                #[allow(deprecated)]
-                {
-                    match handle.runtime_flavor() {
-                        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(
-                            || handle.block_on(self.broadcast_open_registry_payload(payload)),
-                        ),
-                        tokio::runtime::RuntimeFlavor::CurrentThread => Err(
-                            "AVSS open operation called from a single-thread Tokio runtime; synchronous waiting is unsupported in this context".to_string(),
-                        ),
-                        _ => Err(
-                            "AVSS open operation called from an unsupported Tokio runtime flavor"
-                                .to_string(),
-                        ),
-                    }
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.broadcast_open_registry_payload(payload))
-            }
-        }
+        crate::net::block_on_current(self.broadcast_open_registry_payload(payload))
     }
 
     /// Start the engine and mark it ready
@@ -421,61 +402,66 @@ where
         Ok(share)
     }
 
-    /// Wait for a share from a specific session
+    /// Wait for a share from a specific session.
+    ///
+    /// Uses `share_notify` to wake immediately when `process_wrapped_message`
+    /// delivers new data, instead of polling with a fixed sleep interval.
     async fn wait_for_share(
         &self,
         session_id: AvssSessionId,
     ) -> Result<FeldmanShamirShare<F, G>, String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
 
         loop {
-            // Check if share is ready
+            let notified = self.share_notify.notified();
+
             {
                 let node = self.adkg_node.lock().await;
                 let shares = node.share_gen_avss.avss.shares.lock().await;
                 if let Some(Some(share_vec)) = shares.get(&session_id) {
-                    // Inner AVSS stores Vec<FeldmanShamirShare> per session;
-                    // for AVSS the first share is ours
                     if let Some(share) = share_vec.first() {
                         return Ok(share.clone());
                     }
                 }
             }
 
-            if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "Timeout waiting for AVSS share: session={}",
-                    session_id.as_u64()
-                ));
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(format!(
+                        "Timeout waiting for AVSS share: session={}",
+                        session_id.as_u64()
+                    ));
+                }
             }
-
-            // TODO: Replace polling with tokio::sync::Notify for immediate wakeup
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
     /// Wait for a received share (non-dealer path) and store it under the given key name.
     ///
     /// Non-dealer parties receive shares via `process_wrapped_message`, which stores them
-    /// in the inner AVSS shares store. This method polls for any completed share
-    /// not yet stored in `stored_shares`, stores it under `key_name`, and returns it.
+    /// in the inner AVSS shares store. This method waits (via `share_notify`) for any
+    /// completed share not yet stored in `stored_shares`, stores it under `key_name`,
+    /// and returns it.
     pub async fn await_received_share(
         &self,
         key_name: &str,
     ) -> Result<FeldmanShamirShare<F, G>, String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
 
         loop {
+            let notified = self.share_notify.notified();
+
             {
                 let node = self.adkg_node.lock().await;
                 let shares = node.share_gen_avss.avss.shares.lock().await;
                 let stored = self.stored_shares.lock().await;
 
-                // Find any completed share that isn't already stored
                 for (_session_id, maybe_shares) in shares.iter() {
                     if let Some(share_vec) = maybe_shares {
                         if let Some(share) = share_vec.first() {
-                            // Check this share isn't already stored under some key
                             let already_stored = stored
                                 .values()
                                 .any(|s| s.feldmanshare.share == share.feldmanshare.share);
@@ -493,15 +479,15 @@ where
                 }
             }
 
-            if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "Timeout waiting for received share for key '{}'",
-                    key_name
-                ));
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(format!(
+                        "Timeout waiting for received share for key '{}'",
+                        key_name
+                    ));
+                }
             }
-
-            // TODO: Replace polling with tokio::sync::Notify for immediate wakeup
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -549,9 +535,12 @@ where
         net: Arc<N>,
     ) -> Result<(), String> {
         let mut node = self.adkg_node.lock().await;
-        node.process(data.to_vec(), sender_id, net)
+        let result = node
+            .process(sender_id, data.to_vec(), net)
             .await
-            .map_err(|e| format!("AVSS process failed: {:?}", e))
+            .map_err(|e| format!("AVSS process failed: {:?}", e));
+        self.share_notify.notify_waiters();
+        result
     }
 
     /// Helper: encode a group element to bytes
@@ -619,8 +608,12 @@ where
     }
 
     /// Reconstruct the secret from a set of Feldman shares using Lagrange interpolation.
-    fn reconstruct_secret(shares: &[FeldmanShamirShare<F, G>], n: usize) -> Result<F, String> {
-        let (_, secret) = FeldmanShamirShare::<F, G>::recover_secret(shares, n)
+    fn reconstruct_secret(
+        shares: &[FeldmanShamirShare<F, G>],
+        n: usize,
+        t: usize,
+    ) -> Result<F, String> {
+        let (_, secret) = FeldmanShamirShare::<F, G>::recover_secret(shares, n, t)
             .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
         Ok(secret)
     }
@@ -630,20 +623,8 @@ where
         crate::net::curve::field_from_i64(value)
     }
 
-    /// Convert a reconstructed field element to the appropriate [`Value`] for a given share type.
     fn field_to_value(ty: ShareType, secret: F) -> Result<Value, String> {
-        let value = match ty {
-            ShareType::SecretInt { .. } if ty.is_boolean() => Value::Bool(!secret.is_zero()),
-            ShareType::SecretInt { .. } => Value::I64(crate::net::curve::field_to_i64(secret)),
-            ShareType::SecretFixedPoint { precision } => {
-                let scaled_value = crate::net::curve::field_to_i64(secret);
-                let f = precision.f();
-                let scale = (1u64 << f) as f64;
-                let float_value = scaled_value as f64 / scale;
-                Value::Float(F64(float_value))
-            }
-        };
-        Ok(value)
+        Ok(crate::net::curve::field_to_value(ty, secret))
     }
 }
 
@@ -718,91 +699,47 @@ where
         };
 
         let (dealer_id, session_id) = self.allocate_input_share_session()?;
-        let share = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                #[allow(deprecated)]
-                {
-                    match handle.runtime_flavor() {
-                        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(
-                            || handle.block_on(self.run_input_share_round(dealer_id, session_id, secret)),
-                        ),
-                        tokio::runtime::RuntimeFlavor::CurrentThread => Err(
-                            "AVSS input_share called from a single-thread Tokio runtime; synchronous waiting is unsupported in this context".to_string(),
-                        ),
-                        _ => Err(
-                            "AVSS input_share called from an unsupported Tokio runtime flavor".to_string(),
-                        ),
-                    }
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.run_input_share_round(dealer_id, session_id, secret))
-            }
-        }?;
+        let share = crate::net::block_on_current(
+            self.run_input_share_round(dealer_id, session_id, secret),
+        )?;
         Self::encode_feldman_share(&share)
     }
 
     fn multiply_share(&self, _ty: ShareType, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
-        let left_share_bytes = left.to_vec();
-        let right_share_bytes = right.to_vec();
+        let adkg_node = self.adkg_node.clone();
+        let net = self.net.clone();
+        let left_bytes = left.to_vec();
+        let right_bytes = right.to_vec();
+
+        let fut = Self::run_multiply_round(adkg_node, net, left_bytes, right_bytes);
 
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 #[allow(deprecated)]
-                {
-                    match handle.runtime_flavor() {
-                        tokio::runtime::RuntimeFlavor::MultiThread => {
-                            tokio::task::block_in_place(|| {
-                                handle.block_on(Self::run_multiply_round(
-                                    self.adkg_node.clone(),
-                                    self.net.clone(),
-                                    left_share_bytes.clone(),
-                                    right_share_bytes.clone(),
-                                ))
-                            })
-                        }
-                        tokio::runtime::RuntimeFlavor::CurrentThread => {
-                            let adkg_node = self.adkg_node.clone();
-                            let net = self.net.clone();
-                            let left_share_bytes = left_share_bytes.clone();
-                            let right_share_bytes = right_share_bytes.clone();
-                            std::thread::spawn(move || -> Result<Vec<u8>, String> {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                                rt.block_on(Self::run_multiply_round(
-                                    adkg_node,
-                                    net,
-                                    left_share_bytes,
-                                    right_share_bytes,
-                                ))
-                            })
-                            .join()
-                            .map_err(|_| "AVSS multiply worker thread panicked".to_string())?
-                        }
-                        _ => Err(
-                            "AVSS multiply_share called from an unsupported Tokio runtime flavor"
-                                .to_string(),
-                        ),
+                match handle.runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(|| handle.block_on(fut))
                     }
+                    tokio::runtime::RuntimeFlavor::CurrentThread => {
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(|e| format!("failed to create Tokio runtime: {e}"))?;
+                            rt.block_on(fut)
+                        })
+                        .join()
+                        .map_err(|_| "AVSS multiply worker thread panicked".to_string())?
+                    }
+                    _ => Err("operation requires a multi-thread Tokio runtime".to_string()),
                 }
             }
             Err(_) => {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(Self::run_multiply_round(
-                    self.adkg_node.clone(),
-                    self.net.clone(),
-                    left_share_bytes,
-                    right_share_bytes,
-                ))
+                    .map_err(|e| format!("failed to create Tokio runtime: {e}"))?;
+                rt.block_on(fut)
             }
         }
     }
@@ -825,6 +762,7 @@ where
 
         let required = self.t + 1;
         let n = self.n;
+        let t = self.t;
 
         crate::net::open_registry::open_share_via_registry(
             self.instance_id,
@@ -837,7 +775,7 @@ where
                 for bytes in collected {
                     shares.push(Self::decode_feldman_share(bytes)?);
                 }
-                let secret = Self::reconstruct_secret(&shares, n)?;
+                let secret = Self::reconstruct_secret(&shares, n, t)?;
                 Self::field_to_value(ty, secret)
             },
         )
@@ -861,6 +799,7 @@ where
 
         let required = self.t + 1;
         let n = self.n;
+        let t = self.t;
 
         crate::net::open_registry::batch_open_via_registry(
             self.instance_id,
@@ -874,7 +813,7 @@ where
                 for bytes in collected {
                     decoded_shares.push(Self::decode_feldman_share(bytes)?);
                 }
-                let secret = Self::reconstruct_secret(&decoded_shares, n)
+                let secret = Self::reconstruct_secret(&decoded_shares, n, t)
                     .map_err(|e| format!("batch reconstruct_secret pos {}: {}", pos, e))?;
                 Self::field_to_value(ty, secret)
             },
@@ -949,49 +888,18 @@ where
     }
 
     fn avss_get_commitment(&self, key_name: &str, index: usize) -> Result<Vec<u8>, String> {
-        // Use blocking approach for sync interface
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) =>
-            {
-                #[allow(deprecated)]
-                match handle.runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        let key_name = key_name.to_string();
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(async {
-                                let share = self
-                                    .get_share(&key_name)
-                                    .await
-                                    .ok_or_else(|| format!("Key '{}' not found", key_name))?;
-                                let commitment = share.commitments.get(index).ok_or_else(|| {
-                                    format!("Commitment index {} out of bounds", index)
-                                })?;
-                                Self::encode_group_element(commitment)
-                            })
-                        })
-                    }
-                    _ => Err("Cannot call avss_get_commitment from single-thread runtime".into()),
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build runtime: {}", e))?;
-                let key_name = key_name.to_string();
-                rt.block_on(async {
-                    let share = self
-                        .get_share(&key_name)
-                        .await
-                        .ok_or_else(|| format!("Key '{}' not found", key_name))?;
-                    let commitment = share
-                        .commitments
-                        .get(index)
-                        .ok_or_else(|| format!("Commitment index {} out of bounds", index))?;
-                    Self::encode_group_element(commitment)
-                })
-            }
-        }
+        let key_name = key_name.to_string();
+        crate::net::block_on_current(async {
+            let share = self
+                .get_share(&key_name)
+                .await
+                .ok_or_else(|| format!("Key '{}' not found", key_name))?;
+            let commitment = share
+                .commitments
+                .get(index)
+                .ok_or_else(|| format!("Commitment index {} out of bounds", index))?;
+            Self::encode_group_element(commitment)
+        })
     }
 
 }
@@ -1257,7 +1165,7 @@ mod tests {
         // Verify reconstruction works after round-tripping through bytes
         let required = t + 1;
         let subset: Vec<_> = shares.iter().take(required).cloned().collect();
-        let recovered = Bls12381AvssMpcEngine::reconstruct_secret(&subset, n)
+        let recovered = Bls12381AvssMpcEngine::reconstruct_secret(&subset, n, t)
             .expect("reconstruct_secret failed");
         assert_eq!(recovered, secret);
     }
@@ -1296,7 +1204,7 @@ mod tests {
         let required = t + 1;
         let subset: Vec<_> = shares.iter().take(required).cloned().collect();
         let recovered =
-            Bn254AvssMpcEngine::reconstruct_secret(&subset, n).expect("reconstruct_secret failed");
+            Bn254AvssMpcEngine::reconstruct_secret(&subset, n, t).expect("reconstruct_secret failed");
         assert_eq!(recovered, secret);
     }
 
@@ -1402,7 +1310,7 @@ mod tests {
         // Share and reconstruct
         let shares = generate_feldman_shares(secret, n, t);
         let subset: Vec<_> = shares.iter().take(t + 1).cloned().collect();
-        let recovered = Bls12381AvssMpcEngine::reconstruct_secret(&subset, n)
+        let recovered = Bls12381AvssMpcEngine::reconstruct_secret(&subset, n, t)
             .expect("reconstruct_secret failed");
 
         // Decode using field_to_value (now delegates to curve::field_to_i64).
@@ -1438,7 +1346,7 @@ mod tests {
 
         let required = t + 1;
         let subset: Vec<_> = decoded_shares.iter().take(required).cloned().collect();
-        let recovered = Bls12381AvssMpcEngine::reconstruct_secret(&subset, n)
+        let recovered = Bls12381AvssMpcEngine::reconstruct_secret(&subset, n, t)
             .expect("reconstruct_secret failed");
         assert_eq!(
             recovered, secret,
@@ -1480,7 +1388,7 @@ mod tests {
         let required = t + 1;
         let subset: Vec<_> = decoded_shares.iter().take(required).cloned().collect();
         let recovered =
-            Bn254AvssMpcEngine::reconstruct_secret(&subset, n).expect("reconstruct_secret failed");
+            Bn254AvssMpcEngine::reconstruct_secret(&subset, n, t).expect("reconstruct_secret failed");
         assert_eq!(
             recovered, secret,
             "Reconstructed secret should match original"

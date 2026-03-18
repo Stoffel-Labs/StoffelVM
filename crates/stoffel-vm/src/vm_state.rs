@@ -2941,15 +2941,20 @@ impl VMState {
             .mpc_engine()
             .map(|e| e.n_parties())
             .unwrap_or(shares.len());
+        let threshold = self
+            .mpc_engine()
+            .map(|e| e.threshold())
+            .unwrap_or(1);
         let secret = match format {
             Some(LocalShareFormat::Robust) => {
-                let (_degree, secret) = RobustShare::recover_secret(&robust_shares, n_parties)
-                    .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
+                let (_degree, secret) =
+                    RobustShare::recover_secret(&robust_shares, n_parties, threshold)
+                        .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
                 secret
             }
             Some(LocalShareFormat::Feldman) => {
                 let (_degree, secret) =
-                    FeldmanShamirShare::recover_secret(&feldman_shares, n_parties)
+                    FeldmanShamirShare::recover_secret(&feldman_shares, n_parties, threshold)
                         .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
                 secret
             }

@@ -426,7 +426,7 @@ where
         input_ids: Vec<ClientId>,
     ) -> Result<Arc<Self>, String> {
         // Create the MPC node options
-        let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
+        let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id)?;
 
         // Create the MPC node
         let node = <HoneyBadgerMPCNode<F, RBCImpl> as MPCProtocol<
@@ -523,32 +523,7 @@ where
     }
 
     fn broadcast_open_exp_payload_sync(&self, payload: Vec<u8>) -> Result<(), String> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                #[allow(deprecated)]
-                {
-                    match handle.runtime_flavor() {
-                        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(
-                            || handle.block_on(self.broadcast_open_exp_payload(payload)),
-                        ),
-                        tokio::runtime::RuntimeFlavor::CurrentThread => Err(
-                            "open_share_in_exp called from a single-thread Tokio runtime; synchronous waiting is unsupported in this context".to_string(),
-                        ),
-                        _ => Err(
-                            "open_share_in_exp called from an unsupported Tokio runtime flavor"
-                                .to_string(),
-                        ),
-                    }
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.broadcast_open_exp_payload(payload))
-            }
-        }
+        crate::net::block_on_current(self.broadcast_open_exp_payload(payload))
     }
 
     /// Reveal a share in the exponent using transport-backed contribution exchange.
@@ -737,19 +712,8 @@ where
             .map_err(|e| format!("Tokio runtime not available: {}", e))
     }
 
-    /// Convert a reconstructed field element to the appropriate [`Value`] for a given share type.
     fn field_to_value(ty: ShareType, secret: F) -> Value {
-        match ty {
-            ShareType::SecretInt { .. } if ty.is_boolean() => Value::Bool(!secret.is_zero()),
-            ShareType::SecretInt { .. } => Value::I64(crate::net::curve::field_to_i64(secret)),
-            ShareType::SecretFixedPoint { precision } => {
-                let scaled_value = crate::net::curve::field_to_i64(secret);
-                let f = precision.f();
-                let scale = (1u64 << f) as f64;
-                let float_value = scaled_value as f64 / scale;
-                Value::Float(F64(float_value))
-            }
-        }
+        crate::net::curve::field_to_value(ty, secret)
     }
 
     fn encode_share(share: &RobustShare<F>) -> Result<Vec<u8>, String> {
@@ -870,44 +834,7 @@ where
     }
 
     fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
-        // Execute the async version without attempting to create a nested runtime.
-        // If we're already inside a Tokio runtime (which is the case in #[tokio::test]
-        // and most server code), use block_in_place on a multi-thread runtime to
-        // synchronously wait for the future without deadlocking.
-        // Otherwise, create a fresh runtime and block_on.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                // Inside a Tokio runtime; avoid panic by using block_in_place on multi-thread.
-                // If the runtime is current_thread, block_in_place will panic; in that case,
-                // return a clear error to guide callers (our tests use multi-thread runtime).
-                #[allow(deprecated)]
-                {
-                    // RuntimeFlavor is available on stable Tokio; use it to guard block_in_place
-                    match handle.runtime_flavor() {
-                        tokio::runtime::RuntimeFlavor::MultiThread => {
-                            tokio::task::block_in_place(|| {
-                                handle.block_on(self.multiply_share_async(ty, left, right))
-                            })
-                        }
-                        tokio::runtime::RuntimeFlavor::CurrentThread => {
-                            Err("MPC multiply_share called from a single-thread Tokio runtime; synchronous waiting is unsupported in this context".to_string())
-                        }
-                        _ => {
-                            // Any other (future) runtime flavor: conservatively refuse to block synchronously.
-                            Err("MPC multiply_share called from an unsupported Tokio runtime flavor for synchronous waiting".to_string())
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                // No Tokio runtime active; create a lightweight current-thread runtime and block.
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.multiply_share_async(ty, left, right))
-            }
-        }
+        crate::net::block_on_current(self.multiply_share_async(ty, left, right))
     }
 
     fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
@@ -920,6 +847,7 @@ where
 
         let required = 2 * self.t + 1;
         let n = self.n;
+        let t = self.t;
 
         crate::net::open_registry::open_share_via_registry(
             self.instance_id,
@@ -940,7 +868,7 @@ where
                     shares.len()
                 );
 
-                let (_deg, secret) = RobustShare::recover_secret(&shares, n)
+                let (_deg, secret) = RobustShare::recover_secret(&shares, n, t)
                     .map_err(|e| format!("recover_secret: {:?}", e))?;
                 Ok(Self::field_to_value(ty, secret))
             },
@@ -957,6 +885,7 @@ where
 
         let required = 2 * self.t + 1;
         let n = self.n;
+        let t = self.t;
 
         crate::net::open_registry::batch_open_via_registry(
             self.instance_id,
@@ -970,7 +899,7 @@ where
                     decoded_shares.push(Self::decode_share(bytes)?);
                 }
 
-                let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, n)
+                let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, n, t)
                     .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
                 Ok(Self::field_to_value(ty, secret))
             },
@@ -1027,27 +956,7 @@ where
     }
 
     fn random_share(&self, ty: ShareType) -> Result<Vec<u8>, String> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) =>
-            {
-                #[allow(deprecated)]
-                match handle.runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(self.random_share_async_impl(ty))
-                        })
-                    }
-                    _ => Err("random_share requires multi-thread Tokio runtime".to_string()),
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.random_share_async_impl(ty))
-            }
-        }
+        crate::net::block_on_current(self.random_share_async_impl(ty))
     }
 
     fn open_share_in_exp(
@@ -1065,34 +974,9 @@ where
         shares: &[u8],
         input_len: usize,
     ) -> Result<(), String> {
-        // Execute the async version, handling runtime context appropriately
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                #[allow(deprecated)]
-                match handle.runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(self.send_output_to_client_async_impl(
-                                client_id, shares, input_len,
-                            ))
-                        })
-                    }
-                    tokio::runtime::RuntimeFlavor::CurrentThread => {
-                        Err("send_output_to_client called from a single-thread Tokio runtime; synchronous waiting is unsupported".to_string())
-                    }
-                    _ => {
-                        Err("send_output_to_client called from an unsupported Tokio runtime flavor".to_string())
-                    }
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.send_output_to_client_async_impl(client_id, shares, input_len))
-            }
-        }
+        crate::net::block_on_current(
+            self.send_output_to_client_async_impl(client_id, shares, input_len),
+        )
     }
 }
 
@@ -1179,30 +1063,7 @@ where
     }
 
     fn hydrate_client_inputs_sync(&self, store: &ClientInputStore) -> Result<usize, String> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) =>
-            {
-                #[allow(deprecated)]
-                match handle.runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(self.hydrate_client_inputs(store))
-                        })
-                    }
-                    tokio::runtime::RuntimeFlavor::CurrentThread => Err(
-                        "Cannot hydrate client inputs from single-thread Tokio runtime".to_string(),
-                    ),
-                    _ => Err("Unsupported Tokio runtime flavor".to_string()),
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.hydrate_client_inputs(store))
-            }
-        }
+        crate::net::block_on_current(self.hydrate_client_inputs(store))
     }
 
     fn hydrate_client_inputs_for_sync(
@@ -1210,30 +1071,7 @@ where
         store: &ClientInputStore,
         client_ids: &[ClientId],
     ) -> Result<usize, String> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) =>
-            {
-                #[allow(deprecated)]
-                match handle.runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(self.hydrate_client_inputs_for(store, client_ids))
-                        })
-                    }
-                    tokio::runtime::RuntimeFlavor::CurrentThread => Err(
-                        "Cannot hydrate client inputs from single-thread Tokio runtime".to_string(),
-                    ),
-                    _ => Err("Unsupported Tokio runtime flavor".to_string()),
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.hydrate_client_inputs_for(store, client_ids))
-            }
-        }
+        crate::net::block_on_current(self.hydrate_client_inputs_for(store, client_ids))
     }
 }
 

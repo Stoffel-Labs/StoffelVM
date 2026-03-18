@@ -788,12 +788,14 @@ mod tests {
     fn valid_batch_contribution_is_accepted() {
         clear_registries();
         let shares = vec![b"s0".to_vec(), b"s1".to_vec()];
-        let msg = encode_batch_share_wire_message(2, "batch-key", 5, &shares).unwrap();
+        let instance_id = 9999u64; // Use unique instance_id to avoid collisions
+        let msg = encode_batch_share_wire_message(instance_id, "test-batch-unique", 5, &shares)
+            .unwrap();
         let result = try_handle_wire_message(5, &msg);
         assert_eq!(result.unwrap(), true);
 
         let reg = BATCH_OPEN_REGISTRY.lock();
-        let key = (2u64, 0usize, "batch-key".to_string(), 2usize);
+        let key = (instance_id, 0usize, "test-batch-unique".to_string(), 2usize);
         let entry = reg.get(&key).unwrap();
         assert_eq!(entry.party_ids, vec![5]);
         assert_eq!(entry.shares_per_position.len(), 2);

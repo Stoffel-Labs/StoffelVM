@@ -73,11 +73,12 @@ impl MpcBackendKind {
         }
     }
 
-    /// Whether this backend is safe for elliptic curve operations.
+    /// Whether this backend supports and is safe for elliptic curve operations.
     ///
-    /// AVSS commitments use abelian groups (EC points) rather than field elements,
-    /// making it safe for EC operations like threshold signatures. HoneyBadger
-    /// commitments are field-only and not safe for direct EC operations.
+    /// AVSS uses `FeldmanShamirShare<F, G>` whose commitments are EC points (`G`),
+    /// enabling operations like `open_share_in_exp` and threshold signatures.
+    /// HoneyBadger uses `RobustShare<F>` with field-only commitments and is not
+    /// suitable for direct EC operations.
     pub fn supports_elliptic_curves(&self) -> bool {
         match self {
             #[cfg(feature = "honeybadger")]
@@ -89,9 +90,12 @@ impl MpcBackendKind {
 
     /// Whether this backend supports standalone client input mode.
     ///
-    /// `stoffel-run --client` is currently implemented for HoneyBadger only.
-    /// AVSS requires each party to participate directly rather than using the
-    /// separate client flow.
+    /// HoneyBadger supports a separate client role (`stoffel-run --client`) where
+    /// external clients submit secret inputs to the MPC parties.
+    ///
+    /// AVSS does not yet support this: the underlying `AdkgNode` protocol ignores
+    /// `input_ids` during setup and has no `InputServer`/`OutputServer` equivalent.
+    /// In the current AVSS design, each party provides its own inputs directly.
     pub fn supports_client_input(&self) -> bool {
         match self {
             #[cfg(feature = "honeybadger")]

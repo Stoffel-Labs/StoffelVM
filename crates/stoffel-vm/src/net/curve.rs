@@ -158,6 +158,33 @@ pub fn field_to_i64<F: ark_ff::PrimeField>(value: F) -> i64 {
     }
 }
 
+/// Convert a reconstructed field element to the appropriate [`Value`] for a
+/// given [`ShareType`].
+///
+/// Used by both the HoneyBadger and AVSS engines after secret reconstruction.
+pub fn field_to_value<F: ark_ff::PrimeField>(
+    ty: stoffel_vm_types::core_types::ShareType,
+    secret: F,
+) -> stoffel_vm_types::core_types::Value {
+    use stoffel_vm_types::core_types::{Value, F64, BOOLEAN_SECRET_INT_BITS};
+
+    match ty {
+        stoffel_vm_types::core_types::ShareType::SecretInt { bit_length }
+            if bit_length == BOOLEAN_SECRET_INT_BITS =>
+        {
+            Value::Bool(!secret.is_zero())
+        }
+        stoffel_vm_types::core_types::ShareType::SecretInt { .. } => {
+            Value::I64(field_to_i64(secret))
+        }
+        stoffel_vm_types::core_types::ShareType::SecretFixedPoint { precision } => {
+            let scaled = field_to_i64(secret);
+            let scale = (1u64 << precision.f()) as f64;
+            Value::Float(F64(scaled as f64 / scale))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

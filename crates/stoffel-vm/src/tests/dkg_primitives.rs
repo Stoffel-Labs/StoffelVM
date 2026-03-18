@@ -83,7 +83,7 @@ async fn test_open_share_in_exp_known_value() {
                     }
                     Ok(false) => {}
                 }
-                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -252,7 +252,7 @@ async fn test_simulated_dkg_flow() {
                     }
                     Ok(false) => {}
                 }
-                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }

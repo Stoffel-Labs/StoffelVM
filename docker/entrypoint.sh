@@ -121,9 +121,9 @@ build_command() {
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD}"
     fi
 
-    # Add expected client count if specified (for leader and party modes)
+    # Wait for N clients before starting execution (for leader and party modes)
     if [ -n "${STOFFEL_EXPECTED_CLIENT_COUNT}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
-        cmd="${cmd} --expected-client-count ${STOFFEL_EXPECTED_CLIENT_COUNT}"
+        cmd="${cmd} --wait-for-clients ${STOFFEL_EXPECTED_CLIENT_COUNT}"
     fi
 
     # Add optional trace flags

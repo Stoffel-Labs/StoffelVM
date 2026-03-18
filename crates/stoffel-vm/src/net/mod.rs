@@ -23,6 +23,41 @@ pub mod p2p;
 pub mod program_sync;
 pub mod session;
 
+// ---------------------------------------------------------------------------
+// Async/sync bridge
+// ---------------------------------------------------------------------------
+
+/// Execute a future synchronously, bridging from a sync context to async.
+///
+/// Dispatches based on the current Tokio runtime:
+/// - **Multi-thread runtime**: uses `block_in_place` + `block_on` (no deadlock).
+/// - **No runtime**: creates a temporary current-thread runtime.
+/// - **Single-thread runtime**: returns `Err` (would deadlock).
+///
+/// The future does NOT need to be `Send` or `'static`.
+pub fn block_on_current<T>(
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            #[allow(deprecated)]
+            match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(fut))
+                }
+                _ => Err("operation requires a multi-thread Tokio runtime".to_string()),
+            }
+        }
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to create Tokio runtime: {e}"))?;
+            rt.block_on(fut)
+        }
+    }
+}
+
 // Re-export key components
 pub use p2p::{
     NetworkManager, PeerConnection, QuicMessage, QuicNetworkConfig, QuicNetworkManager, QuicNode,

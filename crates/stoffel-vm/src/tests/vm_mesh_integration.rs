@@ -134,7 +134,7 @@ async fn test_vm_mesh_full_integration() {
                     }
                     Ok(false) => {}
                 }
-                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -469,7 +469,7 @@ async fn test_vm_mesh_average_salary_integration() {
                     }
                     Ok(false) => {}
                 }
-                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -590,7 +590,7 @@ async fn test_vm_mesh_average_salary_integration() {
         }
 
         // Verify that individual client shares can be reconstructed
-        let result = RobustShare::recover_secret(&all_shares_for_client, n_parties);
+        let result = RobustShare::recover_secret(&all_shares_for_client, n_parties, threshold);
         assert!(
             result.is_ok(),
             "Failed to reconstruct individual client shares: {:?}",
@@ -656,7 +656,7 @@ async fn test_vm_mesh_average_salary_integration() {
                 salary_sums.push(s);
             }
         }
-        let result = RobustShare::recover_secret(&salary_sums, n_parties);
+        let result = RobustShare::recover_secret(&salary_sums, n_parties, threshold);
         assert!(
             result.is_ok(),
             "Failed to reconstruct summed shares: {:?}",
@@ -906,7 +906,7 @@ async fn test_vm_mesh_large_preprocessing() {
                     }
                     Ok(false) => {}
                 }
-                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -1171,7 +1171,7 @@ async fn test_vm_mesh_output_client_integration() {
                     }
                     Ok(false) => {}
                 }
-                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -1623,7 +1623,7 @@ async fn test_vm_mesh_matrix_average_integration() {
                     }
                     Ok(false) => {}
                 }
-                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -2181,7 +2181,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                     }
                     Ok(false) => {}
                 }
-                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
@@ -3380,7 +3380,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                     }
                     Ok(false) => {}
                 }
-                if let Err(e) = node.process(raw_msg, sender_id, network.clone()).await {
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
