@@ -732,7 +732,6 @@ mod tests {
 
     #[test]
     fn unknown_sender_single_is_rejected() {
-        clear_registries();
         let msg = encode_single_share_wire_message(1, "test-key", 0, b"share0").unwrap();
         let result = try_handle_wire_message(UNKNOWN_SENDER_ID, &msg);
         assert!(result.is_err());
@@ -741,7 +740,6 @@ mod tests {
 
     #[test]
     fn unknown_sender_batch_is_rejected() {
-        clear_registries();
         let msg =
             encode_batch_share_wire_message(1, "test-key", 0, &[b"s0".to_vec(), b"s1".to_vec()])
                 .unwrap();
@@ -752,7 +750,6 @@ mod tests {
 
     #[test]
     fn sender_mismatch_single_is_rejected() {
-        clear_registries();
         // Payload says sender_party_id=0, but transport says authenticated_sender_id=1
         let msg = encode_single_share_wire_message(1, "test-key", 0, b"share0").unwrap();
         let result = try_handle_wire_message(1, &msg);
@@ -762,7 +759,6 @@ mod tests {
 
     #[test]
     fn sender_mismatch_batch_is_rejected() {
-        clear_registries();
         let msg =
             encode_batch_share_wire_message(1, "test-key", 0, &[b"s0".to_vec()]).unwrap();
         let result = try_handle_wire_message(1, &msg);
@@ -772,7 +768,6 @@ mod tests {
 
     #[test]
     fn valid_single_contribution_is_accepted() {
-        clear_registries();
         let msg = encode_single_share_wire_message(1, "test-key", 3, b"share3").unwrap();
         let result = try_handle_wire_message(3, &msg);
         assert_eq!(result.unwrap(), true);
@@ -786,7 +781,6 @@ mod tests {
 
     #[test]
     fn valid_batch_contribution_is_accepted() {
-        clear_registries();
         let shares = vec![b"s0".to_vec(), b"s1".to_vec()];
         let instance_id = 9999u64; // Use unique instance_id to avoid collisions
         let msg = encode_batch_share_wire_message(instance_id, "test-batch-unique", 5, &shares)
