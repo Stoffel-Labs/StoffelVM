@@ -355,7 +355,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
 
     // Step 3: Connect servers
     info!("Step 3: Connecting servers in mesh topology...");
-    for server in &servers {
+    for server in &mut servers {
         server.connect_to_peers().await.expect("Failed to connect");
     }
     tokio::time::sleep(Duration::from_millis(300)).await;

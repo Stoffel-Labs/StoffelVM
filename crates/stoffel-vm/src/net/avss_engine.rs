@@ -21,7 +21,8 @@ use ark_ec::CurveGroup;
 use ark_ff::{FftField, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{Rng, SeedableRng};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -40,6 +41,117 @@ use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
 use tracing::info;
+
+// ============================================================================
+// Open-in-exp registry for AVSS
+// ============================================================================
+
+/// Wire prefix that identifies an AVSS open-in-exp contribution message.
+const AVSS_EXP_WIRE_PREFIX: &[u8; 4] = b"AXOP";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AvssExpOpenWireMessage {
+    instance_id: u64,
+    sender_party_id: usize,
+    share_id: usize,
+    partial_point: Vec<u8>,
+}
+
+#[derive(Default, Clone)]
+struct AvssExpOpenAccumulator {
+    /// (share_id, serialized compressed affine point)
+    partial_points: Vec<(usize, Vec<u8>)>,
+    party_ids: Vec<usize>,
+    result: Option<Vec<u8>>,
+    result_cached_at: Option<std::time::Instant>,
+}
+
+const AVSS_EXP_EVICTION_AGE: Duration = Duration::from_secs(60);
+
+static AVSS_EXP_REGISTRY: once_cell::sync::Lazy<
+    parking_lot::Mutex<HashMap<(u64, usize), AvssExpOpenAccumulator>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+static AVSS_EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
+    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+
+fn insert_remote_avss_exp_partial(
+    instance_id: u64,
+    sender_party_id: usize,
+    share_id: usize,
+    partial_point: Vec<u8>,
+) {
+    let mut reg = AVSS_EXP_REGISTRY.lock();
+    let now = std::time::Instant::now();
+    reg.retain(|_, acc| {
+        acc.result_cached_at
+            .is_none_or(|t| now.duration_since(t) < AVSS_EXP_EVICTION_AGE)
+    });
+    let mut seq = 0usize;
+    loop {
+        let key = (instance_id, seq);
+        let entry = reg.entry(key).or_default();
+        if !entry.party_ids.contains(&sender_party_id) {
+            entry.partial_points.push((share_id, partial_point));
+            entry.party_ids.push(sender_party_id);
+            break;
+        }
+        seq += 1;
+    }
+    drop(reg);
+    AVSS_EXP_NOTIFY.notify_waiters();
+}
+
+/// Inspect an incoming message and, if it carries an AVSS open-in-exp contribution
+/// (`AXOP` prefix), insert it into the accumulator registry and return `Ok(true)`.
+/// Returns `Ok(false)` for unrelated messages.
+pub(crate) fn try_handle_avss_open_exp_wire_message(
+    authenticated_sender_id: usize,
+    payload: &[u8],
+) -> Result<bool, String> {
+    if payload.len() < AVSS_EXP_WIRE_PREFIX.len()
+        || &payload[..AVSS_EXP_WIRE_PREFIX.len()] != AVSS_EXP_WIRE_PREFIX
+    {
+        return Ok(false);
+    }
+
+    let message: AvssExpOpenWireMessage =
+        bincode::deserialize(&payload[AVSS_EXP_WIRE_PREFIX.len()..])
+            .map_err(|e| format!("deserialize avss open-exp payload: {}", e))?;
+
+    if authenticated_sender_id == crate::net::open_registry::UNKNOWN_SENDER_ID {
+        tracing::warn!(
+            sender_party_id = message.sender_party_id,
+            "Rejecting AVSS open-exp wire message from unauthenticated connection"
+        );
+        return Err(
+            "avss open-exp wire rejected: sender identity not authenticated".to_string(),
+        );
+    }
+    if message.sender_party_id != authenticated_sender_id {
+        return Err(format!(
+            "avss open-exp sender mismatch: transport={} payload={}",
+            authenticated_sender_id, message.sender_party_id
+        ));
+    }
+    // In AVSS the share_id equals party_id + 1 (evaluation points are 1-indexed).
+    if message.share_id != message.sender_party_id + 1 {
+        return Err(format!(
+            "avss open-exp share_id mismatch: sender_party_id={} share_id={}",
+            message.sender_party_id, message.share_id
+        ));
+    }
+
+    insert_remote_avss_exp_partial(
+        message.instance_id,
+        message.sender_party_id,
+        message.share_id,
+        message.partial_point,
+    );
+    Ok(true)
+}
+
+// ============================================================================
 
 /// Default number of random double-sharing pairs to pre-generate.
 const DEFAULT_N_RANDOM_SHARES: usize = 16;
@@ -277,6 +389,215 @@ where
 
     fn broadcast_open_registry_payload_sync(&self, payload: Vec<u8>) -> Result<(), String> {
         crate::net::block_on_current(self.broadcast_open_registry_payload(payload))
+    }
+
+    fn encode_avss_open_exp_wire_message(
+        instance_id: u64,
+        sender_party_id: usize,
+        share_id: usize,
+        partial_point: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let payload = AvssExpOpenWireMessage {
+            instance_id,
+            sender_party_id,
+            share_id,
+            partial_point: partial_point.to_vec(),
+        };
+        let encoded = bincode::serialize(&payload)
+            .map_err(|e| format!("serialize avss open-exp payload: {}", e))?;
+        let mut out = Vec::with_capacity(AVSS_EXP_WIRE_PREFIX.len() + encoded.len());
+        out.extend_from_slice(AVSS_EXP_WIRE_PREFIX);
+        out.extend_from_slice(&encoded);
+        Ok(out)
+    }
+
+    async fn broadcast_open_avss_exp_payload(&self, payload: Vec<u8>) -> Result<(), String> {
+        for peer_id in 0..self.n {
+            if peer_id == self.party_id {
+                continue;
+            }
+            self.net.send(peer_id, &payload).await.map_err(|e| {
+                format!("broadcast avss open-exp to {}: {}", peer_id, e)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn broadcast_open_avss_exp_payload_sync(&self, payload: Vec<u8>) -> Result<(), String> {
+        crate::net::block_on_current(self.broadcast_open_avss_exp_payload(payload))
+    }
+
+    /// Reveal an AVSS share in the exponent: reconstructs `[secret] * generator`
+    /// via Lagrange interpolation in the group using integer evaluation points (1, 2, …).
+    ///
+    /// Each party computes `share_value * generator`, broadcasts its partial point,
+    /// and waits until `t+1` contributions are available.
+    pub fn open_share_in_exp_impl(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let share = Self::decode_feldman_share(share_bytes)?;
+        let generator = G::deserialize_compressed(&generator_bytes[..])
+            .map_err(|e| format!("deserialize generator: {}", e))?;
+
+        let share_value = share.feldmanshare.share[0];
+        let share_id = share.feldmanshare.id;
+
+        let partial_point = generator * share_value;
+        let mut partial_bytes = Vec::new();
+        partial_point
+            .into_affine()
+            .serialize_compressed(&mut partial_bytes)
+            .map_err(|e| format!("serialize partial point: {}", e))?;
+
+        let wire_message = Self::encode_avss_open_exp_wire_message(
+            self.instance_id,
+            self.party_id,
+            share_id,
+            &partial_bytes,
+        )?;
+        self.broadcast_open_avss_exp_payload_sync(wire_message)?;
+
+        let required = self.t + 1;
+        let instance_id = self.instance_id;
+        let party_id = self.party_id;
+
+        let try_check = |my_sequence: &mut Option<usize>,
+                         partial_bytes: &[u8],
+                         share_id: usize|
+         -> Result<Option<Vec<u8>>, String> {
+            let mut reg = AVSS_EXP_REGISTRY.lock();
+
+            if my_sequence.is_none() {
+                let mut seq = 0;
+                loop {
+                    let key = (instance_id, seq);
+                    let entry = reg.entry(key).or_insert_with(AvssExpOpenAccumulator::default);
+                    if !entry.party_ids.contains(&party_id) {
+                        entry.partial_points.push((share_id, partial_bytes.to_vec()));
+                        entry.party_ids.push(party_id);
+                        *my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.expect("sequence must be set after insertion");
+            let key = (instance_id, seq);
+            let entry = reg
+                .get_mut(&key)
+                .expect("avss exp registry entry must exist after insertion");
+
+            if let Some(result) = entry.result.clone() {
+                return Ok(Some(result));
+            }
+
+            if entry.partial_points.len() >= required {
+                let collected: Vec<(usize, Vec<u8>)> = entry
+                    .partial_points
+                    .iter()
+                    .take(required)
+                    .cloned()
+                    .collect();
+
+                let mut points: Vec<(usize, G)> = Vec::with_capacity(collected.len());
+                for (sid, bytes) in &collected {
+                    let pt = <G as CurveGroup>::Affine::deserialize_compressed(&bytes[..])
+                        .map_err(|e| format!("deserialize partial point: {}", e))?;
+                    points.push((*sid, pt.into()));
+                }
+
+                // AVSS evaluation points are 1-indexed integers.
+                let eval_points: Vec<(usize, F)> = points
+                    .iter()
+                    .map(|(id, _)| (*id, F::from(*id as u64)))
+                    .collect();
+
+                let mut result = G::zero();
+                for (i, (_id_i, pt_i)) in points.iter().enumerate() {
+                    let x_i = eval_points[i].1;
+                    let mut lambda = F::from(1u64);
+                    for (j, _) in points.iter().enumerate() {
+                        if i == j {
+                            continue;
+                        }
+                        let x_j = eval_points[j].1;
+                        let num = -x_j;
+                        let den = x_i - x_j;
+                        lambda *= num
+                            * den
+                                .inverse()
+                                .ok_or_else(|| "zero denominator in AVSS Lagrange".to_string())?;
+                    }
+                    result += *pt_i * lambda;
+                }
+
+                let mut result_bytes = Vec::new();
+                result
+                    .into_affine()
+                    .serialize_compressed(&mut result_bytes)
+                    .map_err(|e| format!("serialize result: {}", e))?;
+
+                entry.result = Some(result_bytes.clone());
+                entry.result_cached_at = Some(std::time::Instant::now());
+                return Ok(Some(result_bytes));
+            }
+
+            Ok(None)
+        };
+
+        // Use async Notify when a multi-thread tokio runtime is available.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let deadline =
+                            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+                        let mut my_sequence: Option<usize> = None;
+
+                        loop {
+                            let notified = AVSS_EXP_NOTIFY.notified();
+
+                            if let Some(result) =
+                                try_check(&mut my_sequence, &partial_bytes, share_id)?
+                            {
+                                return Ok(result);
+                            }
+
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(
+                                    "Timeout waiting for AVSS open_share_in_exp contributions"
+                                        .to_string(),
+                                );
+                            }
+
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep_until(deadline) => {}
+                            }
+                        }
+                    })
+                });
+            }
+        }
+
+        // Polling fallback.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut my_sequence: Option<usize> = None;
+        loop {
+            if let Some(result) = try_check(&mut my_sequence, &partial_bytes, share_id)? {
+                return Ok(result);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "Timeout waiting for AVSS open_share_in_exp contributions".to_string(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Start the engine and mark it ready
@@ -841,9 +1162,24 @@ where
         F::CURVE_CONFIG
     }
 
-    fn supports_elliptic_curves(&self) -> bool {
-        // `open_share_in_exp` is not implemented for AVSS yet.
-        false
+    fn capabilities(&self) -> crate::net::mpc_engine::MpcCapabilities {
+        use crate::net::mpc_engine::MpcCapabilities;
+        MpcCapabilities::MULTIPLICATION | MpcCapabilities::OPEN_IN_EXP | MpcCapabilities::ELLIPTIC_CURVES
+    }
+
+    fn random_share(&self, _ty: ShareType) -> Result<Vec<u8>, String> {
+        let share =
+            crate::net::block_on_current(self.generate_random_share("__random_share__"))?;
+        Self::encode_feldman_share(&share)
+    }
+
+    fn open_share_in_exp(
+        &self,
+        ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.open_share_in_exp_impl(ty, share_bytes, generator_bytes)
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {

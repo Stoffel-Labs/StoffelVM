@@ -3,13 +3,13 @@ use std::net::SocketAddr;
 use std::process::exit;
 use std::str::FromStr;
 
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use ark_ec::{CurveGroup, PrimeGroup};
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use ark_ff::PrimeField;
 #[cfg(feature = "honeybadger")]
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use std::collections::HashSet;
 use std::fs::File;
 use std::sync::Arc;
@@ -31,9 +31,9 @@ use stoffel_vm::net::{
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 use stoffel_vm_types::compiled_binary::CompiledBinary;
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffelmpc_mpc::common::MPCProtocol;
 #[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
@@ -41,7 +41,7 @@ use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustS
 use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 #[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
@@ -60,7 +60,7 @@ fn fail_removed_flag(raw_args: &[String], old_flag: &str, replacement_hint: &str
     }
 }
 
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 fn parse_inputs_as_field<F: PrimeField>(inputs_str: &str) -> Vec<F> {
     inputs_str
         .split(',')
@@ -76,7 +76,7 @@ fn parse_inputs_as_field<F: PrimeField>(inputs_str: &str) -> Vec<F> {
 }
 
 /// Connect to all MPC servers with retry logic, spawning a receive loop per connection.
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 async fn connect_to_all_servers(
     network: &Arc<tokio::sync::Mutex<QuicNetworkManager>>,
     server_addrs: &[SocketAddr],
@@ -456,6 +456,142 @@ async fn run_hb_client_for_curve(
 }
 
 #[cfg(feature = "honeybadger")]
+async fn run_as_client(
+    n_parties: Option<usize>,
+    threshold: Option<usize>,
+    mpc_backend: Option<&str>,
+    mpc_curve: Option<&str>,
+    client_inputs: Option<String>,
+    server_addrs: Vec<SocketAddr>,
+) {
+    let n = n_parties.unwrap_or_else(|| {
+        eprintln!("Error: --n-parties is required in client mode");
+        exit(2);
+    });
+    let t = threshold.unwrap_or(1);
+
+    if let Some(backend_name) = mpc_backend {
+        let parsed_backend = MpcBackendKind::from_str(backend_name).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            exit(2);
+        });
+        if !matches!(parsed_backend, MpcBackendKind::HoneyBadger) {
+            eprintln!(
+                "Error: client mode only supports honeybadger backend (got {})",
+                parsed_backend.name()
+            );
+            exit(2);
+        }
+    }
+
+    let inputs_str = client_inputs.unwrap_or_else(|| {
+        eprintln!("Error: --inputs is required in client mode (comma-separated values)");
+        exit(2);
+    });
+    let input_len = inputs_str.split(',').count();
+
+    if server_addrs.is_empty() {
+        eprintln!("Error: --servers is required in client mode (comma-separated addresses)");
+        eprintln!("Example: --servers 172.18.0.2:9000,172.18.0.3:9000,172.18.0.4:9000,172.18.0.5:9000,172.18.0.6:9000");
+        exit(2);
+    }
+
+    if server_addrs.len() != n {
+        eprintln!(
+            "Warning: number of servers ({}) doesn't match n_parties ({})",
+            server_addrs.len(),
+            n
+        );
+    }
+
+    let curve_config = if let Some(name) = mpc_curve {
+        MpcCurveConfig::from_str(name).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            exit(2);
+        })
+    } else {
+        MpcCurveConfig::default()
+    };
+
+    eprintln!(
+        "[client] Client mode (curve={}, n={}, t={}, {} inputs, {} servers)",
+        curve_config.name(),
+        n,
+        t,
+        input_len,
+        server_addrs.len()
+    );
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls crypto");
+
+    let network = Arc::new(tokio::sync::Mutex::new(QuicNetworkManager::new()));
+
+    for (party_id, &addr) in server_addrs.iter().enumerate() {
+        network.lock().await.add_node_with_party_id(party_id, addr);
+        eprintln!("[client] Added server party {} at {}", party_id, addr);
+    }
+
+    let (msg_tx, msg_rx) = mpsc::channel::<(usize, Vec<u8>)>(1000);
+
+    eprintln!("[client] Connecting to {} servers...", server_addrs.len());
+    connect_to_all_servers(&network, &server_addrs, msg_tx.clone()).await;
+
+    let cid = {
+        let net = network.lock().await;
+        net.local_derived_id()
+    };
+    eprintln!("[client {}] Derived transport client ID", cid);
+    eprintln!(
+        "[client {}] Connected to all servers, starting input protocol...",
+        cid
+    );
+
+    let network_for_process = network.clone();
+    let client_id_for_task = cid;
+    let inputs_for_task = inputs_str.clone();
+    let process_handle = tokio::spawn(async move {
+        run_hb_client_for_curve(
+            curve_config,
+            client_id_for_task,
+            n,
+            t,
+            &inputs_for_task,
+            input_len,
+            network_for_process,
+            msg_rx,
+        )
+        .await
+    });
+
+    let timeout_duration = Duration::from_secs(120);
+    match tokio::time::timeout(timeout_duration, process_handle).await {
+        Ok(Ok(Ok(()))) => {
+            eprintln!(
+                "[client {}] Successfully submitted inputs to MPC network",
+                cid
+            );
+        }
+        Ok(Ok(Err(e))) => {
+            eprintln!("[client {}] Input protocol failed: {}", cid, e);
+            exit(22);
+        }
+        Ok(Err(e)) => {
+            eprintln!("[client {}] Input task error: {:?}", cid, e);
+            exit(22);
+        }
+        Err(_) => {
+            eprintln!(
+                "[client {}] Timeout waiting for input protocol to complete",
+                cid
+            );
+            exit(23);
+        }
+    }
+}
+
+#[cfg(feature = "honeybadger")]
 async fn setup_hb_party_for_curve<F, G>(
     vm: &mut VirtualMachine,
     net: Arc<QuicNetworkManager>,
@@ -824,152 +960,24 @@ async fn main() {
         return;
     }
 
-    // Client mode: connect to MPC servers and provide inputs (HoneyBadger only)
-    #[cfg(feature = "honeybadger")]
+    // Client mode: connect to MPC servers and provide inputs
     if as_client {
-        let n = n_parties.unwrap_or_else(|| {
-            eprintln!("Error: --n-parties is required in client mode");
-            exit(2);
-        });
-        let t = threshold.unwrap_or(1);
-
-        if let Some(ref backend_name) = mpc_backend {
-            let parsed_backend = MpcBackendKind::from_str(backend_name).unwrap_or_else(|e| {
-                eprintln!("Error: {}", e);
-                exit(2);
-            });
-            if !matches!(parsed_backend, MpcBackendKind::HoneyBadger) {
-                eprintln!(
-                    "Error: client mode only supports honeybadger backend (got {})",
-                    parsed_backend.name()
-                );
-                exit(2);
-            }
-        }
-
-        // Parse inputs (comma-separated integers or fixed-point values)
-        let inputs_str = client_inputs.unwrap_or_else(|| {
-            eprintln!("Error: --inputs is required in client mode (comma-separated values)");
-            exit(2);
-        });
-        let input_len = inputs_str.split(',').count();
-
-        // Server addresses are required
-        if server_addrs.is_empty() {
-            eprintln!("Error: --servers is required in client mode (comma-separated addresses)");
-            eprintln!("Example: --servers 172.18.0.2:9000,172.18.0.3:9000,172.18.0.4:9000,172.18.0.5:9000,172.18.0.6:9000");
+        #[cfg(feature = "honeybadger")]
+        run_as_client(
+            n_parties,
+            threshold,
+            mpc_backend.as_deref(),
+            mpc_curve.as_deref(),
+            client_inputs,
+            server_addrs,
+        )
+        .await;
+        #[cfg(not(feature = "honeybadger"))]
+        {
+            eprintln!("Error: client mode requires the 'honeybadger' feature");
             exit(2);
         }
-
-        if server_addrs.len() != n {
-            eprintln!(
-                "Warning: number of servers ({}) doesn't match n_parties ({})",
-                server_addrs.len(),
-                n
-            );
-        }
-
-        let curve_config = if let Some(ref name) = mpc_curve {
-            MpcCurveConfig::from_str(name).unwrap_or_else(|e| {
-                eprintln!("Error: {}", e);
-                exit(2);
-            })
-        } else {
-            MpcCurveConfig::default()
-        };
-
-        eprintln!(
-            "[client] Client mode (curve={}, n={}, t={}, {} inputs, {} servers)",
-            curve_config.name(),
-            n,
-            t,
-            input_len,
-            server_addrs.len()
-        );
-
-        // Install crypto provider for quinn/rustls
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("install rustls crypto");
-
-        // Create network manager for client connections
-        let network = Arc::new(tokio::sync::Mutex::new(QuicNetworkManager::new()));
-
-        // Add all server addresses as nodes (party IDs 0 to n-1)
-        for (party_id, &addr) in server_addrs.iter().enumerate() {
-            network.lock().await.add_node_with_party_id(party_id, addr);
-            eprintln!("[client] Added server party {} at {}", party_id, addr);
-        }
-
-        // Create channel for receiving messages (sender_id, data)
-        let (msg_tx, msg_rx) = mpsc::channel::<(usize, Vec<u8>)>(1000);
-
-        // Connect to all servers as a client
-        eprintln!("[client] Connecting to {} servers...", server_addrs.len());
-        connect_to_all_servers(&network, &server_addrs, msg_tx.clone()).await;
-
-        // Derive client identity from transport/TLS public key hash
-        let cid = {
-            let net = network.lock().await;
-            net.local_derived_id()
-        };
-        eprintln!("[client {}] Derived transport client ID", cid);
-
-        eprintln!(
-            "[client {}] Connected to all servers, starting input protocol...",
-            cid
-        );
-
-        // Spawn protocol processing with the selected field.
-        let network_for_process = network.clone();
-        let client_id_for_task = cid;
-        let inputs_for_task = inputs_str.clone();
-        let process_handle = tokio::spawn(async move {
-            run_hb_client_for_curve(
-                curve_config,
-                client_id_for_task,
-                n,
-                t,
-                &inputs_for_task,
-                input_len,
-                network_for_process,
-                msg_rx,
-            )
-            .await
-        });
-
-        // Wait for input protocol to complete with timeout
-        let timeout_duration = Duration::from_secs(120);
-        match tokio::time::timeout(timeout_duration, process_handle).await {
-            Ok(Ok(Ok(()))) => {
-                eprintln!(
-                    "[client {}] Successfully submitted inputs to MPC network",
-                    cid
-                );
-            }
-            Ok(Ok(Err(e))) => {
-                eprintln!("[client {}] Input protocol failed: {}", cid, e);
-                exit(22);
-            }
-            Ok(Err(e)) => {
-                eprintln!("[client {}] Input task error: {:?}", cid, e);
-                exit(22);
-            }
-            Err(_) => {
-                eprintln!(
-                    "[client {}] Timeout waiting for input protocol to complete",
-                    cid
-                );
-                exit(23);
-            }
-        }
-
         return;
-    }
-    #[cfg(not(feature = "honeybadger"))]
-    if as_client {
-        eprintln!("Error: client mode requires the 'honeybadger' feature");
-        exit(2);
     }
 
     // Resolve MPC backend kind
@@ -1437,9 +1445,9 @@ async fn main() {
         match backend_kind {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => {
-                let hb_setup_result = match curve_config {
-                    MpcCurveConfig::Bls12_381 => {
-                        setup_hb_party_for_curve::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>(
+                macro_rules! setup_hb {
+                    ($F:ty, $G:ty) => {{
+                        if let Err(e) = setup_hb_party_for_curve::<$F, $G>(
                             &mut vm,
                             net.clone(),
                             my_id,
@@ -1449,51 +1457,26 @@ async fn main() {
                             expected_client_count,
                         )
                         .await
+                        {
+                            eprintln!("[party {}] HoneyBadger setup failed: {}", my_id, e);
+                            exit(13);
+                        }
+                    }};
+                }
+
+                match curve_config {
+                    MpcCurveConfig::Bls12_381 => {
+                        setup_hb!(ark_bls12_381::Fr, ark_bls12_381::G1Projective)
                     }
                     MpcCurveConfig::Bn254 => {
-                        setup_hb_party_for_curve::<ark_bn254::Fr, ark_bn254::G1Projective>(
-                            &mut vm,
-                            net.clone(),
-                            my_id,
-                            n,
-                            t,
-                            instance_id,
-                            expected_client_count,
-                        )
-                        .await
+                        setup_hb!(ark_bn254::Fr, ark_bn254::G1Projective)
                     }
                     MpcCurveConfig::Curve25519 => {
-                        setup_hb_party_for_curve::<
-                            ark_curve25519::Fr,
-                            ark_curve25519::EdwardsProjective,
-                        >(
-                            &mut vm,
-                            net.clone(),
-                            my_id,
-                            n,
-                            t,
-                            instance_id,
-                            expected_client_count,
-                        )
-                        .await
+                        setup_hb!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
                     }
                     MpcCurveConfig::Ed25519 => {
-                        setup_hb_party_for_curve::<ark_ed25519::Fr, ark_ed25519::EdwardsProjective>(
-                            &mut vm,
-                            net.clone(),
-                            my_id,
-                            n,
-                            t,
-                            instance_id,
-                            expected_client_count,
-                        )
-                        .await
+                        setup_hb!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective)
                     }
-                };
-
-                if let Err(e) = hb_setup_result {
-                    eprintln!("[party {}] HoneyBadger setup failed: {}", my_id, e);
-                    exit(13);
                 }
 
                 eprintln!(

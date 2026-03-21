@@ -2,7 +2,7 @@
 //! Integration module for HoneyBadger MPC with QUIC networking
 use crate::net::mpc::honeybadger_node_opts;
 use ark_ff::{FftField, PrimeField};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
@@ -11,12 +11,147 @@ use stoffelmpc_mpc::honeybadger::{
     HoneyBadgerError, HoneyBadgerMPCClient, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts,
 };
 use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId};
-use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
+use stoffelnet::transports::quic::{
+    NetworkManager, PeerConnection, QuicNetworkConfig, QuicNetworkManager,
+};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
+
+/// A `Network` wrapper that routes `send(party_id)` directly via a pre-built
+/// address-based connection table rather than QuicNetworkManager's sorted-key
+/// lookup.  QuicNetworkManager routes by lexicographic public-key position which
+/// does not align with the sequential address-based party IDs (0..n) that
+/// HoneyBadger expects.
+#[derive(Clone)]
+pub struct RoutedNetwork {
+    /// Underlying network for delegating non-routing operations
+    pub inner: Arc<QuicNetworkManager>,
+    /// Direct connections indexed by address-based party ID.
+    /// conns[i] = Some(conn) for party i, None if no connection exists.
+    conns: Arc<Vec<Option<Arc<dyn PeerConnection>>>>,
+    n: usize,
+    local_id: PartyId,
+    /// Logical client ID → connection mapping.
+    /// QuicNetworkManager registers client connections under a QUIC-derived
+    /// peer ID (from TLS public key), not the logical client ID that the
+    /// HoneyBadger input protocol uses. This map bridges the gap.
+    client_conns: Arc<std::sync::RwLock<HashMap<ClientId, Arc<dyn PeerConnection>>>>,
+}
+
+impl RoutedNetwork {
+    /// Register a client connection under a logical client ID so that
+    /// `send_to_client(logical_id, ..)` can find it.
+    pub fn register_client(&self, logical_id: ClientId, conn: Arc<dyn PeerConnection>) {
+        self.client_conns.write().unwrap().insert(logical_id, conn);
+    }
+}
+
+#[async_trait::async_trait]
+impl Network for RoutedNetwork {
+    type NodeType = <QuicNetworkManager as Network>::NodeType;
+    type NetworkConfig = <QuicNetworkManager as Network>::NetworkConfig;
+
+    async fn send(&self, recipient: PartyId, message: &[u8]) -> Result<usize, NetworkError> {
+        let conn = self
+            .conns
+            .get(recipient)
+            .and_then(|c| c.as_ref())
+            .ok_or(NetworkError::PartyNotFound(recipient))?;
+        if !conn.is_connected().await {
+            return Err(NetworkError::PartyNotFound(recipient));
+        }
+        conn.send(message)
+            .await
+            .map(|_| message.len())
+            .map_err(|_| NetworkError::SendError)
+    }
+
+    async fn broadcast(&self, message: &[u8]) -> Result<usize, NetworkError> {
+        let mut total = 0;
+        for i in 0..self.n {
+            // Skip self — sending broadcast messages to ourselves via loopback
+            // causes AVID RBC store amplification: after drain_rbc_output() removes
+            // a completed session, late self-messages recreate the store and trigger
+            // exponential re-processing cascades that starve later protocol rounds.
+            if i == self.local_id {
+                continue;
+            }
+            if let Some(Some(conn)) = self.conns.get(i) {
+                if conn.is_connected().await && conn.send(message).await.is_ok() {
+                    total += message.len();
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    fn parties(&self) -> Vec<&Self::NodeType> {
+        self.inner.parties()
+    }
+
+    fn parties_mut(&mut self) -> Vec<&mut Self::NodeType> {
+        vec![] // never called by HoneyBadger
+    }
+
+    fn config(&self) -> &Self::NetworkConfig {
+        self.inner.config()
+    }
+
+    fn node(&self, id: PartyId) -> Option<&Self::NodeType> {
+        self.inner.node(id)
+    }
+
+    fn node_mut(&mut self, id: PartyId) -> Option<&mut Self::NodeType> {
+        None // never called by HoneyBadger
+    }
+
+    async fn send_to_client(
+        &self,
+        client: ClientId,
+        message: &[u8],
+    ) -> Result<usize, NetworkError> {
+        // Clone the Arc out of the lock before any await point
+        let conn = self.client_conns.read().unwrap().get(&client).cloned();
+        if let Some(conn) = conn {
+            if conn.is_connected().await {
+                return conn
+                    .send(message)
+                    .await
+                    .map(|_| message.len())
+                    .map_err(|_| NetworkError::SendError);
+            }
+        }
+        self.inner.send_to_client(client, message).await
+    }
+
+    fn clients(&self) -> Vec<ClientId> {
+        let mut ids = self.inner.clients();
+        for id in self.client_conns.read().unwrap().keys() {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        ids
+    }
+
+    fn is_client_connected(&self, client: ClientId) -> bool {
+        if self.client_conns.read().unwrap().contains_key(&client) {
+            return true;
+        }
+        self.inner.is_client_connected(client)
+    }
+
+    fn local_party_id(&self) -> PartyId {
+        self.local_id
+    }
+
+    fn party_count(&self) -> usize {
+        self.n
+    }
+}
 
 /// Configuration for HoneyBadger MPC over QUIC
 #[derive(Debug, Clone)]
@@ -61,6 +196,12 @@ pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     pub node_id: PartyId,
     /// Bind address
     pub channels: Sender<(PartyId, Vec<u8>)>,
+    /// Address-based routed network — available after connect_to_peers()
+    pub routed_network: Option<Arc<RoutedNetwork>>,
+    /// Logical client IDs expected by this server.  Used by the accept loop to
+    /// tag incoming client messages with the logical ID (which matches the
+    /// sender_id inside HoneyBadger messages) instead of the QUIC-derived ID.
+    expected_client_ids: Vec<ClientId>,
 }
 
 impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
@@ -78,7 +219,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             F,
             RobustShare<F>,
             QuicNetworkManager,
-        >>::setup(node_id, mpc_opts, input_ids)?;
+        >>::setup(node_id, mpc_opts, input_ids.clone())?;
         //let node = Arc::new(Mutex::new(mpc_node));
 
         // Create network manager
@@ -122,6 +263,8 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             shutdown_tx: None,
             node_id,
             channels,
+            routed_network: None,
+            expected_client_ids: input_ids,
         })
     }
 
@@ -167,10 +310,9 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         // This is a known limitation - MPC operations must use connections
         // established via connect_to_peers, not accepted connections.
         let mut acceptor = (*network).clone();
-        // let network_for_handlers = self.network.clone();
-        // let node_for_handlers = self.node.clone();
         let node_id = self.node_id;
         let tx = self.channels.clone();
+        let expected_clients = self.expected_client_ids.clone();
 
         let connection_task = tokio::spawn(async move {
             loop {
@@ -190,9 +332,23 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                 // Spawn a task to handle this connection's messages
                                 let txx = tx.clone();
                                 let conn_node_id = node_id;
-                                let sender_id = connection.remote_party_id().unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
+                                let remote_addr = connection.remote_address();
+                                let sender_id = connection.remote_party_id()
+                                    .or_else(|| {
+                                        // Try party address lookup (server-to-server)
+                                        acceptor.parties().into_iter()
+                                            .find(|n| n.address() == remote_addr)
+                                            .map(|n| n.id())
+                                    })
+                                    .or_else(|| {
+                                        // Unidentified connection — likely a client.
+                                        // Use the logical client ID so it matches the
+                                        // sender_id inside HoneyBadger messages.
+                                        expected_clients.first().copied()
+                                    })
+                                    .unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
 
-                                info!("[HB-QUIC] Node {} spawning message handler for connection {}", conn_node_id, connection.remote_address());
+                                info!("[HB-QUIC] Node {} spawning message handler for connection {} (sender_id={})", conn_node_id, connection.remote_address(), sender_id);
                                 tokio::spawn(async move {
                                     loop {
                                         match connection.receive().await {
@@ -225,12 +381,14 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         Ok(())
     }
 
-    /// Connects to all configured peer nodes. Must be called after start().
-    pub async fn connect_to_peers(&self) -> Result<(), HoneyBadgerError> {
+    /// Connects to all configured peer nodes and builds the RoutedNetwork.
+    /// Must be called after start(). Sets self.routed_network on success.
+    pub async fn connect_to_peers(&mut self) -> Result<(), HoneyBadgerError> {
         let network = self
             .network
             .as_ref()
-            .expect("connect_to_peers() called before start()");
+            .expect("connect_to_peers() called before start()")
+            .clone();
 
         let peers: Vec<(PartyId, SocketAddr)> = network
             .parties()
@@ -238,9 +396,45 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             .map(|p| (p.id(), p.address()))
             .collect();
 
-        // Clone the network manager to get mutable access for establishing connections
-        // NOTE: Connections are stored in this clone, not in the shared Arc
-        let mut dialer = (**network).clone();
+        let n = peers.len();
+        // Pre-allocate connection slots indexed by address-based party ID.
+        let mut conns: Vec<Option<Arc<dyn PeerConnection>>> = vec![None; n];
+
+        // Install loopback for self
+        if let Some(lb) = network.get_connection(self.node_id).await {
+            info!(
+                "Node {} installed loopback connection at index {}",
+                self.node_id, self.node_id
+            );
+            if self.node_id < n {
+                conns[self.node_id] = Some(lb.clone());
+            }
+            // Spawn loopback reader so self-sends reach the receive loop
+            let loopback_id = self.node_id;
+            let txx = self.channels.clone();
+            tokio::spawn(async move {
+                info!(
+                    "Node {} started loopback reader task (sender_id={})",
+                    loopback_id, loopback_id
+                );
+                loop {
+                    match lb.receive().await {
+                        Ok(data) => {
+                            if txx.send((loopback_id, data)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        } else {
+            warn!("Node {} has no loopback connection", self.node_id);
+        }
+
+        // Clone the network manager to get mutable access for establishing connections.
+        // server_connections is Arc<DashMap>, so connections are visible in `network`.
+        let mut dialer = (*network).clone();
         info!(
             "[HB-QUIC] Node {} discovered {} peers (including self)",
             self.node_id,
@@ -253,9 +447,15 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             );
         }
         for (peer_id, peer_addr) in peers {
-            // Connect to all peers including self to ensure a loopback entry exists in the
-            // network connections map. Some protocols send to self, and the transport
-            // expects an established connection for that PartyId.
+            // Skip self — loopback handles self-sends; connecting to self would
+            // add self's key to peer_public_keys, inflating party_count to n+1.
+            if peer_id == self.node_id {
+                info!(
+                    "Node {} skipping self-connection (loopback handles self-sends)",
+                    self.node_id
+                );
+                continue;
+            }
             info!(
                 "Node {} connecting to peer {} at {}",
                 self.node_id, peer_id, peer_addr
@@ -272,7 +472,12 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                             self.node_id, peer_id
                         );
 
-                        // Spawn message handler for this connection
+                        // Store in address-based routing table
+                        if peer_id < n {
+                            conns[peer_id] = Some(connection.clone());
+                        }
+
+                        // Spawn message handler for replies arriving on this connection
                         let pid_for_task = peer_id;
                         let txx = self.channels.clone();
                         tokio::spawn(async move {
@@ -314,6 +519,20 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                 }
             }
         }
+
+        // Build and store the RoutedNetwork
+        let routed = RoutedNetwork {
+            inner: network.clone(),
+            conns: Arc::new(conns),
+            n,
+            local_id: self.node_id,
+            client_conns: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        };
+        self.routed_network = Some(Arc::new(routed));
+        info!(
+            "Node {} built RoutedNetwork with {} address-based slots",
+            self.node_id, n
+        );
 
         Ok(())
     }
@@ -924,7 +1143,7 @@ mod tests {
 
         // Step 3: Connect servers to each other
         info!("Step 3: Connecting servers to each other...");
-        for server in &servers {
+        for server in &mut servers {
             info!("Connecting server {} to peers...", server.node_id);
             server
                 .connect_to_peers()
@@ -1263,7 +1482,7 @@ mod tests {
 
         // Step 3: Connect servers to each other
         info!("Step 3: Connecting servers to each other...");
-        for server in &servers {
+        for server in &mut servers {
             info!("Connecting server {} to peers...", server.node_id);
             server
                 .connect_to_peers()
@@ -1500,7 +1719,7 @@ mod tests {
 
         // Step 3: Connect servers to each other
         info!("Step 3: Connecting servers to each other...");
-        for server in &servers {
+        for server in &mut servers {
             info!("Connecting server {} to peers...", server.node_id);
             server
                 .connect_to_peers()

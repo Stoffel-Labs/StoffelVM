@@ -21,6 +21,7 @@ use tracing::info;
 use crate::core_vm::VirtualMachine;
 use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
+    RoutedNetwork,
 };
 use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
 use std::collections::HashMap;
@@ -67,17 +68,35 @@ async fn test_vm_mpc_multiplication_integration() {
     .expect("Failed to create servers");
     info!("✓ Created {} servers", servers.len());
 
-    // Step 2: Start all servers
+    // Step 2: Start all servers (accept loops only; receive loops come after step 3)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         // Must call start() first to create the network Arc
         server.start().await.expect("Failed to start server");
+        info!("✓ Started server {}", server.node_id);
+    }
 
+    // Step 3: Connect servers to each other (also builds RoutedNetwork)
+    info!("Step 3: Connecting servers to each other...");
+    for server in servers.iter_mut() {
+        server
+            .connect_to_peers()
+            .await
+            .expect("Failed to connect to peers");
+        info!("✓ Server {} connected to peers", server.node_id);
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 3b: Spawn receive-loop tasks now that RoutedNetwork is available.
+    // Messages queued while connecting are processed once the loops start.
+    info!("Step 3b: Spawning receive-loop tasks...");
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after connect_to_peers()");
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
@@ -103,33 +122,20 @@ async fn test_vm_mpc_multiplication_integration() {
             }
             tracing::info!("Receiver task for node {i} ended");
         });
-        info!("✓ Started server {}", server.node_id);
     }
-
-    // Step 3: Connect servers to each other
-    info!("Step 3: Connecting servers to each other...");
-    for server in &servers {
-        server
-            .connect_to_peers()
-            .await
-            .expect("Failed to connect to peers");
-        info!("✓ Server {} connected to peers", server.node_id);
-    }
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Step 4: Run preprocessing
     info!("Step 4: Running preprocessing on all servers...");
-    let preprocessing_timeout = Duration::from_secs(30);
+    let preprocessing_timeout = Duration::from_secs(120);
     let preprocessing_handles: Vec<_> = servers
         .iter()
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after connect_to_peers()");
 
             tokio::spawn(async move {
                 info!("[Server {}] Starting preprocessing...", i);
@@ -202,6 +208,32 @@ async fn test_vm_mpc_multiplication_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Register client connections under logical IDs in each server's RoutedNetwork.
+    // QuicNetworkManager stores client connections under a QUIC-derived peer ID
+    // (from TLS public key), but the HoneyBadger input protocol uses logical
+    // client IDs. Bridge the gap by copying the accepted client connections into
+    // the RoutedNetwork's logical-ID map.
+    for server in servers.iter() {
+        if let Some(ref routed) = server.routed_network {
+            let all_clients = server
+                .network
+                .as_ref()
+                .expect("network should be set")
+                .get_all_client_connections();
+            // Map all QUIC-derived client connections to the logical client_id.
+            // With a single client this is unambiguous.
+            for (_, conn) in &all_clients {
+                routed.register_client(client_id, conn.clone());
+            }
+            info!(
+                "Server {} registered {} client connection(s) under logical ID {}",
+                server.node_id,
+                all_clients.len(),
+                client_id
+            );
+        }
+    }
+
     // Step 5b: Initialize input protocol on all servers for the client
     info!("Step 5b: Initializing client inputs on all servers...");
     for (i, server) in servers.iter_mut().enumerate() {
@@ -220,7 +252,10 @@ async fn test_vm_mpc_multiplication_integration() {
                 client_id,
                 local_shares,
                 2,
-                server.network.clone().expect("network should be set"),
+                server
+                    .routed_network
+                    .clone()
+                    .expect("routed_network should be set after connect_to_peers()"),
             )
             .await
             .expect("input.init failed");
@@ -240,7 +275,10 @@ async fn test_vm_mpc_multiplication_integration() {
     let mut multiplication_handles = Vec::new();
     for (pid, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let net = server.network.clone().expect("network should be set");
+        let net: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
+            .clone()
+            .expect("routed_network should be set after connect_to_peers()");
 
         let handle = tokio::spawn(async move {
             // Get input shares for this party

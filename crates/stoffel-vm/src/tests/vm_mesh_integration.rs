@@ -143,7 +143,7 @@ async fn test_vm_mesh_full_integration() {
 
     // Step 3: Connect servers in mesh
     info!("Step 3: Connecting servers in mesh topology...");
-    for server in &servers {
+    for server in &mut servers {
         server.connect_to_peers().await.expect("Failed to connect");
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -477,7 +477,7 @@ async fn test_vm_mesh_average_salary_integration() {
     }
 
     info!("Connecting servers...");
-    for server in &servers {
+    for server in &mut servers {
         server.connect_to_peers().await.expect("Failed to connect");
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -915,7 +915,7 @@ async fn test_vm_mesh_large_preprocessing() {
 
     // Step 3: Connect servers in mesh
     info!("Step 3: Connecting servers in mesh topology...");
-    for server in &servers {
+    for server in &mut servers {
         server.connect_to_peers().await.expect("Failed to connect");
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1180,7 +1180,7 @@ async fn test_vm_mesh_output_client_integration() {
 
     // Step 3: Connect servers
     info!("Step 3: Connecting servers...");
-    for server in &servers {
+    for server in &mut servers {
         server.connect_to_peers().await.expect("Failed to connect");
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1384,7 +1384,7 @@ async fn test_vm_mesh_output_client_integration() {
         // Process the message at the output client
         let mut client = output_client.lock().await;
         client
-            .process(output_msg, party_id)
+            .process(output_msg)
             .await
             .expect("OutputClient failed to process message");
 
@@ -1632,7 +1632,7 @@ async fn test_vm_mesh_matrix_average_integration() {
 
     // Step 3: Connect servers
     info!("Step 3: Connecting servers in mesh topology...");
-    for server in &servers {
+    for server in &mut servers {
         server.connect_to_peers().await.expect("Failed to connect");
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2191,15 +2191,13 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     step_timings.push(("Step 2: Start servers", step_start.elapsed()));
     step_start = std::time::Instant::now();
 
-    // Step 3: Connect servers (PARALLELIZED)
+    // Step 3: Connect servers
     info!("Step 3: Connecting servers in mesh topology...");
-    let connect_handles: Vec<_> = servers
-        .iter()
-        .map(|server| server.connect_to_peers())
-        .collect();
-    let connect_results = futures::future::join_all(connect_handles).await;
-    for (i, result) in connect_results.into_iter().enumerate() {
-        result.unwrap_or_else(|e| panic!("Server {} failed to connect: {:?}", i, e));
+    for (i, server) in servers.iter_mut().enumerate() {
+        server
+            .connect_to_peers()
+            .await
+            .unwrap_or_else(|e| panic!("Server {} failed to connect: {:?}", i, e));
     }
     info!("  ✓ All {} servers connected to mesh", n_parties);
     // Brief pause to ensure all connections are fully established
@@ -3389,7 +3387,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 
     // Step 4: Connect servers
     info!("Step 4: Connecting servers in mesh topology...");
-    for server in &servers {
+    for server in &mut servers {
         server.connect_to_peers().await.expect("Failed to connect");
     }
     tokio::time::sleep(Duration::from_millis(300)).await;

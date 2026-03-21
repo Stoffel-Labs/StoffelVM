@@ -91,7 +91,7 @@ async fn test_open_share_in_exp_known_value() {
     }
 
     // Connect servers
-    for server in &servers {
+    for server in &mut servers {
         server
             .connect_to_peers()
             .await
@@ -260,7 +260,7 @@ async fn test_simulated_dkg_flow() {
     }
 
     // Connect servers
-    for server in &servers {
+    for server in &mut servers {
         server
             .connect_to_peers()
             .await
