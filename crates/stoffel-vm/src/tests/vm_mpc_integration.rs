@@ -76,7 +76,7 @@ async fn test_vm_mpc_multiplication_integration() {
         info!("✓ Started server {}", server.node_id);
     }
 
-    // Step 3: Connect servers to each other (also builds RoutedNetwork)
+    // Step 3: Connect servers to each other
     info!("Step 3: Connecting servers to each other...");
     for server in servers.iter_mut() {
         server
@@ -88,8 +88,21 @@ async fn test_vm_mpc_multiplication_integration() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Step 3b: Spawn receive-loop tasks now that RoutedNetwork is available.
-    // Messages queued while connecting are processed once the loops start.
+    // Step 3a: Finalize network — assign_party_ids(), recreate HB nodes with
+    // correct sorted-key party IDs, and build MpcNetwork wrappers.
+    info!("Step 3a: Finalizing network (assign_party_ids)...");
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!(
+            "✓ Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
+    }
+
+    // Step 3b: Spawn receive-loop tasks for the message dispatch channel.
     info!("Step 3b: Spawning receive-loop tasks...");
     for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
