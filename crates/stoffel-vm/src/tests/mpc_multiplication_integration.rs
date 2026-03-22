@@ -15,7 +15,7 @@ use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::honeybadger::{
     HoneyBadgerError, HoneyBadgerMPCClient, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts,
 };
-use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId};
+use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId, VerifiedOrdering};
 use stoffelnet::transports::quic::{
     NetworkManager, PeerConnection, QuicNetworkConfig, QuicNetworkManager,
 };
@@ -143,6 +143,9 @@ impl Network for MpcNetwork {
     fn party_count(&self) -> usize {
         self.inner.party_count()
     }
+    fn verified_ordering(&self) -> Option<VerifiedOrdering> {
+        self.inner.verified_ordering()
+    }
 }
 
 /// `MpcNetwork` variant for the client side.
@@ -223,6 +226,9 @@ impl Network for ClientMpcNetwork {
     }
     fn party_count(&self) -> usize {
         self.n
+    }
+    fn verified_ordering(&self) -> Option<VerifiedOrdering> {
+        None
     }
 }
 
@@ -1178,6 +1184,17 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(300)).await;
 
+        // Assign sorted-public-key party IDs now that the mesh is formed
+        for server in &servers {
+            let network = server.network.as_ref().expect("network should be set");
+            let assigned = network.assign_party_ids();
+            let local_pid = network.local_party_id();
+            info!(
+                "Server {} assigned {} party IDs (local_party_id={})",
+                server.node_id, assigned, local_pid
+            );
+        }
+
         // Step 5: Verify client connectivity
         info!("Step 5: Verifying client connectivity...");
         for (i, client) in clients.iter().enumerate() {
@@ -1204,15 +1221,15 @@ mod tests {
                 info!("  - Party {} at {}", party.id(), party.address());
             }
 
-            // Verify each server can resolve all other parties
+            // Verify each server can resolve all other parties via sorted public keys
             for peer_id in 0..n_parties {
-                match network.node(peer_id) {
-                    Some(node) => {
+                match network.get_connection_by_party_id(peer_id) {
+                    Some(conn) => {
                         info!(
                             "✓ Server {} can resolve peer {} at {}",
                             i,
                             peer_id,
-                            node.address()
+                            conn.remote_address()
                         );
                     }
                     None => {
@@ -1517,6 +1534,17 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(300)).await;
 
+        // Assign sorted-public-key party IDs now that the mesh is formed
+        for server in &servers {
+            let network = server.network.as_ref().expect("network should be set");
+            let assigned = network.assign_party_ids();
+            let local_pid = network.local_party_id();
+            info!(
+                "Server {} assigned {} party IDs (local_party_id={})",
+                server.node_id, assigned, local_pid
+            );
+        }
+
         // Step 5: Verify client connectivity
         info!("Step 5: Verifying client connectivity...");
         for (i, client) in clients.iter().enumerate() {
@@ -1543,15 +1571,15 @@ mod tests {
                 info!("  - Party {} at {}", party.id(), party.address());
             }
 
-            // Verify each server can resolve all other parties
+            // Verify each server can resolve all other parties via sorted public keys
             for peer_id in 0..n_parties {
-                match network.node(peer_id) {
-                    Some(node) => {
+                match network.get_connection_by_party_id(peer_id) {
+                    Some(conn) => {
                         info!(
                             "✓ Server {} can resolve peer {} at {}",
                             i,
                             peer_id,
-                            node.address()
+                            conn.remote_address()
                         );
                     }
                     None => {
@@ -1739,7 +1767,16 @@ mod tests {
                 .expect("Failed to connect to peers");
             info!("✓ Server {} connected to peers", server.node_id);
         }
-        // tokio::time::sleep(Duration::from_millis(300)).await;
+        // Assign sorted-public-key party IDs now that the mesh is formed
+        for server in &servers {
+            let network = server.network.as_ref().expect("network should be set");
+            let assigned = network.assign_party_ids();
+            let local_pid = network.local_party_id();
+            info!(
+                "Server {} assigned {} party IDs (local_party_id={})",
+                server.node_id, assigned, local_pid
+            );
+        }
 
         // Step 4: Verify network connectivity with a simple ping-pong test
         info!("Step 4: Verifying network connectivity...");
@@ -1751,15 +1788,15 @@ mod tests {
                 info!("  - Party {} at {}", party.id(), party.address());
             }
 
-            // Verify each server can resolve all other parties
+            // Verify each server can resolve all other parties via sorted public keys
             for peer_id in 0..n_parties {
-                match network.node(peer_id) {
-                    Some(node) => {
+                match network.get_connection_by_party_id(peer_id) {
+                    Some(conn) => {
                         info!(
                             "✓ Server {} can resolve peer {} at {}",
                             i,
                             peer_id,
-                            node.address()
+                            conn.remote_address()
                         );
                     }
                     None => {

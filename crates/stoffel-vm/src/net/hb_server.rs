@@ -12,7 +12,7 @@ use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustS
 use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts};
 use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId};
-use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
+use stoffelnet::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 use tracing::{error, info, warn};
@@ -84,7 +84,10 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             "[HB-QUIC] Initializing network manager for node {} at {}",
             node_id, bind_address
         );
-        let mut base_manager = QuicNetworkManager::with_node_id(node_id);
+        let mut base_manager = QuicNetworkManager::with_config(QuicNetworkConfig {
+            use_tls: false,
+            ..Default::default()
+        });
         info!(
             "[HB-QUIC] Node {} calling listen({})",
             node_id, bind_address
