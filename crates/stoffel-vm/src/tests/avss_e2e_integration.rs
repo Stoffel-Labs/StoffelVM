@@ -25,7 +25,7 @@ use std::time::Duration;
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
-use stoffelnet::network_utils::{Network, Node};
+use stoffelnet::network_utils::{Network, Node, VerifiedOrdering};
 use stoffelnet::transports::quic::{
     NetworkManager, PeerConnection as QuicPeerConnection, QuicNetworkManager,
 };
@@ -163,6 +163,9 @@ impl stoffelnet::network_utils::Network for SimplePartyNetwork {
     }
     fn party_count(&self) -> usize {
         self.n
+    }
+    fn verified_ordering(&self) -> Option<VerifiedOrdering> {
+        None
     }
 }
 

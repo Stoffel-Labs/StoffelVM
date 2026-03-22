@@ -1208,13 +1208,13 @@ pub async fn register_and_wait_for_session_with_program(
                                 add_node_and_connect_nat(
                                     net,
                                     my_party_id,
-                                    **pid,
-                                    **addr,
+                                    *pid,
+                                    *addr,
                                     &*bn_conn,
                                 )
                                 .await;
                             } else {
-                                add_node_and_connect(net, **pid, **addr).await;
+                                add_node_and_connect(net, *pid, *addr).await;
                             }
                         }
                     }
