@@ -2460,7 +2460,7 @@ impl VMState {
     /// The number of clients whose inputs were hydrated
     ///
     /// # Example
-    /// ```ignore
+    /// ```text
     /// // After MPC preprocessing and client input initialization
     /// let count = vm.state.hydrate_from_mpc_engine()?;
     /// println!("Hydrated inputs from {} clients", count);

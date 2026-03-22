@@ -1540,6 +1540,7 @@ mod tests {
                 threshold: 1,
                 program_bytes: None,
                 auth_token: Some(auth_token.clone()),
+                tls_derived_id: None,
             },
         )
         .await
@@ -1561,6 +1562,7 @@ mod tests {
                 threshold: 1,
                 program_bytes: None,
                 auth_token: Some("bad-token".to_string()),
+                tls_derived_id: None,
             },
         )
         .await
@@ -1582,6 +1584,7 @@ mod tests {
                 threshold: 1,
                 program_bytes: None,
                 auth_token: Some(auth_token),
+                tls_derived_id: None,
             },
         )
         .await

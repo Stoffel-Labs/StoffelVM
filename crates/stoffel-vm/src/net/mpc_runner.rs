@@ -10,7 +10,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use stoffel_vm::net::mpc_runner::MpcRunner;
 //!
 //! let runner = MpcRunner::new(vm, mpc_engine);
@@ -149,7 +149,7 @@ impl MpcRunner {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```text
     /// let handle = tokio::spawn(async move {
     ///     while let Some(raw_msg) = receiver.recv().await {
     ///         node.process(raw_msg, network.clone()).await.ok();
