@@ -26,7 +26,9 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use stoffelnet::network_utils::{ClientId, Message, Network, NetworkError, Node, PartyId};
+use stoffelnet::network_utils::{
+    ClientId, Message, Network, NetworkError, Node, PartyId, VerifiedOrdering,
+};
 use tokio::sync::Mutex;
 use tracing::debug;
 use uuid::Uuid;
@@ -467,8 +469,10 @@ pub struct QuicNetworkManager {
     /// The QUIC endpoint for sending and receiving connections
     endpoint: Option<Endpoint>,
     /// Configuration for the server role
+    #[allow(dead_code)]
     server_config: Option<ServerConfig>,
     /// Configuration for the client role
+    #[allow(dead_code)]
     client_config: Option<ClientConfig>,
     /// The nodes in the network
     nodes: Vec<QuicNode>,
@@ -1006,7 +1010,7 @@ impl Network for QuicNetworkManager {
     async fn send_to_client(
         &self,
         client: ClientId,
-        message: &[u8],
+        _message: &[u8],
     ) -> Result<usize, NetworkError> {
         // Not used in current VM path
         Err(NetworkError::ClientNotFound(client))
@@ -1016,7 +1020,7 @@ impl Network for QuicNetworkManager {
         Vec::new()
     }
 
-    fn is_client_connected(&self, client: ClientId) -> bool {
+    fn is_client_connected(&self, _client: ClientId) -> bool {
         false
     }
 
@@ -1028,6 +1032,10 @@ impl Network for QuicNetworkManager {
 
     fn party_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    fn verified_ordering(&self) -> Option<VerifiedOrdering> {
+        None
     }
 }
 

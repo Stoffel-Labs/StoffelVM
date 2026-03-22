@@ -29,9 +29,9 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS, F64};
+use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS};
 use stoffelmpc_mpc::avss_mpc::{
-    AdkgNode as AvssMpcNode, AdkgNodeOpts as AvssMpcNodeOpts, AvssSessionId,
+    AvssMPCNode as AvssMpcNode, AvssMPCNodeOpts as AvssMpcNodeOpts, AvssSessionId,
     ProtocolType as AvssProtocolType,
 };
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
@@ -906,6 +906,7 @@ where
     /// Create AVSS shares for a secret value (generates Feldman-verifiable shares for all parties).
     ///
     /// Returns this party's share.
+    #[allow(dead_code)]
     fn create_avss_share_with_rng<R: Rng>(
         &self,
         secret: F,

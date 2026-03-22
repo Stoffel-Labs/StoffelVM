@@ -171,7 +171,7 @@ pub mod share_object {
             Value::Share(ty, data) => Ok((*ty, data.clone())),
 
             // Share object
-            Value::Object(id) => {
+            Value::Object(_id) => {
                 // Verify type field
                 let type_field = store
                     .get_field(value, &Value::String(share_fields::TYPE.to_string()))

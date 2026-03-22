@@ -19,11 +19,13 @@ const DEFAULT_THRESHOLD: usize = 1;
 const DEFAULT_SECURITY_PARAMETER_K: usize = 8;
 
 #[cfg(feature = "honeybadger")]
+#[allow(dead_code)]
 fn derive_prandbit_count(n_random_shares: usize) -> usize {
     std::cmp::max(n_random_shares, DEFAULT_FIXED_POINT_FRACTIONAL_BITS)
 }
 
 #[cfg(feature = "honeybadger")]
+#[allow(dead_code)]
 fn derive_prandint_count(n_triples: usize, n_random_shares: usize) -> usize {
     std::cmp::max(n_triples.max(1), n_random_shares.max(1))
 }

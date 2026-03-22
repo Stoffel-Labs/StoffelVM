@@ -20,7 +20,6 @@ use crate::core_types::Value;
 use crate::instructions::Instruction;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use crate::instructions::ResolvedInstruction;
 use smallvec::SmallVec;

@@ -164,7 +164,7 @@ impl ActivationRecordPool {
     ///
     /// The returned `Reusable<ActivationRecord>` will automatically return the
     /// activation record to the pool when dropped.
-    pub fn get(&self) -> Reusable<ActivationRecord> {
+    pub fn get(&self) -> Reusable<'_, ActivationRecord> {
         let mut res = self.pool.try_pull().unwrap();
         res.reset();
         res

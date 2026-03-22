@@ -497,6 +497,7 @@ pub extern "C" fn stoffel_register_foreign_function(
 ///
 /// The user must ensure that the pointer remains valid for the lifetime of this wrapper
 /// and that any operations on the pointer are thread-safe.
+#[allow(dead_code)]
 struct CForeignObject {
     /// The raw pointer, wrapped in Arc<Mutex<>> for thread safety
     ptr: Arc<Mutex<*mut c_void>>,
@@ -524,6 +525,7 @@ impl CForeignObject {
     /// # Safety
     ///
     /// The caller must ensure that any operations on the pointer are thread-safe.
+    #[allow(dead_code)]
     fn get_ptr(&self) -> *mut c_void {
         *self.ptr.lock().unwrap()
     }

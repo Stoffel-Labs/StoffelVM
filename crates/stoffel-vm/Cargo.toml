@@ -56,6 +56,7 @@ honeybadger = []
 avss = []
 hb_itest = ["honeybadger"]
 avss_itest = ["avss"]
+nat = []
 
 [dev-dependencies]
 criterion = { version = "0.6.0", features = ["html_reports"] }

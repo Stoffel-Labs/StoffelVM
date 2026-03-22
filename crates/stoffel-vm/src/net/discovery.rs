@@ -6,13 +6,16 @@ use bincode;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use stoffelnet::network_utils::{Network, PartyId};
-use stoffelnet::transports::quic::{NetworkManager, PeerConnection, QuicNetworkManager};
+use stoffelnet::transports::quic::{
+    NetworkManager, PeerConnection, QuicNetworkConfig, QuicNetworkManager,
+};
 
 // NAT traversal types - use real types when feature is enabled, stubs otherwise
 #[cfg(feature = "nat")]
 use stoffelnet::transports::ice::{CandidateType, IceCandidate, LocalCandidates};
 
 #[cfg(not(feature = "nat"))]
+#[allow(dead_code)]
 mod nat_stubs {
     use serde::{Deserialize, Serialize};
     use std::net::SocketAddr;
@@ -49,7 +52,7 @@ mod nat_stubs {
 }
 
 #[cfg(not(feature = "nat"))]
-use nat_stubs::{CandidateType, IceCandidate, LocalCandidates};
+use nat_stubs::IceCandidate;
 use tokio::{
     sync::{broadcast, watch, Mutex},
     time::sleep,
@@ -75,6 +78,9 @@ pub enum DiscoveryMessage {
         program_bytes: Option<Vec<u8>>,
         /// Optional shared secret for registration authentication
         auth_token: Option<String>,
+        /// TLS-derived identity (hash of certificate public key) so peers can
+        /// pre-register this party in their allowlist before accept().
+        tls_derived_id: Option<PartyId>,
     },
     /// Request to fetch program bytes from bootnode
     ProgramFetchRequest {
@@ -121,6 +127,8 @@ struct PendingSession {
     threshold: usize,
     /// Parties that have registered for this session
     parties: HashMap<PartyId, SocketAddr>,
+    /// TLS-derived IDs for each party (bootnode-party-id → tls-derived-id)
+    tls_ids: HashMap<PartyId, PartyId>,
     /// Session nonce (timestamp-based for uniqueness)
     nonce: u64,
 }
@@ -186,7 +194,10 @@ async fn run_bootnode_with_config_and_auth(
     expected_parties: Option<usize>,
     required_auth_token: Option<String>,
 ) -> Result<(), String> {
-    let mut net = QuicNetworkManager::new();
+    let mut net = QuicNetworkManager::with_config(QuicNetworkConfig {
+        use_tls: false,
+        ..Default::default()
+    });
     net.listen(bind).await?;
     let state: Arc<Mutex<HashMap<PartyId, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
     // Program/Session agreement state: single active session for simplicity
@@ -206,14 +217,14 @@ async fn run_bootnode_with_config_and_auth(
     eprintln!("[bootnode] Listening on {}", bind);
 
     loop {
-        let mut conn = net.accept().await?;
+        let conn = net.accept().await?;
         let state = state.clone();
         let session_state = session_state.clone();
         let uploader_bytes = uploader_bytes.clone();
         let pending_session = pending_session.clone();
         let expected_parties = expected_parties.clone();
         let session_tx = session_tx.clone();
-        let mut session_rx = session_tx.subscribe();
+        let session_rx = session_tx.subscribe();
         let ice_tx = ice_tx.clone();
         let mut ice_rx = ice_tx.subscribe();
         let required_auth_token = required_auth_token.clone();
@@ -315,6 +326,7 @@ async fn run_bootnode_with_config_and_auth(
                                     threshold,
                                     program_bytes,
                                     auth_token: message_auth_token,
+                                    tls_derived_id,
                                 } => {
                                     if !registration_token_is_valid(
                                         required_auth_token.as_deref(),
@@ -375,12 +387,17 @@ async fn run_bootnode_with_config_and_auth(
                                             .unwrap_or(0);
                                         let mut parties = HashMap::new();
                                         parties.insert(party_id, listen_addr);
+                                        let mut tls_ids = HashMap::new();
+                                        if let Some(tid) = tls_derived_id {
+                                            tls_ids.insert(party_id, tid);
+                                        }
                                         *pending = Some(PendingSession {
                                             program_id,
                                             entry,
                                             n_parties: target_n,
                                             threshold,
                                             parties,
+                                            tls_ids,
                                             nonce,
                                         });
                                         eprintln!(
@@ -405,6 +422,9 @@ async fn run_bootnode_with_config_and_auth(
                                             continue;
                                         }
                                         ps.parties.insert(party_id, listen_addr);
+                                        if let Some(tid) = tls_derived_id {
+                                            ps.tls_ids.insert(party_id, tid);
+                                        }
                                         eprintln!(
                                             "[bootnode] Party {} joined, have {}/{} parties",
                                             party_id,
@@ -425,6 +445,8 @@ async fn run_bootnode_with_config_and_auth(
                                             derive_instance_id(&ps.program_id, ps.nonce);
                                         let parties: Vec<(PartyId, SocketAddr)> =
                                             ps.parties.into_iter().collect();
+                                        let tls_ids: Vec<(PartyId, PartyId)> =
+                                            ps.tls_ids.into_iter().collect();
 
                                         let session_info = SessionInfo {
                                             program_id: ps.program_id,
@@ -433,6 +455,7 @@ async fn run_bootnode_with_config_and_auth(
                                             parties: parties.clone(),
                                             n_parties: ps.n_parties,
                                             threshold: ps.threshold,
+                                            tls_ids,
                                         };
 
                                         eprintln!(
@@ -855,6 +878,7 @@ async fn add_node_and_connect_nat(
 }
 
 /// Direct connection helper (used when NAT traversal fails or is disabled)
+#[allow(dead_code)]
 async fn add_node_and_connect_direct(
     net: &mut QuicNetworkManager,
     party_id: PartyId,
@@ -1010,7 +1034,14 @@ pub async fn register_and_wait_for_session_with_program(
     timeout: Duration,
     program_bytes: Option<Vec<u8>>,
 ) -> Result<SessionInfo, String> {
-    let bn_conn = net.connect(bootnode).await?;
+    // Use a separate temporary manager for the bootnode discovery connection
+    // so that the bootnode's TLS public key doesn't pollute the party mesh
+    // manager's peer_public_keys (which would give N+1 sorted party IDs).
+    let mut bn_mgr = QuicNetworkManager::with_config(QuicNetworkConfig {
+        use_tls: false,
+        ..Default::default()
+    });
+    let bn_conn = bn_mgr.connect(bootnode).await?;
     let auth_token = required_discovery_auth_token("session discovery registration")?;
 
     eprintln!(
@@ -1022,7 +1053,10 @@ pub async fn register_and_wait_for_session_with_program(
         program_bytes.is_some()
     );
 
-    // Send session-aware registration with optional program bytes
+    // Send session-aware registration with optional program bytes.
+    // Include our TLS-derived ID so peers can pre-register us in their
+    // allowlist for accept() with use_tls=true.
+    let local_tls_id = net.local_derived_id();
     let reg_msg = DiscoveryMessage::RegisterWithSession {
         party_id: my_party_id,
         listen_addr: my_listen,
@@ -1032,6 +1066,7 @@ pub async fn register_and_wait_for_session_with_program(
         threshold,
         program_bytes,
         auth_token: Some(auth_token),
+        tls_derived_id: Some(local_tls_id),
     };
     send_ctrl(&*bn_conn, &reg_msg).await?;
 
@@ -1058,10 +1093,16 @@ pub async fn register_and_wait_for_session_with_program(
                         info.parties.len()
                     );
 
-                    // Add ALL peers to the node list first
+                    // Build TLS-ID lookup from session info
+                    let tls_id_map: HashMap<PartyId, PartyId> =
+                        info.tls_ids.iter().cloned().collect();
+
+                    // Add ALL peers to the node list using their TLS-derived IDs
+                    // so that accept() recognises them with use_tls=true.
                     for (pid, addr) in &info.parties {
                         if *pid != my_party_id {
-                            net.add_node_with_party_id(*pid, *addr);
+                            let node_id = tls_id_map.get(pid).copied().unwrap_or(*pid);
+                            net.add_node_with_party_id(node_id, *addr);
                         }
                     }
 
@@ -1237,6 +1278,17 @@ pub async fn register_and_wait_for_session_with_program(
                             }
                         }
                     }
+
+                    // Assign party IDs based on sorted public keys now that
+                    // the mesh is fully formed. This sets remote_party_id on
+                    // each connection so that spawn_receive_loops can map
+                    // TLS-derived IDs back to 0..N-1 party indices.
+                    let assigned = net.assign_party_ids();
+                    let local_pid = net.local_party_id();
+                    eprintln!(
+                        "[party {}] Assigned {} party IDs (local party_id={})",
+                        my_party_id, assigned, local_pid
+                    );
 
                     // Send acknowledgment
                     let ack = SessionMessage::SessionAck {

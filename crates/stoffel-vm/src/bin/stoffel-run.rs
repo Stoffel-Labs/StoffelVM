@@ -773,7 +773,7 @@ async fn main() {
         print_usage_and_exit();
     }
 
-    let mut path_opt: Option<String> = None;
+    let path_opt: Option<String>;
     let mut entry: String = "main".to_string();
 
     let mut trace_instr = false;
@@ -789,8 +789,8 @@ async fn main() {
     let mut threshold: Option<usize> = None;
     let mut client_inputs: Option<String> = None;
     let mut expected_client_count: Option<usize> = None;
-    let mut enable_nat: bool = false;
-    let mut stun_servers: Vec<SocketAddr> = Vec::new();
+    let mut _enable_nat: bool = false;
+    let mut _stun_servers: Vec<SocketAddr> = Vec::new();
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
     let mut mpc_backend: Option<String> = None;
     let mut mpc_curve: Option<String> = None;
@@ -811,7 +811,7 @@ async fn main() {
         } else if arg == "--client" {
             as_client = true;
         } else if arg == "--nat" {
-            enable_nat = true;
+            _enable_nat = true;
         } else if let Some(_rest) = arg.strip_prefix("--bind") {
             // support "--bind" and "--bind=.."
             // actual value parsed later from positional with key
@@ -904,7 +904,7 @@ async fn main() {
             }
             "--stun-servers" => {
                 if let Some(v) = args_iter.next() {
-                    stun_servers = v
+                    _stun_servers = v
                         .split(',')
                         .filter_map(|s| {
                             let s = s.trim();
@@ -1042,7 +1042,7 @@ async fn main() {
 
     // Optional: bring up networking in party mode if bootstrap provided or if leader
     let mut net_opt: Option<Arc<QuicNetworkManager>> = None;
-    let mut program_id: [u8; 32] = [0u8; 32];
+    let program_id: [u8; 32];
     let mut agreed_entry = entry.clone();
     let mut session_instance_id: Option<u64> = None;
     let mut session_n_parties: Option<usize> = None;
@@ -1092,8 +1092,7 @@ async fn main() {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Now connect to ourselves as the bootnode
-        // Use with_node_id so connections are indexed by party ID (0-4), not random UUIDs
-        let mut mgr = QuicNetworkManager::with_node_id(my_id);
+        let mut mgr = QuicNetworkManager::new();
         // Listen on a different port for peer connections
         let party_bind: SocketAddr = format!("{}:{}", bind.ip(), bind.port() + 1000)
             .parse()
@@ -1173,8 +1172,7 @@ async fn main() {
         let t = threshold.unwrap_or(1);
 
         // Prepare QUIC manager
-        // Use with_node_id so connections are indexed by party ID (0-4), not random UUIDs
-        let mut mgr = QuicNetworkManager::with_node_id(my_id);
+        let mut mgr = QuicNetworkManager::new();
         // Listen so peers can connect back directly
         if let Err(e) = mgr.listen(bind).await {
             eprintln!("Failed to listen on {}: {}", bind, e);
@@ -1415,7 +1413,9 @@ async fn main() {
 
     // If in party mode, configure MPC engine based on selected backend
     if let Some(net) = net_opt.clone() {
-        let my_id = party_id.unwrap_or(0usize);
+        // Use the network-derived party ID (sorted public key index), not the
+        // bootnode-assigned one, because send() routes via sorted public keys.
+        let my_id = net.local_party_id();
         // Use session parameters (already agreed upon with bootnode)
         let n = session_n_parties.unwrap_or_else(|| net.parties().len());
         let t = session_threshold.unwrap_or(1);

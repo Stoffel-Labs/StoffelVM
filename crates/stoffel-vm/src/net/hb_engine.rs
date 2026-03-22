@@ -17,7 +17,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS, F64};
+use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS};
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode};
@@ -61,6 +61,7 @@ static EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
     once_cell::sync::Lazy::new(tokio::sync::Notify::new);
 
 /// Clear the exponentiation-domain open registry. Useful between test cases.
+#[allow(dead_code)]
 pub(crate) fn clear_exp_registry() {
     EXP_REGISTRY.lock().clear();
 }
@@ -152,6 +153,7 @@ where
     node: Arc<Mutex<HoneyBadgerMPCNode<F, RBCImpl>>>,
     ready: AtomicBool,
     /// Session counter for multiplication operations
+    #[allow(dead_code)]
     mul_session_counter: Arc<Mutex<usize>>,
     group_marker: PhantomData<G>,
 }
@@ -222,7 +224,6 @@ where
 
                 Self::encode_share(&result_share)
             }
-            _ => Err("Unsupported share type for multiply_share".to_string()),
         }
     }
 
@@ -278,7 +279,7 @@ where
     ) -> Result<Vec<RobustShare<F>>, String> {
         loop {
             let attempt = {
-                let mut node = self.node.lock().await;
+                let node = self.node.lock().await;
                 let mut prep_material = node.preprocessing_material.lock().await;
                 prep_material.take_random_shares(num_shares)
             };
@@ -707,6 +708,7 @@ where
         }
     }
 
+    #[allow(dead_code)]
     fn ensure_rt() -> Result<tokio::runtime::Handle, String> {
         tokio::runtime::Handle::try_current()
             .map_err(|e| format!("Tokio runtime not available: {}", e))

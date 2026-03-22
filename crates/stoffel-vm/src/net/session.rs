@@ -19,6 +19,11 @@ pub struct SessionInfo {
     pub parties: Vec<(PartyId, SocketAddr)>,
     pub n_parties: usize,
     pub threshold: usize,
+    /// TLS-derived IDs for each party, parallel to `parties`.
+    /// Used by peers to pre-register allowlist entries so that
+    /// `accept()` succeeds with `use_tls: true`.
+    #[serde(default)]
+    pub tls_ids: Vec<(PartyId, PartyId)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +49,7 @@ pub enum SessionMessage {
 
 pub fn random_instance_id() -> u64 {
     let mut b = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     u64::from_le_bytes(b)
 }
 
@@ -86,7 +91,7 @@ pub async fn agree_session_with_bootnode(
     bn_conn: &mut dyn PeerConnection,
     my_party: PartyId,
     my_program_id: [u8; 32],
-    entry: &str,
+    _entry: &str,
 ) -> Result<SessionInfo, String> {
     // Request peers and implicit session announce via discovery RequestPeers
     // Then wait for SessionAnnounce
