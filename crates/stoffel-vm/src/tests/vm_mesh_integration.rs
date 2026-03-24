@@ -30,7 +30,7 @@ use crate::net::hb_engine::HoneyBadgerMpcEngine;
 use crate::net::mpc_engine::MpcEngine;
 use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
-    HoneyBadgerQuicServer,
+    HoneyBadgerQuicServer, RoutedNetwork,
 };
 use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
 use stoffel_vm_types::core_types::Value;
@@ -76,6 +76,10 @@ async fn test_vm_mesh_full_integration() {
         "Step 1: Creating {} MPC servers in mesh topology...",
         n_parties
     );
+    // Pass None for client IDs — the accept loop must NOT spawn client receive
+    // handlers (they'd use the wrong sender ID for multi-client setups).
+    // Client IDs are set on servers before finalize_network() so the HB node
+    // is created with the correct client registration.
     let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
         n_parties,
         threshold,
@@ -84,7 +88,7 @@ async fn test_vm_mesh_full_integration() {
         instance_id,
         base_port,
         config.clone(),
-        Some(client_ids.clone()),
+        None,
     )
     .await
     .expect("Failed to create servers");
@@ -103,19 +107,46 @@ async fn test_vm_mesh_full_integration() {
         .collect();
     let expected_product = (client_scalar_inputs[0] * client_scalar_inputs[1]) as i64;
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only; receive loops come later)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
-        // Must call start() first to create the network Arc
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+        info!("  Started server {}", server.node_id);
+    }
 
+    // Step 3: Connect servers in mesh
+    info!("Step 3: Connecting servers in mesh topology...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Set client IDs on servers before finalize_network() so the HB node
+    // is created with correct client registration.
+    for server in servers.iter_mut() {
+        server.expected_client_ids = client_ids.clone();
+    }
+
+    // Step 3a: Finalize network — assign_party_ids(), recreate HB nodes with
+    // correct sorted-key party IDs, and build MpcNetwork wrappers.
+    info!("Step 3a: Finalizing network...");
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+    }
+
+    // Step 3b: Spawn receive-loop tasks for the message dispatch channel.
+    info!("Step 3b: Spawning receive-loop tasks...");
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
                 match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
@@ -141,13 +172,6 @@ async fn test_vm_mesh_full_integration() {
         });
     }
 
-    // Step 3: Connect servers in mesh
-    info!("Step 3: Connecting servers in mesh topology...");
-    for server in &mut servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     // Step 4: Create and connect real MPC clients that will submit inputs
     info!("Step 4: Creating and connecting MPC clients...");
     let mut clients = setup_honeybadger_quic_clients::<Fr>(
@@ -172,6 +196,45 @@ async fn test_vm_mesh_full_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 5: Run preprocessing
     info!("Step 5: Running preprocessing on all servers...");
     let preprocessing_handles: Vec<_> = servers
@@ -179,10 +242,10 @@ async fn test_vm_mesh_full_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
 
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
@@ -216,7 +279,10 @@ async fn test_vm_mesh_full_integration() {
                     *client_id,
                     local_shares,
                     1,
-                    server.network.clone().expect("network should be set"),
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -233,25 +299,26 @@ async fn test_vm_mesh_full_integration() {
     // Use Arc<parking_lot::Mutex<...>> so we can execute VMs concurrently from blocking tasks
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
 
-    for party_id in 0..n_parties {
+    for (idx, server) in servers.iter().enumerate() {
+        let sorted_pid = server.party_id.expect("party_id should be set after finalize");
         let mut vm = VirtualMachine::new();
 
         // Attach MPC engine to VM, wrapping the already-running HB node for this party
         let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             instance_id,
-            party_id,
+            sorted_pid,
             n_parties,
             threshold,
-            servers[party_id].network.clone().expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
 
         vm.state.mpc_engine = Some(mpc_engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
 
         info!(
-            "✓ VM {} created with MPC engine (wrapped server node)",
-            party_id
+            "✓ VM {} (party_id={}) created with MPC engine",
+            idx, sorted_pid
         );
     }
 
@@ -441,15 +508,32 @@ async fn test_vm_mesh_average_salary_integration() {
     );
 
     info!("Starting servers for average test...");
-    for (i, server) in servers.iter_mut().enumerate() {
-        // Must call start() first to create the network Arc
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    info!("Connecting servers...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
@@ -476,12 +560,6 @@ async fn test_vm_mesh_average_salary_integration() {
         });
     }
 
-    info!("Connecting servers...");
-    for server in &mut servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     info!("Creating {} salary clients...", client_count);
     let mut clients = setup_honeybadger_quic_clients::<Fr>(
         client_ids.clone(),
@@ -503,16 +581,55 @@ async fn test_vm_mesh_average_salary_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     info!("Running preprocessing for average test...");
     let preprocessing_handles: Vec<_> = servers
         .iter()
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 node.run_preprocessing(network, &mut rng)
@@ -543,7 +660,10 @@ async fn test_vm_mesh_average_salary_integration() {
                     *client_id,
                     local_shares,
                     2,
-                    server.network.clone().expect("network should be set"),
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -876,18 +996,37 @@ async fn test_vm_mesh_large_preprocessing() {
         })
         .collect();
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    // Step 3: Connect servers in mesh
+    info!("Step 3: Connecting servers in mesh topology...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    info!("✓ All {} servers connected in mesh", n_parties);
+
+    // Step 3a: Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
                 match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
@@ -912,14 +1051,6 @@ async fn test_vm_mesh_large_preprocessing() {
             }
         });
     }
-
-    // Step 3: Connect servers in mesh
-    info!("Step 3: Connecting servers in mesh topology...");
-    for server in &mut servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    info!("✓ All {} servers connected in mesh", n_parties);
 
     // Step 4: Create and connect MPC clients (required for preprocessing protocol)
     info!("Step 4: Creating and connecting MPC clients...");
@@ -946,6 +1077,45 @@ async fn test_vm_mesh_large_preprocessing() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 5: Run preprocessing (matching the exact pattern from test_vm_mesh_full_integration)
     info!("Step 5: Running preprocessing on all servers...");
     let preprocessing_handles: Vec<_> = servers
@@ -953,10 +1123,10 @@ async fn test_vm_mesh_large_preprocessing() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
 
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
@@ -1141,18 +1311,36 @@ async fn test_vm_mesh_output_client_integration() {
         })
         .collect();
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    // Step 3: Connect servers
+    info!("Step 3: Connecting servers...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 3a: Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
                 match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
@@ -1178,13 +1366,6 @@ async fn test_vm_mesh_output_client_integration() {
         });
     }
 
-    // Step 3: Connect servers
-    info!("Step 3: Connecting servers...");
-    for server in &mut servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     // Step 4: Create input clients
     info!("Step 4: Creating {} input clients...", client_count);
     let mut clients = setup_honeybadger_quic_clients::<Fr>(
@@ -1208,6 +1389,45 @@ async fn test_vm_mesh_output_client_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 5: Run preprocessing
     info!("Step 5: Running preprocessing...");
     let preprocessing_handles: Vec<_> = servers
@@ -1215,10 +1435,10 @@ async fn test_vm_mesh_output_client_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 node.run_preprocessing(network, &mut rng)
@@ -1250,7 +1470,10 @@ async fn test_vm_mesh_output_client_integration() {
                     *client_id,
                     local_shares,
                     1,
-                    server.network.clone().expect("network should be set"),
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -1593,18 +1816,36 @@ async fn test_vm_mesh_matrix_average_integration() {
         })
         .collect();
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    // Step 3: Connect servers
+    info!("Step 3: Connecting servers in mesh topology...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 3a: Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
                 match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
@@ -1630,13 +1871,6 @@ async fn test_vm_mesh_matrix_average_integration() {
         });
     }
 
-    // Step 3: Connect servers
-    info!("Step 3: Connecting servers in mesh topology...");
-    for server in &mut servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     // Step 4: Create input clients
     info!("Step 4: Creating {} matrix input clients...", client_count);
     let mut clients = setup_honeybadger_quic_clients::<Fr>(
@@ -1661,6 +1895,45 @@ async fn test_vm_mesh_matrix_average_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 5: Run preprocessing
     info!("Step 5: Running preprocessing...");
     let preprocessing_handles: Vec<_> = servers
@@ -1668,10 +1941,10 @@ async fn test_vm_mesh_matrix_average_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 node.run_preprocessing(network, &mut rng)
@@ -1706,7 +1979,10 @@ async fn test_vm_mesh_matrix_average_integration() {
                     *client_id,
                     local_shares,
                     MATRIX_SIZE,
-                    server.network.clone().expect("network should be set"),
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -2151,18 +2427,43 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     step_timings.push(("Step 1: Create MPC servers", step_start.elapsed()));
     step_start = std::time::Instant::now();
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    step_timings.push(("Step 2: Start servers", step_start.elapsed()));
+    step_start = std::time::Instant::now();
+
+    // Step 3: Connect servers
+    info!("Step 3: Connecting servers in mesh topology...");
+    for (i, server) in servers.iter_mut().enumerate() {
+        server
+            .connect_to_peers()
+            .await
+            .unwrap_or_else(|e| panic!("Server {} failed to connect: {:?}", i, e));
+    }
+    info!("  ✓ All {} servers connected to mesh", n_parties);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 3a: Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
                 match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
@@ -2187,21 +2488,6 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             }
         });
     }
-
-    step_timings.push(("Step 2: Start servers", step_start.elapsed()));
-    step_start = std::time::Instant::now();
-
-    // Step 3: Connect servers
-    info!("Step 3: Connecting servers in mesh topology...");
-    for (i, server) in servers.iter_mut().enumerate() {
-        server
-            .connect_to_peers()
-            .await
-            .unwrap_or_else(|e| panic!("Server {} failed to connect: {:?}", i, e));
-    }
-    info!("  ✓ All {} servers connected to mesh", n_parties);
-    // Brief pause to ensure all connections are fully established
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     step_timings.push(("Step 3: Connect servers", step_start.elapsed()));
     step_start = std::time::Instant::now();
@@ -2301,10 +2587,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             .enumerate()
             .map(|(i, server)| {
                 let mut node = server.node.clone();
-                let network = server
-                    .network
+                let network: std::sync::Arc<RoutedNetwork> = server
+                    .routed_network
                     .clone()
-                    .expect("network should be set after start()");
+                    .expect("routed_network should be set after finalize_network()");
                 tokio::spawn(async move {
                     let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                     node.run_preprocessing(network, &mut rng)
@@ -2421,6 +2707,45 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     // Brief pause to ensure connections are stable
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // OPTIMIZATION: Initialize input protocol for all servers in parallel
     // Each server initializes input protocol for all clients
     info!(
@@ -2433,7 +2758,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         .enumerate()
         .map(|(idx, server)| {
             let client_ids = client_ids.clone();
-            let network = server.network.clone().expect("network should be set");
+            let network = server
+                .routed_network
+                .clone()
+                .expect("routed_network should be set");
             let preprocessing_material = server.node.preprocessing_material.clone();
             let mut preprocess_input = server.node.preprocess.input.clone();
 
@@ -3348,18 +3676,36 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 
     info!("Expected total scaled sum: {}", total_sum);
 
-    // Step 3: Start servers and spawn message processors
+    // Step 3: Start servers (accept loops only)
     info!("Step 3: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    // Step 4: Connect servers
+    info!("Step 4: Connecting servers in mesh topology...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 4a: Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
                 match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
@@ -3385,13 +3731,6 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         });
     }
 
-    // Step 4: Connect servers
-    info!("Step 4: Connecting servers in mesh topology...");
-    for server in &mut servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     // Step 5: Create input clients
     info!("Step 5: Creating {} matrix input clients...", client_count);
     let mut clients = setup_honeybadger_quic_clients::<Fr>(
@@ -3416,6 +3755,45 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 6: Run preprocessing
     info!("Step 6: Running preprocessing...");
     let preprocessing_handles: Vec<_> = servers
@@ -3423,10 +3801,10 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 node.run_preprocessing(network, &mut rng)
@@ -3461,7 +3839,10 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                     *client_id,
                     local_shares,
                     MATRIX_SIZE,
-                    server.network.clone().expect("network should be set"),
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
                 )
                 .await
                 .expect("input.init failed");

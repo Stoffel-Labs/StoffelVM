@@ -211,17 +211,17 @@ struct AvssTestNode {
 }
 
 impl AvssTestNode {
-    fn new(node_id: usize, bind_addr: SocketAddr) -> Self {
+    fn new(node_id: usize, _bind_addr: SocketAddr) -> Self {
         let (tx, rx) = mpsc::channel(1500);
 
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
         let sk_i = Fr::rand(&mut rng);
         let pk_i = G1::generator() * sk_i;
 
-        let mut mgr = QuicNetworkManager::with_node_id(node_id);
-        // listen is async but we're in a sync constructor — caller must await listen separately
-        // Instead, return builder and let setup do listen
-        mgr.add_node_with_party_id(node_id, bind_addr);
+        let mgr = QuicNetworkManager::with_node_id(node_id);
+        // listen is async — caller must await listen separately.
+        // Peer registration is deferred to setup_avss_test_network() where
+        // TLS-derived IDs are available for the QUIC allowlist.
 
         Self {
             node_id,
@@ -255,7 +255,7 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
         base_port + n as u16 - 1
     );
 
-    // Step 1: Create nodes with listening endpoints
+    // Step 1: Create nodes and start listening (generates TLS certificates)
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
         let mut node = AvssTestNode::new(i, addresses[i]);
@@ -263,53 +263,58 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
         mgr.listen(addresses[i])
             .await
             .map_err(|e| format!("Node {} listen failed: {}", i, e))?;
-        // Register all peers
-        for j in 0..n {
-            if j != i {
-                mgr.add_node_with_party_id(j, addresses[j]);
-            }
-        }
         nodes.push(node);
     }
 
-    // Step 2: Start — convert builders to Arc and spawn accept loops
+    // Step 1b: Collect TLS-derived IDs (available after listen()) and
+    // cross-register all peers using derived IDs for the QUIC allowlist.
+    let derived_ids: Vec<usize> = nodes
+        .iter()
+        .map(|n| n.network_builder.as_ref().unwrap().local_derived_id())
+        .collect();
+    info!(
+        "[AVSS-E2E] TLS-derived IDs: {:?}",
+        derived_ids
+    );
+    for i in 0..n {
+        let mgr = nodes[i].network_builder.as_mut().unwrap();
+        // Register self with derived ID
+        mgr.add_node_with_party_id(derived_ids[i], addresses[i]);
+        // Register all peers with their derived IDs
+        for j in 0..n {
+            if j != i {
+                mgr.add_node_with_party_id(derived_ids[j], addresses[j]);
+            }
+        }
+    }
+
+    // Build derived_id -> logical party index mapping for connection setup
+    // and message routing.
+    let derived_to_logical: HashMap<usize, usize> = derived_ids
+        .iter()
+        .enumerate()
+        .map(|(logical, &derived)| (derived, logical))
+        .collect();
+
+    // Step 2: Start — convert builders to Arc and spawn accept loops.
+    // Accept just stores connections in the DashMap; receive handlers are
+    // spawned in Step 4 after assign_party_ids() sets remote_party_id().
     for node in &mut nodes {
         let mgr = node.network_builder.take().unwrap();
         let net = Arc::new(mgr);
         node.network = Some(net.clone());
 
-        // Spawn accept loop
         let mut acceptor = (*net).clone();
         let node_id = node.node_id;
-        let tx = node.tx.clone();
         tokio::spawn(async move {
             loop {
                 match acceptor.accept().await {
                     Ok(connection) => {
-                        let sender_id = connection
-                            .remote_party_id()
-                            .unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
                         info!(
                             "[AVSS] Node {} accepted connection from {}",
                             node_id,
-                            connection.remote_address()
+                            connection.remote_address(),
                         );
-                        let txx = tx.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                match connection.receive().await {
-                                    Ok(data) => {
-                                        if let Err(e) = txx.send((sender_id, data)).await {
-                                            error!(
-                                                "[AVSS] Node {} channel send error: {:?}",
-                                                node_id, e
-                                            );
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        });
                     }
                     Err(e) => {
                         warn!("[AVSS] Node {} accept error: {}", node_id, e);
@@ -320,13 +325,13 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
         });
     }
 
-    // Step 3: Connect to all peers (dial outgoing) and capture connections
-    // for building SimplePartyNetwork instances
-    let mut all_peer_connections: Vec<Vec<(usize, Arc<dyn QuicPeerConnection>)>> =
-        (0..n).map(|_| Vec::new()).collect();
-
+    // Step 3: Dial all peers to establish connections.
+    // QUIC dedup may replace connections, so we don't save dial-returned
+    // connections directly. Instead we build SimplePartyNetwork from the
+    // canonical server_connections DashMap in Step 4.
     for idx in 0..n {
         let net = nodes[idx].network.as_ref().unwrap();
+        let local_derived = derived_ids[idx];
         let peers: Vec<(usize, SocketAddr)> = net
             .parties()
             .iter()
@@ -335,37 +340,23 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
 
         let mut dialer = (**net).clone();
         let node_id = nodes[idx].node_id;
-        let tx = nodes[idx].tx.clone();
 
-        for (peer_id, peer_addr) in peers {
-            if peer_id == node_id {
+        for (peer_derived_id, peer_addr) in peers {
+            if peer_derived_id == local_derived {
                 continue; // skip self
             }
+            let peer_logical = *derived_to_logical.get(&peer_derived_id).unwrap_or(&peer_derived_id);
             let mut retry_count = 0u32;
             loop {
                 match dialer.connect_as_server(peer_addr).await {
-                    Ok(connection) => {
+                    Ok(_connection) => {
                         info!(
                             "[AVSS] Node {} connected to peer {} at {}",
-                            node_id, peer_id, peer_addr
+                            node_id, peer_logical, peer_addr
                         );
-                        // Save connection for SimplePartyNetwork
-                        all_peer_connections[idx].push((peer_id, connection.clone()));
-                        // Spawn receive handler that feeds the channel
-                        let txx = tx.clone();
-                        let pid = peer_id;
-                        tokio::spawn(async move {
-                            loop {
-                                match connection.receive().await {
-                                    Ok(data) => {
-                                        if let Err(e) = txx.send((pid, data)).await {
-                                            error!("[AVSS] Node channel send error: {:?}", e);
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        });
+                        // Don't spawn receive handlers here — they'll be spawned
+                        // in Step 4 on DashMap connections after assign_party_ids()
+                        // so that sender IDs use sorted-key party IDs.
                         break;
                     }
                     Err(e) => {
@@ -373,7 +364,7 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
                         if retry_count >= 10 {
                             warn!(
                                 "[AVSS] Node {} failed to connect to peer {} after {} attempts: {}",
-                                node_id, peer_id, retry_count, e
+                                node_id, peer_logical, retry_count, e
                             );
                             break;
                         }
@@ -384,15 +375,91 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
         }
     }
 
-    // Step 4: Build SimplePartyNetwork for each node (with self-delivery via channel)
-    for idx in 0..n {
-        let peer_conns = std::mem::take(&mut all_peer_connections[idx]);
-        let self_tx = nodes[idx].tx.clone();
-        nodes[idx].simple_net = Some(build_simple_network(idx, n, peer_conns, self_tx));
+    // Let connections stabilize and deduplication settle
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Step 3b: assign_party_ids() — stamps sorted-key party IDs on all
+    // connections so that remote_party_id() returns deterministic indices.
+    for node in &nodes {
+        let net = node.network.as_ref().unwrap();
+        let assigned = net.assign_party_ids();
+        let local_pid = net.compute_local_party_id()
+            .expect("compute_local_party_id failed");
+        info!(
+            "[AVSS] Node {} assigned {} party IDs, sorted-key party_id={}",
+            node.node_id, assigned, local_pid
+        );
     }
 
-    // Let connections stabilize
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Build sorted-key party_id for each node
+    let party_ids: Vec<usize> = nodes
+        .iter()
+        .map(|n| {
+            n.network
+                .as_ref()
+                .unwrap()
+                .compute_local_party_id()
+                .unwrap()
+        })
+        .collect();
+
+    // Step 4: Build SimplePartyNetwork using sorted-key party IDs.
+    // After assign_party_ids(), get_all_server_connections() returns
+    // connections with remote_party_id() set to sorted-key positions.
+    // Spawn receive handlers on each canonical DashMap connection.
+    for idx in 0..n {
+        let net = nodes[idx].network.as_ref().unwrap();
+        let local_pid = party_ids[idx];
+        let tx = nodes[idx].tx.clone();
+        let node_id = nodes[idx].node_id;
+
+        let all_conns = net.get_all_server_connections();
+        let mut peer_conns: Vec<(usize, Arc<dyn QuicPeerConnection>)> = Vec::new();
+        for (did, conn) in all_conns {
+            if did == net.local_derived_id() {
+                continue; // skip self/loopback by derived ID
+            }
+            let pid = conn.remote_party_id().unwrap_or_else(|| {
+                // Fallback: use derived_to_logical mapping
+                *derived_to_logical.get(&did).unwrap_or(&did)
+            });
+            if pid == local_pid {
+                continue; // skip self/loopback by party ID
+            }
+            peer_conns.push((pid, conn.clone()));
+
+            // Spawn receive handler — feeds channel with sorted-key party ID
+            let txx = tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match conn.receive().await {
+                        Ok(data) => {
+                            if let Err(e) = txx.send((pid, data)).await {
+                                error!(
+                                    "[AVSS] Node {} recv send error: {:?}",
+                                    node_id, e
+                                );
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        info!(
+            "[AVSS] Node {} (party_id={}) has {} peer connections",
+            idx, local_pid, peer_conns.len()
+        );
+
+        let self_tx = nodes[idx].tx.clone();
+        nodes[idx].simple_net = Some(build_simple_network(local_pid, n, peer_conns, self_tx));
+        // Update node_id to sorted-key party ID for engine creation
+        nodes[idx].node_id = local_pid;
+    }
+
+    // Brief pause for receive handlers to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     Ok(nodes)
 }
@@ -418,10 +485,11 @@ async fn exchange_ecdh_keys(nodes: &mut [AvssTestNode]) -> Result<Vec<Arc<Vec<G1
         envelope.extend_from_slice(&(node.node_id as u32).to_le_bytes());
         envelope.extend_from_slice(&pk_bytes);
 
+        let local_derived = net.local_derived_id();
         let connections = net.get_all_server_connections();
         for (peer_id, conn) in &connections {
-            if *peer_id == node.node_id {
-                continue;
+            if *peer_id == local_derived {
+                continue; // skip self (peer_id is a TLS-derived ID)
             }
             if let Err(e) = conn.send(&envelope).await {
                 warn!(
@@ -579,7 +647,7 @@ async fn test_avss_e2e_distributed_key_generation() {
     for (i, node) in nodes.iter().enumerate() {
         let engine = AvssMpcEngine::new(
             instance_id,
-            i,
+            node.node_id, // sorted-key party ID (set by setup_avss_test_network)
             n,
             t,
             node.network.clone().unwrap(),
@@ -596,9 +664,9 @@ async fn test_avss_e2e_distributed_key_generation() {
     info!("Step 4: Spawning AVSS message processors");
     spawn_avss_message_processors(&mut nodes, &engines);
 
-    // Step 5: Party 0 initiates AVSS (distributed key generation)
+    // Step 5: Party 0 (by array index) initiates AVSS
     let key_name = "signing_key";
-    info!("Step 5: Party 0 initiating AVSS for key '{}'", key_name);
+    info!("Step 5: Party {} initiating AVSS for key '{}'", nodes[0].node_id, key_name);
 
     let simple_net_0 = nodes[0].simple_net.clone().unwrap();
     let share = engines[0]

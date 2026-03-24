@@ -31,7 +31,7 @@ use std::sync::{
 use std::time::Duration;
 use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS};
 use stoffelmpc_mpc::avss_mpc::{
-    AvssMPCNode as AvssMpcNode, AvssMPCNodeOpts as AvssMpcNodeOpts, AvssSessionId,
+    AdkgNode as AvssMpcNode, AdkgNodeOpts as AvssMpcNodeOpts, AvssSessionId,
     ProtocolType as AvssProtocolType,
 };
 use stoffelmpc_mpc::common::rbc::rbc::Avid;

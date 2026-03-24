@@ -288,7 +288,7 @@ pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     pub channels: Sender<(PartyId, Vec<u8>)>,
     /// Available after `finalize_network()`.
     pub routed_network: Option<Arc<MpcNetwork>>,
-    expected_client_ids: Vec<ClientId>,
+    pub expected_client_ids: Vec<ClientId>,
 }
 
 impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
@@ -354,13 +354,26 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         })
     }
 
+    /// Returns the TLS-derived identity of this server's QUIC endpoint.
+    /// Available before and after `start()`.
+    pub fn local_derived_id(&self) -> PartyId {
+        if let Some(ref net) = self.network {
+            net.local_derived_id()
+        } else if let Some(ref builder) = self.network_builder {
+            builder.local_derived_id()
+        } else {
+            0
+        }
+    }
+
     /// Adds a peer node to connect to.  Must be called before `start()`.
-    pub async fn add_peer(&mut self, _peer_id: PartyId, address: SocketAddr) {
+    ///
+    /// `peer_id` should be the peer's TLS-derived identity so that the
+    /// QUIC accept-loop allowlist recognises inbound connections from it.
+    pub async fn add_peer(&mut self, peer_id: PartyId, address: SocketAddr) {
         if let Some(ref mut builder) = self.network_builder {
-            // Use a placeholder ID – the real party ID comes from
-            // assign_party_ids() after connections exchange public keys.
-            builder.add_node_with_party_id(0, address);
-            info!("Added peer at {} to node {}", address, self.node_id);
+            builder.add_node_with_party_id(peer_id, address);
+            info!("Added peer {} at {} to node {}", peer_id, address, self.node_id);
         } else {
             panic!("Cannot add peer after start() on node {}", self.node_id);
         }
@@ -1004,9 +1017,10 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
     .expect("Failed to create HoneyBadger node options");
 
     let mut recv = Vec::new();
+    // First pass: create all servers so their TLS identities are available.
     for i in 0..n_parties {
         let (tx, rx) = mpsc::channel(1500);
-        let mut server = HoneyBadgerQuicServer::new(
+        let server = HoneyBadgerQuicServer::new(
             i,
             addresses[i],
             mpc_opts.clone(),
@@ -1015,15 +1029,21 @@ pub async fn setup_honeybadger_quic_network<F: FftField + PrimeField + 'static>(
             input_ids.clone(),
         )
         .await?;
-        // Register peer addresses (IDs are placeholders; real IDs come later)
-        for j in 0..n_parties {
-            if i != j {
-                server.add_peer(j, addresses[j]).await;
-            }
-        }
-
         servers.push(server);
         recv.push(rx);
+    }
+
+    // Collect each server's TLS-derived ID so peers can be registered with
+    // the correct identity (required for the QUIC accept-loop allowlist).
+    let derived_ids: Vec<PartyId> = servers.iter().map(|s| s.local_derived_id()).collect();
+
+    // Second pass: cross-register peers using real derived IDs.
+    for i in 0..n_parties {
+        for j in 0..n_parties {
+            if i != j {
+                servers[i].add_peer(derived_ids[j], addresses[j]).await;
+            }
+        }
     }
 
     info!("Created {} HoneyBadger QUIC servers", servers.len());
@@ -1116,18 +1136,71 @@ mod tests {
         .await
         .expect("Failed to create clients");
 
-        // Step 2: Start all servers
+        // Step 2: Start all servers (no receive handler spawn yet)
         info!("Step 2: Starting servers...");
-        for (i, server) in servers.iter_mut().enumerate() {
-            // Must call start() first to create the network Arc
+        for server in servers.iter_mut() {
             server.start().await.expect("Failed to start server");
+            info!("✓ Started server {}", server.node_id);
+        }
 
-            //Receiver for each node
+        // Step 3: Connect servers to each other
+        info!("Step 3: Connecting servers to each other...");
+        for server in servers.iter_mut() {
+            server
+                .connect_to_peers()
+                .await
+                .expect("Failed to connect to peers");
+            info!("✓ Server {} connected to peers", server.node_id);
+        }
+
+        // Step 4: Connect clients to servers
+        info!("Step 4: Connecting clients to servers...");
+        for client in &mut clients {
+            info!("Connecting client {} to servers...", client.client_id);
+            client
+                .connect_to_servers()
+                .await
+                .expect("Failed to connect client to servers");
+            info!("✓ Client {} connected to servers", client.client_id);
+        }
+        info!("✓ All clients connected to servers");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Finalize network: assign party IDs and recreate HB nodes
+        for server in servers.iter_mut() {
+            let pid = server.finalize_network().expect("Failed to finalize network");
+            server.spawn_server_receive_loops();
+            info!("✓ Server {} finalized with party_id={}", server.node_id, pid);
+        }
+
+        // Register client connections under logical IDs in each server's RoutedNetwork
+        for server in servers.iter() {
+            if let Some(ref routed) = server.routed_network {
+                let all_clients = server
+                    .network
+                    .as_ref()
+                    .expect("network should be set")
+                    .get_all_client_connections();
+                for (_, conn) in &all_clients {
+                    routed.register_client(input_client_id, conn.clone());
+                }
+                info!(
+                    "Server {} registered {} client connection(s) under logical ID {}",
+                    server.node_id,
+                    all_clients.len(),
+                    input_client_id
+                );
+            }
+        }
+
+        // Spawn receive-loop tasks with updated nodes and routed networks
+        for (i, server) in servers.iter().enumerate() {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
@@ -1155,44 +1228,6 @@ mod tests {
                 }
                 tracing::info!("Receiver task for node {i} ended");
             });
-            info!("✓ Started server {}", server.node_id);
-        }
-        // tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Step 3: Connect servers to each other
-        info!("Step 3: Connecting servers to each other...");
-        for server in &mut servers {
-            info!("Connecting server {} to peers...", server.node_id);
-            server
-                .connect_to_peers()
-                .await
-                .expect("Failed to connect to peers");
-            info!("✓ Server {} connected to peers", server.node_id);
-        }
-
-        // Step 4: Connect clients to servers
-        info!("Step 4: Connecting clients to servers...");
-        for client in &mut clients {
-            info!("Connecting client {} to servers...", client.client_id);
-            client
-                .connect_to_servers()
-                .await
-                .expect("Failed to connect client to servers");
-            info!("✓ Client {} connected to servers", client.client_id);
-        }
-        info!("✓ All clients connected to servers");
-
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        // Assign sorted-public-key party IDs now that the mesh is formed
-        for server in &servers {
-            let network = server.network.as_ref().expect("network should be set");
-            let assigned = network.assign_party_ids();
-            let local_pid = network.local_party_id();
-            info!(
-                "Server {} assigned {} party IDs (local_party_id={})",
-                server.node_id, assigned, local_pid
-            );
         }
 
         // Step 5: Verify client connectivity
@@ -1211,8 +1246,8 @@ mod tests {
         }
         info!("✓ Client connectivity verified");
 
-        // Step 5: Verify network connectivity with a simple ping-pong test
-        info!("Step 4: Verifying network connectivity...");
+        // Verify network connectivity
+        info!("Verifying network connectivity...");
         for (i, server) in servers.iter().enumerate() {
             let network = server.network.as_ref().expect("network should be set");
             let parties = network.parties();
@@ -1244,8 +1279,8 @@ mod tests {
         }
         info!("✓ Network connectivity verified");
 
-        // Step 5: Run preprocessing with timeout and detailed logging
-        info!("Step 5: Running preprocessing on all servers...");
+        // Step 6: Run preprocessing with timeout and detailed logging
+        info!("Step 6: Running preprocessing on all servers...");
         info!(
             "Each server will generate {} triples and {} random shares",
             n_triples, n_random_shares
@@ -1262,10 +1297,10 @@ mod tests {
             .enumerate()
             .map(|(i, server)| {
                 let mut node_arc = server.node.clone();
-                let network_clone = server
-                    .network
+                let network_clone: Arc<RoutedNetwork> = server
+                    .routed_network
                     .clone()
-                    .expect("network should be set after start()");
+                    .expect("routed_network should be set after finalize_network()");
 
                 tokio::spawn(async move {
                     info!("[Server {}] Starting preprocessing...", i);
@@ -1318,7 +1353,7 @@ mod tests {
                     input_client_id,
                     local_shares,
                     2,
-                    server.network.clone().expect("network should be set"),
+                    server.routed_network.clone().expect("routed_network should be set"),
                 )
                 .await
             {
@@ -1335,7 +1370,7 @@ mod tests {
         let mut handles = Vec::new();
         for pid in 0..n_parties {
             let mut node = servers[pid].node.clone();
-            let net = servers[pid].network.clone().expect("network should be set");
+            let net: Arc<RoutedNetwork> = servers[pid].routed_network.clone().expect("routed_network should be set");
 
             let (x_shares, y_shares) = {
                 let input_store = node
@@ -1374,7 +1409,7 @@ mod tests {
         // Use the output client ID we defined earlier
         // Each server sends its output shares using the results from mul()
         for (i, server) in servers.iter().enumerate() {
-            let net = server.network.clone().expect("network should be set");
+            let net: Arc<RoutedNetwork> = server.routed_network.clone().expect("routed_network should be set");
 
             // Find the result for this party from the collected mul results
             let shares_mult_for_node = mul_results
@@ -1466,18 +1501,74 @@ mod tests {
         .await
         .expect("Failed to create clients");
 
-        // Step 2: Start all servers
+        // Step 2: Start all servers (no receive handler spawn yet)
         info!("Step 2: Starting servers...");
-        for (i, server) in servers.iter_mut().enumerate() {
-            // Must call start() first to create the network Arc
+        for server in servers.iter_mut() {
             server.start().await.expect("Failed to start server");
+            info!("✓ Started server {}", server.node_id);
+        }
 
-            //Receiver for each node
+        // Step 3: Connect servers to each other
+        info!("Step 3: Connecting servers to each other...");
+        for server in servers.iter_mut() {
+            server
+                .connect_to_peers()
+                .await
+                .expect("Failed to connect to peers");
+            info!("✓ Server {} connected to peers", server.node_id);
+        }
+
+        // Step 4: Connect clients to servers
+        info!("Step 4: Connecting clients to servers...");
+        for client in &mut clients {
+            info!("Connecting client {} to servers...", client.client_id);
+            client
+                .connect_to_servers()
+                .await
+                .expect("Failed to connect client to servers");
+            info!("✓ Client {} connected to servers", client.client_id);
+        }
+        info!("✓ All clients connected to servers");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Finalize network: assign party IDs and recreate HB nodes
+        for server in servers.iter_mut() {
+            let pid = server.finalize_network().expect("Failed to finalize network");
+            server.spawn_server_receive_loops();
+            info!("✓ Server {} finalized with party_id={}", server.node_id, pid);
+        }
+
+        // Register client connections under logical IDs in each server's RoutedNetwork
+        for server in servers.iter() {
+            if let Some(ref routed) = server.routed_network {
+                let all_clients = server
+                    .network
+                    .as_ref()
+                    .expect("network should be set")
+                    .get_all_client_connections();
+                // Register each client connection under both logical client IDs
+                for (_, conn) in &all_clients {
+                    for &cid in &clientid {
+                        routed.register_client(cid, conn.clone());
+                    }
+                }
+                info!(
+                    "Server {} registered {} client connection(s) under logical IDs {:?}",
+                    server.node_id,
+                    all_clients.len(),
+                    clientid
+                );
+            }
+        }
+
+        // Spawn receive-loop tasks with updated nodes and routed networks
+        for (i, server) in servers.iter().enumerate() {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
@@ -1505,44 +1596,6 @@ mod tests {
                 }
                 tracing::info!("Receiver task for node {i} ended");
             });
-            info!("✓ Started server {}", server.node_id);
-        }
-        // tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Step 3: Connect servers to each other
-        info!("Step 3: Connecting servers to each other...");
-        for server in &mut servers {
-            info!("Connecting server {} to peers...", server.node_id);
-            server
-                .connect_to_peers()
-                .await
-                .expect("Failed to connect to peers");
-            info!("✓ Server {} connected to peers", server.node_id);
-        }
-
-        // Step 4: Connect clients to servers
-        info!("Step 4: Connecting clients to servers...");
-        for client in &mut clients {
-            info!("Connecting client {} to servers...", client.client_id);
-            client
-                .connect_to_servers()
-                .await
-                .expect("Failed to connect client to servers");
-            info!("✓ Client {} connected to servers", client.client_id);
-        }
-        info!("✓ All clients connected to servers");
-
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        // Assign sorted-public-key party IDs now that the mesh is formed
-        for server in &servers {
-            let network = server.network.as_ref().expect("network should be set");
-            let assigned = network.assign_party_ids();
-            let local_pid = network.local_party_id();
-            info!(
-                "Server {} assigned {} party IDs (local_party_id={})",
-                server.node_id, assigned, local_pid
-            );
         }
 
         // Step 5: Verify client connectivity
@@ -1561,8 +1614,8 @@ mod tests {
         }
         info!("✓ Client connectivity verified");
 
-        // Step 4: Verify network connectivity with a simple ping-pong test
-        info!("Step 4: Verifying network connectivity...");
+        // Verify network connectivity
+        info!("Verifying network connectivity...");
         for (i, server) in servers.iter().enumerate() {
             let network = server.network.as_ref().expect("network should be set");
             let parties = network.parties();
@@ -1594,8 +1647,8 @@ mod tests {
         }
         info!("✓ Network connectivity verified");
 
-        // Step 5: Run preprocessing with timeout and detailed logging
-        info!("Step 5: Running preprocessing on all servers...");
+        // Step 6: Run preprocessing with timeout and detailed logging
+        info!("Step 6: Running preprocessing on all servers...");
         info!(
             "Each server will generate {} triples and {} random shares",
             n_triples, n_random_shares
@@ -1612,10 +1665,10 @@ mod tests {
             .enumerate()
             .map(|(i, server)| {
                 let mut node_arc = server.node.clone();
-                let network_clone = server
-                    .network
+                let network_clone: Arc<RoutedNetwork> = server
+                    .routed_network
                     .clone()
-                    .expect("network should be set after start()");
+                    .expect("routed_network should be set after finalize_network()");
 
                 tokio::spawn(async move {
                     info!("[Server {}] Starting preprocessing...", i);
@@ -1667,7 +1720,7 @@ mod tests {
                     clientid[0],
                     local_shares,
                     2,
-                    server.network.clone().expect("network should be set"),
+                    server.routed_network.clone().expect("routed_network should be set"),
                 )
                 .await
             {
@@ -1716,16 +1769,37 @@ mod tests {
 
         // Step 2: Start all servers
         info!("Step 2: Starting servers...");
-        for (i, server) in servers.iter_mut().enumerate() {
-            // Must call start() first to create the network Arc
+        for server in servers.iter_mut() {
             server.start().await.expect("Failed to start server");
+            info!("✓ Started server {}", server.node_id);
+        }
 
-            //Receiver for each node
+        // Step 3: Connect servers to each other
+        info!("Step 3: Connecting servers to each other...");
+        for server in servers.iter_mut() {
+            server
+                .connect_to_peers()
+                .await
+                .expect("Failed to connect to peers");
+            info!("✓ Server {} connected to peers", server.node_id);
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Finalize network: assign party IDs and recreate HB nodes
+        for server in servers.iter_mut() {
+            let pid = server.finalize_network().expect("Failed to finalize network");
+            server.spawn_server_receive_loops();
+            info!("✓ Server {} finalized with party_id={}", server.node_id, pid);
+        }
+
+        // Spawn receive-loop tasks with updated nodes and routed networks
+        for (i, server) in servers.iter().enumerate() {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
@@ -1753,29 +1827,6 @@ mod tests {
                 }
                 tracing::info!("Receiver task for node {i} ended");
             });
-            info!("✓ Started server {}", server.node_id);
-        }
-        // tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Step 3: Connect servers to each other
-        info!("Step 3: Connecting servers to each other...");
-        for server in &mut servers {
-            info!("Connecting server {} to peers...", server.node_id);
-            server
-                .connect_to_peers()
-                .await
-                .expect("Failed to connect to peers");
-            info!("✓ Server {} connected to peers", server.node_id);
-        }
-        // Assign sorted-public-key party IDs now that the mesh is formed
-        for server in &servers {
-            let network = server.network.as_ref().expect("network should be set");
-            let assigned = network.assign_party_ids();
-            let local_pid = network.local_party_id();
-            info!(
-                "Server {} assigned {} party IDs (local_party_id={})",
-                server.node_id, assigned, local_pid
-            );
         }
 
         // Step 4: Verify network connectivity with a simple ping-pong test
@@ -1829,10 +1880,10 @@ mod tests {
             .enumerate()
             .map(|(i, server)| {
                 let mut node_arc = server.node.clone();
-                let network_clone = server
-                    .network
+                let network_clone: Arc<RoutedNetwork> = server
+                    .routed_network
                     .clone()
-                    .expect("network should be set after start()");
+                    .expect("routed_network should be set after finalize_network()");
 
                 tokio::spawn(async move {
                     info!("[Server {}] Starting preprocessing...", i);
