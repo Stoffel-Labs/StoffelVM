@@ -124,9 +124,7 @@ pub(crate) fn try_handle_avss_open_exp_wire_message(
             sender_party_id = message.sender_party_id,
             "Rejecting AVSS open-exp wire message from unauthenticated connection"
         );
-        return Err(
-            "avss open-exp wire rejected: sender identity not authenticated".to_string(),
-        );
+        return Err("avss open-exp wire rejected: sender identity not authenticated".to_string());
     }
     if message.sender_party_id != authenticated_sender_id {
         return Err(format!(
@@ -320,16 +318,29 @@ where
         (Self::mix64(seed) as u32) & 0x00ff_ffff
     }
 
+    #[inline]
+    fn allocate_local_avss_session(
+        &self,
+        slot24_seed: u32,
+        counter: u64,
+    ) -> Result<AvssSessionId, String> {
+        let counter16 = u16::try_from(counter)
+            .map_err(|_| "AVSS local session counter overflowed u16".to_string())?;
+        let instance_id = u32::try_from(self.instance_id)
+            .map_err(|_| format!("instance_id {} exceeds u32", self.instance_id))?;
+        let slot24 = (slot24_seed & 0x00ff_0000) | u32::from(counter16);
+        Ok(AvssSessionId::new(
+            AvssProtocolType::Avss,
+            slot24,
+            instance_id,
+        ))
+    }
+
     fn allocate_input_share_session(&self) -> Result<(usize, AvssSessionId), String> {
         let round = self.input_share_counter.fetch_add(1, Ordering::SeqCst);
         let dealer_id = (round as usize) % self.n.max(1);
-        let round_u32 = u32::try_from(round)
-            .map_err(|_| "AVSS input_share counter overflowed u32".to_string())?;
         let slot24 = Self::derive_input_share_slot24(self.instance_id, dealer_id);
-        Ok((
-            dealer_id,
-            AvssSessionId::new(AvssProtocolType::Avss, slot24, round_u32),
-        ))
+        Ok((dealer_id, self.allocate_local_avss_session(slot24, round)?))
     }
 
     async fn run_input_share_round(
@@ -416,9 +427,10 @@ where
             if peer_id == self.party_id {
                 continue;
             }
-            self.net.send(peer_id, &payload).await.map_err(|e| {
-                format!("broadcast avss open-exp to {}: {}", peer_id, e)
-            })?;
+            self.net
+                .send(peer_id, &payload)
+                .await
+                .map_err(|e| format!("broadcast avss open-exp to {}: {}", peer_id, e))?;
         }
         Ok(())
     }
@@ -474,9 +486,13 @@ where
                 let mut seq = 0;
                 loop {
                     let key = (instance_id, seq);
-                    let entry = reg.entry(key).or_insert_with(AvssExpOpenAccumulator::default);
+                    let entry = reg
+                        .entry(key)
+                        .or_insert_with(AvssExpOpenAccumulator::default);
                     if !entry.party_ids.contains(&party_id) {
-                        entry.partial_points.push((share_id, partial_bytes.to_vec()));
+                        entry
+                            .partial_points
+                            .push((share_id, partial_bytes.to_vec()));
                         entry.party_ids.push(party_id);
                         *my_sequence = Some(seq);
                         break;
@@ -592,9 +608,7 @@ where
                 return Ok(result);
             }
             if std::time::Instant::now() >= deadline {
-                return Err(
-                    "Timeout waiting for AVSS open_share_in_exp contributions".to_string(),
-                );
+                return Err("Timeout waiting for AVSS open_share_in_exp contributions".to_string());
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -638,25 +652,14 @@ where
             return Err("AVSS engine not ready".into());
         }
 
-        let share = {
-            let mut node = self.avss_node.lock().await;
-            node.rand(net)
-                .await
-                .map_err(|e| format!("AVSS rand failed: {:?}", e))?
-        };
-
-        // Store the share under the user-defined key name
-        {
-            let mut shares = self.stored_shares.lock().await;
-            shares.insert(key_name.to_string(), share.clone());
-        }
-
-        info!(
-            "AVSS share generation completed: party={}, key='{}'",
-            self.party_id, key_name
-        );
-
-        Ok(share)
+        // The public engine API is dealer-driven: one caller generates a fresh
+        // secret and distributes Feldman-verifiable shares to the other parties.
+        // The inner `rand()` path is cooperative preprocessing and requires every
+        // party to start the round locally, which is not how this API is used.
+        let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+        let secret = F::rand(&mut rng);
+        self.generate_share_with_secret_and_network(key_name, secret, net)
+            .await
     }
 
     /// Generate an AVSS share for a specific secret and store under the given key name.
@@ -687,23 +690,18 @@ where
             let mut counter = self.session_counter.lock().await;
             let id = *counter;
             *counter += 1;
-            let id = u32::try_from(id).map_err(|_| {
-                "AVSS session counter overflowed u32; cannot allocate new session".to_string()
-            })?;
             let slot24 = Self::derive_session_slot24(self.instance_id, self.party_id);
-            AvssSessionId::new(AvssProtocolType::Avss, slot24, id)
+            self.allocate_local_avss_session(slot24, id)?
         };
 
         // Run AVSS init through the inner share_gen_avss node
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        {
-            let mut node = self.avss_node.lock().await;
-            node.share_gen_avss
-                .avss
-                .init(vec![secret], session_id, &mut rng, net)
-                .await
-                .map_err(|e| format!("AVSS init failed: {:?}", e))?;
-        }
+        let mut node = self.avss_node.lock().await.clone();
+        node.share_gen_avss
+            .avss
+            .init(vec![secret], session_id, &mut rng, net)
+            .await
+            .map_err(|e| format!("AVSS init failed: {:?}", e))?;
 
         info!(
             "AVSS share generation initiated: party={}, key='{}', session={}",
@@ -732,8 +730,7 @@ where
         &self,
         session_id: AvssSessionId,
     ) -> Result<FeldmanShamirShare<F, G>, String> {
-        let deadline =
-            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
 
         loop {
             let notified = self.share_notify.notified();
@@ -770,8 +767,7 @@ where
         &self,
         key_name: &str,
     ) -> Result<FeldmanShamirShare<F, G>, String> {
-        let deadline =
-            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
 
         loop {
             let notified = self.share_notify.notified();
@@ -1037,23 +1033,22 @@ where
         let fut = Self::run_multiply_round(avss_node, net, left_bytes, right_bytes);
 
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
+            Ok(handle) =>
+            {
                 #[allow(deprecated)]
                 match handle.runtime_flavor() {
                     tokio::runtime::RuntimeFlavor::MultiThread => {
                         tokio::task::block_in_place(|| handle.block_on(fut))
                     }
-                    tokio::runtime::RuntimeFlavor::CurrentThread => {
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .map_err(|e| format!("failed to create Tokio runtime: {e}"))?;
-                            rt.block_on(fut)
-                        })
-                        .join()
-                        .map_err(|_| "AVSS multiply worker thread panicked".to_string())?
-                    }
+                    tokio::runtime::RuntimeFlavor::CurrentThread => std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| format!("failed to create Tokio runtime: {e}"))?;
+                        rt.block_on(fut)
+                    })
+                    .join()
+                    .map_err(|_| "AVSS multiply worker thread panicked".to_string())?,
                     _ => Err("operation requires a multi-thread Tokio runtime".to_string()),
                 }
             }
@@ -1165,12 +1160,13 @@ where
 
     fn capabilities(&self) -> crate::net::mpc_engine::MpcCapabilities {
         use crate::net::mpc_engine::MpcCapabilities;
-        MpcCapabilities::MULTIPLICATION | MpcCapabilities::OPEN_IN_EXP | MpcCapabilities::ELLIPTIC_CURVES
+        MpcCapabilities::MULTIPLICATION
+            | MpcCapabilities::OPEN_IN_EXP
+            | MpcCapabilities::ELLIPTIC_CURVES
     }
 
     fn random_share(&self, _ty: ShareType) -> Result<Vec<u8>, String> {
-        let share =
-            crate::net::block_on_current(self.generate_random_share("__random_share__"))?;
+        let share = crate::net::block_on_current(self.generate_random_share("__random_share__"))?;
         Self::encode_feldman_share(&share)
     }
 
@@ -1239,7 +1235,6 @@ where
             Self::encode_group_element(commitment)
         })
     }
-
 }
 
 // ============================================================================
@@ -1541,8 +1536,8 @@ mod tests {
 
         let required = t + 1;
         let subset: Vec<_> = shares.iter().take(required).cloned().collect();
-        let recovered =
-            Bn254AvssMpcEngine::reconstruct_secret(&subset, n, t).expect("reconstruct_secret failed");
+        let recovered = Bn254AvssMpcEngine::reconstruct_secret(&subset, n, t)
+            .expect("reconstruct_secret failed");
         assert_eq!(recovered, secret);
     }
 
@@ -1725,8 +1720,8 @@ mod tests {
 
         let required = t + 1;
         let subset: Vec<_> = decoded_shares.iter().take(required).cloned().collect();
-        let recovered =
-            Bn254AvssMpcEngine::reconstruct_secret(&subset, n, t).expect("reconstruct_secret failed");
+        let recovered = Bn254AvssMpcEngine::reconstruct_secret(&subset, n, t)
+            .expect("reconstruct_secret failed");
         assert_eq!(
             recovered, secret,
             "Reconstructed secret should match original"

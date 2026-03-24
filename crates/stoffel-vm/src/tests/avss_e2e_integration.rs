@@ -272,10 +272,7 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
         .iter()
         .map(|n| n.network_builder.as_ref().unwrap().local_derived_id())
         .collect();
-    info!(
-        "[AVSS-E2E] TLS-derived IDs: {:?}",
-        derived_ids
-    );
+    info!("[AVSS-E2E] TLS-derived IDs: {:?}", derived_ids);
     for i in 0..n {
         let mgr = nodes[i].network_builder.as_mut().unwrap();
         // Register self with derived ID
@@ -345,7 +342,9 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
             if peer_derived_id == local_derived {
                 continue; // skip self
             }
-            let peer_logical = *derived_to_logical.get(&peer_derived_id).unwrap_or(&peer_derived_id);
+            let peer_logical = *derived_to_logical
+                .get(&peer_derived_id)
+                .unwrap_or(&peer_derived_id);
             let mut retry_count = 0u32;
             loop {
                 match dialer.connect_as_server(peer_addr).await {
@@ -383,7 +382,8 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
     for node in &nodes {
         let net = node.network.as_ref().unwrap();
         let assigned = net.assign_party_ids();
-        let local_pid = net.compute_local_party_id()
+        let local_pid = net
+            .compute_local_party_id()
             .expect("compute_local_party_id failed");
         info!(
             "[AVSS] Node {} assigned {} party IDs, sorted-key party_id={}",
@@ -435,10 +435,7 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
                     match conn.receive().await {
                         Ok(data) => {
                             if let Err(e) = txx.send((pid, data)).await {
-                                error!(
-                                    "[AVSS] Node {} recv send error: {:?}",
-                                    node_id, e
-                                );
+                                error!("[AVSS] Node {} recv send error: {:?}", node_id, e);
                             }
                         }
                         Err(_) => break,
@@ -449,7 +446,9 @@ async fn setup_avss_test_network(n: usize, base_port: u16) -> Result<Vec<AvssTes
 
         info!(
             "[AVSS] Node {} (party_id={}) has {} peer connections",
-            idx, local_pid, peer_conns.len()
+            idx,
+            local_pid,
+            peer_conns.len()
         );
 
         let self_tx = nodes[idx].tx.clone();
@@ -666,7 +665,10 @@ async fn test_avss_e2e_distributed_key_generation() {
 
     // Step 5: Party 0 (by array index) initiates AVSS
     let key_name = "signing_key";
-    info!("Step 5: Party {} initiating AVSS for key '{}'", nodes[0].node_id, key_name);
+    info!(
+        "Step 5: Party {} initiating AVSS for key '{}'",
+        nodes[0].node_id, key_name
+    );
 
     let simple_net_0 = nodes[0].simple_net.clone().unwrap();
     let share = engines[0]
@@ -769,7 +771,7 @@ async fn test_avss_e2e_vm_public_key_extraction() {
     for (i, node) in nodes.iter().enumerate() {
         let engine = AvssMpcEngine::new(
             instance_id,
-            i,
+            node.node_id,
             n,
             t,
             node.network.clone().unwrap(),
@@ -943,7 +945,7 @@ async fn test_avss_e2e_multiple_keys() {
     for (i, node) in nodes.iter().enumerate() {
         let engine = AvssMpcEngine::new(
             instance_id,
-            i,
+            node.node_id,
             n,
             t,
             node.network.clone().unwrap(),

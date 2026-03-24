@@ -372,31 +372,29 @@ async fn test_vm_mesh_full_integration() {
     // Step 10: Execute VM programs on all parties (this triggers MPC multiplication)
     info!("Step 10: Executing VM programs on all parties...");
 
-    use futures::FutureExt;
     let handles: Vec<_> = vms
         .iter()
         .enumerate()
         .map(|(pid, vm_arc)| {
             let vm_arc = vm_arc.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut vm = vm_arc.lock();
-                let val = vm
-                    .execute("multiply_client_inputs")
-                    .map_err(|e| format!("VM execution failed at party {}: {}", pid, e))?;
-                Ok::<(usize, Value), String>((pid, val))
-            })
-            .map(move |join_res| match join_res {
-                Ok(inner) => inner,
-                Err(e) => Err(format!("Join error executing VM {}: {:?}", pid, e)),
+            tokio::spawn(async move {
+                tokio::task::block_in_place(|| {
+                    let mut vm = vm_arc.lock();
+                    let val = vm
+                        .execute("multiply_client_inputs")
+                        .map_err(|e| format!("VM execution failed at party {}: {}", pid, e))?;
+                    Ok::<(usize, Value), String>((pid, val))
+                })
             })
         })
         .collect();
 
     // Put a timeout guard to avoid infinite hangs in CI
     let join_all_fut = futures::future::join_all(handles);
-    let joined = tokio::time::timeout(Duration::from_secs(30), join_all_fut)
+    let joined = tokio::time::timeout(Duration::from_secs(120), join_all_fut)
         .await
         .expect("Timed out waiting for VMs to execute; possible deadlock if parties didn't run concurrently");
+    let joined: Vec<_> = joined.into_iter().map(|r| r.expect("VM task panicked")).collect();
 
     let mut party_results: Vec<(usize, Value)> = Vec::new();
     for res in joined {

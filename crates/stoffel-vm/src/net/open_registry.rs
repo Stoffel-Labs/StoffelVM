@@ -117,6 +117,7 @@ where
     loop {
         // Create the notified future *before* checking the registry (avoids races).
         let notified = OPEN_NOTIFY.notified();
+        let mut inserted_local = false;
 
         {
             let mut reg = OPEN_REGISTRY.lock();
@@ -131,6 +132,7 @@ where
                         entry.shares.push(share_bytes.clone());
                         entry.party_ids.push(party_id);
                         my_sequence = Some(seq);
+                        inserted_local = true;
                         break;
                     }
                     seq += 1;
@@ -139,7 +141,9 @@ where
 
             let seq = my_sequence.expect("sequence must be set after insertion");
             let key = (instance_id, seq, type_key.clone());
-            let entry = reg.get_mut(&key).expect("registry entry must exist after insertion");
+            let entry = reg
+                .get_mut(&key)
+                .expect("registry entry must exist after insertion");
 
             if let Some(result) = entry.result.clone() {
                 return Ok(result);
@@ -155,6 +159,8 @@ where
                     .expect("registry entry must exist after insertion");
                 entry.result = Some(value.clone());
                 entry.result_cached_at = Some(Instant::now());
+                drop(reg);
+                OPEN_NOTIFY.notify_waiters();
                 return Ok(value);
             }
 
@@ -167,6 +173,10 @@ where
                     current_count, required
                 ));
             }
+        }
+
+        if inserted_local {
+            OPEN_NOTIFY.notify_waiters();
         }
 
         // Wait for a new insertion or timeout.
@@ -213,7 +223,9 @@ where
 
         let seq = my_sequence.expect("sequence must be set after insertion");
         let key = (instance_id, seq, type_key.clone());
-        let entry = reg.get_mut(&key).expect("registry entry must exist after insertion");
+        let entry = reg
+            .get_mut(&key)
+            .expect("registry entry must exist after insertion");
 
         if let Some(result) = entry.result.clone() {
             return Ok(result);
@@ -429,8 +441,8 @@ pub fn try_handle_wire_message(
         ));
     }
 
-    let decoded: OpenRegistryWireMessage = bincode::deserialize(body)
-        .map_err(|e| format!("deserialize open wire payload: {}", e))?;
+    let decoded: OpenRegistryWireMessage =
+        bincode::deserialize(body).map_err(|e| format!("deserialize open wire payload: {}", e))?;
 
     match decoded {
         OpenRegistryWireMessage::Single {
@@ -444,9 +456,7 @@ pub fn try_handle_wire_message(
                     sender_party_id,
                     "Rejecting open wire message from unauthenticated connection"
                 );
-                return Err(
-                    "open wire rejected: sender identity not authenticated".to_string(),
-                );
+                return Err("open wire rejected: sender identity not authenticated".to_string());
             }
             if sender_party_id != authenticated_sender_id {
                 return Err(format!(
@@ -523,6 +533,7 @@ where
 
     loop {
         let notified = BATCH_OPEN_NOTIFY.notified();
+        let mut inserted_local = false;
 
         {
             let mut reg = BATCH_OPEN_REGISTRY.lock();
@@ -541,6 +552,7 @@ where
                         }
                         entry.party_ids.push(party_id);
                         my_sequence = Some(seq);
+                        inserted_local = true;
                         break;
                     }
                     seq += 1;
@@ -549,7 +561,9 @@ where
 
             let seq = my_sequence.expect("sequence must be set after insertion");
             let key = (instance_id, seq, type_key.clone(), batch_size);
-            let entry = reg.get_mut(&key).expect("registry entry must exist after insertion");
+            let entry = reg
+                .get_mut(&key)
+                .expect("registry entry must exist after insertion");
 
             if let Some(results) = entry.results.clone() {
                 return Ok(results);
@@ -574,6 +588,8 @@ where
                     .expect("batch registry entry must exist after insertion");
                 entry.results = Some(results.clone());
                 entry.result_cached_at = Some(Instant::now());
+                drop(reg);
+                BATCH_OPEN_NOTIFY.notify_waiters();
                 return Ok(results);
             }
 
@@ -586,6 +602,10 @@ where
                     current_count, required
                 ));
             }
+        }
+
+        if inserted_local {
+            BATCH_OPEN_NOTIFY.notify_waiters();
         }
 
         tokio::select! {
@@ -636,7 +656,9 @@ where
 
         let seq = my_sequence.expect("sequence must be set after insertion");
         let key = (instance_id, seq, type_key.clone(), batch_size);
-        let entry = reg.get_mut(&key).expect("registry entry must exist after insertion");
+        let entry = reg
+            .get_mut(&key)
+            .expect("registry entry must exist after insertion");
 
         if let Some(results) = entry.results.clone() {
             return Ok(results);
@@ -759,8 +781,7 @@ mod tests {
 
     #[test]
     fn sender_mismatch_batch_is_rejected() {
-        let msg =
-            encode_batch_share_wire_message(1, "test-key", 0, &[b"s0".to_vec()]).unwrap();
+        let msg = encode_batch_share_wire_message(1, "test-key", 0, &[b"s0".to_vec()]).unwrap();
         let result = try_handle_wire_message(1, &msg);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("sender mismatch"));
@@ -783,8 +804,8 @@ mod tests {
     fn valid_batch_contribution_is_accepted() {
         let shares = vec![b"s0".to_vec(), b"s1".to_vec()];
         let instance_id = 9999u64; // Use unique instance_id to avoid collisions
-        let msg = encode_batch_share_wire_message(instance_id, "test-batch-unique", 5, &shares)
-            .unwrap();
+        let msg =
+            encode_batch_share_wire_message(instance_id, "test-batch-unique", 5, &shares).unwrap();
         let result = try_handle_wire_message(5, &msg);
         assert_eq!(result.unwrap(), true);
 
@@ -813,8 +834,7 @@ mod tests {
 
     #[test]
     fn wire_message_roundtrip_single() {
-        let encoded =
-            encode_single_share_wire_message(42, "rt-key", 7, b"test_share").unwrap();
+        let encoded = encode_single_share_wire_message(42, "rt-key", 7, b"test_share").unwrap();
         assert!(encoded.starts_with(OPEN_REGISTRY_WIRE_PREFIX));
         assert!(encoded.len() < MAX_WIRE_MESSAGE_LEN + OPEN_REGISTRY_WIRE_PREFIX.len());
     }
@@ -822,8 +842,133 @@ mod tests {
     #[test]
     fn wire_message_roundtrip_batch() {
         let shares = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
-        let encoded =
-            encode_batch_share_wire_message(99, "batch-rt", 2, &shares).unwrap();
+        let encoded = encode_batch_share_wire_message(99, "batch-rt", 2, &shares).unwrap();
         assert!(encoded.starts_with(OPEN_REGISTRY_WIRE_PREFIX));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_single_insert_wakes_waiters() {
+        clear_registries();
+
+        let waiter = tokio::spawn(async {
+            open_share_via_registry_async(
+                55,
+                0,
+                "single-notify".to_string(),
+                b"s0".to_vec(),
+                2,
+                |shares| Ok(Value::I64(shares.len() as i64)),
+            )
+            .await
+        });
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            loop {
+                let ready = {
+                    let reg = OPEN_REGISTRY.lock();
+                    reg.get(&(55u64, 0usize, "single-notify".to_string()))
+                        .is_some_and(|entry| entry.party_ids == vec![0])
+                };
+                if ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first single contribution should be registered");
+
+        let finalizer = tokio::spawn(async {
+            open_share_via_registry_async(
+                55,
+                1,
+                "single-notify".to_string(),
+                b"s1".to_vec(),
+                2,
+                |shares| Ok(Value::I64(shares.len() as i64)),
+            )
+            .await
+        });
+
+        let (waiter, finalizer) =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+                tokio::join!(waiter, finalizer)
+            })
+            .await
+            .expect("single open waiters should be notified by local insertion");
+
+        assert_eq!(
+            waiter.expect("waiter task").expect("waiter result"),
+            Value::I64(2)
+        );
+        assert_eq!(
+            finalizer
+                .expect("finalizer task")
+                .expect("finalizer result"),
+            Value::I64(2)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_batch_insert_wakes_waiters() {
+        clear_registries();
+
+        let waiter = tokio::spawn(async {
+            batch_open_via_registry_async(
+                77,
+                0,
+                "batch-notify".to_string(),
+                vec![b"a0".to_vec(), b"b0".to_vec()],
+                2,
+                |shares, _pos| Ok(Value::I64(shares.len() as i64)),
+            )
+            .await
+        });
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            loop {
+                let ready = {
+                    let reg = BATCH_OPEN_REGISTRY.lock();
+                    reg.get(&(77u64, 0usize, "batch-notify".to_string(), 2usize))
+                        .is_some_and(|entry| entry.party_ids == vec![0])
+                };
+                if ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first batch contribution should be registered");
+
+        let finalizer = tokio::spawn(async {
+            batch_open_via_registry_async(
+                77,
+                1,
+                "batch-notify".to_string(),
+                vec![b"a1".to_vec(), b"b1".to_vec()],
+                2,
+                |shares, _pos| Ok(Value::I64(shares.len() as i64)),
+            )
+            .await
+        });
+
+        let (waiter, finalizer) =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+                tokio::join!(waiter, finalizer)
+            })
+            .await
+            .expect("batch open waiters should be notified by local insertion");
+
+        assert_eq!(
+            waiter.expect("waiter task").expect("waiter result"),
+            vec![Value::I64(2), Value::I64(2)]
+        );
+        assert_eq!(
+            finalizer
+                .expect("finalizer task")
+                .expect("finalizer result"),
+            vec![Value::I64(2), Value::I64(2)]
+        );
     }
 }
