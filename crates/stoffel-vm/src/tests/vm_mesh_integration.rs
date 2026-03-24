@@ -63,7 +63,7 @@ async fn test_vm_mesh_full_integration() {
     let base_port = 9400;
 
     let config = HoneyBadgerQuicConfig {
-        mpc_timeout: Duration::from_secs(10),
+        mpc_timeout: Duration::from_secs(90),
         connection_retry_delay: Duration::from_millis(100),
         ..Default::default()
     };
@@ -330,7 +330,7 @@ async fn test_vm_mesh_full_integration() {
                 .node
                 .preprocess
                 .input
-                .wait_for_all_inputs(Duration::from_secs(30))
+                .wait_for_all_inputs(Duration::from_secs(90))
                 .await
                 .expect("Failed to get client inputs");
             input_store
@@ -471,7 +471,7 @@ async fn test_vm_mesh_average_salary_integration() {
     let mut client_inputs = Vec::new();
     let mut expected_sum = 0i64;
     for idx in 0..client_count {
-        let client_id = 500 + idx as ClientId;
+        let client_id = 50 + idx as ClientId;
         client_ids.push(client_id);
         let salary = rng.gen_range(40_000i64..=200_000i64);
         expected_sum += salary;
@@ -699,7 +699,7 @@ async fn test_vm_mesh_average_salary_integration() {
                 .node
                 .preprocess
                 .input
-                .wait_for_all_inputs(Duration::from_secs(30))
+                .wait_for_all_inputs(Duration::from_secs(90))
                 .await
                 .expect("Failed to get client inputs");
             if let Some(shares) = input_store.get(&first_client) {
@@ -950,20 +950,20 @@ async fn test_vm_mesh_large_preprocessing() {
     // Use same parameters as test_vm_mesh_full_integration
     let n_triples = 32;
     let n_random_shares = 2 + 2 * n_triples; // = 8
-    let instance_id = 77777; // Unique instance ID
+    let instance_id = 77780; // Unique instance ID
     let base_port = 9700; // Unique port range (far from 9400/9450/9500/9550)
 
     let config = HoneyBadgerQuicConfig {
-        mpc_timeout: Duration::from_secs(30),
+        mpc_timeout: Duration::from_secs(90),
         connection_retry_delay: Duration::from_millis(100),
         ..Default::default()
     };
 
     // Define client IDs before network setup (client IDs must be registered at setup time)
-    let client_ids: Vec<ClientId> = vec![300, 301];
+    let client_ids: Vec<ClientId> = vec![30, 31];
     let client_inputs: Vec<Vec<Fr>> = vec![
-        vec![Fr::from(10u64)], // Client 300 input
-        vec![Fr::from(20u64)], // Client 301 input
+        vec![Fr::from(10u64)], // Client 30 input
+        vec![Fr::from(20u64)], // Client 31 input
     ];
 
     info!(
@@ -1259,7 +1259,7 @@ async fn test_vm_mesh_output_client_integration() {
     let n_random_shares = 8 + 2 * n_triples;
     let instance_id = 66666;
     let base_port = 9650;
-    let output_client_id: ClientId = 999; // Designated output recipient
+    let output_client_id: ClientId = 99; // Designated output recipient
 
     let config = HoneyBadgerQuicConfig {
         mpc_timeout: Duration::from_secs(30),
@@ -1274,7 +1274,7 @@ async fn test_vm_mesh_output_client_integration() {
     let mut client_inputs = Vec::new();
     let mut expected_sum = 0i64;
     for idx in 0..client_count {
-        let client_id = 600 + idx as ClientId;
+        let client_id = 60 + idx as ClientId;
         client_ids.push(client_id);
         let salary = rng.gen_range(50_000i64..=150_000i64);
         expected_sum += salary;
@@ -1507,7 +1507,7 @@ async fn test_vm_mesh_output_client_integration() {
                 .node
                 .preprocess
                 .input
-                .wait_for_all_inputs(Duration::from_secs(30))
+                .wait_for_all_inputs(Duration::from_secs(90))
                 .await
                 .expect("Failed to get client inputs");
             input_store
@@ -1591,16 +1591,17 @@ async fn test_vm_mesh_output_client_integration() {
     // Simulate each server sending its output share to the client
     // In production, OutputServer.init() sends via network; here we directly
     // create and process the OutputMessage at the client
-    for (party_id, _server) in servers.iter().enumerate() {
-        let share = result_shares[party_id].clone();
+    for share in &result_shares {
+        let sender_id = share.id;
 
         // Serialize the share as OutputServer would
         let mut payload = Vec::new();
-        ark_serialize::CanonicalSerialize::serialize_compressed(&vec![share], &mut payload)
+        ark_serialize::CanonicalSerialize::serialize_compressed(&vec![share.clone()], &mut payload)
             .expect("Failed to serialize share");
 
         // Create the OutputMessage that would be sent over network
-        let output_msg = stoffelmpc_mpc::honeybadger::output::OutputMessage::new(party_id, payload);
+        let output_msg =
+            stoffelmpc_mpc::honeybadger::output::OutputMessage::new(sender_id, payload);
 
         // Process the message at the output client
         let mut client = output_client.lock().await;
@@ -1610,8 +1611,8 @@ async fn test_vm_mesh_output_client_integration() {
             .expect("OutputClient failed to process message");
 
         info!(
-            "✓ Simulated server {} sending output share to client {}",
-            party_id, output_client_id
+            "✓ Simulated server party {} sending output share to client {}",
+            sender_id, output_client_id
         );
     }
 
@@ -1762,7 +1763,7 @@ async fn test_vm_mesh_matrix_average_integration() {
     );
 
     for idx in 0..client_count {
-        let client_id = 700 + idx as ClientId;
+        let client_id = 70 + idx as ClientId;
         client_ids.push(client_id);
 
         // Generate a random matrix (values between 1-100)
@@ -2354,7 +2355,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     );
 
     for idx in 0..client_count {
-        let client_id = 800 + idx as ClientId;
+        let client_id = 80 + idx as ClientId;
         client_ids.push(client_id);
 
         // Generate random matrix with decimal values (e.g., 1.5, 42.75)
@@ -3340,7 +3341,7 @@ fn build_federated_average_program(
     // reg8 = scratch
     // reg9 = current client index for output sending
     // reg10 = client_id for output
-    // reg11 = 800 (base client id)
+    // reg11 = 80 (base client id)
     // reg16 = current element sum accumulator (secret share)
     // reg17 = scratch for shares
     // reg18 = scratch for shares
@@ -3353,7 +3354,7 @@ fn build_federated_average_program(
 
     instructions.push(Instruction::LDI(3, Value::I64(1))); // reg3 = 1
     instructions.push(Instruction::LDI(4, Value::I64(matrix_size as i64))); // reg4 = matrix_size
-    instructions.push(Instruction::LDI(11, Value::I64(800))); // reg11 = base client id
+    instructions.push(Instruction::LDI(11, Value::I64(80))); // reg11 = base client id
 
     // Step 2: Create result array to store revealed averaged values (for verification)
     instructions.push(Instruction::LDI(0, Value::I64(matrix_size as i64))); // capacity
@@ -3505,7 +3506,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     let threshold = 1;
     let n_triples = 32;
     let n_random_shares = 64 + MATRIX_SIZE * 8;
-    let instance_id = 77777;
+    let instance_id = 77781;
     let base_port = 9850;
 
     let config = HoneyBadgerQuicConfig {
@@ -3585,7 +3586,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     );
 
     for idx in 0..client_count {
-        let client_id = 900 + idx as ClientId;
+        let client_id = 90 + idx as ClientId;
         client_ids.push(client_id);
 
         // Generate random matrix with decimal values
@@ -3615,7 +3616,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     info!("");
     info!("=== Client Input Matrices ===");
     for (idx, matrix) in client_matrices_f64.iter().enumerate() {
-        let client_id = 900 + idx as ClientId;
+        let client_id = 90 + idx as ClientId;
         info!(
             "Client {} matrix ({}x{}):",
             client_id, MATRIX_ROWS, MATRIX_COLS

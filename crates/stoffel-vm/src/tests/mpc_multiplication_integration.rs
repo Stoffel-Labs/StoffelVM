@@ -414,13 +414,17 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                 // spawn_server_receive_loops() after
                                 // assign_party_ids() has run.
                                 //
-                                // For client connections (arriving later),
-                                // spawn a handler using the expected logical ID.
+                                // For client connections (arriving later), only
+                                // auto-bridge when there is exactly one logical
+                                // client. Multi-client integration tests install
+                                // explicit derived-id -> logical-id handlers after
+                                // connect_to_servers(); guessing here would route
+                                // every client through expected_clients[0].
                                 let is_unknown = connection.remote_party_id().is_none()
                                     && acceptor.parties().iter().all(|n| {
                                         n.address() != connection.remote_address()
                                     });
-                                if is_unknown && !expected_clients.is_empty() {
+                                if is_unknown && expected_clients.len() == 1 {
                                     let txx = tx.clone();
                                     let client_sid = expected_clients[0];
                                     tokio::spawn(async move {

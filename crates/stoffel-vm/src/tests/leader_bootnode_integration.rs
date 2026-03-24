@@ -224,7 +224,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
     let threshold = 1;
     let n_triples = 32;
     let n_random_shares = 64 + MATRIX_SIZE * 8;
-    let instance_id = 77777;
+    let instance_id = 77779;
     let base_port = 11000;
 
     let config = HoneyBadgerQuicConfig {
@@ -258,7 +258,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
     );
 
     for idx in 0..client_count {
-        let client_id = 900 + idx as ClientId;
+        let client_id = 90 + idx as ClientId;
         client_ids.push(client_id);
 
         let mut matrix_values: Vec<Fr> = Vec::new();
