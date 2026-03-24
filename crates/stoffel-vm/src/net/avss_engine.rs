@@ -351,7 +351,7 @@ where
     ) -> Result<FeldmanShamirShare<F, G>, String> {
         if self.party_id == dealer_id {
             let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-            let mut node = self.avss_node.lock().await;
+            let mut node = self.avss_node.lock().await.clone();
             node.share_gen_avss
                 .avss
                 .init(vec![secret], session_id, &mut rng, self.net.clone())
