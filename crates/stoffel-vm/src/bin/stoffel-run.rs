@@ -15,6 +15,7 @@ use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
 use stoffel_vm::core_vm::VirtualMachine;
+use stoffel_vm_types::core_types::Value;
 #[cfg(feature = "avss")]
 use stoffel_vm::net::avss_server::{
     AvssQuicConfig, Bls12381AvssServer, Bn254AvssServer, Curve25519AvssServer, Ed25519AvssServer,
@@ -1942,6 +1943,23 @@ async fn main() {
     // Execute entry function
     match vm.execute(&agreed_entry) {
         Ok(result) => {
+            // Auto-reveal if the program returned an unrevealed share
+            let result = if let Value::Share(ty, ref data) = result {
+                if let Some(engine) = vm.state.mpc_engine() {
+                    eprintln!("Program returned a secret share, revealing...");
+                    match engine.open_share(ty, data) {
+                        Ok(revealed) => revealed,
+                        Err(e) => {
+                            eprintln!("Failed to reveal returned share: {}", e);
+                            result
+                        }
+                    }
+                } else {
+                    result
+                }
+            } else {
+                result
+            };
             println!("Program returned: {:?}", result);
         }
         Err(err) => {

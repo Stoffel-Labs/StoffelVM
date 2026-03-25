@@ -5,18 +5,6 @@ set -e
 # Handles both leader and party node startup with proper coordination
 
 validate_env() {
-    if [ -n "${STOFFEL_CLIENT_ID:-}" ]; then
-        echo "ERROR: STOFFEL_CLIENT_ID is no longer supported."
-        echo "Client IDs are now transport-derived. Remove STOFFEL_CLIENT_ID."
-        exit 2
-    fi
-
-    if [ -n "${STOFFEL_EXPECTED_CLIENTS:-}" ]; then
-        echo "ERROR: STOFFEL_EXPECTED_CLIENTS is no longer supported."
-        echo "Use STOFFEL_EXPECTED_CLIENT_COUNT instead."
-        exit 2
-    fi
-
     if [ "${STOFFEL_ROLE}" != "client" ] && [ -z "${STOFFEL_AUTH_TOKEN:-}" ]; then
         echo "ERROR: STOFFEL_AUTH_TOKEN must be set for ${STOFFEL_ROLE} mode."
         echo "Bootnode and parties require authenticated discovery registration."

@@ -532,6 +532,25 @@ where
         crate::net::block_on_current(self.broadcast_open_exp_payload(payload))
     }
 
+    async fn broadcast_open_registry_payload(&self, payload: Vec<u8>) -> Result<(), String> {
+        for peer_id in 0..self.n {
+            if peer_id == self.party_id {
+                continue;
+            }
+            self.net.send(peer_id, &payload).await.map_err(|e| {
+                format!(
+                    "Failed to send open payload to party {}: {}",
+                    peer_id, e
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn broadcast_open_registry_payload_sync(&self, payload: Vec<u8>) -> Result<(), String> {
+        crate::net::block_on_current(self.broadcast_open_registry_payload(payload))
+    }
+
     /// Reveal a share in the exponent using transport-backed contribution exchange.
     ///
     /// Each party computes `share_value * generator`, broadcasts its partial point,
@@ -852,6 +871,15 @@ where
             }
         };
 
+        // Broadcast our share to all peers so they can reconstruct too
+        let wire_message = crate::net::open_registry::encode_single_share_wire_message(
+            self.instance_id,
+            &type_key,
+            self.party_id,
+            share_bytes,
+        )?;
+        self.broadcast_open_registry_payload_sync(wire_message)?;
+
         let required = 2 * self.t + 1;
         let n = self.n;
         let t = self.t;
@@ -889,6 +917,15 @@ where
                 format!("hb-batch-fixed-{}-{}", precision.k(), precision.f())
             }
         };
+
+        // Broadcast our shares to all peers
+        let wire_message = crate::net::open_registry::encode_batch_share_wire_message(
+            self.instance_id,
+            &type_key,
+            self.party_id,
+            shares,
+        )?;
+        self.broadcast_open_registry_payload_sync(wire_message)?;
 
         let required = 2 * self.t + 1;
         let n = self.n;
