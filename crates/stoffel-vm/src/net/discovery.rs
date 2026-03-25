@@ -1244,41 +1244,6 @@ pub async fn register_and_wait_for_session_with_program(
                         }
                     }
 
-                    // Create loopback connection to self (required by MPC protocols)
-                    // Some MPC operations send messages to self, requiring a connection entry
-                    let my_addr = info
-                        .parties
-                        .iter()
-                        .find(|(pid, _)| *pid == my_party_id)
-                        .map(|(_, addr)| *addr);
-                    if let Some(addr) = my_addr {
-                        eprintln!(
-                            "[party {}] Establishing loopback connection to self at {}",
-                            my_party_id, addr
-                        );
-                        match tokio::time::timeout(Duration::from_secs(5), net.connect(addr)).await
-                        {
-                            Ok(Ok(_)) => {
-                                eprintln!(
-                                    "[party {}] Loopback connection established",
-                                    my_party_id
-                                );
-                            }
-                            Ok(Err(e)) => {
-                                eprintln!(
-                                    "[party {}] Loopback connection failed: {} (non-fatal)",
-                                    my_party_id, e
-                                );
-                            }
-                            Err(_) => {
-                                eprintln!(
-                                    "[party {}] Loopback connection timed out (non-fatal)",
-                                    my_party_id
-                                );
-                            }
-                        }
-                    }
-
                     // Assign party IDs based on sorted public keys now that
                     // the mesh is fully formed. This sets remote_party_id on
                     // each connection so that spawn_receive_loops can map

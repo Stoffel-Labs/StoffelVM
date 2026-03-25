@@ -4,19 +4,10 @@
 # including program sync, leader node, and client input provision.
 #
 # Usage:
-#   docker-compose build
-#   docker-compose up
-#
-# To build with NAT traversal support:
-#   docker-compose build --build-arg ENABLE_NAT=true
+#   STOFFEL_AUTH_TOKEN=<token> docker-compose up
 #
 # To view logs from a specific party:
 #   docker-compose logs -f party0
-#
-# To run with a different program:
-#   STOFFEL_PROGRAM=/app/programs/your_program.stflb docker-compose up
-#
-# For cross-internet NAT traversal, see docker-compose.nat.yml
 
 services:
   # Party 0 - Leader node (runs bootnode + party 0)
@@ -24,8 +15,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party0
     hostname: party0
     environment:
@@ -44,10 +33,10 @@ services:
       stoffel-net:
         ipv4_address: 172.28.0.10
     ports:
-      - "9000:9000/tcp"   # Bootnode port (TCP)
-      - "9000:9000/udp"   # Bootnode port (UDP/QUIC)
-      - "10000:10000/tcp" # Party communication port (TCP)
-      - "10000:10000/udp" # Party communication port (UDP/QUIC)
+      - "9000:9000/tcp"
+      - "9000:9000/udp"
+      - "10000:10000/tcp"
+      - "10000:10000/udp"
     healthcheck:
       test: ["CMD-SHELL", "netstat -tuln | grep -q ':9000' || exit 1"]
       interval: 5s
@@ -60,8 +49,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party1
     hostname: party1
     environment:
@@ -92,8 +79,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party2
     hostname: party2
     environment:
@@ -124,8 +109,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party3
     hostname: party3
     environment:
@@ -156,8 +139,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party4
     hostname: party4
     environment:
@@ -188,8 +169,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-client0
     hostname: client0
     environment:
@@ -221,8 +200,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-client1
     hostname: client1
     environment:

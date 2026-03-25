@@ -72,7 +72,7 @@ pub fn honeybadger_node_opts(
         n_prandint,
         l,
         k,
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(600),
     )
     .map_err(|e| format!("Failed to create HoneyBadger node options: {:?}", e))
 }

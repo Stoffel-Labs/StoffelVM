@@ -74,7 +74,8 @@ pub use mpc::{default_node_opts, honeybadger_node_opts};
 // Re-export HoneyBadger QUIC server
 #[cfg(feature = "honeybadger")]
 pub use hb_server::{
-    spawn_receive_loops, FrHoneyBadgerQuicServer, HoneyBadgerQuicConfig, HoneyBadgerQuicServer,
+    spawn_receive_loops, spawn_receive_loops_split, FrHoneyBadgerQuicServer,
+    HoneyBadgerQuicConfig, HoneyBadgerQuicServer,
 };
 // Re-export MpcRunner for convenient VM+MPC orchestration
 #[cfg(feature = "honeybadger")]

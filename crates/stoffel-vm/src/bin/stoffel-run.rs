@@ -24,7 +24,7 @@ use stoffel_vm::net::curve::SupportedMpcField;
 #[cfg(feature = "honeybadger")]
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
 #[cfg(feature = "honeybadger")]
-use stoffel_vm::net::{honeybadger_node_opts, spawn_receive_loops};
+use stoffel_vm::net::{honeybadger_node_opts, spawn_receive_loops_split};
 use stoffel_vm::net::{
     program_id_from_bytes, register_and_wait_for_session_with_program, run_bootnode_with_config,
 };
@@ -46,6 +46,197 @@ use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
+
+/// Network adapter for MPC clients that remaps party IDs from 5-space (0..n-1)
+/// to 6-space (0..n with client's position excluded).
+///
+/// The client's QuicNetworkManager includes the client's own public key in the
+/// sorted key list, creating n+1 entries. The MPC protocol expects n parties.
+/// This wrapper adjusts send() to skip the client's own position.
+#[cfg(feature = "honeybadger")]
+struct ClientNetworkAdapter {
+    inner: QuicNetworkManager,
+    /// The client's position in the (n+1)-key sorted list
+    local_position: usize,
+}
+
+#[cfg(feature = "honeybadger")]
+#[async_trait::async_trait]
+impl Network for ClientNetworkAdapter {
+    type NodeType = <QuicNetworkManager as Network>::NodeType;
+    type NetworkConfig = <QuicNetworkManager as Network>::NetworkConfig;
+
+    async fn send(
+        &self,
+        recipient: stoffelnet::network_utils::PartyId,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        // Remap: 5-space party_id → 6-space position (skip our own slot)
+        let mapped = if recipient >= self.local_position {
+            recipient + 1
+        } else {
+            recipient
+        };
+        self.inner.send(mapped, message).await
+    }
+
+    async fn broadcast(&self, message: &[u8]) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        // Must remap each party_id through our send() to skip the client's own
+        // slot in the 6-key sorted list. Using inner.broadcast() directly would
+        // iterate over 6 positions (including self) with wrong party mapping.
+        let n = self.party_count();
+        let mut total = 0usize;
+        for party_id in 0..n {
+            match self.send(party_id, message).await {
+                Ok(bytes) => total += bytes,
+                Err(e) => {
+                    tracing::debug!("client broadcast to party {} failed: {:?}", party_id, e);
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    fn parties(&self) -> Vec<&Self::NodeType> {
+        self.inner.parties()
+    }
+
+    fn parties_mut(&mut self) -> Vec<&mut Self::NodeType> {
+        self.inner.parties_mut()
+    }
+
+    fn config(&self) -> &Self::NetworkConfig {
+        self.inner.config()
+    }
+
+    fn node(&self, id: stoffelnet::network_utils::PartyId) -> Option<&Self::NodeType> {
+        self.inner.node(id)
+    }
+
+    fn node_mut(&mut self, id: stoffelnet::network_utils::PartyId) -> Option<&mut Self::NodeType> {
+        self.inner.node_mut(id)
+    }
+
+    async fn send_to_client(
+        &self,
+        client: ClientId,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        self.inner.send_to_client(client, message).await
+    }
+
+    fn clients(&self) -> Vec<ClientId> {
+        self.inner.clients()
+    }
+
+    fn is_client_connected(&self, client: ClientId) -> bool {
+        self.inner.is_client_connected(client)
+    }
+
+    fn local_party_id(&self) -> stoffelnet::network_utils::PartyId {
+        self.inner.local_party_id()
+    }
+
+    fn party_count(&self) -> usize {
+        // Return n (not n+1) — exclude the client from the party count
+        self.inner.party_count().saturating_sub(1)
+    }
+
+    fn verified_ordering(&self) -> Option<stoffelnet::network_utils::VerifiedOrdering> {
+        self.inner.verified_ordering()
+    }
+}
+
+/// Network adapter for MPC servers that remaps sequential client indices
+/// (0, 1, ...) back to transport-derived client IDs for send_to_client().
+/// The MPC protocol uses small indices (because session_id only has 8 bits),
+/// but the network layer needs transport-derived IDs to route messages.
+#[cfg(feature = "honeybadger")]
+struct ServerClientAdapter {
+    inner: Arc<QuicNetworkManager>,
+    /// Maps sequential index → transport-derived client ID
+    client_id_map: Vec<ClientId>,
+}
+
+#[cfg(feature = "honeybadger")]
+#[async_trait::async_trait]
+impl Network for ServerClientAdapter {
+    type NodeType = <QuicNetworkManager as Network>::NodeType;
+    type NetworkConfig = <QuicNetworkManager as Network>::NetworkConfig;
+
+    async fn send(
+        &self,
+        recipient: stoffelnet::network_utils::PartyId,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        self.inner.send(recipient, message).await
+    }
+
+    async fn broadcast(&self, message: &[u8]) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        self.inner.broadcast(message).await
+    }
+
+    fn parties(&self) -> Vec<&Self::NodeType> {
+        self.inner.parties()
+    }
+
+    fn parties_mut(&mut self) -> Vec<&mut Self::NodeType> {
+        // Safety: we hold Arc, can't get &mut easily; the MPC protocol
+        // never calls this on the server adapter.
+        unimplemented!("parties_mut not needed for server client adapter")
+    }
+
+    fn config(&self) -> &Self::NetworkConfig {
+        self.inner.config()
+    }
+
+    fn node(&self, id: stoffelnet::network_utils::PartyId) -> Option<&Self::NodeType> {
+        self.inner.node(id)
+    }
+
+    fn node_mut(&mut self, id: stoffelnet::network_utils::PartyId) -> Option<&mut Self::NodeType> {
+        unimplemented!("node_mut not needed for server client adapter")
+    }
+
+    async fn send_to_client(
+        &self,
+        client: ClientId,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        // Remap sequential index → transport-derived client ID
+        let transport_id = self
+            .client_id_map
+            .get(client)
+            .copied()
+            .unwrap_or(client);
+        self.inner.send_to_client(transport_id, message).await
+    }
+
+    fn clients(&self) -> Vec<ClientId> {
+        self.inner.clients()
+    }
+
+    fn is_client_connected(&self, client: ClientId) -> bool {
+        let transport_id = self
+            .client_id_map
+            .get(client)
+            .copied()
+            .unwrap_or(client);
+        self.inner.is_client_connected(transport_id)
+    }
+
+    fn local_party_id(&self) -> stoffelnet::network_utils::PartyId {
+        self.inner.local_party_id()
+    }
+
+    fn party_count(&self) -> usize {
+        self.inner.party_count()
+    }
+
+    fn verified_ordering(&self) -> Option<stoffelnet::network_utils::VerifiedOrdering> {
+        self.inner.verified_ordering()
+    }
+}
 
 fn is_flag_present(raw_args: &[String], flag: &str) -> bool {
     raw_args
@@ -350,12 +541,19 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
     t: usize,
     inputs_str: &str,
     input_len: usize,
+    instance_id: u64,
+    client_index: u8,
+    local_position: usize,
     network_for_process: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
     mut msg_rx: mpsc::Receiver<(usize, Vec<u8>)>,
 ) -> Result<(), String> {
-    let instance_id = 0u32;
+    let instance_id = instance_id as u32;
+    // Use the sequential client_index (0, 1, ...) as the MPC identity,
+    // not the transport-derived cid, because the session_id only has
+    // 8 bits for the client_id field.
+    let mpc_cid = client_index as usize;
     let mut mpc_client = HoneyBadgerMPCClient::<F, Avid<HbSessionId>>::new(
-        cid,
+        mpc_cid,
         n,
         t,
         instance_id,
@@ -366,28 +564,52 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
 
     let mut messages_processed = 0usize;
     while let Some((sender_id, data)) = msg_rx.recv().await {
-        let network_clone = {
+        // Skip INST messages from other servers (already consumed the first one)
+        if data.len() == 13 && data.starts_with(b"INST") {
+            eprintln!("[client {}] Skipping extra INST from sender {}", mpc_cid, sender_id);
+            continue;
+        }
+        eprintln!(
+            "[client {}] Received {} bytes from sender {} (raw)",
+            mpc_cid, data.len(), sender_id
+        );
+
+        let adapter = {
             let guard = network_for_process.lock().await;
-            (*guard).clone()
+            ClientNetworkAdapter {
+                inner: (*guard).clone(),
+                local_position,
+            }
         };
 
-        if let Err(e) = mpc_client
-            .process(sender_id, data, Arc::new(network_clone))
+        match mpc_client
+            .process(sender_id, data, Arc::new(adapter))
             .await
         {
-            eprintln!("[client {}] Failed to process message: {:?}", cid, e);
+            Ok(()) => {
+                messages_processed += 1;
+                eprintln!(
+                    "[client {}] Successfully processed message #{} from server {}",
+                    mpc_cid, messages_processed, sender_id
+                );
+            }
+            Err(e) => {
+                eprintln!("[client {}] Failed to process message from {}: {:?}", mpc_cid, sender_id, e);
+            }
         }
 
-        messages_processed += 1;
         if messages_processed >= n {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Keep connection alive long enough for servers to drain their
+            // preprocessing backlog and process our input messages.
+            eprintln!("[client {}] Input protocol complete, holding connection for 300s...", mpc_cid);
+            tokio::time::sleep(Duration::from_secs(300)).await;
             break;
         }
     }
 
     eprintln!(
-        "[client {}] Message processing complete ({} messages)",
-        cid, messages_processed
+        "[client {}] Message processing done ({} messages)",
+        mpc_cid, messages_processed
     );
     Ok(())
 }
@@ -400,55 +622,38 @@ async fn run_hb_client_for_curve(
     t: usize,
     inputs_str: &str,
     input_len: usize,
+    instance_id: u64,
+    client_index: u8,
+    local_position: usize,
     network_for_process: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
     msg_rx: mpsc::Receiver<(usize, Vec<u8>)>,
 ) -> Result<(), String> {
     match curve_config {
         MpcCurveConfig::Bls12_381 => {
             run_hb_client_protocol_for_curve::<ark_bls12_381::Fr>(
-                cid,
-                n,
-                t,
-                inputs_str,
-                input_len,
-                network_for_process,
-                msg_rx,
+                cid, n, t, inputs_str, input_len, instance_id, client_index,
+                local_position, network_for_process, msg_rx,
             )
             .await
         }
         MpcCurveConfig::Bn254 => {
             run_hb_client_protocol_for_curve::<ark_bn254::Fr>(
-                cid,
-                n,
-                t,
-                inputs_str,
-                input_len,
-                network_for_process,
-                msg_rx,
+                cid, n, t, inputs_str, input_len, instance_id, client_index,
+                local_position, network_for_process, msg_rx,
             )
             .await
         }
         MpcCurveConfig::Curve25519 => {
             run_hb_client_protocol_for_curve::<ark_curve25519::Fr>(
-                cid,
-                n,
-                t,
-                inputs_str,
-                input_len,
-                network_for_process,
-                msg_rx,
+                cid, n, t, inputs_str, input_len, instance_id, client_index,
+                local_position, network_for_process, msg_rx,
             )
             .await
         }
         MpcCurveConfig::Ed25519 => {
             run_hb_client_protocol_for_curve::<ark_ed25519::Fr>(
-                cid,
-                n,
-                t,
-                inputs_str,
-                input_len,
-                network_for_process,
-                msg_rx,
+                cid, n, t, inputs_str, input_len, instance_id, client_index,
+                local_position, network_for_process, msg_rx,
             )
             .await
         }
@@ -533,7 +738,7 @@ async fn run_as_client(
         eprintln!("[client] Added server party {} at {}", party_id, addr);
     }
 
-    let (msg_tx, msg_rx) = mpsc::channel::<(usize, Vec<u8>)>(1000);
+    let (msg_tx, mut msg_rx) = mpsc::channel::<(usize, Vec<u8>)>(1000);
 
     eprintln!("[client] Connecting to {} servers...", server_addrs.len());
     connect_to_all_servers(&network, &server_addrs, msg_tx.clone()).await;
@@ -543,10 +748,53 @@ async fn run_as_client(
         net.local_derived_id()
     };
     eprintln!("[client {}] Derived transport client ID", cid);
+
+    // Read INST message from servers: [b"INST" | instance_id:u64 | client_index:u8]
+    let (instance_id, client_index) = {
+        let timeout_dur = Duration::from_secs(600);
+        let mut result: Option<(u64, u8)> = None;
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        while result.is_none() {
+            match tokio::time::timeout_at(deadline, msg_rx.recv()).await {
+                Ok(Some((_sender, data))) => {
+                    if data.len() == 13 && &data[0..4] == b"INST" {
+                        let id_bytes: [u8; 8] = data[4..12].try_into().unwrap();
+                        let inst_id = u64::from_le_bytes(id_bytes);
+                        let idx = data[12];
+                        result = Some((inst_id, idx));
+                    }
+                    // If not an INST message, discard
+                }
+                Ok(None) => {
+                    eprintln!("[client {}] Channel closed before receiving INST", cid);
+                    exit(25);
+                }
+                Err(_) => {
+                    eprintln!("[client {}] Timeout waiting for INST from server", cid);
+                    exit(25);
+                }
+            }
+        }
+        let (id, idx) = result.unwrap();
+        eprintln!(
+            "[client {}] Received INST: instance_id={}, client_index={}",
+            cid, id, idx
+        );
+        (id, idx)
+    };
+
     eprintln!(
         "[client {}] Connected to all servers, starting input protocol...",
         cid
     );
+
+    // Get the client's position in the (n+1)-key sorted list so we can
+    // remap party IDs when sending (skip our own slot).
+    let local_position = {
+        let net = network.lock().await;
+        net.compute_local_party_id().unwrap_or(0)
+    };
+    eprintln!("[client {}] Local position in sorted key list: {}", cid, local_position);
 
     let network_for_process = network.clone();
     let client_id_for_task = cid;
@@ -559,13 +807,16 @@ async fn run_as_client(
             t,
             &inputs_for_task,
             input_len,
+            instance_id,
+            client_index,
+            local_position,
             network_for_process,
             msg_rx,
         )
         .await
     });
 
-    let timeout_duration = Duration::from_secs(120);
+    let timeout_duration = Duration::from_secs(600);
     match tokio::time::timeout(timeout_duration, process_handle).await {
         Ok(Ok(Ok(()))) => {
             eprintln!(
@@ -605,6 +856,7 @@ where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
+    // ---- Phase 1: Wait for clients ----
     let mut input_ids: Vec<ClientId> = Vec::new();
 
     if let Some(expected_count) = expected_client_count {
@@ -633,7 +885,7 @@ where
             }
         });
 
-        let connect_timeout = Duration::from_secs(60);
+        let connect_timeout = Duration::from_secs(600);
         let check_interval = Duration::from_millis(250);
         let start = std::time::Instant::now();
 
@@ -683,79 +935,188 @@ where
         sync_client_set_across_parties(net.clone(), my_id, n, &input_ids).await?;
     }
 
-    let n_triples = 8;
-    let n_random = 16;
+    // ---- Phase 2: Setup MPC node and preprocess ----
+    //
+    // CRITICAL: We use exactly TWO clones of the MPC node to avoid the
+    // double-processing bug where init_ransha() is called multiple times:
+    //   - Clone 1 (`processing_node`): handles incoming messages via process()
+    //   - Clone 2 (inside `engine`): initiates preprocessing via run_preprocessing()
+    // Both share the same Arc<Mutex> stores, but only ONE processes each message.
+    let n_triples = 1;
+    let n_random = 4;
+    eprintln!(
+        "[party {}] Creating MPC node opts (n_triples={}, n_random={}, timeout=600s)",
+        my_id, n_triples, n_random
+    );
     let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id)
         .unwrap_or_else(|e| {
             eprintln!("Failed to create MPC node options: {}", e);
             std::process::exit(2);
         });
 
-    let mut mpc_node = <HoneyBadgerMPCNode<F, Avid<HbSessionId>> as MPCProtocol<
+    // Use sequential indices (0..n_clients) as client IDs for the MPC protocol
+    // because the session_id only has 8 bits for the client_id field.
+    let mpc_input_ids: Vec<ClientId> = (0..input_ids.len()).collect();
+    let mpc_node = <HoneyBadgerMPCNode<F, Avid<HbSessionId>> as MPCProtocol<
         F,
         RobustShare<F>,
         QuicNetworkManager,
-    >>::setup(my_id, mpc_opts, input_ids.clone())
+    >>::setup(my_id, mpc_opts, mpc_input_ids)
     .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
+    eprintln!("[party {}] MPC node setup complete", my_id);
 
-    let mut msg_rx = spawn_receive_loops(net.clone(), my_id, n).await;
+    // Clone 1: the processing node — MOVED into the processing loop task.
+    // This is the ONLY clone that calls process() on incoming messages.
     let mut processing_node = mpc_node.clone();
-    let processing_net = net.clone();
-    tokio::spawn(async move {
-        while let Some((sender_id, raw_msg)) = msg_rx.recv().await {
-            if let Err(e) = processing_node
-                .process(sender_id, raw_msg, processing_net.clone())
-                .await
-            {
-                eprintln!(
-                    "[party {}] Failed to process message from {}: {:?}",
-                    my_id, sender_id, e
-                );
-            }
-        }
-    });
 
+    // Clone 2: the engine node — used for preprocessing initiation only.
+    // Created via from_existing_node which wraps it in Arc<Mutex>.
     let engine = HoneyBadgerMpcEngine::<F, G>::from_existing_node(
         instance_id,
         my_id,
         n,
         t,
         net.clone(),
-        mpc_node.clone(),
+        mpc_node, // moved, not cloned
     );
 
+    eprintln!("[party {}] Spawning receive loops (split channels)...", my_id);
+    let (mut server_rx, mut client_rx) =
+        spawn_receive_loops_split(net.clone(), my_id, n).await;
+
+    // Remap transport-derived client IDs to sequential indices for the MPC protocol.
+    let client_id_to_index: std::collections::HashMap<ClientId, usize> = input_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, &tid)| (tid, idx))
+        .collect();
+
+    // Single processing loop using tokio::select! for both server and client messages.
+    // Only this task calls process() — no other task touches the processing_node.
+    let processing_net = net.clone();
+    let process_party_id = my_id;
+    tokio::spawn(async move {
+        let mut msg_count = 0u64;
+        loop {
+            tokio::select! {
+                Some((sender_id, raw_msg)) = server_rx.recv() => {
+                    msg_count += 1;
+                    if msg_count <= 5 || msg_count % 1000 == 0 {
+                        eprintln!(
+                            "[party {}] Processing message #{} from sender {} ({} bytes)",
+                            process_party_id, msg_count, sender_id, raw_msg.len()
+                        );
+                    }
+                    if let Err(e) = processing_node
+                        .process(sender_id, raw_msg, processing_net.clone())
+                        .await
+                    {
+                        eprintln!(
+                            "[party {}] Failed to process message from {}: {:?}",
+                            process_party_id, sender_id, e
+                        );
+                    }
+                }
+                Some((client_id, raw_msg)) = client_rx.recv() => {
+                    // Remap transport client ID → sequential index
+                    let mpc_sender_id = client_id_to_index
+                        .get(&client_id)
+                        .copied()
+                        .unwrap_or(client_id);
+                    if let Err(e) = processing_node
+                        .process(mpc_sender_id, raw_msg, processing_net.clone())
+                        .await
+                    {
+                        eprintln!(
+                            "[party {}] Failed to process client message from {} (idx {}): {:?}",
+                            process_party_id, client_id, mpc_sender_id, e
+                        );
+                    }
+                }
+                else => break,
+            }
+        }
+    });
+
+    // Brief delay to let receive loops discover connections
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    eprintln!("[party {}] Starting MPC preprocessing...", my_id);
     engine
         .preprocess()
         .await
         .map_err(|e| format!("MPC preprocessing failed: {}", e))?;
+    eprintln!("[party {}] MPC preprocessing complete!", my_id);
 
     if !input_ids.is_empty() {
-        for &cid in &input_ids {
-            let local_shares = mpc_node
-                .preprocessing_material
-                .lock()
-                .await
-                .take_random_shares(1)
-                .map_err(|e| format!("Not enough random shares for client {}: {:?}", cid, e))?;
+        let client_index_map: Vec<(usize, ClientId)> = input_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, &tid)| (idx, tid))
+            .collect();
 
-            mpc_node
-                .preprocess
-                .input
-                .init(cid, local_shares, 1, net.clone())
-                .await
-                .map_err(|e| format!("Failed to init InputServer for client {}: {:?}", cid, e))?;
+        // Create a server-side network adapter that remaps sequential client
+        // indices to transport-derived client IDs for send_to_client().
+        let server_adapter = Arc::new(ServerClientAdapter {
+            inner: net.clone(),
+            client_id_map: client_index_map.iter().map(|(_, tid)| *tid).collect(),
+        });
+
+        // Access the engine's node for InputServer init
+        eprintln!("[party {}] Initializing InputServer for {} clients...", my_id, client_index_map.len());
+        {
+            let mut node = engine.node_handle().lock().await;
+            for &(idx, _tid) in &client_index_map {
+                let local_shares = node
+                    .preprocessing_material
+                    .lock()
+                    .await
+                    .take_random_shares(1)
+                    .map_err(|e| format!("Not enough random shares for client {}: {:?}", idx, e))?;
+
+                eprintln!(
+                    "[party {}] Sending random shares to client index {} (server_id={})",
+                    my_id, idx, node.id
+                );
+                node.preprocess
+                    .input
+                    .init(idx, local_shares, 1, server_adapter.clone())
+                    .await
+                    .map_err(|e| format!("Failed to init InputServer for client {}: {:?}", idx, e))?;
+                eprintln!("[party {}] InputServer initialized for client index {}", my_id, idx);
+            }
         }
 
-        let client_inputs = mpc_node
-            .preprocess
-            .input
-            .wait_for_all_inputs(Duration::from_secs(60))
-            .await
-            .map_err(|e| format!("Failed to receive client inputs: {:?}", e))?;
+        // Signal readiness to clients
+        eprintln!("[party {}] Sending INST to {} clients...", my_id, client_index_map.len());
+        for &(idx, tid) in &client_index_map {
+            let mut inst_msg = Vec::with_capacity(13);
+            inst_msg.extend_from_slice(b"INST");
+            inst_msg.extend_from_slice(&instance_id.to_le_bytes());
+            inst_msg.push(idx as u8);
+            if let Err(e) = net.send_to_client(tid, &inst_msg).await {
+                eprintln!("[party {}] Failed to send INST to client {}: {:?}", my_id, tid, e);
+            }
+        }
 
-        for (cid, shares) in client_inputs {
-            vm.state.client_store().store_client_input(cid, shares);
-            eprintln!("[party {}] Stored inputs for client {}", my_id, cid);
+        eprintln!("[party {}] Waiting for all client inputs (timeout=600s)...", my_id);
+        let client_inputs = {
+            let mut node = engine.node_handle().lock().await;
+            node.preprocess
+                .input
+                .wait_for_all_inputs(Duration::from_secs(600))
+                .await
+                .map_err(|e| format!("Failed to receive client inputs: {:?}", e))?
+        };
+
+        for (idx, shares) in client_inputs {
+            let transport_cid = client_index_map
+                .iter()
+                .find(|(i, _)| *i == idx)
+                .map(|(_, tid)| *tid)
+                .unwrap_or(idx);
+            vm.state.client_store().store_client_input(transport_cid, shares);
+            eprintln!("[party {}] Stored inputs for client {} (index {})", my_id, transport_cid, idx);
         }
     }
 

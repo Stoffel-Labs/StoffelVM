@@ -397,8 +397,10 @@ pub async fn spawn_receive_loops(
     node_id: PartyId,
     n_parties: usize,
 ) -> mpsc::Receiver<(PartyId, Vec<u8>)> {
-    let (tx, rx) = mpsc::channel::<(PartyId, Vec<u8>)>(1024);
+    let (tx, rx) = mpsc::channel::<(PartyId, Vec<u8>)>(65536);
     let scan_tx = tx.clone();
+    // Note: client messages also go through this channel. If you need
+    // separate client handling, use spawn_receive_loops_split instead.
     let scan_net = net.clone();
     tokio::spawn(async move {
         let mut spawned_server_ids = std::collections::HashSet::new();
@@ -539,4 +541,132 @@ pub async fn spawn_receive_loops(
     });
 
     rx
+}
+
+/// Like `spawn_receive_loops` but returns separate channels for server (party-to-party)
+/// messages and client (input provider) messages. This prevents the preprocessing
+/// message backlog from blocking client input delivery.
+pub async fn spawn_receive_loops_split(
+    net: Arc<QuicNetworkManager>,
+    node_id: PartyId,
+    n_parties: usize,
+) -> (
+    mpsc::Receiver<(PartyId, Vec<u8>)>,
+    mpsc::Receiver<(PartyId, Vec<u8>)>,
+) {
+    let (server_tx, server_rx) = mpsc::channel::<(PartyId, Vec<u8>)>(65536);
+    let (client_tx, client_rx) = mpsc::channel::<(PartyId, Vec<u8>)>(4096);
+    let scan_net = net.clone();
+    tokio::spawn(async move {
+        let mut spawned_server_ids = std::collections::HashSet::new();
+        let mut spawned_client_ids = std::collections::HashSet::new();
+
+        loop {
+            // Server-to-server connections (MPC parties)
+            for (derived_id, connection) in scan_net.get_all_server_connections() {
+                let sender_id = connection.remote_party_id().unwrap_or(derived_id);
+                if sender_id >= n_parties {
+                    continue;
+                }
+                if !spawned_server_ids.insert(sender_id) {
+                    continue;
+                }
+
+                let txx = server_tx.clone();
+                let local_party_id = node_id;
+                tracing::info!(
+                    party_id = local_party_id,
+                    sender_id,
+                    "Spawning server receive loop"
+                );
+
+                tokio::spawn(async move {
+                    loop {
+                        match connection.receive().await {
+                            Ok(data) => {
+                                match crate::net::open_registry::try_handle_wire_message(
+                                    sender_id, &data,
+                                ) {
+                                    Ok(true) => continue,
+                                    Err(_) => continue,
+                                    Ok(false) => {}
+                                }
+                                match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                                    sender_id, &data,
+                                ) {
+                                    Ok(true) => continue,
+                                    Err(_) => continue,
+                                    Ok(false) => {}
+                                }
+                                if let Err(e) = txx.send((sender_id, data)).await {
+                                    tracing::warn!(
+                                        party_id = local_party_id,
+                                        sender_id,
+                                        error = ?e,
+                                        "Failed to forward server message"
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+
+            // Client-to-server connections — separate channel
+            let all_clients = scan_net.get_all_client_connections();
+            if !all_clients.is_empty() && spawned_client_ids.is_empty() {
+                eprintln!(
+                    "[party {}] Found {} client connections to monitor",
+                    node_id,
+                    all_clients.len()
+                );
+            }
+            for (cid, connection) in all_clients {
+                if !spawned_client_ids.insert(cid) {
+                    continue;
+                }
+
+                let txx = client_tx.clone();
+                let local_party_id = node_id;
+                tracing::info!(
+                    party_id = local_party_id,
+                    client_id = cid,
+                    "Spawning client receive loop (separate channel)"
+                );
+
+                tokio::spawn(async move {
+                    loop {
+                        match connection.receive().await {
+                            Ok(data) => {
+                                if let Err(e) = txx.send((cid, data)).await {
+                                    tracing::warn!(
+                                        party_id = local_party_id,
+                                        client_id = cid,
+                                        error = ?e,
+                                        "Failed to forward client message"
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::info!(
+                                    party_id = local_party_id,
+                                    client_id = cid,
+                                    error = %e,
+                                    "Client connection closed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    (server_rx, client_rx)
 }

@@ -480,6 +480,11 @@ where
         })
     }
 
+    /// Returns a handle to the inner MPC node for direct access (e.g., InputServer init).
+    pub fn node_handle(&self) -> &Arc<Mutex<HoneyBadgerMPCNode<F, RBCImpl>>> {
+        &self.node
+    }
+
     /// Pull one pre-generated random share from the preprocessing pool.
     /// If the pool is empty, `reserve_random_shares` auto-regenerates via
     /// the RanSha protocol over the network.

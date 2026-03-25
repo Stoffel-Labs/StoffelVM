@@ -126,6 +126,11 @@ build_command() {
         cmd="${cmd} --wait-for-clients ${STOFFEL_EXPECTED_CLIENT_COUNT}"
     fi
 
+    # Add MPC backend if specified
+    if [ -n "${STOFFEL_MPC_BACKEND:-}" ]; then
+        cmd="${cmd} --mpc-backend ${STOFFEL_MPC_BACKEND}"
+    fi
+
     # Add optional trace flags
     if [ "${STOFFEL_TRACE_INSTR}" = "true" ]; then
         cmd="${cmd} --trace-instr"
@@ -185,11 +190,9 @@ main() {
         BOOTSTRAP_HOST=$(echo "${STOFFEL_BOOTSTRAP_ADDR}" | cut -d: -f1)
         BOOTSTRAP_PORT=$(echo "${STOFFEL_BOOTSTRAP_ADDR}" | cut -d: -f2)
 
-        # Add startup delay based on party ID to stagger connections
-        # This helps avoid thundering herd issues
-        DELAY=$((STOFFEL_PARTY_ID * 2))
-        echo "Party ${STOFFEL_PARTY_ID}: waiting ${DELAY}s before connecting..."
-        sleep $DELAY
+        # Small fixed delay to let bootnode stabilize
+        echo "Party ${STOFFEL_PARTY_ID}: waiting 2s before connecting..."
+        sleep 2
 
         # Wait for bootnode to be available
         if ! wait_for_host "$BOOTSTRAP_HOST" "$BOOTSTRAP_PORT" 120; then
