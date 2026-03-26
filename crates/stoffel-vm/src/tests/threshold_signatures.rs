@@ -677,33 +677,34 @@ where
 }
 
 // ===========================================================================
-// Test 1: Schnorr Threshold Signature (BLS12-381)
+// Test 1: Schnorr Threshold Signature (Ed25519)
+// Verified by: arkworks
 // ===========================================================================
 
-/// Schnorr threshold signature on BLS12-381:
-///   sk = DKG random
-///   pk = g^sk  (via commitment[0])
-///   k = DKG random (nonce)
-///   R = g^k  (via open_exp)
-///   e = H(R || pk || msg)  (hash to field)
-///   s = k + e*sk  (open_field)
+/// Standard Schnorr threshold signature on Ed25519:
+///   sk = DKG random  (multi-dealer RanSha — no party knows sk)
+///   pk = commitment[0] = g^sk
+///   k = DKG random  (nonce)
+///   R = commitment[0] of k = g^k
+///   e = SHA-256(R || msg) mod l  [standard Schnorr — no pk in hash]
+///   s = k + e*sk  (threshold open)
+///   Signature = (R, s)
 ///
-/// Verification: g^s == R + e*pk
+/// Verification: g^s == R + e*pk (arkworks)
 #[tokio::test(flavor = "multi_thread")]
-async fn test_threshold_schnorr_bls12_381() {
-    use ark_bls12_381::{Fr, G1Affine, G1Projective};
+async fn test_threshold_schnorr_ed25519() {
+    use ark_ed25519::{EdwardsAffine, EdwardsProjective, Fr};
 
     init_crypto_provider();
     setup_test_tracing();
-    info!("=== Threshold Schnorr Signature (BLS12-381) ===");
+    info!("=== Threshold Schnorr Signature (Ed25519) ===");
 
     let n = 5;
     let t = 1;
     let instance_id = 900_000u64;
     let base_port = 13000u16;
 
-    // Setup network
-    let mut nodes = setup_test_network::<Fr, G1Projective>(n, base_port)
+    let mut nodes = setup_test_network::<Fr, EdwardsProjective>(n, base_port)
         .await
         .expect("Failed to create test network");
 
@@ -711,8 +712,7 @@ async fn test_threshold_schnorr_bls12_381() {
         .await
         .expect("PK exchange failed");
 
-    // Create engines
-    let mut engines: Vec<Arc<AvssMpcEngine<Fr, G1Projective>>> = Vec::with_capacity(n);
+    let mut engines: Vec<Arc<AvssMpcEngine<Fr, EdwardsProjective>>> = Vec::with_capacity(n);
     for (i, node) in nodes.iter().enumerate() {
         let engine = AvssMpcEngine::new(
             instance_id,
@@ -732,184 +732,147 @@ async fn test_threshold_schnorr_bls12_381() {
 
     spawn_message_processors(&mut nodes, &engines);
 
-    // Build the Schnorr signing program
-    //
-    // The program:
-    //   1. Share.random() -> sk share (DKG)
-    //   2. Share.get_commitment(sk, 0) -> pk bytes (48-byte compressed G1)
-    //   3. Share.random() -> k share (nonce DKG)
-    //   4. Share.open_exp(k, "bls12-381-g1") -> R bytes (48-byte compressed G1)
-    //   5. Bytes.concat(R, pk), Bytes.concat(_, msg), Crypto.sha256, Crypto.hash_to_field -> e
-    //   6. Share.mul_field(sk, e) -> e*sk share
-    //   7. Share.add(k, e*sk) -> s share = k + e*sk
-    //   8. Share.open_field(s) -> s bytes (32-byte Fr)
-    //   9. Bytes.concat results: R(48) + s(32) + pk(48) + e(32) = 160 bytes
+    // Schnorr signing program on Ed25519
+    // Challenge: e = SHA-256(R || msg) — standard Schnorr (no pk in hash)
+    // Result layout: R(32) + s(32) + pk(32) = 96 bytes
     let program = vec![
-        // r0 = Share.random() -- sk share (DKG)
+        // DKG for secret key
         Instruction::CALL("Share.random".to_string()),
         Instruction::MOV(1, 0), // r1 = sk share
-
-        // r0 = Share.get_commitment(sk, 0) -- pk bytes
+        // pk = commitment[0]
         Instruction::LDI(2, Value::I64(0)),
         Instruction::PUSHARG(1),
         Instruction::PUSHARG(2),
         Instruction::CALL("Share.get_commitment".to_string()),
-        Instruction::MOV(3, 0), // r3 = pk (byte array)
-
-        // r0 = Share.random() -- nonce share (DKG)
+        Instruction::MOV(3, 0), // r3 = pk bytes (32)
+        // DKG for nonce
         Instruction::CALL("Share.random".to_string()),
         Instruction::MOV(4, 0), // r4 = k share
-
-        // r0 = Share.open_exp(k, "bls12-381-g1") -- R point
-        Instruction::LDI(5, Value::String("bls12-381-g1".to_string())),
+        // R = commitment[0] of nonce
+        Instruction::LDI(2, Value::I64(0)),
         Instruction::PUSHARG(4),
-        Instruction::PUSHARG(5),
-        Instruction::CALL("Share.open_exp".to_string()),
-        Instruction::MOV(6, 0), // r6 = R (byte array)
-
-        // Build challenge: e = hash_to_field(sha256(R || pk || msg))
-        // r0 = Bytes.concat(R, pk)
+        Instruction::PUSHARG(2),
+        Instruction::CALL("Share.get_commitment".to_string()),
+        Instruction::MOV(5, 0), // r5 = R bytes (32)
+        // Challenge: e = hash_to_field(SHA-256(R || msg), "ed25519")
+        Instruction::LDI(6, Value::String("test message for schnorr".to_string())),
         Instruction::PUSHARG(6),
-        Instruction::PUSHARG(3),
-        Instruction::CALL("Bytes.concat".to_string()),
-        Instruction::MOV(7, 0), // r7 = R||pk
-
-        // r0 = Bytes.from_string(msg)
-        Instruction::LDI(8, Value::String("test message for schnorr".to_string())),
-        Instruction::PUSHARG(8),
         Instruction::CALL("Bytes.from_string".to_string()),
-        Instruction::MOV(9, 0), // r9 = msg bytes
-
-        // r0 = Bytes.concat(R||pk, msg)
+        Instruction::MOV(7, 0), // r7 = msg bytes
+        Instruction::PUSHARG(5),
         Instruction::PUSHARG(7),
-        Instruction::PUSHARG(9),
-        Instruction::CALL("Bytes.concat".to_string()),
-        // r0 = R||pk||msg
-
-        // r0 = Crypto.sha256(R||pk||msg)
+        Instruction::CALL("Bytes.concat".to_string()), // R || msg
         Instruction::PUSHARG(0),
-        Instruction::CALL("Crypto.sha256".to_string()),
-
-        // r0 = Crypto.hash_to_field(hash, "bls12-381")
-        Instruction::LDI(10, Value::String("bls12-381".to_string())),
+        Instruction::CALL("Crypto.sha256".to_string()), // SHA-256(R || msg)
+        Instruction::LDI(8, Value::String("ed25519".to_string())),
         Instruction::PUSHARG(0),
-        Instruction::PUSHARG(10),
-        Instruction::CALL("Crypto.hash_to_field".to_string()),
-        Instruction::MOV(11, 0), // r11 = e (field element bytes)
-
-        // r0 = Share.mul_field(sk, e) -- e*sk share
+        Instruction::PUSHARG(8),
+        Instruction::CALL("Crypto.hash_to_field".to_string()), // e
+        Instruction::MOV(9, 0), // r9 = e bytes
+        // s = k + e*sk
         Instruction::PUSHARG(1),
-        Instruction::PUSHARG(11),
-        Instruction::CALL("Share.mul_field".to_string()),
-        Instruction::MOV(12, 0), // r12 = e*sk share
-
-        // r0 = Share.add(k, e*sk) -- s = k + e*sk share
+        Instruction::PUSHARG(9),
+        Instruction::CALL("Share.mul_field".to_string()), // e*sk
+        Instruction::MOV(10, 0),
         Instruction::PUSHARG(4),
-        Instruction::PUSHARG(12),
-        Instruction::CALL("Share.add".to_string()),
-
-        // r0 = Share.open_field(s) -- reconstruct s as field element bytes
+        Instruction::PUSHARG(10),
+        Instruction::CALL("Share.add".to_string()), // k + e*sk
         Instruction::PUSHARG(0),
-        Instruction::CALL("Share.open_field".to_string()),
-        Instruction::MOV(13, 0), // r13 = s bytes
-
-        // Build result: R(48) + s(32) + pk(48) + e(32) = 160 bytes
-        Instruction::PUSHARG(6),
-        Instruction::PUSHARG(13),
+        Instruction::CALL("Share.open_field".to_string()), // s bytes
+        Instruction::MOV(11, 0), // r11 = s bytes (32)
+        // Result: R(32) + s(32) + pk(32) = 96 bytes
+        Instruction::PUSHARG(5),
+        Instruction::PUSHARG(11),
         Instruction::CALL("Bytes.concat".to_string()), // R || s
         Instruction::PUSHARG(0),
         Instruction::PUSHARG(3),
         Instruction::CALL("Bytes.concat".to_string()), // R || s || pk
-        Instruction::PUSHARG(0),
-        Instruction::PUSHARG(11),
-        Instruction::CALL("Bytes.concat".to_string()), // R || s || pk || e
-
         Instruction::RET(0),
     ];
 
     info!("Running Schnorr signing program on {} parties...", n);
-    let results = run_program_on_all_parties(&engines, program, 16).await;
+    let results = run_program_on_all_parties(&engines, program, 14).await;
 
-    // Extract byte arrays from all parties and verify consistency
     let mut byte_results: Vec<Vec<u8>> = Vec::new();
     for (vm, result) in &results {
-        let bytes = extract_vm_byte_array(vm, result);
-        byte_results.push(bytes);
+        byte_results.push(extract_vm_byte_array(vm, result));
     }
 
-    // All parties must produce the same result
     for i in 1..n {
-        assert_eq!(
-            byte_results[0], byte_results[i],
-            "Party 0 and party {} produced different results",
-            i
-        );
+        assert_eq!(byte_results[0], byte_results[i],
+            "Party 0 and party {} produced different results", i);
     }
 
     let result = &byte_results[0];
-    assert_eq!(
-        result.len(),
-        160,
-        "Expected 160 bytes (R:48 + s:32 + pk:48 + e:32), got {}",
-        result.len()
-    );
+    assert_eq!(result.len(), 96, "Expected 96 bytes (R:32 + s:32 + pk:32), got {}", result.len());
 
-    // Parse components
-    let r_point: G1Projective = G1Affine::deserialize_compressed(&result[..48])
-        .expect("Failed to deserialize R")
-        .into();
-    let s_scalar =
-        Fr::deserialize_compressed(&result[48..80]).expect("Failed to deserialize s");
-    let pk_point: G1Projective = G1Affine::deserialize_compressed(&result[80..128])
-        .expect("Failed to deserialize pk")
-        .into();
-    let e_scalar =
-        Fr::deserialize_compressed(&result[128..160]).expect("Failed to deserialize e");
+    // Parse
+    let r_point: EdwardsProjective = EdwardsAffine::deserialize_compressed(&result[..32])
+        .expect("deserialize R").into();
+    let s_scalar = Fr::deserialize_compressed(&result[32..64]).expect("deserialize s");
+    let pk_point: EdwardsProjective = EdwardsAffine::deserialize_compressed(&result[64..96])
+        .expect("deserialize pk").into();
 
-    // Display signature components
-    let r_hex: String = result[..48].iter().map(|b| format!("{:02x}", b)).collect();
-    let s_hex: String = result[48..80].iter().map(|b| format!("{:02x}", b)).collect();
-    let pk_hex: String = result[80..128].iter().map(|b| format!("{:02x}", b)).collect();
-    let e_hex: String = result[128..160].iter().map(|b| format!("{:02x}", b)).collect();
-    println!("\n=== Threshold Schnorr Signature (BLS12-381) ===");
+    // Recompute challenge: e = hash_to_field(SHA-256(R || msg), "ed25519")
+    let msg = b"test message for schnorr";
+    let mut hash_input = Vec::new();
+    hash_input.extend_from_slice(&result[..32]); // R
+    hash_input.extend_from_slice(msg);
+    let hash = sha2::Sha256::digest(&hash_input);
+    let e_scalar = Fr::from_le_bytes_mod_order(&hash);
+
+    // Display
+    println!("\n=== Threshold Schnorr Signature (Ed25519) ===");
     println!("  Parties:   {}", n);
     println!("  Threshold: {}", t);
     println!("  Message:   \"test message for schnorr\"");
-    println!("  Public Key (G1, {} bytes): 0x{}", result[80..128].len(), pk_hex);
-    println!("  R (G1, {} bytes):          0x{}", result[..48].len(), r_hex);
-    println!("  s (Fr, {} bytes):          0x{}", result[48..80].len(), s_hex);
-    println!("  e (Fr, {} bytes):          0x{}", result[128..160].len(), e_hex);
+    println!("  Public Key (32 bytes): 0x{}", hex::encode(&result[64..96]));
+    println!("  R (32 bytes):          0x{}", hex::encode(&result[..32]));
+    println!("  s (32 bytes):          0x{}", hex::encode(&result[32..64]));
+    println!("  Challenge:             e = SHA-256(R || msg) mod l");
     println!("  All {} parties produced identical signatures: YES", n);
 
-    // Validate public key loads into arkworks as a valid curve point
-    assert!(!pk_point.is_zero(), "Public key must not be the identity point");
-    assert!(
-        pk_point.into_affine().is_on_curve(),
-        "Public key must be on the BLS12-381 G1 curve"
-    );
-    println!("  Public key is valid BLS12-381 G1 point: YES");
+    assert!(!pk_point.is_zero(), "pk must not be identity");
+    assert!(pk_point.into_affine().is_on_curve(), "pk must be on curve");
+    println!("  Public key is valid Ed25519 point: YES");
 
-    // Schnorr verification using ark-bls12-381 (third-party): g^s == R + e*pk
-    let lhs: G1Projective = G1Projective::generator() * s_scalar;
-    let rhs: G1Projective = r_point + pk_point * e_scalar;
-    assert_eq!(lhs, rhs, "Schnorr signature verification FAILED");
-    println!("  Verification via ark-bls12-381 (g^s == R + e*pk): PASSED");
+    // 1) Schnorr verification via arkworks: g^s == R + e*pk
+    let lhs = EdwardsProjective::generator() * s_scalar;
+    let rhs = r_point + pk_point * e_scalar;
+    assert_eq!(lhs, rhs, "Schnorr arkworks verification FAILED");
+    println!("  Verification via arkworks (g^s == R + e*pk): PASSED");
+
+    // 2) Verify R and pk are valid points in curve25519-dalek (third-party)
+    {
+        use curve25519_dalek::edwards::CompressedEdwardsY;
+        let r_d = CompressedEdwardsY(result[..32].try_into().unwrap())
+            .decompress();
+        assert!(r_d.is_some(), "R must decompress as valid Ed25519 point in curve25519-dalek");
+        let pk_d = CompressedEdwardsY(result[64..96].try_into().unwrap())
+            .decompress();
+        assert!(pk_d.is_some(), "pk must decompress as valid Ed25519 point in curve25519-dalek");
+        println!("  R and pk validated by curve25519-dalek: YES");
+    }
     println!("================================================\n");
 }
 
 // ===========================================================================
-// Test 2: EdDSA Threshold Signature (Ed25519 via arkworks)
+// Test 1: EdDSA Threshold Signature (Ed25519)
+// Verified by: arkworks + ed25519-dalek (third-party)
 // ===========================================================================
 
-/// EdDSA-like threshold signature on Ed25519:
-///   sk = DKG random
-///   pk = g^sk  (via open_exp)
-///   k = DKG random (nonce)
-///   R = g^k  (via open_exp)
-///   e = hash_to_field(sha512(R || pk || msg))
-///   s = k + e*sk  (open_field)
+/// Threshold EdDSA signature on Ed25519:
+///   sk = DKG random  (multi-dealer RanSha — no party knows sk)
+///   pk = commitment[0] = g^sk
+///   k = DKG random  (nonce — fresh per signing, random instead of deterministic)
+///   R = commitment[0] of k = g^k
+///   e = SHA-512(R || pk || msg) mod l  [LE per RFC 8032]
+///   S = k + e*sk  (threshold open)
+///   Signature = (R, S) — standard Ed25519 64-byte format
 ///
-/// Verification: g^s == R + e*pk (using arkworks Ed25519)
+/// Verification:
+///   1) arkworks: g^S == R + e*pk
+///   2) ed25519-dalek: VerifyingKey::verify(msg, &Signature)
 #[tokio::test(flavor = "multi_thread")]
 async fn test_threshold_eddsa_ed25519() {
     use ark_ed25519::{EdwardsAffine, EdwardsProjective, Fr};
