@@ -25,7 +25,7 @@ use crate::tests::mpc_multiplication_integration::{
 };
 use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
 use std::collections::HashMap;
-use stoffel_vm_types::core_types::{ShareType, Value};
+use stoffel_vm_types::core_types::{ShareData, ShareType, Value};
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
 
@@ -358,7 +358,7 @@ async fn test_vm_mpc_multiplication_integration() {
             // Load the result share into r0
             Instruction::LDI(
                 0,
-                Value::Share(ShareType::secret_int(64), result_share_bytes.clone()),
+                Value::Share(ShareType::secret_int(64), ShareData::Opaque(result_share_bytes.clone())),
             ),
             // Could perform additional operations here (e.g., add constants)
             // For now, just return the share
@@ -384,10 +384,10 @@ async fn test_vm_mpc_multiplication_integration() {
 
     match result {
         Value::Share(ShareType::SecretInt { .. }, result_bytes) => {
-            info!("Received result share: {} bytes", result_bytes.len());
+            info!("Received result share: {} bytes", result_bytes.as_bytes().len());
 
             // Decode the result share
-            let result_share = RobustShare::<Fr>::deserialize_compressed(&result_bytes[..])
+            let result_share = RobustShare::<Fr>::deserialize_compressed(result_bytes.as_bytes())
                 .expect("Failed to deserialize result share");
 
             info!("Result share decoded successfully");

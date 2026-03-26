@@ -1556,7 +1556,7 @@ async fn test_vm_mesh_output_client_integration() {
             Ok(Value::Share(_, data)) => {
                 // Decode the share from the returned bytes
                 let share: RobustShare<Fr> =
-                    ark_serialize::CanonicalDeserialize::deserialize_compressed(data.as_slice())
+                    ark_serialize::CanonicalDeserialize::deserialize_compressed(data.as_bytes())
                         .expect("Failed to deserialize share");
                 info!(
                     "Party {} returned share: id={}, degree={}",
