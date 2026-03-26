@@ -26,7 +26,12 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENT_COUNT=2
+      - STOFFEL_COORD_ADDR=host.docker.internal:31415
+      - STOFFEL_RPC_ADDR=172.28.0.10:16180
+      - STOFFEL_CERT=/app/ids/nodes/cert0.crt
+      - STOFFEL_KEY=/app/ids/nodes/key0.der
+      - STOFFEL_EXPECTED_CLIENTS=/app/ids/clients/cert0.crt,/app/ids/clients/cert1.crt
+      - STOFFEL_TIMESTAMP=0
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -37,6 +42,8 @@ services:
       - "9000:9000/udp"
       - "10000:10000/tcp"
       - "10000:10000/udp"
+      - "16180:16180/tcp"
+      - "16180:16180/udp"
     healthcheck:
       test: ["CMD-SHELL", "netstat -tuln | grep -q ':9000' || exit 1"]
       interval: 5s
@@ -61,7 +68,12 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENT_COUNT=2
+      - STOFFEL_COORD_ADDR=host.docker.internal:31415
+      - STOFFEL_RPC_ADDR=172.28.0.11:16181
+      - STOFFEL_CERT=/app/ids/nodes/cert1.crt
+      - STOFFEL_KEY=/app/ids/nodes/key1.der
+      - STOFFEL_EXPECTED_CLIENTS=/app/ids/clients/cert0.crt,/app/ids/clients/cert1.crt
+      - STOFFEL_TIMESTAMP=0
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -73,6 +85,8 @@ services:
     ports:
       - "9001:9001/tcp"
       - "9001:9001/udp"
+      - "16181:16181/tcp"
+      - "16181:16181/udp"
 
   # Party 2
   party2:
@@ -91,7 +105,12 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENT_COUNT=2
+      - STOFFEL_COORD_ADDR=host.docker.internal:31415
+      - STOFFEL_RPC_ADDR=172.28.0.12:16182
+      - STOFFEL_CERT=/app/ids/nodes/cert2.crt
+      - STOFFEL_KEY=/app/ids/nodes/key2.der
+      - STOFFEL_EXPECTED_CLIENTS=/app/ids/clients/cert0.crt,/app/ids/clients/cert1.crt
+      - STOFFEL_TIMESTAMP=0
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -103,6 +122,8 @@ services:
     ports:
       - "9002:9002/tcp"
       - "9002:9002/udp"
+      - "16182:16182/tcp"
+      - "16182:16182/udp"
 
   # Party 3
   party3:
@@ -121,7 +142,12 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENT_COUNT=2
+      - STOFFEL_COORD_ADDR=host.docker.internal:31415
+      - STOFFEL_RPC_ADDR=172.28.0.13:16183
+      - STOFFEL_CERT=/app/ids/nodes/cert3.crt
+      - STOFFEL_KEY=/app/ids/nodes/key3.der
+      - STOFFEL_EXPECTED_CLIENTS=/app/ids/clients/cert0.crt,/app/ids/clients/cert1.crt
+      - STOFFEL_TIMESTAMP=0
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -133,6 +159,8 @@ services:
     ports:
       - "9003:9003/tcp"
       - "9003:9003/udp"
+      - "16183:16183/tcp"
+      - "16183:16183/udp"
 
   # Party 4
   party4:
@@ -151,7 +179,12 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENT_COUNT=2
+      - STOFFEL_COORD_ADDR=host.docker.internal:31415
+      - STOFFEL_RPC_ADDR=172.28.0.14:16184
+      - STOFFEL_CERT=/app/ids/nodes/cert4.crt
+      - STOFFEL_KEY=/app/ids/nodes/key4.der
+      - STOFFEL_EXPECTED_CLIENTS=/app/ids/clients/cert0.crt,/app/ids/clients/cert1.crt
+      - STOFFEL_TIMESTAMP=0
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -163,6 +196,8 @@ services:
     ports:
       - "9004:9004/tcp"
       - "9004:9004/udp"
+      - "16184:16184/tcp"
+      - "16184:16184/udp"
 
   # Client 0 - Provides first input (value: 15)
   client0:
@@ -174,9 +209,13 @@ services:
     environment:
       - STOFFEL_ROLE=client
       - STOFFEL_INPUTS=15
-      - STOFFEL_SERVERS=172.28.0.10:10000,172.28.0.11:9001,172.28.0.12:9002,172.28.0.13:9003,172.28.0.14:9004
+      - STOFFEL_SERVERS=172.28.0.10:16180,172.28.0.11:16181,172.28.0.12:16182,172.28.0.13:16183,172.28.0.14:16184
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
+      - STOFFEL_COORD_ADDR=host.docker.internal:31415
+      - STOFFEL_CERT=/app/ids/clients/cert0.crt
+      - STOFFEL_KEY=/app/ids/clients/key0.der
+      - STOFFEL_TIMESTAMP=0
       - STOFFEL_CLIENT_DELAY=15
       - RUST_LOG=info
       - RUST_BACKTRACE=1
@@ -205,9 +244,13 @@ services:
     environment:
       - STOFFEL_ROLE=client
       - STOFFEL_INPUTS=25
-      - STOFFEL_SERVERS=172.28.0.10:10000,172.28.0.11:9001,172.28.0.12:9002,172.28.0.13:9003,172.28.0.14:9004
+      - STOFFEL_SERVERS=172.28.0.10:16180,172.28.0.11:16181,172.28.0.12:16182,172.28.0.13:16183,172.28.0.14:16184
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
+      - STOFFEL_COORD_ADDR=host.docker.internal:31415
+      - STOFFEL_CERT=/app/ids/clients/cert1.crt
+      - STOFFEL_KEY=/app/ids/clients/key1.der
+      - STOFFEL_TIMESTAMP=0
       - STOFFEL_CLIENT_DELAY=15
       - RUST_LOG=info
       - RUST_BACKTRACE=1

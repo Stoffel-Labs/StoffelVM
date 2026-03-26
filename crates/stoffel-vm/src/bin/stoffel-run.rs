@@ -1,8 +1,11 @@
 use std::env;
+use std::fs;
 use std::net::SocketAddr;
 use std::process::exit;
 use std::str::FromStr;
 
+use alloy::signers::local::PrivateKeySigner;
+use alloy_primitives::Address;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 use ark_ec::{CurveGroup, PrimeGroup};
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
@@ -14,6 +17,10 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
+use stoffel_mpc_coordinator::off_chain::node_rpc::{NodeRPCClient, NodeRPCServer};
+use stoffel_mpc_coordinator::off_chain::OffChainCoordinator;
+use stoffel_mpc_coordinator::on_chain;
+use stoffel_mpc_coordinator::Coordinator;
 use stoffel_vm::core_vm::VirtualMachine;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffel_vm::net::curve::SupportedMpcField;
@@ -43,6 +50,17 @@ use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
+use x509_parser::prelude::*;
+
+fn extract_pubkey_from_cert(cert_der: &[u8]) -> Vec<u8> {
+    let (_, parsed) = X509Certificate::from_der(cert_der).expect("parse X.509 cert");
+    parsed
+        .public_key()
+        .subject_public_key
+        .data
+        .as_ref()
+        .to_vec()
+}
 
 /// Network adapter for MPC clients that remaps party IDs from 5-space (0..n-1)
 /// to 6-space (0..n with client's position excluded).
@@ -889,7 +907,7 @@ async fn setup_hb_party_for_curve<F, G>(
     t: usize,
     instance_id: u64,
     expected_client_count: Option<usize>,
-) -> Result<(), String>
+) -> Result<Arc<HoneyBadgerMpcEngine<F, G>>, String>
 where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
@@ -1184,8 +1202,7 @@ where
         }
     }
 
-    vm.state.set_mpc_engine(engine);
-    Ok(())
+    Ok(engine)
 }
 
 #[cfg(feature = "avss")]
@@ -1672,6 +1689,16 @@ async fn main() {
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
     let mut mpc_backend: Option<String> = None;
     let mut mpc_curve: Option<String> = None;
+    let mut rpc_addr: Option<(String, u16)> = None;
+    let mut coord_addr: Option<(String, u16)> = None;
+    let mut key_der: Option<Vec<u8>> = None;
+    let mut cert_der: Option<Vec<u8>> = None;
+    let mut timestamp: Option<u64> = None;
+    let mut expected_clients: Vec<String> = Vec::new();
+    let mut eth_node_addr: Option<String> = None;
+    let mut wallet_sk_str: Option<String> = None;
+    let mut contract_addr: Option<Address> = None;
+    let mut node_ids: Vec<Address> = Vec::new();
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -1703,6 +1730,16 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--servers") {
         } else if let Some(_rest) = arg.strip_prefix("--mpc-backend") {
         } else if let Some(_rest) = arg.strip_prefix("--mpc-curve") {
+        } else if let Some(_rest) = arg.strip_prefix("--rpc-bind") {
+        } else if let Some(_rest) = arg.strip_prefix("--off-chain-coord") {
+        } else if let Some(_rest) = arg.strip_prefix("--on-chain-coord") {
+        } else if let Some(_rest) = arg.strip_prefix("--eth-node") {
+        } else if let Some(_rest) = arg.strip_prefix("--wallet-sk") {
+        } else if let Some(_rest) = arg.strip_prefix("--key") {
+        } else if let Some(_rest) = arg.strip_prefix("--cert") {
+        } else if let Some(_rest) = arg.strip_prefix("--timestamp") {
+        } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
+        } else if let Some(_rest) = arg.strip_prefix("--node-ids") {
         }
     }
 
@@ -1713,13 +1750,8 @@ async fn main() {
     );
     fail_removed_flag(
         &raw_args,
-        "--expected-clients",
-        "Use `--wait-for-clients <n>` instead.",
-    );
-    fail_removed_flag(
-        &raw_args,
         "--expected-client-count",
-        "Renamed to `--wait-for-clients <n>`.",
+        "Use `--expected-clients <cert-paths>` instead.",
     );
     fail_removed_flag(
         &raw_args,
@@ -1815,6 +1847,66 @@ async fn main() {
             "--mpc-curve" => {
                 if let Some(v) = args_iter.next() {
                     mpc_curve = Some(v);
+                }
+            }
+            "--rpc-bind" => {
+                if let Some(v) = args_iter.next() {
+                    let parts: Vec<&str> = v.rsplitn(2, ':').collect();
+                    let port: u16 = parts[0].parse().expect("Invalid --rpc-bind port");
+                    let host = parts[1].to_string();
+                    rpc_addr = Some((host, port));
+                }
+            }
+            "--off-chain-coord" => {
+                if let Some(v) = args_iter.next() {
+                    let parts: Vec<&str> = v.rsplitn(2, ':').collect();
+                    let port: u16 = parts[0].parse().expect("Invalid --off-chain-coord port");
+                    let host = parts[1].to_string();
+                    coord_addr = Some((host, port));
+                }
+            }
+            "--on-chain-coord" => {
+                if let Some(v) = args_iter.next() {
+                    contract_addr =
+                        Some(Address::from_str(&v).expect("invalid smart contract address"));
+                }
+            }
+            "--node-ids" => {
+                if let Some(v) = args_iter.next() {
+                    node_ids = v
+                        .split(',')
+                        .map(|s| Address::from_str(s.trim()).expect("invalid node address"))
+                        .collect();
+                }
+            }
+            "--eth-node" => {
+                if let Some(v) = args_iter.next() {
+                    eth_node_addr = Some(v);
+                }
+            }
+            "--wallet-sk" => {
+                if let Some(v) = args_iter.next() {
+                    wallet_sk_str = Some(v);
+                }
+            }
+            "--key" => {
+                if let Some(v) = args_iter.next() {
+                    key_der = Some(std::fs::read(&v).expect("Failed to read --key file"));
+                }
+            }
+            "--cert" => {
+                if let Some(v) = args_iter.next() {
+                    cert_der = Some(std::fs::read(&v).expect("Failed to read --cert file"));
+                }
+            }
+            "--timestamp" => {
+                if let Some(v) = args_iter.next() {
+                    timestamp = Some(v.parse().expect("Invalid --timestamp"));
+                }
+            }
+            "--expected-clients" => {
+                if let Some(v) = args_iter.next() {
+                    expected_clients = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
             _ => {}
@@ -2288,6 +2380,41 @@ async fn main() {
         );
     }
 
+    // Off-chain coordinator initialization (both leader and party modes)
+    let mut coord_opt: Option<OffChainCoordinator<ark_bls12_381::Fr>> = None;
+    let mut node_rpc_opt: Option<NodeRPCServer<ark_bls12_381::Fr>> = None;
+    let mut input_ids: Vec<Vec<u8>> = Vec::new();
+
+    if let Some(ref ca) = coord_addr {
+        let coord = OffChainCoordinator::start_rpc_client(
+            &ca.0,
+            ca.1,
+            timestamp.expect("--timestamp required"),
+            session_threshold.unwrap_or(1) as u64,
+            1,
+            cert_der.clone().expect("--cert required"),
+            key_der.clone().expect("--key required"),
+        )
+        .await;
+        coord_opt = Some(coord);
+
+        input_ids = expected_clients
+            .iter()
+            .map(|path| extract_pubkey_from_cert(&fs::read(path).expect("read client cert")))
+            .collect();
+
+        if let Some(ref rpc) = rpc_addr {
+            let node_rpc = NodeRPCServer::start(
+                &rpc.0,
+                rpc.1,
+                cert_der.clone().unwrap(),
+                key_der.clone().unwrap(),
+            )
+            .await;
+            node_rpc_opt = Some(node_rpc);
+        }
+    }
+
     // If in party mode, configure MPC engine based on selected backend
     if let Some(net) = net_opt.clone() {
         // Use the network-derived party ID (sorted public key index), not the
@@ -2322,9 +2449,18 @@ async fn main() {
         match backend_kind {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => {
+                // Phase 1: Coordinator preprocessing trigger
+                if let Some(ref mut coord) = coord_opt {
+                    if as_leader {
+                        coord.trigger_pp().await.unwrap();
+                    }
+                    coord.wait_for_pp().await.unwrap();
+                }
+
+                // Phase 2: Create MPC engine + preprocessing + coordinator input phases
                 macro_rules! setup_hb {
                     ($F:ty, $G:ty) => {{
-                        if let Err(e) = setup_hb_party_for_curve::<$F, $G>(
+                        let engine = match setup_hb_party_for_curve::<$F, $G>(
                             &mut vm,
                             net.clone(),
                             my_id,
@@ -2335,24 +2471,121 @@ async fn main() {
                         )
                         .await
                         {
-                            eprintln!("[party {}] HoneyBadger setup failed: {}", my_id, e);
-                            exit(13);
-                        }
+                            Ok(e) => e,
+                            Err(e) => {
+                                eprintln!("[party {}] HoneyBadger setup failed: {}", my_id, e);
+                                exit(13);
+                            }
+                        };
+                        vm.state.set_mpc_engine(engine);
                     }};
                 }
 
-                match curve_config {
-                    MpcCurveConfig::Bls12_381 => {
-                        setup_hb!(ark_bls12_381::Fr, ark_bls12_381::G1Projective)
+                // Bls12_381 path with coordinator support
+                if coord_opt.is_some() && matches!(curve_config, MpcCurveConfig::Bls12_381) {
+                    let engine = match setup_hb_party_for_curve::<
+                        ark_bls12_381::Fr,
+                        ark_bls12_381::G1Projective,
+                    >(
+                        &mut vm,
+                        net.clone(),
+                        my_id,
+                        n,
+                        t,
+                        instance_id,
+                        None, // coordinator handles clients
+                    )
+                    .await
+                    {
+                        Ok(e) => e,
+                        Err(e) => {
+                            eprintln!("[party {}] HoneyBadger setup failed: {}", my_id, e);
+                            exit(13);
+                        }
+                    };
+
+                    // Coordinator mask distribution + input collection
+                    if let Some(ref mut coord) = coord_opt {
+                        let node_rpc = node_rpc_opt
+                            .as_mut()
+                            .expect("--rpc-bind required with coordinator");
+
+                        if !input_ids.is_empty() {
+                            let mask_shares = engine
+                                .node_handle()
+                                .lock()
+                                .await
+                                .preprocessing_material
+                                .lock()
+                                .await
+                                .take_random_shares(input_ids.len())
+                                .unwrap_or_else(|e| {
+                                    eprintln!("take_random_shares: {}", e);
+                                    exit(13);
+                                });
+
+                            for (i, share) in mask_shares.iter().enumerate() {
+                                node_rpc
+                                    .add_mask_share(i as u64, share)
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        eprintln!("add_mask_share: {:?}", e);
+                                        exit(13);
+                                    });
+                            }
+
+                            if as_leader {
+                                coord.init_input_masks().await.unwrap();
+                            }
+                            coord.wait_for_input_mask_init().await.unwrap();
+
+                            let client_to_index = coord
+                                .wait_for_indices(input_ids.len() as u64)
+                                .await
+                                .unwrap();
+                            for (cid, idx) in &client_to_index {
+                                node_rpc
+                                    .add_reserved_index(cid.clone(), *idx)
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        eprintln!("add_reserved_index: {:?}", e);
+                                        exit(13);
+                                    });
+                            }
+
+                            if as_leader {
+                                coord.trigger_input().await.unwrap();
+                            }
+                            coord.wait_for_input().await.unwrap();
+
+                            let client_inputs = coord
+                                .wait_for_inputs(input_ids.len() as u64, mask_shares)
+                                .await
+                                .unwrap();
+                            for (client_idx, (_cid, shares)) in client_inputs.iter().enumerate() {
+                                vm.state
+                                    .client_store()
+                                    .store_client_input(client_idx, shares.clone());
+                            }
+                        }
                     }
-                    MpcCurveConfig::Bn254 => {
-                        setup_hb!(ark_bn254::Fr, ark_bn254::G1Projective)
-                    }
-                    MpcCurveConfig::Curve25519 => {
-                        setup_hb!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
-                    }
-                    MpcCurveConfig::Ed25519 => {
-                        setup_hb!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective)
+
+                    vm.state.set_mpc_engine(engine);
+                } else {
+                    // No coordinator or non-Bls12_381 curves
+                    match curve_config {
+                        MpcCurveConfig::Bls12_381 => {
+                            setup_hb!(ark_bls12_381::Fr, ark_bls12_381::G1Projective)
+                        }
+                        MpcCurveConfig::Bn254 => {
+                            setup_hb!(ark_bn254::Fr, ark_bn254::G1Projective)
+                        }
+                        MpcCurveConfig::Curve25519 => {
+                            setup_hb!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
+                        }
+                        MpcCurveConfig::Ed25519 => {
+                            setup_hb!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective)
+                        }
                     }
                 }
 
@@ -2412,56 +2645,96 @@ async fn main() {
         }
     }
 
+    // Coordinator: signal MPC execution phase
+    if let Some(ref mut coord) = coord_opt {
+        if as_leader {
+            coord.trigger_mpc().await.unwrap();
+        }
+        coord.wait_for_mpc().await.unwrap();
+    }
+
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
 
     // Execute entry function
     match vm.execute(&agreed_entry) {
         Ok(result) => {
-            // Auto-reveal if the program returned an unrevealed share
-            let result = if let Value::Share(ty, ref sd) = result {
-                if let Some(engine) = vm.state.mpc_engine() {
-                    eprintln!("Program returned a secret share, revealing...");
-                    match engine.open_share(ty, sd.as_bytes()) {
-                        Ok(revealed) => revealed,
-                        Err(e) => {
-                            eprintln!("Failed to reveal returned share: {}", e);
-                            result
+            if let Some(ref mut coord) = coord_opt {
+                // Coordinator output delivery
+                let output_share = match &result {
+                    Value::Share(_ty, share_bytes) => share_bytes.clone(),
+                    _ => {
+                        println!("Program returned: {:?}", result);
+                        vec![]
+                    }
+                };
+
+                if !output_share.is_empty() {
+                    if as_leader {
+                        coord.trigger_outputs().await.unwrap();
+                    }
+                    coord.wait_for_outputs().await.unwrap();
+                    for cid in input_ids.iter() {
+                        let share: RobustShare<ark_bls12_381::Fr> =
+                            ark_serialize::CanonicalDeserialize::deserialize_compressed(
+                                output_share.as_slice(),
+                            )
+                            .expect("deserialize output share");
+                        coord
+                            .send_output_shares(cid.clone(), cid.clone(), vec![share])
+                            .await
+                            .unwrap();
+                    }
+                    if as_leader {
+                        coord.finalize().await.unwrap();
+                    }
+                }
+            } else {
+                // No coordinator — auto-reveal as before
+                let result = if let Value::Share(ty, ref sd) = result {
+                    if let Some(engine) = vm.state.mpc_engine() {
+                        eprintln!("Program returned a secret share, revealing...");
+                        match engine.open_share(ty, sd.as_bytes()) {
+                            Ok(revealed) => revealed,
+                            Err(e) => {
+                                eprintln!("Failed to reveal returned share: {}", e);
+                                result
+                            }
                         }
+                    } else {
+                        result
                     }
                 } else {
                     result
-                }
-            } else {
-                result
-            };
-            // Pretty-print the result
-            match &result {
-                Value::Array(arr_id) => {
-                    if let Some(arr) = vm.state.object_store.get_array(*arr_id) {
-                        let len = arr.length();
-                        // Check if it's a byte array (all U8 values)
-                        let mut bytes = Vec::with_capacity(len);
-                        let mut is_byte_array = true;
-                        for i in 0..len {
-                            match arr.get(&Value::I64(i as i64)) {
-                                Some(Value::U8(b)) => bytes.push(*b),
-                                _ => {
-                                    is_byte_array = false;
-                                    break;
+                };
+                // Pretty-print the result
+                match &result {
+                    Value::Array(arr_id) => {
+                        if let Some(arr) = vm.state.object_store.get_array(*arr_id) {
+                            let len = arr.length();
+                            let mut bytes = Vec::with_capacity(len);
+                            let mut is_byte_array = true;
+                            for i in 0..len {
+                                match arr.get(&Value::I64(i as i64)) {
+                                    Some(Value::U8(b)) => bytes.push(*b),
+                                    _ => {
+                                        is_byte_array = false;
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        if is_byte_array && !bytes.is_empty() {
-                            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                            println!("Program returned: byte[{}] 0x{}", bytes.len(), hex);
+                            if is_byte_array && !bytes.is_empty() {
+                                let hex: String =
+                                    bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                                println!("Program returned: byte[{}] 0x{}", bytes.len(), hex);
+                            } else {
+                                println!("Program returned: {:?}", result);
+                            }
                         } else {
                             println!("Program returned: {:?}", result);
                         }
-                    } else {
-                        println!("Program returned: {:?}", result);
                     }
+                    _ => println!("Program returned: {:?}", result),
                 }
-                _ => println!("Program returned: {:?}", result),
             }
         }
         Err(err) => {
@@ -2497,6 +2770,18 @@ Flags:
   --wait-for-clients <n>
                           Number of client inputs to collect before starting computation
                           (HoneyBadger only; ALPN handles routing, this controls coordination)
+  --off-chain-coord <addr:port>
+                          Off-chain coordinator address
+  --rpc-bind <addr:port>  Node RPC server bind address (for mask distribution)
+  --cert <path>           Path to DER-encoded X.509 certificate
+  --key <path>            Path to DER-encoded private key
+  --timestamp <u64>       Coordinator session timestamp
+  --expected-clients <cert-paths>
+                          Comma-separated paths to client certificates
+  --on-chain-coord <addr> On-chain coordinator smart contract address
+  --eth-node <url>        Ethereum node URL (on-chain coordinator)
+  --wallet-sk <hex>       Wallet secret key (on-chain coordinator)
+  --node-ids <addrs>      Comma-separated node Ethereum addresses (on-chain coordinator)
   -h, --help              Show this help
 
 Required environment:
