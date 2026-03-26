@@ -7,6 +7,11 @@
 # Usage:
 #   STOFFEL_AUTH_TOKEN=<token> docker-compose -f docker-compose.avss.yml up
 #
+# To use a different elliptic curve (default: bls12-381):
+#   STOFFEL_AUTH_TOKEN=<token> STOFFEL_MPC_CURVE=bn254 docker-compose -f docker-compose.avss.yml up
+#
+# Supported curves: bls12-381, bn254, curve25519, ed25519
+#
 # To view logs from a specific party:
 #   docker-compose -f docker-compose.avss.yml logs -f party0
 
@@ -28,6 +33,7 @@ services:
       - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
       - STOFFEL_ENTRY=main
       - STOFFEL_MPC_BACKEND=avss
+      - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -61,6 +67,7 @@ services:
       - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
       - STOFFEL_ENTRY=main
       - STOFFEL_MPC_BACKEND=avss
+      - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -91,6 +98,7 @@ services:
       - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
       - STOFFEL_ENTRY=main
       - STOFFEL_MPC_BACKEND=avss
+      - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -121,6 +129,7 @@ services:
       - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
       - STOFFEL_ENTRY=main
       - STOFFEL_MPC_BACKEND=avss
+      - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -151,6 +160,7 @@ services:
       - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
       - STOFFEL_ENTRY=main
       - STOFFEL_MPC_BACKEND=avss
+      - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:

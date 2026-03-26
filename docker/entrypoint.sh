@@ -119,6 +119,11 @@ build_command() {
         cmd="${cmd} --mpc-backend ${STOFFEL_MPC_BACKEND}"
     fi
 
+    # Add MPC curve if specified
+    if [ -n "${STOFFEL_MPC_CURVE:-}" ]; then
+        cmd="${cmd} --mpc-curve ${STOFFEL_MPC_CURVE}"
+    fi
+
     # Add optional trace flags
     if [ "${STOFFEL_TRACE_INSTR}" = "true" ]; then
         cmd="${cmd} --trace-instr"
