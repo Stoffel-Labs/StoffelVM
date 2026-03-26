@@ -49,6 +49,9 @@ dirs = "5"
 dashmap = "5"
 tokio-util = { version = "0.7", features = ["rt"] }
 bitflags = "2"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["std"] }
+curve25519-dalek = { version = "4", features = ["alloc"] }
 
 [features]
 default = ["honeybadger", "avss"]

@@ -2845,6 +2845,33 @@ impl VMState {
         }
     }
 
+    fn share_field_mul_typed<F, G>(
+        &self,
+        share_bytes: &[u8],
+        scalar_bytes: &[u8],
+    ) -> Result<Vec<u8>, String>
+    where
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
+    {
+        let share = Self::decode_share_bytes_typed::<F, G>(share_bytes)?;
+        let scalar_f = F::deserialize_compressed(&scalar_bytes[..])
+            .map_err(|e| format!("Failed to deserialize field element: {}", e))?;
+        match share {
+            DecodedShare::Robust(share) => {
+                let new_share =
+                    RobustShare::new(share.share[0] * scalar_f, share.id, share.degree);
+                Self::encode_share_bytes_typed(&new_share)
+            }
+            DecodedShare::Feldman(share) => {
+                let new_share = (share * scalar_f).map_err(|e| {
+                    format!("Failed to multiply Feldman share by field element: {:?}", e)
+                })?;
+                Self::encode_share_bytes_typed(&new_share)
+            }
+        }
+    }
+
     fn scalar_sub_share_typed<F, G>(
         &self,
         scalar: i64,
@@ -3207,6 +3234,16 @@ impl VMState {
                 self.secret_fixed_point_mul_scalar(ty, share_bytes, scalar)
             }
         }
+    }
+
+    /// Multiply secret share by a field element given as raw bytes (public wrapper for mpc_builtins)
+    pub fn secret_share_mul_field(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        scalar_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        dispatch_share_curve!(self, share_field_mul_typed(share_bytes, scalar_bytes))
     }
 
     /// Local interpolation - reconstruct secret from array of shares (public wrapper for mpc_builtins)

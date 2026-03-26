@@ -87,6 +87,19 @@ pub trait MpcEngine: Send + Sync {
         Err("open_share_in_exp not implemented for this engine".to_string())
     }
 
+    /// Reconstruct a secret from shares and return the raw field element bytes
+    /// instead of converting to a VM `Value`.
+    ///
+    /// This is used by `Share.open_field` to get the serialized field element
+    /// for cryptographic operations (e.g. threshold signatures).
+    fn open_share_as_field(
+        &self,
+        _ty: ShareType,
+        _share_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        Err("open_share_as_field not implemented for this engine".to_string())
+    }
+
     /// Whether this engine supports `open_share_in_exp`.
     fn supports_open_share_in_exp(&self) -> bool {
         self.capabilities().contains(MpcCapabilities::OPEN_IN_EXP)

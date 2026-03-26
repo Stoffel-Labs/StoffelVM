@@ -76,6 +76,20 @@ static AVSS_EXP_REGISTRY: once_cell::sync::Lazy<
 static AVSS_EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
     once_cell::sync::Lazy::new(tokio::sync::Notify::new);
 
+// ============================================================================
+// Open-in-exp registry for AVSS G2 (BLS12-381 threshold BLS signatures)
+// ============================================================================
+
+/// Wire prefix that identifies an AVSS open-in-exp G2 contribution message.
+const AVSS_G2_EXP_WIRE_PREFIX: &[u8; 4] = b"AXG2";
+
+static AVSS_G2_EXP_REGISTRY: once_cell::sync::Lazy<
+    parking_lot::Mutex<HashMap<(u64, usize), AvssExpOpenAccumulator>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+static AVSS_G2_EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
+    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+
 fn insert_remote_avss_exp_partial(
     instance_id: u64,
     sender_party_id: usize,
@@ -142,6 +156,82 @@ pub fn try_handle_avss_open_exp_wire_message(
     }
 
     insert_remote_avss_exp_partial(
+        message.instance_id,
+        message.sender_party_id,
+        message.share_id,
+        message.partial_point,
+    );
+    Ok(true)
+}
+
+fn insert_remote_avss_g2_exp_partial(
+    instance_id: u64,
+    sender_party_id: usize,
+    share_id: usize,
+    partial_point: Vec<u8>,
+) {
+    let mut reg = AVSS_G2_EXP_REGISTRY.lock();
+    let now = std::time::Instant::now();
+    reg.retain(|_, acc| {
+        acc.result_cached_at
+            .is_none_or(|t| now.duration_since(t) < AVSS_EXP_EVICTION_AGE)
+    });
+    let mut seq = 0usize;
+    loop {
+        let key = (instance_id, seq);
+        let entry = reg.entry(key).or_default();
+        if !entry.party_ids.contains(&sender_party_id) {
+            entry.partial_points.push((share_id, partial_point));
+            entry.party_ids.push(sender_party_id);
+            break;
+        }
+        seq += 1;
+    }
+    drop(reg);
+    AVSS_G2_EXP_NOTIFY.notify_waiters();
+}
+
+/// Inspect an incoming message and, if it carries an AVSS G2 open-in-exp contribution
+/// (`AXG2` prefix), insert it into the G2 accumulator registry and return `Ok(true)`.
+/// Returns `Ok(false)` for unrelated messages.
+pub fn try_handle_avss_g2_exp_wire_message(
+    authenticated_sender_id: usize,
+    payload: &[u8],
+) -> Result<bool, String> {
+    if payload.len() < AVSS_G2_EXP_WIRE_PREFIX.len()
+        || &payload[..AVSS_G2_EXP_WIRE_PREFIX.len()] != AVSS_G2_EXP_WIRE_PREFIX
+    {
+        return Ok(false);
+    }
+
+    let message: AvssExpOpenWireMessage =
+        bincode::deserialize(&payload[AVSS_G2_EXP_WIRE_PREFIX.len()..])
+            .map_err(|e| format!("deserialize avss g2 open-exp payload: {}", e))?;
+
+    if authenticated_sender_id == crate::net::open_registry::UNKNOWN_SENDER_ID {
+        tracing::warn!(
+            sender_party_id = message.sender_party_id,
+            "Rejecting AVSS G2 open-exp wire message from unauthenticated connection"
+        );
+        return Err(
+            "avss g2 open-exp wire rejected: sender identity not authenticated".to_string(),
+        );
+    }
+    if message.sender_party_id != authenticated_sender_id {
+        return Err(format!(
+            "avss g2 open-exp sender mismatch: transport={} payload={}",
+            authenticated_sender_id, message.sender_party_id
+        ));
+    }
+    // In AVSS the share_id equals party_id + 1 (evaluation points are 1-indexed).
+    if message.share_id != message.sender_party_id + 1 {
+        return Err(format!(
+            "avss g2 open-exp share_id mismatch: sender_party_id={} share_id={}",
+            message.sender_party_id, message.share_id
+        ));
+    }
+
+    insert_remote_avss_g2_exp_partial(
         message.instance_id,
         message.sender_party_id,
         message.share_id,
@@ -1241,6 +1331,70 @@ where
         )
     }
 
+    fn open_share_as_field(
+        &self,
+        ty: ShareType,
+        share_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let type_key = match ty {
+            ShareType::SecretInt { bit_length } => format!("avss-field-int-{bit_length}"),
+            ShareType::SecretFixedPoint { precision } => {
+                format!("avss-field-fixed-{}-{}", precision.k(), precision.f())
+            }
+        };
+
+        let wire_message = crate::net::open_registry::encode_single_share_wire_message(
+            self.instance_id,
+            &type_key,
+            self.party_id,
+            share_bytes,
+        )?;
+        self.broadcast_open_registry_payload_sync(wire_message)?;
+
+        let required = self.t + 1;
+        let n = self.n;
+        let t = self.t;
+
+        // Use open_share_via_registry with a closure that serializes the secret
+        // as a field element, then carries the bytes through Value::String
+        // (using unsafe-from-utf8-lossy is fine since we immediately extract).
+        let result = crate::net::open_registry::open_share_via_registry(
+            self.instance_id,
+            self.party_id,
+            &type_key,
+            share_bytes,
+            required,
+            |collected| {
+                let mut shares: Vec<FeldmanShamirShare<F, G>> = Vec::with_capacity(collected.len());
+                for bytes in collected {
+                    shares.push(Self::decode_feldman_share(bytes)?);
+                }
+                let secret = Self::reconstruct_secret(&shares, n, t)?;
+                let mut out = Vec::new();
+                secret
+                    .serialize_compressed(&mut out)
+                    .map_err(|e| format!("serialize field element: {}", e))?;
+                // Encode as hex to carry through the Value::String channel
+                let hex = out.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                Ok(Value::String(hex))
+            },
+        )?;
+
+        // Decode hex back to bytes
+        match result {
+            Value::String(hex) => {
+                let mut bytes = Vec::with_capacity(hex.len() / 2);
+                for i in (0..hex.len()).step_by(2) {
+                    let byte = u8::from_str_radix(&hex[i..i + 2], 16)
+                        .map_err(|e| format!("hex decode error: {}", e))?;
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+            _ => Err("unexpected result from open_share_via_registry".to_string()),
+        }
+    }
+
     fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
         let type_key = match ty {
             ShareType::SecretInt { bit_length } => format!("avss-batch-int-{bit_length}"),
@@ -1308,14 +1462,24 @@ where
     }
 
     fn random_share(&self, _ty: ShareType) -> Result<ShareData, String> {
-        // Use the same coordinated dealer pattern as input_share so all
-        // parties participate in the SAME AVSS session and get shares of
-        // the SAME random secret (with identical commitments).
-        let (dealer_id, session_id) = self.allocate_input_share_session()?;
-        let secret = F::rand(&mut ark_std::rand::rngs::StdRng::from_entropy());
-        let share = crate::net::block_on_current(
-            self.run_input_share_round(dealer_id, session_id, secret),
-        )?;
+        // Use the multi-dealer RanSha protocol: ALL parties contribute
+        // randomness via ensure_v_random_shares(), so no single party
+        // knows the combined secret. This is proper threshold DKG.
+        //
+        // Clone the node (same pattern as preprocess()) to avoid holding
+        // the mutex while the cooperative protocol runs.
+        let share = crate::net::block_on_current(async {
+            let mut node_clone = {
+                let node = self.avss_node.lock().await;
+                node.clone()
+            };
+            MPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::rand(
+                &mut node_clone,
+                self.net.clone(),
+            )
+            .await
+            .map_err(|e| format!("random_share (multi-dealer RanSha) failed: {:?}", e))
+        })?;
         Self::share_to_share_data(&share)
     }
 
@@ -1442,6 +1606,232 @@ where
                 .ok_or_else(|| format!("Commitment index {} out of bounds", index))?;
             Self::encode_group_element(commitment)
         })
+    }
+}
+
+// ============================================================================
+// ThresholdExpG2 - Threshold exponentiation in G2 (BLS12-381 specific)
+// ============================================================================
+
+/// Threshold exponentiation in G2 (BLS12-381 specific).
+///
+/// Enables computing `[secret] * generator_g2` without revealing the secret,
+/// via partial-point exchange and Lagrange interpolation in G2.
+pub trait ThresholdExpG2: Send + Sync {
+    fn open_share_in_exp_g2(
+        &self,
+        share_bytes: &[u8],
+        generator_g2_bytes: &[u8],
+    ) -> Result<Vec<u8>, String>;
+}
+
+impl ThresholdExpG2
+    for AvssMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>
+{
+    fn open_share_in_exp_g2(
+        &self,
+        share_bytes: &[u8],
+        generator_g2_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        use ark_bls12_381::{Fr, G2Affine, G2Projective};
+        use ark_ec::CurveGroup as _;
+        use ark_ff::Field as _;
+        use ark_serialize::{CanonicalDeserialize as _, CanonicalSerialize as _};
+
+        type G1 = ark_bls12_381::G1Projective;
+
+        let share =
+            AvssMpcEngine::<Fr, G1>::decode_feldman_share(share_bytes)?;
+        let generator_g2 = G2Projective::deserialize_compressed(&generator_g2_bytes[..])
+            .map_err(|e| format!("deserialize G2 generator: {}", e))?;
+
+        let share_value: Fr = share.feldmanshare.share[0];
+        let share_id: usize = share.feldmanshare.id;
+
+        // Compute partial point in G2
+        let partial_point: G2Projective = generator_g2 * share_value;
+        let mut partial_bytes = Vec::new();
+        partial_point
+            .into_affine()
+            .serialize_compressed(&mut partial_bytes)
+            .map_err(|e| format!("serialize G2 partial point: {}", e))?;
+
+        // Build wire message with AXG2 prefix
+        let wire_payload = {
+            let msg = AvssExpOpenWireMessage {
+                instance_id: self.instance_id,
+                sender_party_id: self.party_id,
+                share_id,
+                partial_point: partial_bytes.clone(),
+            };
+            let encoded = bincode::serialize(&msg)
+                .map_err(|e| format!("serialize avss g2 open-exp payload: {}", e))?;
+            let mut out = Vec::with_capacity(AVSS_G2_EXP_WIRE_PREFIX.len() + encoded.len());
+            out.extend_from_slice(AVSS_G2_EXP_WIRE_PREFIX);
+            out.extend_from_slice(&encoded);
+            out
+        };
+
+        // Broadcast to all peers
+        crate::net::block_on_current(async {
+            for peer_id in 0..self.n {
+                if peer_id == self.party_id {
+                    continue;
+                }
+                self.net
+                    .send(peer_id, &wire_payload)
+                    .await
+                    .map_err(|e| {
+                        format!("broadcast avss g2 open-exp to {}: {}", peer_id, e)
+                    })?;
+            }
+            Ok::<(), String>(())
+        })?;
+
+        let required = self.t + 1;
+        let instance_id = self.instance_id;
+        let party_id = self.party_id;
+
+        let try_check = |my_sequence: &mut Option<usize>,
+                         partial_bytes: &[u8],
+                         share_id: usize|
+         -> Result<Option<Vec<u8>>, String> {
+            let mut reg = AVSS_G2_EXP_REGISTRY.lock();
+
+            if my_sequence.is_none() {
+                let mut seq = 0;
+                loop {
+                    let key = (instance_id, seq);
+                    let entry = reg
+                        .entry(key)
+                        .or_insert_with(AvssExpOpenAccumulator::default);
+                    if !entry.party_ids.contains(&party_id) {
+                        entry
+                            .partial_points
+                            .push((share_id, partial_bytes.to_vec()));
+                        entry.party_ids.push(party_id);
+                        *my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.expect("sequence must be set after insertion");
+            let key = (instance_id, seq);
+            let entry = reg
+                .get_mut(&key)
+                .expect("avss g2 exp registry entry must exist after insertion");
+
+            if let Some(result) = entry.result.clone() {
+                return Ok(Some(result));
+            }
+
+            if entry.partial_points.len() >= required {
+                let collected: Vec<(usize, Vec<u8>)> = entry
+                    .partial_points
+                    .iter()
+                    .take(required)
+                    .cloned()
+                    .collect();
+
+                let mut points: Vec<(usize, G2Projective)> = Vec::with_capacity(collected.len());
+                for (sid, bytes) in &collected {
+                    let pt = G2Affine::deserialize_compressed(&bytes[..])
+                        .map_err(|e| format!("deserialize G2 partial point: {}", e))?;
+                    points.push((*sid, pt.into()));
+                }
+
+                // AVSS evaluation points are 1-indexed integers.
+                let eval_points: Vec<(usize, Fr)> = points
+                    .iter()
+                    .map(|(id, _)| (*id, Fr::from(*id as u64)))
+                    .collect();
+
+                let mut result = G2Projective::default(); // zero
+                for (i, (_id_i, pt_i)) in points.iter().enumerate() {
+                    let x_i = eval_points[i].1;
+                    let mut lambda = Fr::from(1u64);
+                    for (j, _) in points.iter().enumerate() {
+                        if i == j {
+                            continue;
+                        }
+                        let x_j = eval_points[j].1;
+                        let num = -x_j;
+                        let den = x_i - x_j;
+                        lambda *= num
+                            * den
+                                .inverse()
+                                .ok_or_else(|| {
+                                    "zero denominator in AVSS G2 Lagrange".to_string()
+                                })?;
+                    }
+                    result += *pt_i * lambda;
+                }
+
+                let mut result_bytes = Vec::new();
+                result
+                    .into_affine()
+                    .serialize_compressed(&mut result_bytes)
+                    .map_err(|e| format!("serialize G2 result: {}", e))?;
+
+                entry.result = Some(result_bytes.clone());
+                entry.result_cached_at = Some(std::time::Instant::now());
+                return Ok(Some(result_bytes));
+            }
+
+            Ok(None)
+        };
+
+        // Use async Notify when a multi-thread tokio runtime is available.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let deadline =
+                            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+                        let mut my_sequence: Option<usize> = None;
+
+                        loop {
+                            let notified = AVSS_G2_EXP_NOTIFY.notified();
+
+                            if let Some(result) =
+                                try_check(&mut my_sequence, &partial_bytes, share_id)?
+                            {
+                                return Ok(result);
+                            }
+
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(
+                                    "Timeout waiting for AVSS G2 open_share_in_exp contributions"
+                                        .to_string(),
+                                );
+                            }
+
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep_until(deadline) => {}
+                            }
+                        }
+                    })
+                });
+            }
+        }
+
+        // Polling fallback.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut my_sequence: Option<usize> = None;
+        loop {
+            if let Some(result) = try_check(&mut my_sequence, &partial_bytes, share_id)? {
+                return Ok(result);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "Timeout waiting for AVSS G2 open_share_in_exp contributions".to_string(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 

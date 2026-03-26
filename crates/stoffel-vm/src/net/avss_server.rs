@@ -600,6 +600,20 @@ where
                                         Ok(false) => {}
                                     }
 
+                                    match crate::net::avss_engine::try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
+                                        Ok(true) => {
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "[AVSS] Failed to handle G2 open-exp wire message from {}: {}",
+                                                authenticated_sender_id, e
+                                            );
+                                            continue;
+                                        }
+                                        Ok(false) => {}
+                                    }
+
                                     // Route raw bytes to the AVSS node with sender_id
                                     if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {
                                         // May fail to process non-protocol messages; forward as raw bytes
@@ -678,6 +692,9 @@ where
                                         continue;
                                     }
                                     if let Ok(true) = crate::net::avss_engine::try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
+                                        continue;
+                                    }
+                                    if let Ok(true) = crate::net::avss_engine::try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
                                         continue;
                                     }
                                     if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {

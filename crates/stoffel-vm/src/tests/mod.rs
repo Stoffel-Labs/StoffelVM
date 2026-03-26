@@ -10,8 +10,12 @@ pub mod leader_bootnode_integration;
 pub mod mpc_multiplication_integration;
 #[cfg(feature = "avss")]
 pub mod avss_keygen_program;
+#[cfg(feature = "avss")]
+pub mod ed25519_compat;
 pub mod p2p_integration;
 pub mod test_utils;
+#[cfg(feature = "avss_itest")]
+pub mod threshold_signatures;
 #[cfg(feature = "hb_itest")]
 pub mod vm_mesh_integration;
 #[cfg(feature = "hb_itest")]

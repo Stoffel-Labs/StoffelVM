@@ -1356,6 +1356,9 @@ where
                         if let Ok(true) = stoffel_vm::net::avss_engine::try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
                             continue;
                         }
+                        if let Ok(true) = stoffel_vm::net::avss_engine::try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
+                            continue;
+                        }
                         if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {
                             let _ = tx.send((authenticated_sender_id, data)).await;
                             if !e.contains("deserialize") && !e.contains("process failed") {

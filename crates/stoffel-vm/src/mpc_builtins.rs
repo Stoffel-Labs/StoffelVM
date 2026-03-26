@@ -26,7 +26,8 @@
 
 use crate::core_vm::VirtualMachine;
 use crate::foreign_functions::ForeignFunctionContext;
-use stoffel_vm_types::core_types::{ShareData, ShareType, Value};
+use sha2::{Digest, Sha256, Sha512};
+use stoffel_vm_types::core_types::{ObjectStore, ShareData, ShareType, Value};
 
 /// Field name constants for Share objects
 pub mod share_fields {
@@ -259,12 +260,47 @@ pub mod share_object {
     }
 }
 
+// ============================================================================
+// Byte array helpers
+// ============================================================================
+
+/// Extract a `Vec<u8>` from a VM byte array (`Value::Array` of `Value::U8`).
+fn extract_byte_array(store: &ObjectStore, value: &Value) -> Result<Vec<u8>, String> {
+    match value {
+        Value::Array(arr_id) => {
+            let arr = store.get_array(*arr_id).ok_or("Array not found")?;
+            let len = arr.length();
+            let mut bytes = Vec::with_capacity(len);
+            for i in 0..len {
+                match arr.get(&Value::I64(i as i64)) {
+                    Some(Value::U8(b)) => bytes.push(*b),
+                    _ => return Err(format!("Expected U8 at index {}", i)),
+                }
+            }
+            Ok(bytes)
+        }
+        _ => Err("Expected byte array".to_string()),
+    }
+}
+
+/// Create a VM byte array (`Value::Array` of `Value::U8`) from raw bytes.
+fn create_byte_array(store: &mut ObjectStore, bytes: &[u8]) -> usize {
+    let arr_id = store.create_array_with_capacity(bytes.len());
+    let arr = store.get_array_mut(arr_id).unwrap();
+    for (i, &b) in bytes.iter().enumerate() {
+        arr.set(Value::I64(i as i64), Value::U8(b));
+    }
+    arr_id
+}
+
 /// Register all MPC builtin functions with the VM
 pub fn register_mpc_builtins(vm: &mut VirtualMachine) {
     register_share_builtins(vm);
     register_mpc_info_builtins(vm);
     register_rbc_builtins(vm);
     register_aba_builtins(vm);
+    register_crypto_builtins(vm);
+    register_bytes_builtins(vm);
     #[cfg(feature = "avss")]
     register_avss_builtins(vm);
 }
@@ -426,6 +462,272 @@ fn register_share_builtins(vm: &mut VirtualMachine) {
         let (_, share_data) =
             share_object::extract_share_data(&ctx.vm_state.object_store, &ctx.args[0])?;
         Ok(Value::Bool(share_data.has_commitments()))
+    });
+
+    // Share.mul_field - Multiply share by a field element (given as byte array)
+    vm.register_foreign_function("Share.mul_field", |ctx| {
+        if ctx.args.len() < 2 {
+            return Err(
+                "Share.mul_field expects 2 arguments: share, field_bytes".to_string(),
+            );
+        }
+
+        let (ty, data) =
+            share_object::extract_share_data(&ctx.vm_state.object_store, &ctx.args[0])?;
+        let field_bytes = extract_byte_array(&ctx.vm_state.object_store, &ctx.args[1])?;
+
+        let result_data =
+            ctx.vm_state
+                .secret_share_mul_field(ty, data.as_bytes(), &field_bytes)?;
+
+        let party_id = ctx
+            .vm_state
+            .mpc_engine()
+            .map(|e| e.party_id())
+            .unwrap_or(0);
+
+        let obj_id = share_object::create_share_object(
+            &mut ctx.vm_state.object_store,
+            ty,
+            ShareData::Opaque(result_data),
+            party_id,
+        );
+
+        Ok(Value::Object(obj_id))
+    });
+
+    // Share.open_field - Open a share and return the raw field element bytes
+    vm.register_foreign_function("Share.open_field", |ctx| {
+        if ctx.args.is_empty() {
+            return Err("Share.open_field expects 1 argument: share".to_string());
+        }
+
+        let engine = ctx
+            .vm_state
+            .mpc_engine()
+            .ok_or_else(|| "MPC engine not configured".to_string())?;
+
+        if !engine.is_ready() {
+            return Err("MPC engine not ready".to_string());
+        }
+
+        let (ty, data) =
+            share_object::extract_share_data(&ctx.vm_state.object_store, &ctx.args[0])?;
+
+        let result_bytes = engine.open_share_as_field(ty, data.as_bytes())?;
+
+        let arr_id = create_byte_array(&mut ctx.vm_state.object_store, &result_bytes);
+        Ok(Value::Array(arr_id))
+    });
+
+    // Share.open_exp_custom - Reveal share in the exponent with a custom generator point
+    // Same as Share.open_exp but the generator is provided directly as bytes
+    vm.register_foreign_function("Share.open_exp_custom", |ctx| {
+        if ctx.args.len() < 2 {
+            return Err(
+                "Share.open_exp_custom expects 2 arguments: share, generator_bytes".to_string(),
+            );
+        }
+
+        let engine = ctx
+            .vm_state
+            .mpc_engine()
+            .ok_or_else(|| "MPC engine not configured".to_string())?;
+
+        if !engine.is_ready() {
+            return Err("MPC engine not ready".to_string());
+        }
+
+        if !engine.supports_open_share_in_exp() {
+            return Err(format!(
+                "MPC backend '{}' does not support Share.open_exp_custom",
+                engine.protocol_name()
+            ));
+        }
+
+        let (ty, data) =
+            share_object::extract_share_data(&ctx.vm_state.object_store, &ctx.args[0])?;
+        let gen_bytes = extract_byte_array(&ctx.vm_state.object_store, &ctx.args[1])?;
+
+        let result_bytes = engine.open_share_in_exp(ty, data.as_bytes(), &gen_bytes)?;
+
+        let arr_id = create_byte_array(&mut ctx.vm_state.object_store, &result_bytes);
+        Ok(Value::Array(arr_id))
+    });
+}
+
+// ============================================================================
+// Bytes builtins
+// ============================================================================
+
+/// Register Bytes module builtins
+fn register_bytes_builtins(vm: &mut VirtualMachine) {
+    // Bytes.concat - Concatenate two byte arrays
+    vm.register_foreign_function("Bytes.concat", |ctx| {
+        if ctx.args.len() < 2 {
+            return Err("Bytes.concat expects 2 arguments: a, b".to_string());
+        }
+
+        let a = extract_byte_array(&ctx.vm_state.object_store, &ctx.args[0])?;
+        let b = extract_byte_array(&ctx.vm_state.object_store, &ctx.args[1])?;
+
+        let mut combined = Vec::with_capacity(a.len() + b.len());
+        combined.extend_from_slice(&a);
+        combined.extend_from_slice(&b);
+
+        let arr_id = create_byte_array(&mut ctx.vm_state.object_store, &combined);
+        Ok(Value::Array(arr_id))
+    });
+
+    // Bytes.from_string - Convert a string to a byte array
+    vm.register_foreign_function("Bytes.from_string", |ctx| {
+        if ctx.args.is_empty() {
+            return Err("Bytes.from_string expects 1 argument: string".to_string());
+        }
+
+        let s = match &ctx.args[0] {
+            Value::String(s) => s.clone(),
+            _ => return Err("Argument must be a string".to_string()),
+        };
+
+        let bytes = s.as_bytes();
+        let arr_id = create_byte_array(&mut ctx.vm_state.object_store, bytes);
+        Ok(Value::Array(arr_id))
+    });
+}
+
+// ============================================================================
+// Crypto builtins
+// ============================================================================
+
+/// Register Crypto module builtins
+fn register_crypto_builtins(vm: &mut VirtualMachine) {
+    // Crypto.sha256 - Compute SHA-256 hash of byte array
+    vm.register_foreign_function("Crypto.sha256", |ctx| {
+        if ctx.args.is_empty() {
+            return Err("Crypto.sha256 expects 1 argument: data (byte array)".to_string());
+        }
+
+        let bytes = extract_byte_array(&ctx.vm_state.object_store, &ctx.args[0])?;
+        let hash = Sha256::digest(&bytes);
+
+        let arr_id = create_byte_array(&mut ctx.vm_state.object_store, &hash);
+        Ok(Value::Array(arr_id))
+    });
+
+    // Crypto.sha512 - Compute SHA-512 hash of byte array
+    vm.register_foreign_function("Crypto.sha512", |ctx| {
+        if ctx.args.is_empty() {
+            return Err("Crypto.sha512 expects 1 argument: data (byte array)".to_string());
+        }
+
+        let bytes = extract_byte_array(&ctx.vm_state.object_store, &ctx.args[0])?;
+        let hash = Sha512::digest(&bytes);
+
+        let arr_id = create_byte_array(&mut ctx.vm_state.object_store, &hash);
+        Ok(Value::Array(arr_id))
+    });
+
+    // Crypto.hash_to_field - Hash bytes to a field element (reduced mod field order)
+    vm.register_foreign_function("Crypto.hash_to_field", |ctx| {
+        if ctx.args.len() < 2 {
+            return Err(
+                "Crypto.hash_to_field expects 2 arguments: hash_bytes, curve_name".to_string(),
+            );
+        }
+
+        let hash_bytes = extract_byte_array(&ctx.vm_state.object_store, &ctx.args[0])?;
+
+        let curve_name = match &ctx.args[1] {
+            Value::String(s) => s.clone(),
+            _ => return Err("curve_name must be a string".to_string()),
+        };
+
+        use crate::net::curve::MpcCurveConfig;
+        use ark_ff::PrimeField;
+        use ark_serialize::CanonicalSerialize;
+
+        let curve = curve_name
+            .parse::<MpcCurveConfig>()
+            .map_err(|e| format!("Invalid curve name: {}", e))?;
+
+        let out_bytes = match curve {
+            MpcCurveConfig::Bls12_381 => {
+                let field_elem = ark_bls12_381::Fr::from_be_bytes_mod_order(&hash_bytes);
+                let mut out = Vec::new();
+                field_elem
+                    .serialize_compressed(&mut out)
+                    .map_err(|e| format!("serialize field element: {}", e))?;
+                out
+            }
+            MpcCurveConfig::Bn254 => {
+                let field_elem = ark_bn254::Fr::from_be_bytes_mod_order(&hash_bytes);
+                let mut out = Vec::new();
+                field_elem
+                    .serialize_compressed(&mut out)
+                    .map_err(|e| format!("serialize field element: {}", e))?;
+                out
+            }
+            MpcCurveConfig::Curve25519 | MpcCurveConfig::Ed25519 => {
+                // Ed25519/Curve25519 uses little-endian byte order per RFC 8032
+                let field_elem = ark_curve25519::Fr::from_le_bytes_mod_order(&hash_bytes);
+                let mut out = Vec::new();
+                field_elem
+                    .serialize_compressed(&mut out)
+                    .map_err(|e| format!("serialize field element: {}", e))?;
+                out
+            }
+        };
+
+        let arr_id = create_byte_array(&mut ctx.vm_state.object_store, &out_bytes);
+        Ok(Value::Array(arr_id))
+    });
+
+    // Crypto.hash_to_g1 - Hash bytes to a BLS12-381 G1 point
+    //
+    // Uses try-and-increment: H(msg || counter) is interpreted as a
+    // candidate Fq x-coordinate. If a valid G1 point exists at that x,
+    // we use it; otherwise increment counter and retry. This avoids
+    // a known DLOG relation between the hash point and the generator.
+    vm.register_foreign_function("Crypto.hash_to_g1", |ctx| {
+        if ctx.args.is_empty() {
+            return Err("Crypto.hash_to_g1 expects 1 argument: data (byte array)".to_string());
+        }
+
+        let bytes = extract_byte_array(&ctx.vm_state.object_store, &ctx.args[0])?;
+
+        use ark_bls12_381::{Fq, G1Affine};
+        use ark_ec::AffineRepr;
+        use ark_ff::PrimeField;
+        use ark_serialize::CanonicalSerialize;
+
+        // Try-and-increment: hash(msg || counter) → Fq → try as x-coord
+        let mut point: Option<G1Affine> = None;
+        for counter in 0u32..256 {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            hasher.update(counter.to_le_bytes());
+            let hash = hasher.finalize();
+            let x = Fq::from_be_bytes_mod_order(&hash);
+            if let Some(p) = G1Affine::get_point_from_x_unchecked(x, false) {
+                if p.is_on_curve() && !p.is_zero() {
+                    // Clear cofactor to ensure we're in the prime-order subgroup
+                    let cleared = p.clear_cofactor();
+                    if !cleared.is_zero() {
+                        point = Some(cleared);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let p = point.ok_or("hash_to_g1: failed to find valid point after 256 attempts")?;
+        let mut out = Vec::new();
+        p.serialize_compressed(&mut out)
+            .map_err(|e| format!("serialize G1 point: {}", e))?;
+
+        let arr_id = create_byte_array(&mut ctx.vm_state.object_store, &out);
+        Ok(Value::Array(arr_id))
     });
 }
 
@@ -1248,6 +1550,51 @@ fn share_open_exp(ctx: ForeignFunctionContext) -> Result<Value, String> {
         Value::String(s) => s.as_str(),
         _ => return Err("curve_name must be a string".to_string()),
     };
+
+    // Special case: G2 threshold exponentiation for BLS12-381 threshold BLS signatures.
+    // This uses a separate trait (ThresholdExpG2) with its own wire protocol and registry.
+    #[cfg(feature = "avss")]
+    if curve_name == "bls12-381-g2" {
+        use crate::net::avss_engine::{Bls12381AvssMpcEngine, ThresholdExpG2};
+        use ark_bls12_381::G2Projective;
+        use ark_ec::{CurveGroup, PrimeGroup};
+        use ark_serialize::CanonicalSerialize;
+
+        let g2_engine: &Bls12381AvssMpcEngine = engine
+            .as_any()
+            .and_then(|any| any.downcast_ref::<Bls12381AvssMpcEngine>())
+            .ok_or_else(|| {
+                "G2 threshold exponentiation requires the BLS12-381 AVSS backend".to_string()
+            })?;
+
+        let gen = G2Projective::generator();
+        let mut gen_bytes = Vec::new();
+        gen.into_affine()
+            .serialize_compressed(&mut gen_bytes)
+            .map_err(|e| format!("serialize G2 generator: {}", e))?;
+
+        let result_bytes = g2_engine.open_share_in_exp_g2(data.as_bytes(), &gen_bytes)?;
+
+        let arr_id = ctx
+            .vm_state
+            .object_store
+            .create_array_with_capacity(result_bytes.len());
+        {
+            let arr = ctx
+                .vm_state
+                .object_store
+                .get_array_mut(arr_id)
+                .ok_or_else(|| "Failed to create result array".to_string())?;
+            for (i, byte) in result_bytes.into_iter().enumerate() {
+                arr.set(Value::I64(i as i64), Value::U8(byte));
+            }
+        }
+        return Ok(Value::Array(arr_id));
+    }
+    #[cfg(not(feature = "avss"))]
+    if curve_name == "bls12-381-g2" {
+        return Err("G2 threshold exponentiation requires the 'avss' feature".to_string());
+    }
 
     // Map curve name to the serialized generator point
     let generator_bytes = match curve_name {
