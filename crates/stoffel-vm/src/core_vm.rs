@@ -266,7 +266,7 @@ impl VirtualMachine {
 
             // Get the share bytes from the share value
             let (share_bytes, input_len) = match &ctx.args[1] {
-                Value::Share(_, data) => (data.clone(), 1usize),
+                Value::Share(_, data) => (data.as_bytes().to_vec(), 1usize),
                 _ => return Err("share_value must be a Value::Share".to_string()),
             };
 

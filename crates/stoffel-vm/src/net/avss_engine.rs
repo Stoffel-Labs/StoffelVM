@@ -15,8 +15,9 @@
 // Only tested pairs from `MpcCurveConfig` should be used; arbitrary pairs are not guaranteed
 // to work correctly with the AVSS protocol.
 
+use crate::net::client_store::ClientInputStore;
 use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
-use crate::net::mpc_engine::MpcEngine;
+use crate::net::mpc_engine::{MpcCapabilities, MpcEngine, MpcEngineClientOps};
 use ark_ec::CurveGroup;
 use ark_ff::{FftField, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -29,15 +30,15 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS};
+use stoffel_vm_types::core_types::{ShareData, ShareType, Value, BOOLEAN_SECRET_INT_BITS};
 use stoffelmpc_mpc::avss_mpc::{
-    AdkgNode as AvssMpcNode, AdkgNodeOpts as AvssMpcNodeOpts, AvssSessionId,
+    AvssMPCNode as AvssMpcNode, AvssMPCNodeOpts as AvssMpcNodeOpts, AvssSessionId,
     ProtocolType as AvssProtocolType,
 };
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
-use stoffelmpc_mpc::common::{MPCProtocol, ProtocolSessionId, SecretSharingScheme};
-use stoffelnet::network_utils::Network;
+use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, ProtocolSessionId, SecretSharingScheme};
+use stoffelnet::network_utils::{ClientId, Network};
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -105,7 +106,7 @@ fn insert_remote_avss_exp_partial(
 /// Inspect an incoming message and, if it carries an AVSS open-in-exp contribution
 /// (`AXOP` prefix), insert it into the accumulator registry and return `Ok(true)`.
 /// Returns `Ok(false)` for unrelated messages.
-pub(crate) fn try_handle_avss_open_exp_wire_message(
+pub fn try_handle_avss_open_exp_wire_message(
     authenticated_sender_id: usize,
     payload: &[u8],
 ) -> Result<bool, String> {
@@ -247,6 +248,7 @@ where
     /// * `net` - Network manager for communication
     /// * `sk_i` - This party's AVSS ECDH secret key for share encryption
     /// * `pk_map` - AVSS ECDH public keys from all parties
+    /// * `input_ids` - Client IDs that will provide inputs (empty if no clients)
     pub async fn new(
         instance_id: u64,
         party_id: usize,
@@ -255,10 +257,11 @@ where
         net: Arc<QuicNetworkManager>,
         sk_i: F,
         pk_map: Arc<Vec<G>>,
+        input_ids: Vec<ClientId>,
     ) -> Result<Arc<Self>, String> {
         // Create the AvssMpcNode via MPCProtocol::setup
-        let instance_id_u32 = u32::try_from(instance_id)
-            .map_err(|_| format!("instance_id {} exceeds u32", instance_id))?;
+        // AvssSessionId packs instance_id into 32 bits — truncate large u64 values.
+        let instance_id_u32 = instance_id as u32;
         let opts = AvssMpcNodeOpts::new(
             n,
             t,
@@ -274,7 +277,7 @@ where
             F,
             FeldmanShamirShare<F, G>,
             QuicNetworkManager,
-        >>::setup(party_id, opts, vec![])
+        >>::setup(party_id, opts, input_ids)
         .map_err(|e| format!("Failed to create AvssMpcNode: {:?}", e))?;
 
         Ok(Arc::new(Self {
@@ -326,8 +329,7 @@ where
     ) -> Result<AvssSessionId, String> {
         let counter16 = u16::try_from(counter)
             .map_err(|_| "AVSS local session counter overflowed u16".to_string())?;
-        let instance_id = u32::try_from(self.instance_id)
-            .map_err(|_| format!("instance_id {} exceeds u32", self.instance_id))?;
+        let instance_id = self.instance_id as u32;
         let slot24 = (slot24_seed & 0x00ff_0000) | u32::from(counter16);
         Ok(AvssSessionId::new(
             AvssProtocolType::Avss,
@@ -367,7 +369,7 @@ where
         net: Arc<QuicNetworkManager>,
         left_share_bytes: Vec<u8>,
         right_share_bytes: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<ShareData, String> {
         let left_share = Self::decode_feldman_share(&left_share_bytes)?;
         let right_share = Self::decode_feldman_share(&right_share_bytes)?;
 
@@ -382,7 +384,7 @@ where
             .into_iter()
             .next()
             .ok_or_else(|| "Multiplication returned no result".to_string())?;
-        Self::encode_feldman_share(&product)
+        Self::share_to_share_data(&product)
     }
 
     async fn broadcast_open_registry_payload(&self, payload: Vec<u8>) -> Result<(), String> {
@@ -622,6 +624,127 @@ where
             self.instance_id, self.party_id, self.n, self.t
         );
         Ok(())
+    }
+
+    /// Returns a handle to the inner MPC node for direct access (e.g., InputServer init).
+    pub fn node_handle(&self) -> &Arc<Mutex<AvssMpcNode<F, Avid<AvssSessionId>, G>>> {
+        &self.avss_node
+    }
+
+    /// Run cooperative preprocessing to generate random shares and Beaver triples.
+    /// Run cooperative preprocessing to generate random shares and Beaver triples.
+    ///
+    /// This clones the inner node so that preprocessing can run concurrently
+    /// with the message processing loop (which also needs the node lock for
+    /// `process()`). Both clones share `Arc<Mutex<>>` internal state
+    /// (preprocessing_material, shares) so results are visible to either.
+    pub async fn preprocess(&self) -> Result<(), String> {
+        let mut node_clone = {
+            let node = self.avss_node.lock().await;
+            node.clone()
+        };
+        let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+        PreprocessingMPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::run_preprocessing(
+            &mut node_clone,
+            self.net.clone(),
+            &mut rng,
+        )
+        .await
+        .map_err(|e| format!("AVSS preprocessing failed: {:?}", e))
+    }
+
+    // ========================================================================
+    // Client Input/Output Support
+    // ========================================================================
+
+    /// Get all client input shares after waiting for them to arrive.
+    pub async fn get_all_client_inputs(
+        &self,
+    ) -> Result<HashMap<ClientId, Vec<FeldmanShamirShare<F, G>>>, String> {
+        self.wait_for_inputs().await
+    }
+
+    /// Wait for all client inputs to arrive via the InputServer protocol.
+    async fn wait_for_inputs(
+        &self,
+    ) -> Result<HashMap<ClientId, Vec<FeldmanShamirShare<F, G>>>, String> {
+        let mut node = self.avss_node.lock().await;
+        node.input_server
+            .wait_for_all_inputs(Duration::from_secs(30))
+            .await
+            .map_err(|e| format!("Failed to wait for inputs: {:?}", e))
+    }
+
+    /// Get the list of client IDs that have registered inputs.
+    pub async fn get_client_ids(&self) -> Vec<ClientId> {
+        match self.wait_for_inputs().await {
+            Ok(map) => map.keys().copied().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Copy all client input shares into the global ClientInputStore.
+    pub async fn hydrate_client_inputs(
+        &self,
+        store: &ClientInputStore,
+    ) -> Result<usize, String> {
+        let all_inputs = self.get_all_client_inputs().await?;
+        let count = all_inputs.len();
+        for (client_id, shares) in all_inputs {
+            store.store_client_input_feldman(client_id, shares);
+        }
+        Ok(count)
+    }
+
+    /// Copy specific client input shares into the global ClientInputStore.
+    pub async fn hydrate_client_inputs_for(
+        &self,
+        store: &ClientInputStore,
+        client_ids: &[ClientId],
+    ) -> Result<usize, String> {
+        let all_inputs = self.get_all_client_inputs().await?;
+        let mut count = 0;
+        for &client_id in client_ids {
+            if let Some(shares) = all_inputs.get(&client_id) {
+                store.store_client_input_feldman(client_id, shares.clone());
+                count += 1;
+            } else {
+                tracing::warn!("No input shares for client {}", client_id);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Send output shares to a client for reconstruction.
+    pub async fn send_output_to_client_async_impl(
+        &self,
+        client_id: ClientId,
+        shares_bytes: &[u8],
+        input_len: usize,
+    ) -> Result<(), String> {
+        let shares: Vec<FeldmanShamirShare<F, G>> = if input_len == 1 {
+            let single_share: FeldmanShamirShare<F, G> =
+                CanonicalDeserialize::deserialize_compressed(shares_bytes)
+                    .map_err(|e| format!("Failed to deserialize single share: {:?}", e))?;
+            vec![single_share]
+        } else {
+            CanonicalDeserialize::deserialize_compressed(shares_bytes)
+                .map_err(|e| format!("Failed to deserialize shares: {:?}", e))?
+        };
+
+        if shares.len() != input_len {
+            return Err(format!(
+                "Share count mismatch: got {}, expected {}",
+                shares.len(),
+                input_len
+            ));
+        }
+
+        let node = self.avss_node.lock().await;
+        node.output_server
+            .init(client_id, shares, input_len, self.net.clone())
+            .await
+            .map_err(|e| format!("OutputServer.init failed: {:?}", e))
     }
 
     /// Generate a new random AVSS share and store it under the given key name.
@@ -899,6 +1022,25 @@ where
             .map_err(|e| format!("deserialize FeldmanShamirShare: {}", e))
     }
 
+    /// Convert a FeldmanShamirShare into a `ShareData::Feldman` with extracted commitments.
+    fn share_to_share_data(share: &FeldmanShamirShare<F, G>) -> Result<ShareData, String> {
+        let data = Self::encode_feldman_share(share)?;
+
+        let commitments = share
+            .commitments
+            .iter()
+            .map(|c| {
+                let mut buf = Vec::new();
+                c.into_affine()
+                    .serialize_compressed(&mut buf)
+                    .map_err(|e| format!("serialize commitment: {}", e))?;
+                Ok(buf)
+            })
+            .collect::<Result<Vec<Vec<u8>>, String>>()?;
+
+        Ok(ShareData::Feldman { data, commitments })
+    }
+
     /// Create AVSS shares for a secret value (generates Feldman-verifiable shares for all parties).
     ///
     /// Returns this party's share.
@@ -993,7 +1135,7 @@ where
         Ok(())
     }
 
-    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<Vec<u8>, String> {
+    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<ShareData, String> {
         let secret = match (ty, clear) {
             (ShareType::SecretInt { .. }, Value::I64(v)) => Self::field_from_i64(*v),
             (
@@ -1021,10 +1163,10 @@ where
         let share = crate::net::block_on_current(
             self.run_input_share_round(dealer_id, session_id, secret),
         )?;
-        Self::encode_feldman_share(&share)
+        Self::share_to_share_data(&share)
     }
 
-    fn multiply_share(&self, _ty: ShareType, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
+    fn multiply_share(&self, _ty: ShareType, left: &[u8], right: &[u8]) -> Result<ShareData, String> {
         let avss_node = self.avss_node.clone();
         let net = self.net.clone();
         let left_bytes = left.to_vec();
@@ -1158,16 +1300,23 @@ where
         F::CURVE_CONFIG
     }
 
-    fn capabilities(&self) -> crate::net::mpc_engine::MpcCapabilities {
-        use crate::net::mpc_engine::MpcCapabilities;
+    fn capabilities(&self) -> MpcCapabilities {
         MpcCapabilities::MULTIPLICATION
             | MpcCapabilities::OPEN_IN_EXP
             | MpcCapabilities::ELLIPTIC_CURVES
+            | MpcCapabilities::CLIENT_INPUT
     }
 
-    fn random_share(&self, _ty: ShareType) -> Result<Vec<u8>, String> {
-        let share = crate::net::block_on_current(self.generate_random_share("__random_share__"))?;
-        Self::encode_feldman_share(&share)
+    fn random_share(&self, _ty: ShareType) -> Result<ShareData, String> {
+        // Use the same coordinated dealer pattern as input_share so all
+        // parties participate in the SAME AVSS session and get shares of
+        // the SAME random secret (with identical commitments).
+        let (dealer_id, session_id) = self.allocate_input_share_session()?;
+        let secret = F::rand(&mut ark_std::rand::rngs::StdRng::from_entropy());
+        let share = crate::net::block_on_current(
+            self.run_input_share_round(dealer_id, session_id, secret),
+        )?;
+        Self::share_to_share_data(&share)
     }
 
     fn open_share_in_exp(
@@ -1179,8 +1328,67 @@ where
         self.open_share_in_exp_impl(ty, share_bytes, generator_bytes)
     }
 
+    fn send_output_to_client(
+        &self,
+        client_id: ClientId,
+        shares: &[u8],
+        input_len: usize,
+    ) -> Result<(), String> {
+        crate::net::block_on_current(
+            self.send_output_to_client_async_impl(client_id, shares, input_len),
+        )
+    }
+
+    fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> {
+        Some(self)
+    }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+}
+
+// ============================================================================
+// MpcEngineClientOps Implementation
+// ============================================================================
+
+impl<F, G> MpcEngineClientOps for AvssMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
+{
+    fn get_client_ids_sync(&self) -> Vec<ClientId> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                #[allow(deprecated)]
+                match handle.runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(|| handle.block_on(self.get_client_ids()))
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok();
+                rt.map(|rt| rt.block_on(self.get_client_ids()))
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    fn hydrate_client_inputs_sync(&self, store: &ClientInputStore) -> Result<usize, String> {
+        crate::net::block_on_current(self.hydrate_client_inputs(store))
+    }
+
+    fn hydrate_client_inputs_for_sync(
+        &self,
+        store: &ClientInputStore,
+        client_ids: &[ClientId],
+    ) -> Result<usize, String> {
+        crate::net::block_on_current(self.hydrate_client_inputs_for(store, client_ids))
     }
 }
 
@@ -1745,10 +1953,11 @@ mod tests {
             net.clone(),
             Fr::from(11u64),
             pk_map.clone(),
+            vec![],
         )
         .await
         .expect("engine0");
-        let e1 = AvssMpcEngine::<Fr, G1>::new(instance_id, 1, n, t, net, Fr::from(13u64), pk_map)
+        let e1 = AvssMpcEngine::<Fr, G1>::new(instance_id, 1, n, t, net, Fr::from(13u64), pk_map, vec![])
             .await
             .expect("engine1");
 

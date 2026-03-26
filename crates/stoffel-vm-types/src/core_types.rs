@@ -388,6 +388,59 @@ impl Hash for ShareType {
     }
 }
 
+/// Backing data for a secret share, distinguishing opaque bytes from Feldman
+/// shares that carry extractable commitments.
+///
+/// When the AVSS backend produces a `FeldmanShamirShare`, the commitments
+/// (where `commitment[0] = g^secret` is the public key) are stored alongside
+/// the serialized share bytes. This allows bytecode programs to access
+/// commitments via `Share.get_commitment(share, index)`.
+///
+/// The HoneyBadger backend produces `Opaque` shares (no commitments).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ShareData {
+    /// Opaque share bytes (e.g., HoneyBadger RobustShare)
+    Opaque(Vec<u8>),
+    /// Feldman share with extractable commitments (AVSS)
+    Feldman {
+        /// Full serialized FeldmanShamirShare (used by engine for MPC ops)
+        data: Vec<u8>,
+        /// Extracted Feldman commitments — commitment\[0\] is the public key
+        commitments: Vec<Vec<u8>>,
+    },
+}
+
+impl ShareData {
+    /// Share bytes for MPC engine operations (multiply, open, etc.)
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            ShareData::Opaque(b) => b,
+            ShareData::Feldman { data, .. } => data,
+        }
+    }
+
+    /// Consume and return the share bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        match self {
+            ShareData::Opaque(b) => b,
+            ShareData::Feldman { data, .. } => data,
+        }
+    }
+
+    /// Feldman commitments, if available.
+    pub fn commitments(&self) -> Option<&[Vec<u8>]> {
+        match self {
+            ShareData::Opaque(_) => None,
+            ShareData::Feldman { commitments, .. } => Some(commitments),
+        }
+    }
+
+    /// Whether this share carries Feldman commitments.
+    pub fn has_commitments(&self) -> bool {
+        matches!(self, ShareData::Feldman { .. })
+    }
+}
+
 /// Value types supported by the VM
 ///
 /// This enum represents all possible values that can be manipulated by the VM.
@@ -431,8 +484,8 @@ pub enum Value {
     Closure(Arc<Closure>),
     /// Unit/void/nil value
     Unit,
-    /// Secret shared value (for SMPC) TODO: Change
-    Share(ShareType, Vec<u8>),
+    /// Secret shared value (for SMPC)
+    Share(ShareType, ShareData),
     /// Marker for a deferred reveal operation (auto-batching optimization)
     /// Contains index into the VM's reveal batcher pending queue
     PendingReveal(usize),

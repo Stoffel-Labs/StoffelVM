@@ -10,6 +10,13 @@ use std::collections::BTreeMap;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelnet::network_utils::ClientId;
 
+#[cfg(feature = "avss")]
+use ark_ec::CurveGroup;
+#[cfg(feature = "avss")]
+use ark_ff::{FftField, PrimeField};
+#[cfg(feature = "avss")]
+use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
+
 /// A single entry in the client store, representing all shares from one client
 #[derive(Debug, Clone)]
 pub struct ClientInputEntry {
@@ -179,6 +186,78 @@ impl ClientInputStore {
         let entries = self.entries.read();
         entries.keys().copied().collect()
     }
+
+    /// Store typed Feldman shares from a client (AVSS backend).
+    #[cfg(feature = "avss")]
+    pub fn store_client_input_feldman<F, G>(
+        &self,
+        client_id: ClientId,
+        shares: Vec<FeldmanShamirShare<F, G>>,
+    ) where
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
+    {
+        let mut serialized = Vec::with_capacity(shares.len());
+        for (i, share) in shares.into_iter().enumerate() {
+            let mut bytes = Vec::new();
+            match share.serialize_compressed(&mut bytes) {
+                Ok(()) => serialized.push(bytes),
+                Err(e) => {
+                    tracing::warn!(
+                        client_id = client_id,
+                        share_index = i,
+                        "Failed to serialize FeldmanShamirShare: {}",
+                        e
+                    );
+                }
+            }
+        }
+        self.store_client_input_bytes(client_id, serialized);
+    }
+
+    /// Retrieve typed Feldman shares for a specific client (AVSS backend).
+    #[cfg(feature = "avss")]
+    pub fn get_client_input_feldman<F, G>(
+        &self,
+        client_id: ClientId,
+    ) -> Option<Vec<FeldmanShamirShare<F, G>>>
+    where
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
+    {
+        let share_bytes = self.get_client_input_bytes(client_id)?;
+        let mut shares = Vec::with_capacity(share_bytes.len());
+        for (i, bytes) in share_bytes.iter().enumerate() {
+            match FeldmanShamirShare::<F, G>::deserialize_compressed(bytes.as_slice()) {
+                Ok(share) => shares.push(share),
+                Err(e) => {
+                    tracing::warn!(
+                        client_id = client_id,
+                        share_index = i,
+                        "Failed to deserialize FeldmanShamirShare: {}",
+                        e
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(shares)
+    }
+
+    /// Retrieve a specific typed Feldman share for a client by index (AVSS backend).
+    #[cfg(feature = "avss")]
+    pub fn get_client_share_feldman<F, G>(
+        &self,
+        client_id: ClientId,
+        index: usize,
+    ) -> Option<FeldmanShamirShare<F, G>>
+    where
+        F: FftField + PrimeField,
+        G: CurveGroup<ScalarField = F>,
+    {
+        let bytes = self.get_client_share_bytes(client_id, index)?;
+        FeldmanShamirShare::<F, G>::deserialize_compressed(bytes.as_slice()).ok()
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +265,9 @@ mod tests {
     use super::*;
     use ark_bls12_381::Fr;
     use stoffelmpc_mpc::common::SecretSharingScheme;
+
+    #[cfg(feature = "avss")]
+    use ark_bls12_381::G1Projective as G1;
 
     #[test]
     fn test_store_and_retrieve() {
@@ -222,6 +304,33 @@ mod tests {
         // Get specific share
         let share_1: RobustShare<Fr> = store.get_client_share(client_id, 1).unwrap();
         assert_eq!(share_1.share, shares[1].share);
+    }
+
+    #[test]
+    #[cfg(feature = "avss")]
+    fn test_store_and_retrieve_feldman() {
+        let store = ClientInputStore::new();
+        let client_id = 55;
+
+        let secret = Fr::from(42u64);
+        let mut rng = ark_std::test_rng();
+        let ids: Vec<usize> = (1..=5).collect();
+        let shares =
+            FeldmanShamirShare::<Fr, G1>::compute_shares(secret, 5, 1, Some(&ids), &mut rng).unwrap();
+
+        store.store_client_input_feldman(client_id, shares.clone());
+
+        assert!(store.has_client_input(client_id));
+        assert_eq!(store.get_client_input_count(client_id), shares.len());
+
+        let retrieved: Vec<FeldmanShamirShare<Fr, G1>> =
+            store.get_client_input_feldman(client_id).unwrap();
+        assert_eq!(retrieved.len(), shares.len());
+
+        // Verify individual share retrieval
+        let single: FeldmanShamirShare<Fr, G1> =
+            store.get_client_share_feldman(client_id, 0).unwrap();
+        assert_eq!(single.feldmanshare.share, shares[0].feldmanshare.share);
     }
 
     #[test]

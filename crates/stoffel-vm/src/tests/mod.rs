@@ -8,6 +8,8 @@ pub mod dkg_primitives;
 pub mod leader_bootnode_integration;
 #[cfg(feature = "hb_itest")]
 pub mod mpc_multiplication_integration;
+#[cfg(feature = "avss")]
+pub mod avss_keygen_program;
 pub mod p2p_integration;
 pub mod test_utils;
 #[cfg(feature = "hb_itest")]

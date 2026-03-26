@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use stoffelnet::network_utils::{Network, Node};
+use stoffelnet::network_utils::{ClientId, Network, Node};
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -509,7 +509,13 @@ where
     /// Create an AVSS engine using the collected public keys.
     ///
     /// Must be called after `exchange_public_keys()`.
-    pub async fn create_engine(&self) -> Result<Arc<AvssMpcEngine<F, G>>, String> {
+    ///
+    /// `input_ids` are sequential client indices (0..num_clients) used by the
+    /// AVSS InputServer protocol. Pass an empty vec if no clients will connect.
+    pub async fn create_engine(
+        &self,
+        input_ids: Vec<ClientId>,
+    ) -> Result<Arc<AvssMpcEngine<F, G>>, String> {
         let net = self.network.as_ref().ok_or("Server not started")?.clone();
         let pk_map = self
             .pk_map
@@ -525,6 +531,7 @@ where
             net,
             self.sk_i,
             pk_map,
+            input_ids,
         )
         .await
     }
@@ -620,6 +627,128 @@ where
         }
 
         Ok(msg_rx)
+    }
+
+    /// Spawn receive loops for both server and client connections with separate channels.
+    ///
+    /// Returns `(server_rx, client_rx)` where:
+    /// - `server_rx` receives `(party_id, raw_msg)` from peer parties
+    /// - `client_rx` receives `(client_id, raw_msg)` from connected clients
+    ///
+    /// Server messages are routed through the engine's message processor.
+    /// Client messages are forwarded raw for the caller to route through the
+    /// AVSS node's `process()` with appropriate sender_id remapping.
+    pub async fn spawn_message_loops_split(
+        &self,
+        engine: Arc<AvssMpcEngine<F, G>>,
+    ) -> Result<
+        (
+            mpsc::Receiver<(usize, Vec<u8>)>,
+            mpsc::Receiver<(usize, Vec<u8>)>,
+        ),
+        String,
+    > {
+        let net = self.network.as_ref().ok_or("Server not started")?.clone();
+
+        let (server_tx, server_rx) = mpsc::channel::<(usize, Vec<u8>)>(65536);
+        let (client_tx, client_rx) = mpsc::channel::<(usize, Vec<u8>)>(4096);
+
+        // Server connection receive loops
+        let connections = net.get_all_server_connections();
+        for (peer_id, conn) in &connections {
+            if *peer_id == self.node_id {
+                continue;
+            }
+            let peer_id = *peer_id;
+            let engine = engine.clone();
+            let tx = server_tx.clone();
+            let conn = conn.clone();
+            let net_clone = net.clone();
+            let shutdown_token = self.shutdown_token.clone();
+            let authenticated_sender_id = conn.remote_party_id().unwrap_or(peer_id);
+
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown_token.cancelled() => break,
+                        result = conn.receive() => {
+                            match result {
+                                Ok(data) => {
+                                    if let Ok(true) = crate::net::open_registry::try_handle_wire_message(authenticated_sender_id, &data) {
+                                        continue;
+                                    }
+                                    if let Ok(true) = crate::net::avss_engine::try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
+                                        continue;
+                                    }
+                                    if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {
+                                        let _ = tx.send((authenticated_sender_id, data)).await;
+                                        if !e.contains("deserialize") && !e.contains("process failed") {
+                                            error!(
+                                                "[AVSS] Party failed to process message from {}: {}",
+                                                authenticated_sender_id, e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("[AVSS] Connection to peer {} closed: {}", peer_id, e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Client connection receive loops — poll for new client connections
+        // and spawn a per-client receive task for each.
+        let scan_net = net.clone();
+        let shutdown_token = self.shutdown_token.clone();
+        let node_id = self.node_id;
+        tokio::spawn(async move {
+            let mut spawned_client_ids = HashSet::new();
+            loop {
+                for (client_id, conn) in scan_net.get_all_client_connections() {
+                    if !spawned_client_ids.insert(client_id) {
+                        continue;
+                    }
+                    info!(
+                        "[AVSS] Party {} spawning receive loop for client {}",
+                        node_id, client_id
+                    );
+                    let txx = client_tx.clone();
+                    let shutdown2 = shutdown_token.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = shutdown2.cancelled() => break,
+                                result = conn.receive() => {
+                                    match result {
+                                        Ok(data) => {
+                                            if let Err(e) = txx.send((client_id, data)).await {
+                                                warn!("[AVSS] Failed to forward client {} message: {}", client_id, e);
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("[AVSS] Client {} connection closed: {}", client_id, e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+        });
+
+        Ok((server_rx, client_rx))
     }
 
     /// Gracefully shut down the server, cancelling accept loop and message loops.

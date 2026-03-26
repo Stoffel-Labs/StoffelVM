@@ -4,7 +4,7 @@
 use crate::net::client_store::ClientInputStore;
 use crate::net::curve::{MpcCurveConfig, MpcFieldKind};
 use std::any::Any;
-use stoffel_vm_types::core_types::{ShareType, Value};
+use stoffel_vm_types::core_types::{ShareData, ShareType, Value};
 use stoffelnet::network_utils::ClientId;
 
 bitflags::bitflags! {
@@ -40,10 +40,10 @@ pub trait MpcEngine: Send + Sync {
     fn start(&self) -> Result<(), String>;
 
     /// Create a secret share from a clear value
-    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<Vec<u8>, String>;
+    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<ShareData, String>;
 
     /// Perform secure multiplication of two shares (requires MPC interaction)
-    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String>;
+    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<ShareData, String>;
 
     /// Reconstruct a secret from shares (requires collecting shares from other parties)
     /// This broadcasts to all parties - all parties learn the secret.
@@ -69,7 +69,7 @@ pub trait MpcEngine: Send + Sync {
     ///
     /// The engine uses its preprocessing pool (e.g. RanSha protocol) to produce
     /// jointly-random shares that no single party knows.
-    fn random_share(&self, _ty: ShareType) -> Result<Vec<u8>, String> {
+    fn random_share(&self, _ty: ShareType) -> Result<ShareData, String> {
         Err("random_share not implemented for this engine".to_string())
     }
 
@@ -200,7 +200,7 @@ pub trait AsyncMpcEngine: MpcEngine {
         ty: ShareType,
         left: &[u8],
         right: &[u8],
-    ) -> Result<Vec<u8>, String>;
+    ) -> Result<ShareData, String>;
 
     /// Reconstruct a secret from shares asynchronously
     async fn open_share_async(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String>;
@@ -218,7 +218,7 @@ pub trait AsyncMpcEngine: MpcEngine {
     }
 
     /// Generate random bytes as a secret-shared value (async).
-    async fn random_share_async(&self, ty: ShareType) -> Result<Vec<u8>, String> {
+    async fn random_share_async(&self, ty: ShareType) -> Result<ShareData, String> {
         self.random_share(ty)
     }
 

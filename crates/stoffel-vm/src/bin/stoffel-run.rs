@@ -7,7 +7,7 @@ use std::str::FromStr;
 use ark_ec::{CurveGroup, PrimeGroup};
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 use ark_ff::PrimeField;
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use serde::{Deserialize, Serialize};
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 use std::collections::HashSet;
@@ -17,10 +17,8 @@ use std::time::Duration;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm_types::core_types::Value;
 #[cfg(feature = "avss")]
-use stoffel_vm::net::avss_server::{
-    AvssQuicConfig, Bls12381AvssServer, Bn254AvssServer, Curve25519AvssServer, Ed25519AvssServer,
-};
-#[cfg(feature = "honeybadger")]
+use stoffel_vm::net::avss_server::AvssQuicConfig;
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffel_vm::net::curve::SupportedMpcField;
 #[cfg(feature = "honeybadger")]
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
@@ -152,14 +150,14 @@ impl Network for ClientNetworkAdapter {
 /// (0, 1, ...) back to transport-derived client IDs for send_to_client().
 /// The MPC protocol uses small indices (because session_id only has 8 bits),
 /// but the network layer needs transport-derived IDs to route messages.
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 struct ServerClientAdapter {
     inner: Arc<QuicNetworkManager>,
     /// Maps sequential index → transport-derived client ID
     client_id_map: Vec<ClientId>,
 }
 
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 #[async_trait::async_trait]
 impl Network for ServerClientAdapter {
     type NodeType = <QuicNetworkManager as Network>::NodeType;
@@ -383,24 +381,24 @@ async fn connect_to_all_servers(
     }
 }
 
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 const CLIENT_SET_SYNC_PREFIX: &[u8; 4] = b"CSS1";
 
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClientSetSyncMessage {
     sender_party_id: usize,
     client_ids: Vec<ClientId>,
 }
 
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 fn normalize_client_ids(mut ids: Vec<ClientId>) -> Vec<ClientId> {
     ids.sort_unstable();
     ids.dedup();
     ids
 }
 
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 fn encode_client_set_sync(msg: &ClientSetSyncMessage) -> Result<Vec<u8>, String> {
     let payload = bincode::serialize(msg)
         .map_err(|e| format!("Failed to serialize client-set sync payload: {}", e))?;
@@ -410,7 +408,7 @@ fn encode_client_set_sync(msg: &ClientSetSyncMessage) -> Result<Vec<u8>, String>
     Ok(out)
 }
 
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 fn decode_client_set_sync(bytes: &[u8]) -> Result<ClientSetSyncMessage, String> {
     if bytes.len() < CLIENT_SET_SYNC_PREFIX.len()
         || &bytes[..CLIENT_SET_SYNC_PREFIX.len()] != CLIENT_SET_SYNC_PREFIX
@@ -422,7 +420,7 @@ fn decode_client_set_sync(bytes: &[u8]) -> Result<ClientSetSyncMessage, String> 
         .map_err(|e| format!("Failed to deserialize client-set sync payload: {}", e))
 }
 
-#[cfg(feature = "honeybadger")]
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 async fn sync_client_set_across_parties(
     net: Arc<QuicNetworkManager>,
     my_id: usize,
@@ -1118,6 +1116,410 @@ where
                 .unwrap_or(idx);
             vm.state.client_store().store_client_input(transport_cid, shares);
             eprintln!("[party {}] Stored inputs for client {} (index {})", my_id, transport_cid, idx);
+        }
+    }
+
+    vm.state.set_mpc_engine(engine);
+    Ok(())
+}
+
+#[cfg(feature = "avss")]
+async fn setup_avss_party_for_curve<F, G>(
+    vm: &mut VirtualMachine,
+    net: Arc<QuicNetworkManager>,
+    my_id: usize,
+    n: usize,
+    t: usize,
+    instance_id: u64,
+    expected_client_count: Option<usize>,
+) -> Result<(), String>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
+    // ---- Phase 1: Wait for clients ----
+    let mut input_ids: Vec<ClientId> = Vec::new();
+
+    if let Some(expected_count) = expected_client_count {
+        if expected_count == 0 {
+            return Err("--wait-for-clients count must be greater than 0".to_string());
+        }
+
+        eprintln!(
+            "[party {}] Waiting for {} clients (AVSS)...",
+            my_id, expected_count
+        );
+
+        let mut accept_net = (*net).clone();
+        let accept_party_id = my_id;
+        tokio::spawn(async move {
+            loop {
+                match accept_net.accept().await {
+                    Ok(_) => {
+                        eprintln!("[party {}] Accepted client connection", accept_party_id);
+                    }
+                    Err(e) => {
+                        eprintln!("[party {}] Accept error: {}", accept_party_id, e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+
+        let connect_timeout = Duration::from_secs(600);
+        let check_interval = Duration::from_millis(250);
+        let start = std::time::Instant::now();
+
+        loop {
+            let mut connected_clients = net.clients();
+            connected_clients.sort_unstable();
+            connected_clients.dedup();
+
+            eprintln!(
+                "[party {}] {} of {} expected clients connected: {:?}",
+                my_id,
+                connected_clients.len(),
+                expected_count,
+                connected_clients
+            );
+
+            if connected_clients.len() > expected_count {
+                return Err(format!(
+                    "Expected exactly {} clients, but {} are connected: {:?}",
+                    expected_count,
+                    connected_clients.len(),
+                    connected_clients
+                ));
+            }
+
+            if connected_clients.len() == expected_count {
+                input_ids = connected_clients;
+                break;
+            }
+
+            if start.elapsed() > connect_timeout {
+                return Err(format!(
+                    "Timeout waiting for {} clients; connected so far: {:?}",
+                    expected_count,
+                    net.clients()
+                ));
+            }
+
+            tokio::time::sleep(check_interval).await;
+        }
+
+        eprintln!(
+            "[party {}] Using transport-derived input IDs: {:?}",
+            my_id, input_ids
+        );
+
+        sync_client_set_across_parties(net.clone(), my_id, n, &input_ids).await?;
+    }
+
+    // ---- Phase 2: ECDH key exchange over existing network ----
+    let mpc_input_ids: Vec<ClientId> = (0..input_ids.len()).collect();
+
+    // Generate ECDH key pair for AVSS payload confidentiality
+    use ark_ec::PrimeGroup as _;
+    use ark_std::rand::SeedableRng as _;
+    let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+    let sk_i = F::rand(&mut rng);
+    let pk_i: G = G::generator() * sk_i;
+
+    // Serialize our public key into an envelope: [party_id: u32][pk_bytes]
+    let mut pk_bytes = Vec::new();
+    pk_i.serialize_compressed(&mut pk_bytes)
+        .map_err(|e| format!("Failed to serialize ECDH public key: {:?}", e))?;
+    let mut envelope = Vec::with_capacity(4 + pk_bytes.len());
+    envelope.extend_from_slice(&(my_id as u32).to_le_bytes());
+    envelope.extend_from_slice(&pk_bytes);
+
+    eprintln!("[party {}] Exchanging ECDH public keys over existing network...", my_id);
+
+    // Broadcast our PK to all peers via existing connections
+    let connections = net.get_all_server_connections();
+    for (peer_id, conn) in &connections {
+        if *peer_id == my_id {
+            continue;
+        }
+        if let Err(e) = conn.send(&envelope).await {
+            eprintln!("[party {}] Failed to send PK to peer {}: {}", my_id, peer_id, e);
+        }
+    }
+
+    // Collect PKs from all peers
+    let mut pk_map: Vec<G> = vec![G::default(); n];
+    pk_map[my_id] = pk_i;
+    let mut received = 1usize;
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(my_id);
+
+    let (pk_tx, mut pk_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(n);
+
+    for (peer_id, conn) in &connections {
+        if *peer_id == my_id {
+            continue;
+        }
+        let peer_id = *peer_id;
+        let tx = pk_tx.clone();
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            match conn.receive().await {
+                Ok(data) => { let _ = tx.send((peer_id, data)).await; }
+                Err(e) => {
+                    eprintln!("[AVSS] Failed to receive PK from peer {}: {}", peer_id, e);
+                }
+            }
+        });
+    }
+    drop(pk_tx);
+
+    let pk_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while received < n {
+        let remaining = pk_deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, pk_rx.recv()).await {
+            Ok(Some((_peer_id, data))) => {
+                if data.len() < 4 {
+                    continue;
+                }
+                let sender_id = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+                if sender_id >= n || !seen.insert(sender_id) {
+                    continue;
+                }
+                match G::deserialize_compressed(&data[4..]) {
+                    Ok(pk) => {
+                        pk_map[sender_id] = pk;
+                        received += 1;
+                        eprintln!("[party {}] Received PK from party {} ({}/{})", my_id, sender_id, received, n);
+                    }
+                    Err(e) => {
+                        eprintln!("[party {}] Failed to deserialize PK from party {}: {:?}", my_id, sender_id, e);
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return Err(format!("Timeout during PK exchange: received {}/{} keys", received, n));
+            }
+        }
+    }
+
+    if received < n {
+        return Err(format!("PK exchange incomplete: received {}/{} keys", received, n));
+    }
+    eprintln!("[party {}] PK exchange complete ({} keys)", my_id, n);
+
+    let pk_map = Arc::new(pk_map);
+
+    // ---- Phase 3: Create engine directly with existing network ----
+    use stoffel_vm::net::avss_engine::AvssMpcEngine;
+    let engine = AvssMpcEngine::<F, G>::new(
+        instance_id,
+        my_id,
+        n,
+        t,
+        net.clone(),
+        sk_i,
+        pk_map,
+        mpc_input_ids,
+    )
+    .await
+    .map_err(|e| format!("Failed to create AVSS engine: {}", e))?;
+
+    engine
+        .start_async()
+        .await
+        .map_err(|e| format!("Failed to start AVSS engine: {}", e))?;
+
+    // ---- Phase 4: Spawn message loops on existing connections ----
+    // Server message loops
+    let (msg_tx, _server_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(65536);
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(4096);
+
+    for (peer_id, conn) in &connections {
+        if *peer_id == my_id {
+            continue;
+        }
+        let peer_id = *peer_id;
+        let engine = engine.clone();
+        let tx = msg_tx.clone();
+        let conn = conn.clone();
+        let net_clone = net.clone();
+        let authenticated_sender_id = conn.remote_party_id().unwrap_or(peer_id);
+        tokio::spawn(async move {
+            loop {
+                match conn.receive().await {
+                    Ok(data) => {
+                        if let Ok(true) = stoffel_vm::net::open_registry::try_handle_wire_message(authenticated_sender_id, &data) {
+                            continue;
+                        }
+                        if let Ok(true) = stoffel_vm::net::avss_engine::try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
+                            continue;
+                        }
+                        if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {
+                            let _ = tx.send((authenticated_sender_id, data)).await;
+                            if !e.contains("deserialize") && !e.contains("process failed") {
+                                eprintln!("[AVSS] Party failed to process message from {}: {}", authenticated_sender_id, e);
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Client connection monitor
+    let client_net = net.clone();
+    tokio::spawn(async move {
+        let mut spawned = std::collections::HashSet::new();
+        loop {
+            for (cid, conn) in client_net.get_all_client_connections() {
+                if !spawned.insert(cid) { continue; }
+                let txx = client_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => { if txx.send((cid, data)).await.is_err() { break; } }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+
+    // Route client messages through the AVSS node's process()
+    if !input_ids.is_empty() {
+        let client_id_to_index: std::collections::HashMap<ClientId, usize> = input_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, &tid)| (tid, idx))
+            .collect();
+
+        let processing_engine = engine.clone();
+        let processing_net = net.clone();
+        tokio::spawn(async move {
+            while let Some((client_id, raw_msg)) = client_rx.recv().await {
+                let mpc_sender_id = client_id_to_index
+                    .get(&client_id)
+                    .copied()
+                    .unwrap_or(client_id);
+                if let Err(e) = processing_engine
+                    .process_wrapped_message_with_network(
+                        mpc_sender_id,
+                        &raw_msg,
+                        processing_net.clone(),
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "[party {}] Failed to process client message from {} (idx {}): {:?}",
+                        processing_engine.party_id(),
+                        client_id,
+                        mpc_sender_id,
+                        e
+                    );
+                }
+            }
+        });
+    }
+
+    // ---- Phase 5: Preprocessing ----
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    eprintln!("[party {}] Starting AVSS preprocessing...", my_id);
+    engine.preprocess().await?;
+    eprintln!("[party {}] AVSS preprocessing complete!", my_id);
+
+    // ---- Phase 6: Client input initialization ----
+    if !input_ids.is_empty() {
+        let client_index_map: Vec<(usize, ClientId)> = input_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, &tid)| (idx, tid))
+            .collect();
+
+        let server_adapter = Arc::new(ServerClientAdapter {
+            inner: net.clone(),
+            client_id_map: client_index_map.iter().map(|(_, tid)| *tid).collect(),
+        });
+
+        eprintln!(
+            "[party {}] Initializing AVSS InputServer for {} clients...",
+            my_id,
+            client_index_map.len()
+        );
+        {
+            let mut node = engine.node_handle().lock().await;
+            for &(idx, _tid) in &client_index_map {
+                let local_shares = node
+                    .preprocessing_material
+                    .lock()
+                    .await
+                    .take_v_random_shares(1)
+                    .map_err(|e| {
+                        format!("Not enough random shares for client {}: {:?}", idx, e)
+                    })?;
+
+                node.input_server
+                    .init(idx, local_shares, 1, server_adapter.clone())
+                    .await
+                    .map_err(|e| {
+                        format!("Failed to init InputServer for client {}: {:?}", idx, e)
+                    })?;
+                eprintln!(
+                    "[party {}] InputServer initialized for client index {}",
+                    my_id, idx
+                );
+            }
+        }
+
+        // Signal readiness to clients
+        eprintln!(
+            "[party {}] Sending INST to {} clients...",
+            my_id,
+            client_index_map.len()
+        );
+        for &(idx, tid) in &client_index_map {
+            let mut inst_msg = Vec::with_capacity(13);
+            inst_msg.extend_from_slice(b"INST");
+            inst_msg.extend_from_slice(&instance_id.to_le_bytes());
+            inst_msg.push(idx as u8);
+            if let Err(e) = net.send_to_client(tid, &inst_msg).await {
+                eprintln!(
+                    "[party {}] Failed to send INST to client {}: {:?}",
+                    my_id, tid, e
+                );
+            }
+        }
+
+        // Wait for all client inputs
+        eprintln!(
+            "[party {}] Waiting for all client inputs (timeout=600s)...",
+            my_id
+        );
+        let client_inputs = {
+            let mut node = engine.node_handle().lock().await;
+            node.input_server
+                .wait_for_all_inputs(Duration::from_secs(600))
+                .await
+                .map_err(|e| format!("Failed to receive client inputs: {:?}", e))?
+        };
+
+        for (idx, shares) in client_inputs {
+            let transport_cid = client_index_map
+                .iter()
+                .find(|(i, _)| *i == idx)
+                .map(|(_, tid)| *tid)
+                .unwrap_or(idx);
+            vm.state
+                .client_store()
+                .store_client_input_feldman(transport_cid, shares);
+            eprintln!(
+                "[party {}] Stored inputs for client {} (index {})",
+                my_id, transport_cid, idx
+            );
         }
     }
 
@@ -1855,79 +2257,38 @@ async fn main() {
                     curve_config.name()
                 );
 
-                // Macro to avoid duplicating AVSS setup for each curve
                 macro_rules! setup_avss {
-                    ($server_type:ty) => {{
-                        let mut avss_server = <$server_type>::new(
+                    ($F:ty, $G:ty) => {{
+                        if let Err(e) = setup_avss_party_for_curve::<$F, $G>(
+                            &mut vm,
+                            net.clone(),
                             my_id,
                             n,
                             t,
                             instance_id,
-                            (*net).clone(),
-                            AvssQuicConfig::default(),
-                        );
-
-                        // Start the server (converts network builder to Arc)
-                        let _avss_net = match avss_server.start() {
-                            Ok(n) => n,
-                            Err(e) => {
-                                eprintln!("[party {}] Failed to start AVSS server: {}", my_id, e);
-                                exit(13);
-                            }
-                        };
-
-                        // Ensure server lifecycle mirrors HoneyBadger setup.
-                        if let Err(e) = avss_server.connect_to_peers().await {
-                            eprintln!("[party {}] Failed to connect AVSS peers: {}", my_id, e);
+                            expected_client_count,
+                        )
+                        .await
+                        {
+                            eprintln!("[party {}] AVSS setup failed: {}", my_id, e);
                             exit(13);
                         }
-
-                        // Exchange ECDH public keys
-                        eprintln!("[party {}] Exchanging ECDH public keys...", my_id);
-                        match avss_server.exchange_public_keys().await {
-                            Ok(pk_map) => {
-                                eprintln!(
-                                    "[party {}] PK exchange complete ({} keys collected)",
-                                    my_id,
-                                    pk_map.len()
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("[party {}] PK exchange failed: {}", my_id, e);
-                                exit(14);
-                            }
-                        }
-
-                        // Create AVSS engine
-                        let engine = match avss_server.create_engine().await {
-                            Ok(e) => e,
-                            Err(e) => {
-                                eprintln!("[party {}] Failed to create AVSS engine: {}", my_id, e);
-                                exit(14);
-                            }
-                        };
-
-                        // Start the engine
-                        if let Err(e) = engine.start_async().await {
-                            eprintln!("[party {}] Failed to start AVSS engine: {}", my_id, e);
-                            exit(14);
-                        }
-
-                        // Spawn AVSS message receive/process loops
-                        if let Err(e) = avss_server.spawn_message_loops(engine.clone()).await {
-                            eprintln!("[party {}] Failed to spawn message loops: {}", my_id, e);
-                            exit(14);
-                        }
-
-                        vm.state.set_mpc_engine(engine);
                     }};
                 }
 
                 match curve_config {
-                    MpcCurveConfig::Bls12_381 => setup_avss!(Bls12381AvssServer),
-                    MpcCurveConfig::Bn254 => setup_avss!(Bn254AvssServer),
-                    MpcCurveConfig::Curve25519 => setup_avss!(Curve25519AvssServer),
-                    MpcCurveConfig::Ed25519 => setup_avss!(Ed25519AvssServer),
+                    MpcCurveConfig::Bls12_381 => {
+                        setup_avss!(ark_bls12_381::Fr, ark_bls12_381::G1Projective)
+                    }
+                    MpcCurveConfig::Bn254 => {
+                        setup_avss!(ark_bn254::Fr, ark_bn254::G1Projective)
+                    }
+                    MpcCurveConfig::Curve25519 => {
+                        setup_avss!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
+                    }
+                    MpcCurveConfig::Ed25519 => {
+                        setup_avss!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective)
+                    }
                 }
 
                 eprintln!(
@@ -1944,10 +2305,10 @@ async fn main() {
     match vm.execute(&agreed_entry) {
         Ok(result) => {
             // Auto-reveal if the program returned an unrevealed share
-            let result = if let Value::Share(ty, ref data) = result {
+            let result = if let Value::Share(ty, ref sd) = result {
                 if let Some(engine) = vm.state.mpc_engine() {
                     eprintln!("Program returned a secret share, revealing...");
-                    match engine.open_share(ty, data) {
+                    match engine.open_share(ty, sd.as_bytes()) {
                         Ok(revealed) => revealed,
                         Err(e) => {
                             eprintln!("Failed to reveal returned share: {}", e);
@@ -1960,7 +2321,32 @@ async fn main() {
             } else {
                 result
             };
-            println!("Program returned: {:?}", result);
+            // Pretty-print the result
+            match &result {
+                Value::Array(arr_id) => {
+                    if let Some(arr) = vm.state.object_store.get_array(*arr_id) {
+                        let len = arr.length();
+                        // Check if it's a byte array (all U8 values)
+                        let mut bytes = Vec::with_capacity(len);
+                        let mut is_byte_array = true;
+                        for i in 0..len {
+                            match arr.get(&Value::I64(i as i64)) {
+                                Some(Value::U8(b)) => bytes.push(*b),
+                                _ => { is_byte_array = false; break; }
+                            }
+                        }
+                        if is_byte_array && !bytes.is_empty() {
+                            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                            println!("Program returned: byte[{}] 0x{}", bytes.len(), hex);
+                        } else {
+                            println!("Program returned: {:?}", result);
+                        }
+                    } else {
+                        println!("Program returned: {:?}", result);
+                    }
+                }
+                _ => println!("Program returned: {:?}", result),
+            }
         }
         Err(err) => {
             eprintln!("Execution error in '{}': {}", agreed_entry, err);

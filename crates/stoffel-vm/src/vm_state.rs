@@ -25,7 +25,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use stoffel_vm_types::activations::{ActivationRecord, ActivationRecordPool};
 use stoffel_vm_types::core_types::{
-    Closure, ForeignObjectStorage, ObjectStore, ShareType, Upvalue, Value, F64,
+    Closure, ForeignObjectStorage, ObjectStore, ShareData, ShareType, Upvalue, Value, F64,
 };
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::{Instruction, ResolvedInstruction};
@@ -623,8 +623,8 @@ impl VMState {
                 // Check if this is a Share * Share multiplication (requires MPC)
                 match (left, right) {
                     (
-                        Value::Share(ty @ ShareType::SecretInt { .. }, left_data),
-                        Value::Share(ShareType::SecretInt { .. }, right_data),
+                        Value::Share(ty @ ShareType::SecretInt { .. }, sd1),
+                        Value::Share(ShareType::SecretInt { .. }, sd2),
                     ) => {
                         // Verify MPC engine is available
                         let engine = self.mpc_engine().ok_or("MPC engine not configured")?;
@@ -633,14 +633,14 @@ impl VMState {
                         }
                         Ok(Some(PendingMpcOperation::MultiplyShare {
                             share_type: *ty,
-                            left_data: left_data.clone(),
-                            right_data: right_data.clone(),
+                            left_data: sd1.as_bytes().to_vec(),
+                            right_data: sd2.as_bytes().to_vec(),
                             dest_reg: *dest,
                         }))
                     }
                     (
-                        Value::Share(ty @ ShareType::SecretFixedPoint { .. }, left_data),
-                        Value::Share(ShareType::SecretFixedPoint { .. }, right_data),
+                        Value::Share(ty @ ShareType::SecretFixedPoint { .. }, sd1),
+                        Value::Share(ShareType::SecretFixedPoint { .. }, sd2),
                     ) => {
                         let engine = self.mpc_engine().ok_or("MPC engine not configured")?;
                         if !engine.is_ready() {
@@ -648,8 +648,8 @@ impl VMState {
                         }
                         Ok(Some(PendingMpcOperation::MultiplyShare {
                             share_type: *ty,
-                            left_data: left_data.clone(),
-                            right_data: right_data.clone(),
+                            left_data: sd1.as_bytes().to_vec(),
+                            right_data: sd2.as_bytes().to_vec(),
                             dest_reg: *dest,
                         }))
                     }
@@ -1074,24 +1074,24 @@ impl VMState {
         match value {
             Value::I64(_) => {
                 let ty = ShareType::default_secret_int();
-                let bytes = engine
+                let share_data = engine
                     .input_share(ty, value)
                     .map_err(|e| format!("MPC input_share failed: {}", e))?;
-                Ok(Value::Share(ty, bytes))
+                Ok(Value::Share(ty, share_data))
             }
             Value::Float(_) => {
                 let ty = ShareType::default_secret_fixed_point();
-                let bytes = engine
+                let share_data = engine
                     .input_share(ty, value)
                     .map_err(|e| format!("MPC input_share failed: {}", e))?;
-                Ok(Value::Share(ty, bytes))
+                Ok(Value::Share(ty, share_data))
             }
             Value::Bool(_) => {
                 let ty = ShareType::boolean();
-                let bytes = engine
+                let share_data = engine
                     .input_share(ty, value)
                     .map_err(|e| format!("MPC input_share failed: {}", e))?;
-                Ok(Value::Share(ty, bytes))
+                Ok(Value::Share(ty, share_data))
             }
             _ => Err(
                 "Only primitive types (Int, Float, Bool) can be converted to shares".to_string(),
@@ -1110,11 +1110,11 @@ impl VMState {
         }
 
         match value {
-            Value::Share(ty @ ShareType::SecretInt { .. }, data) => engine
-                .open_share(*ty, data)
+            Value::Share(ty @ ShareType::SecretInt { .. }, sd) => engine
+                .open_share(*ty, sd.as_bytes())
                 .map_err(|e| format!("MPC open_share failed: {}", e)),
-            Value::Share(ty @ ShareType::SecretFixedPoint { .. }, data) => engine
-                .open_share(*ty, data)
+            Value::Share(ty @ ShareType::SecretFixedPoint { .. }, sd) => engine
+                .open_share(*ty, sd.as_bytes())
                 .map_err(|e| format!("MPC open_share failed: {}", e)),
             _ => Err("Invalid share type for conversion to clear value".to_string()),
         }
@@ -1139,9 +1139,9 @@ impl VMState {
         }
 
         match value {
-            Value::Share(ty, data) => {
+            Value::Share(ty, sd) => {
                 // Queue the reveal instead of executing immediately
-                let index = self.reveal_batcher.queue(*ty, data.clone(), dest_reg);
+                let index = self.reveal_batcher.queue(*ty, sd.as_bytes().to_vec(), dest_reg);
 
                 // Check if we should auto-flush (hit max pending)
                 if self.reveal_batcher.should_auto_flush() {
@@ -1246,43 +1246,43 @@ impl VMState {
             (Value::U64(a), Value::U64(b)) => Value::U64(a + *b),
             // Share + Share (offline addition)
             (
-                Value::Share(ty_left @ ShareType::SecretInt { .. }, data1),
-                Value::Share(ty_right @ ShareType::SecretInt { .. }, data2),
+                Value::Share(ty_left @ ShareType::SecretInt { .. }, sd1),
+                Value::Share(ty_right @ ShareType::SecretInt { .. }, sd2),
             ) => {
                 if ty_left != ty_right {
                     return Err("Share type mismatch in ADD operation".to_string());
                 }
-                let bytes = self.secret_share_add(*ty_left, data1, data2)?;
-                Value::Share(*ty_left, bytes)
+                let bytes = self.secret_share_add(*ty_left, sd1.as_bytes(), sd2.as_bytes())?;
+                Value::Share(*ty_left, ShareData::Opaque(bytes))
             }
             (
-                Value::Share(ty_left @ ShareType::SecretFixedPoint { .. }, data1),
-                Value::Share(ty_right @ ShareType::SecretFixedPoint { .. }, data2),
+                Value::Share(ty_left @ ShareType::SecretFixedPoint { .. }, sd1),
+                Value::Share(ty_right @ ShareType::SecretFixedPoint { .. }, sd2),
             ) => {
                 if ty_left != ty_right {
                     return Err("Share type mismatch in ADD operation".to_string());
                 }
-                let bytes = self.secret_share_add(*ty_left, data1, data2)?;
-                Value::Share(*ty_left, bytes)
+                let bytes = self.secret_share_add(*ty_left, sd1.as_bytes(), sd2.as_bytes())?;
+                Value::Share(*ty_left, ShareData::Opaque(bytes))
             }
             // Share + Scalar (offline - local computation)
-            (Value::Share(ty @ ShareType::SecretInt { .. }, data), Value::I64(scalar)) => {
+            (Value::Share(ty @ ShareType::SecretInt { .. }, sd), Value::I64(scalar)) => {
                 tracing::trace!("ADD Share+Scalar");
-                let bytes = self.secret_share_add_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+                let bytes = self.secret_share_add_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
-            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretInt { .. }, data)) => {
+            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretInt { .. }, sd)) => {
                 tracing::trace!("ADD Scalar+Share");
-                let bytes = self.secret_share_add_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+                let bytes = self.secret_share_add_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
-            (Value::Share(ty @ ShareType::SecretFixedPoint { .. }, data), Value::I64(scalar)) => {
-                let bytes = self.secret_share_add_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+            (Value::Share(ty @ ShareType::SecretFixedPoint { .. }, sd), Value::I64(scalar)) => {
+                let bytes = self.secret_share_add_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
-            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretFixedPoint { .. }, data)) => {
-                let bytes = self.secret_share_add_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretFixedPoint { .. }, sd)) => {
+                let bytes = self.secret_share_add_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
             _ => return Err("Type error in ADD operation".to_string()),
         };
@@ -1329,42 +1329,42 @@ impl VMState {
             (Value::U64(a), Value::U64(b)) => Value::U64(a.saturating_sub(*b)),
             // Share - Share (offline subtraction)
             (
-                Value::Share(ty_left @ ShareType::SecretInt { .. }, data1),
-                Value::Share(ty_right @ ShareType::SecretInt { .. }, data2),
+                Value::Share(ty_left @ ShareType::SecretInt { .. }, sd1),
+                Value::Share(ty_right @ ShareType::SecretInt { .. }, sd2),
             ) => {
                 if ty_left != ty_right {
                     return Err("Share type mismatch in SUB operation".to_string());
                 }
-                let bytes = self.secret_share_sub(*ty_left, data1, data2)?;
-                Value::Share(*ty_left, bytes)
+                let bytes = self.secret_share_sub(*ty_left, sd1.as_bytes(), sd2.as_bytes())?;
+                Value::Share(*ty_left, ShareData::Opaque(bytes))
             }
             (
-                Value::Share(ty_left @ ShareType::SecretFixedPoint { .. }, data1),
-                Value::Share(ty_right @ ShareType::SecretFixedPoint { .. }, data2),
+                Value::Share(ty_left @ ShareType::SecretFixedPoint { .. }, sd1),
+                Value::Share(ty_right @ ShareType::SecretFixedPoint { .. }, sd2),
             ) => {
                 if ty_left != ty_right {
                     return Err("Share type mismatch in SUB operation".to_string());
                 }
-                let bytes = self.secret_share_sub(*ty_left, data1, data2)?;
-                Value::Share(*ty_left, bytes)
+                let bytes = self.secret_share_sub(*ty_left, sd1.as_bytes(), sd2.as_bytes())?;
+                Value::Share(*ty_left, ShareData::Opaque(bytes))
             }
             // Share - Scalar (offline - local computation)
-            (Value::Share(ty @ ShareType::SecretInt { .. }, data), Value::I64(scalar)) => {
-                let bytes = self.secret_share_sub_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+            (Value::Share(ty @ ShareType::SecretInt { .. }, sd), Value::I64(scalar)) => {
+                let bytes = self.secret_share_sub_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
             // Scalar - Share (offline - local computation)
-            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretInt { .. }, data)) => {
-                let bytes = self.scalar_sub_secret_share(*ty, *scalar, data)?;
-                Value::Share(*ty, bytes)
+            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretInt { .. }, sd)) => {
+                let bytes = self.scalar_sub_secret_share(*ty, *scalar, sd.as_bytes())?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
-            (Value::Share(ty @ ShareType::SecretFixedPoint { .. }, data), Value::I64(scalar)) => {
-                let bytes = self.secret_share_sub_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+            (Value::Share(ty @ ShareType::SecretFixedPoint { .. }, sd), Value::I64(scalar)) => {
+                let bytes = self.secret_share_sub_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
-            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretFixedPoint { .. }, data)) => {
-                let bytes = self.scalar_sub_secret_share(*ty, *scalar, data)?;
-                Value::Share(*ty, bytes)
+            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretFixedPoint { .. }, sd)) => {
+                let bytes = self.scalar_sub_secret_share(*ty, *scalar, sd.as_bytes())?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
             _ => return Err("Type error in SUB operation".to_string()),
         };
@@ -1412,8 +1412,8 @@ impl VMState {
             (Value::U64(a), Value::U64(b)) => Value::U64(a * *b),
             // Share * Share (online multiplication)
             (
-                Value::Share(ty1 @ ShareType::SecretInt { .. }, data1),
-                Value::Share(ShareType::SecretInt { .. }, data2),
+                Value::Share(ty1 @ ShareType::SecretInt { .. }, sd1),
+                Value::Share(ShareType::SecretInt { .. }, sd2),
             ) => {
                 let engine = self
                     .mpc_engine()
@@ -1422,13 +1422,13 @@ impl VMState {
                     return Err("MPC engine configured but not ready".to_string());
                 }
                 let product = engine
-                    .multiply_share(*ty1, data1, data2)
+                    .multiply_share(*ty1, sd1.as_bytes(), sd2.as_bytes())
                     .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
                 Value::Share(*ty1, product)
             }
             (
-                Value::Share(ty1 @ ShareType::SecretFixedPoint { .. }, data1),
-                Value::Share(ShareType::SecretFixedPoint { .. }, data2),
+                Value::Share(ty1 @ ShareType::SecretFixedPoint { .. }, sd1),
+                Value::Share(ShareType::SecretFixedPoint { .. }, sd2),
             ) => {
                 let engine = self
                     .mpc_engine()
@@ -1437,26 +1437,26 @@ impl VMState {
                     return Err("MPC engine configured but not ready".to_string());
                 }
                 let product = engine
-                    .multiply_share(*ty1, data1, data2)
+                    .multiply_share(*ty1, sd1.as_bytes(), sd2.as_bytes())
                     .map_err(|e| format!("MPC multiply_share failed: {}", e))?;
                 Value::Share(*ty1, product)
             }
             // Share * Scalar (offline - local computation, no MPC required)
-            (Value::Share(ty @ ShareType::SecretInt { .. }, data), Value::I64(scalar)) => {
-                let bytes = self.secret_share_mul_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+            (Value::Share(ty @ ShareType::SecretInt { .. }, sd), Value::I64(scalar)) => {
+                let bytes = self.secret_share_mul_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
-            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretInt { .. }, data)) => {
-                let bytes = self.secret_share_mul_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretInt { .. }, sd)) => {
+                let bytes = self.secret_share_mul_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
-            (Value::Share(ty @ ShareType::SecretFixedPoint { .. }, data), Value::I64(scalar)) => {
-                let bytes = self.secret_share_mul_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+            (Value::Share(ty @ ShareType::SecretFixedPoint { .. }, sd), Value::I64(scalar)) => {
+                let bytes = self.secret_share_mul_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
-            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretFixedPoint { .. }, data)) => {
-                let bytes = self.secret_share_mul_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+            (Value::I64(scalar), Value::Share(ty @ ShareType::SecretFixedPoint { .. }, sd)) => {
+                let bytes = self.secret_share_mul_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
             _ => return Err("Type error in MUL operation".to_string()),
         };
@@ -1572,13 +1572,13 @@ impl VMState {
                 Value::Share(ShareType::SecretFixedPoint { .. }, _data2),
             ) => return Err("Share/Share division is not supported on secret shares".to_string()),
             // Share / Scalar (offline - local computation via field inverse)
-            (Value::Share(ty @ ShareType::SecretInt { .. }, data), Value::I64(scalar)) => {
-                let bytes = self.secret_share_div_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+            (Value::Share(ty @ ShareType::SecretInt { .. }, sd), Value::I64(scalar)) => {
+                let bytes = self.secret_share_div_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
-            (Value::Share(ty @ ShareType::SecretFixedPoint { .. }, data), Value::I64(scalar)) => {
-                let bytes = self.secret_share_div_scalar(*ty, data, *scalar)?;
-                Value::Share(*ty, bytes)
+            (Value::Share(ty @ ShareType::SecretFixedPoint { .. }, sd), Value::I64(scalar)) => {
+                let bytes = self.secret_share_div_scalar(*ty, sd.as_bytes(), *scalar)?;
+                Value::Share(*ty, ShareData::Opaque(bytes))
             }
             _ => return Err("Type error in DIV operation".to_string()),
         };
@@ -2344,26 +2344,26 @@ impl VMState {
             },
             // Share comparison (Int)
             (
-                Value::Share(ShareType::SecretInt { .. }, data1),
-                Value::Share(ShareType::SecretInt { .. }, data2),
+                Value::Share(ShareType::SecretInt { .. }, sd1),
+                Value::Share(ShareType::SecretInt { .. }, sd2),
             ) => {
                 let mut bytes1 = [0u8; 8];
                 let mut bytes2 = [0u8; 8];
-                bytes1.copy_from_slice(&data1[0..8]);
-                bytes2.copy_from_slice(&data2[0..8]);
+                bytes1.copy_from_slice(&sd1.as_bytes()[0..8]);
+                bytes2.copy_from_slice(&sd2.as_bytes()[0..8]);
                 let val1 = i64::from_le_bytes(bytes1);
                 let val2 = i64::from_le_bytes(bytes2);
                 impl_cmp!(val1, val2)
             }
             // Share comparison (Float)
             (
-                Value::Share(ShareType::SecretFixedPoint { .. }, data1),
-                Value::Share(ShareType::SecretFixedPoint { .. }, data2),
+                Value::Share(ShareType::SecretFixedPoint { .. }, sd1),
+                Value::Share(ShareType::SecretFixedPoint { .. }, sd2),
             ) => {
                 let mut bytes1 = [0u8; 8];
                 let mut bytes2 = [0u8; 8];
-                bytes1.copy_from_slice(&data1[0..8]);
-                bytes2.copy_from_slice(&data2[0..8]);
+                bytes1.copy_from_slice(&sd1.as_bytes()[0..8]);
+                bytes2.copy_from_slice(&sd2.as_bytes()[0..8]);
                 let val1 = i64::from_le_bytes(bytes1);
                 let val2 = i64::from_le_bytes(bytes2);
                 impl_cmp!(val1, val2)
@@ -2513,7 +2513,7 @@ impl VMState {
             .ok_or_else(|| format!("No share found for client {} at index {}", client_id, index))?;
 
         // TODO: The client store doesn't carry type metadata, so we assume 64-bit secret int.
-        Ok(Value::Share(ShareType::secret_int(64), share_bytes))
+        Ok(Value::Share(ShareType::secret_int(64), ShareData::Opaque(share_bytes)))
     }
 
     /// Load a client's input share as a fixed-point share from the global client store
@@ -2529,7 +2529,7 @@ impl VMState {
 
         Ok(Value::Share(
             ShareType::default_secret_fixed_point(),
-            share_bytes,
+            ShareData::Opaque(share_bytes),
         ))
     }
 
@@ -2543,7 +2543,7 @@ impl VMState {
         Ok(shares
             .into_iter()
             // TODO: The client store doesn't carry type metadata, so we assume 64-bit secret int.
-            .map(|share_bytes| Value::Share(ShareType::secret_int(64), share_bytes))
+            .map(|share_bytes| Value::Share(ShareType::secret_int(64), ShareData::Opaque(share_bytes)))
             .collect())
     }
 
@@ -3245,7 +3245,7 @@ mod tests {
         fn start(&self) -> Result<(), String> {
             Ok(())
         }
-        fn input_share(&self, _ty: ShareType, _clear: &Value) -> Result<Vec<u8>, String> {
+        fn input_share(&self, _ty: ShareType, _clear: &Value) -> Result<ShareData, String> {
             Err("not implemented".to_string())
         }
         fn multiply_share(
@@ -3253,7 +3253,7 @@ mod tests {
             _ty: ShareType,
             _left: &[u8],
             _right: &[u8],
-        ) -> Result<Vec<u8>, String> {
+        ) -> Result<ShareData, String> {
             Err("not implemented".to_string())
         }
         fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> Result<Value, String> {
@@ -3292,7 +3292,7 @@ mod tests {
         fn start(&self) -> Result<(), String> {
             Ok(())
         }
-        fn input_share(&self, _ty: ShareType, _clear: &Value) -> Result<Vec<u8>, String> {
+        fn input_share(&self, _ty: ShareType, _clear: &Value) -> Result<ShareData, String> {
             Err("not implemented".to_string())
         }
         fn multiply_share(
@@ -3300,7 +3300,7 @@ mod tests {
             _ty: ShareType,
             _left: &[u8],
             _right: &[u8],
-        ) -> Result<Vec<u8>, String> {
+        ) -> Result<ShareData, String> {
             Err("not implemented".to_string())
         }
         fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> Result<Value, String> {

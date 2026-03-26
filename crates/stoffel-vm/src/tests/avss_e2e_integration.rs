@@ -652,6 +652,7 @@ async fn test_avss_e2e_distributed_key_generation() {
             node.network.clone().unwrap(),
             node.sk_i,
             pk_maps[i].clone(),
+            vec![],
         )
         .await
         .expect("Failed to create engine");
@@ -777,6 +778,7 @@ async fn test_avss_e2e_vm_public_key_extraction() {
             node.network.clone().unwrap(),
             node.sk_i,
             pk_maps[i].clone(),
+            vec![],
         )
         .await
         .expect("Failed to create engine");
@@ -951,6 +953,7 @@ async fn test_avss_e2e_multiple_keys() {
             node.network.clone().unwrap(),
             node.sk_i,
             pk_maps[i].clone(),
+            vec![],
         )
         .await
         .expect("Failed to create engine");

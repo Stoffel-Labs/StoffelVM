@@ -17,7 +17,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use stoffel_vm_types::core_types::{ShareType, Value, BOOLEAN_SECRET_INT_BITS};
+use stoffel_vm_types::core_types::{ShareData, ShareType, Value, BOOLEAN_SECRET_INT_BITS};
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode};
@@ -193,7 +193,7 @@ where
         ty: ShareType,
         left: &[u8],
         right: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<ShareData, String> {
         if !self.is_ready() {
             return Err("MPC engine not ready".into());
         }
@@ -222,7 +222,7 @@ where
                     .next()
                     .ok_or_else(|| "Multiplication returned no shares".to_string())?;
 
-                Self::encode_share(&result_share)
+                Self::encode_share(&result_share).map(ShareData::Opaque)
             }
         }
     }
@@ -488,9 +488,9 @@ where
     /// Pull one pre-generated random share from the preprocessing pool.
     /// If the pool is empty, `reserve_random_shares` auto-regenerates via
     /// the RanSha protocol over the network.
-    pub async fn random_share_async_impl(&self, _ty: ShareType) -> Result<Vec<u8>, String> {
+    pub async fn random_share_async_impl(&self, _ty: ShareType) -> Result<ShareData, String> {
         let shares = self.reserve_random_shares(1).await?;
-        Self::encode_share(&shares[0])
+        Self::encode_share(&shares[0]).map(ShareData::Opaque)
     }
 
     fn encode_open_exp_wire_message(
@@ -818,7 +818,7 @@ where
         Ok(())
     }
 
-    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<Vec<u8>, String> {
+    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<ShareData, String> {
         // Minimal support: ShareType::Int over Fr via direct embedding (u64 -> Fr).
         match (ty, clear) {
             (ShareType::SecretInt { .. }, Value::I64(v)) => {
@@ -827,7 +827,7 @@ where
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
                 let my = &shares[self.party_id];
-                Self::encode_share(my)
+                Self::encode_share(my).map(ShareData::Opaque)
             }
             (
                 ShareType::SecretInt {
@@ -840,7 +840,7 @@ where
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
                 let my = &shares[self.party_id];
-                Self::encode_share(my)
+                Self::encode_share(my).map(ShareData::Opaque)
             }
             (ShareType::SecretFixedPoint { precision }, Value::Float(fp)) => {
                 // Convert f64 to fixed-point scaled integer
@@ -853,13 +853,13 @@ where
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
                 let my = &shares[self.party_id];
-                Self::encode_share(my)
+                Self::encode_share(my).map(ShareData::Opaque)
             }
             _ => Err("Unsupported type for input_share".to_string()),
         }
     }
 
-    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
+    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<ShareData, String> {
         crate::net::block_on_current(self.multiply_share_async(ty, left, right))
     }
 
@@ -999,7 +999,7 @@ where
         Some(self)
     }
 
-    fn random_share(&self, ty: ShareType) -> Result<Vec<u8>, String> {
+    fn random_share(&self, ty: ShareType) -> Result<ShareData, String> {
         crate::net::block_on_current(self.random_share_async_impl(ty))
     }
 
@@ -1037,7 +1037,7 @@ where
         ty: ShareType,
         left: &[u8],
         right: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<ShareData, String> {
         self.multiply_share_async(ty, left, right).await
     }
 
@@ -1064,7 +1064,7 @@ where
             .await
     }
 
-    async fn random_share_async(&self, ty: ShareType) -> Result<Vec<u8>, String> {
+    async fn random_share_async(&self, ty: ShareType) -> Result<ShareData, String> {
         self.random_share_async_impl(ty).await
     }
 

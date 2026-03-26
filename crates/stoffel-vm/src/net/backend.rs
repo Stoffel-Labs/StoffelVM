@@ -90,18 +90,15 @@ impl MpcBackendKind {
 
     /// Whether this backend supports standalone client input mode.
     ///
-    /// HoneyBadger supports a separate client role (`stoffel-run --client`) where
-    /// external clients submit secret inputs to the MPC parties.
-    ///
-    /// AVSS does not yet support this: the underlying `AvssMpcNode` protocol ignores
-    /// `input_ids` during setup and has no `InputServer`/`OutputServer` equivalent.
-    /// In the current AVSS design, each party provides its own inputs directly.
+    /// Both HoneyBadger and AVSS support a separate client role
+    /// (`stoffel-run --client`) where external clients submit secret inputs
+    /// to the MPC parties.
     pub fn supports_client_input(&self) -> bool {
         match self {
             #[cfg(feature = "honeybadger")]
             MpcBackendKind::HoneyBadger => true,
             #[cfg(feature = "avss")]
-            MpcBackendKind::Avss => false,
+            MpcBackendKind::Avss => true,
         }
     }
 
@@ -184,7 +181,7 @@ mod tests {
         let avss = MpcBackendKind::Avss;
         assert!(avss.supports_multiplication());
         assert!(avss.supports_elliptic_curves());
-        assert!(!avss.supports_client_input());
+        assert!(avss.supports_client_input());
     }
 
     #[test]

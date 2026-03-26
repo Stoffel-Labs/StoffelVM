@@ -1012,7 +1012,7 @@ pub extern "C" fn hb_engine_multiply_share_async(
     match rt.block_on(engine.multiply_share_async(ty, left, right)) {
         Ok(result) => {
             unsafe {
-                write_ffi_result_bytes(result, result_ptr, result_len_ptr);
+                write_ffi_result_bytes(result.into_bytes(), result_ptr, result_len_ptr);
             }
             HBEngineErrorCode::HBEngineSuccess
         }
@@ -1496,6 +1496,7 @@ mod avss_ffi {
             net,
             sk_i,
             Arc::new(pk_map),
+            vec![],
         ))?;
 
         let engine_arc: Arc<AvssMpcEngine<F, G>> = engine;
