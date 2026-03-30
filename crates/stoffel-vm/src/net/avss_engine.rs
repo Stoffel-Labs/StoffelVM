@@ -18,6 +18,9 @@
 use crate::net::client_store::ClientInputStore;
 use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
 use crate::net::mpc_engine::{MpcCapabilities, MpcEngine, MpcEngineClientOps};
+use crate::storage::preproc::{
+    self, MaterialKind, PreprocBlob, PreprocKey, PreprocStore,
+};
 use ark_ec::CurveGroup;
 use ark_ff::{FftField, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -321,6 +324,10 @@ where
     #[allow(dead_code)]
     sk_i: F,
     _marker: PhantomData<G>,
+    /// Persistent preprocessing store.
+    preproc_store: tokio::sync::RwLock<Option<Arc<dyn crate::storage::preproc::PreprocStore>>>,
+    /// Program hash and field kind for keying stored material.
+    preproc_config: tokio::sync::RwLock<Option<([u8; 32], crate::net::curve::MpcFieldKind)>>,
 }
 
 impl<F, G> AvssMpcEngine<F, G>
@@ -384,6 +391,8 @@ where
             share_notify: Arc::new(tokio::sync::Notify::new()),
             sk_i,
             _marker: PhantomData,
+            preproc_store: tokio::sync::RwLock::new(None),
+            preproc_config: tokio::sync::RwLock::new(None),
         }))
     }
 
@@ -722,25 +731,115 @@ where
     }
 
     /// Run cooperative preprocessing to generate random shares and Beaver triples.
-    /// Run cooperative preprocessing to generate random shares and Beaver triples.
+    ///
+    /// If a persistent store is configured, attempts to load from it first.
+    /// After generation, persists the result for future runs.
     ///
     /// This clones the inner node so that preprocessing can run concurrently
     /// with the message processing loop (which also needs the node lock for
     /// `process()`). Both clones share `Arc<Mutex<>>` internal state
     /// (preprocessing_material, shares) so results are visible to either.
     pub async fn preprocess(&self) -> Result<(), String> {
-        let mut node_clone = {
-            let node = self.avss_node.lock().await;
-            node.clone()
+        // Try loading from persistent store first
+        if self.try_load_preproc().await? {
+            return Ok(());
+        }
+
+        {
+            let mut node_clone = {
+                let node = self.avss_node.lock().await;
+                node.clone()
+            };
+            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+            PreprocessingMPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::run_preprocessing(
+                &mut node_clone,
+                self.net.clone(),
+                &mut rng,
+            )
+            .await
+            .map_err(|e| format!("AVSS preprocessing failed: {:?}", e))?;
+        }
+
+        // Persist for future runs
+        self.persist_preproc().await?;
+        Ok(())
+    }
+
+    /// Try to load AVSS preprocessing material from the persistent store.
+    async fn try_load_preproc(&self) -> Result<bool, String> {
+        let store = self.preproc_store.read().await.clone();
+        let config = *self.preproc_config.read().await;
+        let (store, (hash, field_kind)) = match (store, config) {
+            (Some(s), Some(c)) => (s, c),
+            _ => return Ok(false),
         };
-        let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        PreprocessingMPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::run_preprocessing(
-            &mut node_clone,
-            self.net.clone(),
-            &mut rng,
-        )
-        .await
-        .map_err(|e| format!("AVSS preprocessing failed: {:?}", e))
+
+        let base = PreprocKey::new(hash, field_kind, self.n, self.t, self.party_id, MaterialKind::BeaverTriple);
+        let k_rs = base.with_kind(MaterialKind::RandomShare);
+        let (triples, randoms) = tokio::try_join!(
+            store.load(&base),
+            store.load(&k_rs),
+        )?;
+
+        if triples.is_none() && randoms.is_none() {
+            return Ok(false);
+        }
+
+        let node = self.avss_node.lock().await;
+        let mut prep = node.preprocessing_material.lock().await;
+
+        if let Some(blob) = triples {
+            let decoded = preproc::deserialize_avss_triples::<F, G>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            prep.add(Some(decoded), None);
+        }
+        if let Some(blob) = randoms {
+            let decoded = preproc::deserialize_feldman_shares::<F, G>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            prep.add(None, Some(decoded));
+        }
+
+        info!("Loaded AVSS preprocessing material from store for program {}", hex::encode(hash));
+        Ok(true)
+    }
+
+    /// Persist current AVSS preprocessing material to the store.
+    ///
+    /// Drains and serializes inside the lock, then stores after releasing.
+    async fn persist_preproc(&self) -> Result<(), String> {
+        let store = self.preproc_store.read().await.clone();
+        let config = *self.preproc_config.read().await;
+        let (store, (hash, field_kind)) = match (store, config) {
+            (Some(s), Some(c)) => (s, c),
+            _ => return Ok(()),
+        };
+
+        let base = PreprocKey::new(hash, field_kind, self.n, self.t, self.party_id, MaterialKind::BeaverTriple);
+        let mut to_store: Vec<(PreprocKey, PreprocBlob)> = Vec::new();
+
+        {
+            let node = self.avss_node.lock().await;
+            let mut prep = node.preprocessing_material.lock().await;
+            let (n_bt, n_rs) = prep.len();
+
+            if n_bt > 0 {
+                let items = prep.take_triples(n_bt).map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_avss_triples::<F, G>(&items)?;
+                to_store.push((base.clone(), PreprocBlob::new(data, item_size, items.len() as u32)));
+                prep.add(Some(items), None);
+            }
+            if n_rs > 0 {
+                let items = prep.take_v_random_shares(n_rs).map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_feldman_shares::<F, G>(&items)?;
+                to_store.push((base.with_kind(MaterialKind::RandomShare), PreprocBlob::new(data, item_size, items.len() as u32)));
+                prep.add(None, Some(items));
+            }
+        }
+
+        for (key, blob) in &to_store {
+            store.store(key, blob).await?;
+        }
+
+        info!("Persisted AVSS preprocessing material to store for program {}", hex::encode(hash));
+        Ok(())
     }
 
     // ========================================================================
@@ -1505,6 +1604,17 @@ where
 
     fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> {
         Some(self)
+    }
+
+    fn set_preproc_store(&self, store: Arc<dyn PreprocStore>, program_hash: [u8; 32]) {
+        let field_kind = self.curve_config().field_kind();
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                *self.preproc_store.write().await = Some(store);
+                *self.preproc_config.write().await = Some((program_hash, field_kind));
+            });
+        });
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {

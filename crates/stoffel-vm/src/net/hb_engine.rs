@@ -3,7 +3,10 @@ use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
 use crate::net::mpc::honeybadger_node_opts;
 use crate::net::mpc_engine::{
     AsyncMpcEngineConsensus, MpcEngine, MpcEngineClientOps, MpcEngineConsensus,
+    MpcEngineReservation,
 };
+use crate::net::reservation::{ReservationGrant, ReservationRegistry};
+use crate::storage::preproc::{self, MaterialKind, PreprocBlob, PreprocKey, PreprocStore};
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -156,6 +159,12 @@ where
     #[allow(dead_code)]
     mul_session_counter: Arc<Mutex<usize>>,
     group_marker: PhantomData<G>,
+    /// Persistent preprocessing store.
+    preproc_store: tokio::sync::RwLock<Option<Arc<dyn PreprocStore>>>,
+    /// Program hash for keying stored material.
+    program_hash: tokio::sync::RwLock<Option<[u8; 32]>>,
+    /// Reservation registry for masked-input protocol.
+    reservation: tokio::sync::RwLock<Option<ReservationRegistry>>,
 }
 
 pub type Bls12381HoneyBadgerMpcEngine =
@@ -177,14 +186,137 @@ where
     }
 
     pub async fn preprocess(&self) -> Result<(), String> {
+        // Try loading from persistent store first
+        if self.try_load_preproc().await? {
+            self.ready.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+
         // Run the actual preprocessing protocol to generate triples and random shares
-        let mut node = self.node.lock().await;
-        let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        node.run_preprocessing(self.net.clone(), &mut rng)
-            .await
-            .map_err(|e| format!("Preprocessing failed: {:?}", e))?;
+        {
+            let mut node = self.node.lock().await;
+            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+            node.run_preprocessing(self.net.clone(), &mut rng)
+                .await
+                .map_err(|e| format!("Preprocessing failed: {:?}", e))?;
+        }
+
+        // Persist to store for future runs
+        self.persist_preproc().await?;
 
         self.ready.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Try to load preprocessing material from the persistent store.
+    /// Returns `true` if material was loaded, `false` if nothing available.
+    async fn try_load_preproc(&self) -> Result<bool, String> {
+        let store = self.preproc_store.read().await.clone();
+        let hash = *self.program_hash.read().await;
+        let (store, hash) = match (store, hash) {
+            (Some(s), Some(h)) => (s, h),
+            _ => return Ok(false),
+        };
+
+        let base = PreprocKey::new(hash, F::field_kind(), self.n, self.t, self.party_id, MaterialKind::BeaverTriple);
+        let k_rs = base.with_kind(MaterialKind::RandomShare);
+        let k_pb = base.with_kind(MaterialKind::PRandBit);
+        let k_pi = base.with_kind(MaterialKind::PRandInt);
+        let (triples, randoms, prandbits, prandints) = tokio::try_join!(
+            store.load(&base),
+            store.load(&k_rs),
+            store.load(&k_pb),
+            store.load(&k_pi),
+        )?;
+
+        if triples.is_none() && randoms.is_none() && prandbits.is_none() && prandints.is_none() {
+            return Ok(false);
+        }
+
+        let mut node = self.node.lock().await;
+        let mut prep = node.preprocessing_material.lock().await;
+
+        if let Some(blob) = triples {
+            let decoded = preproc::deserialize_beaver_triples::<F>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            prep.add(Some(decoded), None, None, None);
+        }
+        if let Some(blob) = randoms {
+            let decoded = preproc::deserialize_robust_shares::<F>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            prep.add(None, Some(decoded), None, None);
+        }
+        if let Some(blob) = prandbits {
+            let decoded = preproc::deserialize_prandbit_shares::<F>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            prep.add(None, None, Some(decoded), None);
+        }
+        if let Some(blob) = prandints {
+            let decoded = preproc::deserialize_robust_shares::<F>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            prep.add(None, None, None, Some(decoded));
+        }
+
+        tracing::info!("Loaded preprocessing material from store for program {}", hex::encode(hash));
+        Ok(true)
+    }
+
+    /// Persist current preprocessing material to the store.
+    ///
+    /// Drains and serializes material inside the lock, then releases the lock
+    /// before the async store writes to minimise lock hold time.
+    async fn persist_preproc(&self) -> Result<(), String> {
+        let store = self.preproc_store.read().await.clone();
+        let hash = *self.program_hash.read().await;
+        let (store, hash) = match (store, hash) {
+            (Some(s), Some(h)) => (s, h),
+            _ => return Ok(()),
+        };
+
+        let base = PreprocKey::new(hash, F::field_kind(), self.n, self.t, self.party_id, MaterialKind::BeaverTriple);
+
+        // Drain and serialize inside the lock, collect (key, blob, items) tuples
+        let mut to_store: Vec<(PreprocKey, PreprocBlob)> = Vec::new();
+        let mut restore_bt = None;
+        let mut restore_rs = None;
+        let mut restore_pb = None;
+        let mut restore_pi = None;
+
+        {
+            let mut node = self.node.lock().await;
+            let mut prep = node.preprocessing_material.lock().await;
+            let (n_bt, n_rs, n_pb, n_pi) = prep.len();
+
+            if n_bt > 0 {
+                let items = prep.take_beaver_triples(n_bt).map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_beaver_triples::<F>(&items)?;
+                to_store.push((base.clone(), PreprocBlob::new(data, item_size, items.len() as u32)));
+                restore_bt = Some(items);
+            }
+            if n_rs > 0 {
+                let items = prep.take_random_shares(n_rs).map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
+                to_store.push((base.with_kind(MaterialKind::RandomShare), PreprocBlob::new(data, item_size, items.len() as u32)));
+                restore_rs = Some(items);
+            }
+            if n_pb > 0 {
+                let items = prep.take_prandbit_shares(n_pb).map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_prandbit_shares::<F>(&items)?;
+                to_store.push((base.with_kind(MaterialKind::PRandBit), PreprocBlob::new(data, item_size, items.len() as u32)));
+                restore_pb = Some(items);
+            }
+            if n_pi > 0 {
+                let items = prep.take_prandint_shares(n_pi).map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
+                to_store.push((base.with_kind(MaterialKind::PRandInt), PreprocBlob::new(data, item_size, items.len() as u32)));
+                restore_pi = Some(items);
+            }
+
+            // Restore immediately so the pool is available even if store.store fails
+            prep.add(restore_bt, restore_rs, restore_pb, restore_pi);
+        }
+        // Lock released — store blobs without holding the node mutex
+        for (key, blob) in &to_store {
+            store.store(key, blob).await?;
+        }
+
+        tracing::info!("Persisted preprocessing material to store for program {}", hex::encode(hash));
         Ok(())
     }
 
@@ -447,6 +579,9 @@ where
             ready: AtomicBool::new(false),
             mul_session_counter: Arc::new(Mutex::new(0)),
             group_marker: PhantomData,
+            preproc_store: tokio::sync::RwLock::new(None),
+            program_hash: tokio::sync::RwLock::new(None),
+            reservation: tokio::sync::RwLock::new(None),
         }))
     }
 
@@ -460,11 +595,6 @@ where
         net: Arc<QuicNetworkManager>,
         node: HoneyBadgerMPCNode<F, RBCImpl>,
     ) -> Arc<Self> {
-        // Wrap the provided node so this engine can access it via async locks.
-        // Note: This currently clones/moves a node instance rather than sharing the
-        // exact same node that the server loop owns. Concurrency semantics depend on
-        // the underlying type's Clone implementation. For tests focused on compile
-        // viability, we prioritize type compatibility here.
         let node = Arc::new(Mutex::new(node));
         Arc::new(Self {
             instance_id,
@@ -473,10 +603,12 @@ where
             t,
             net,
             node,
-            // Assume the provided node has been preprocessed already in tests; callers can override via start()/preprocess().
             ready: AtomicBool::new(true),
             mul_session_counter: Arc::new(Mutex::new(0)),
             group_marker: PhantomData,
+            preproc_store: tokio::sync::RwLock::new(None),
+            program_hash: tokio::sync::RwLock::new(None),
+            reservation: tokio::sync::RwLock::new(None),
         })
     }
 
@@ -986,6 +1118,7 @@ where
             | MpcCapabilities::OPEN_IN_EXP
             | MpcCapabilities::CLIENT_INPUT
             | MpcCapabilities::CONSENSUS
+            | MpcCapabilities::RESERVATION
     }
 
     fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> {
@@ -993,6 +1126,20 @@ where
     }
     fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> {
         Some(self)
+    }
+    fn as_reservation(&self) -> Option<&dyn MpcEngineReservation> {
+        Some(self)
+    }
+
+    fn set_preproc_store(&self, store: Arc<dyn PreprocStore>, program_hash: [u8; 32]) {
+        // Use block_in_place since this is called from sync context before start()
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                *self.preproc_store.write().await = Some(store);
+                *self.program_hash.write().await = Some(program_hash);
+            });
+        });
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -1512,6 +1659,150 @@ where
 
     async fn aba_result_async(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
         self.aba_result(session_id, timeout_ms)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MpcEngineReservation
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl<F, G> MpcEngineReservation for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
+    async fn init_reservations(
+        &self,
+        program_hash: [u8; 32],
+        capacity: u64,
+    ) -> Result<(), String> {
+        let store = self.preproc_store.read().await.clone();
+        if let Some(store) = store {
+            if let Some(restored) =
+                ReservationRegistry::load(store.as_ref(), &program_hash, self.party_id)
+                    .await
+                    .map_err(|e| e.to_string())?
+            {
+                *self.reservation.write().await = Some(restored);
+                return Ok(());
+            }
+        }
+        *self.reservation.write().await =
+            Some(ReservationRegistry::new(program_hash, self.party_id, capacity));
+        Ok(())
+    }
+
+    async fn reserve_masks(
+        &self,
+        client_id: ClientId,
+        n: u64,
+    ) -> Result<ReservationGrant, String> {
+        let guard = self.reservation.read().await;
+        let reg = guard.as_ref().ok_or("reservations not initialized")?;
+        reg.reserve(client_id, n).await.map_err(|e| e.to_string())
+    }
+
+    async fn get_mask_share(&self, index: u64) -> Result<Vec<u8>, String> {
+        let store = self.preproc_store.read().await.clone();
+        let hash = *self.program_hash.read().await;
+        let (store, hash) = match (store, hash) {
+            (Some(s), Some(h)) => (s, h),
+            _ => return Err("preproc store not configured".into()),
+        };
+
+        let key = PreprocKey::new(
+            hash, F::field_kind(), self.n, self.t, self.party_id, MaterialKind::RandomShare,
+        );
+        let blob = store.load(&key).await?.ok_or("no random shares stored")?;
+        let share = preproc::deserialize_one_robust_share::<F>(
+            &blob.data, blob.meta.item_size, index as u32,
+        )?;
+        Self::encode_share(&share)
+    }
+
+    async fn submit_masked_input(
+        &self,
+        client_id: ClientId,
+        index: u64,
+        value: Vec<u8>,
+    ) -> Result<(), String> {
+        let guard = self.reservation.read().await;
+        let reg = guard.as_ref().ok_or("reservations not initialized")?;
+        reg.submit_masked_input(client_id, index, value)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn consume_masked_inputs(
+        &self,
+        indices: &[u64],
+    ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        // Collect masked inputs from the registry first, then drop the lock
+        let masked_inputs: Vec<(u64, Vec<u8>)> = {
+            let reg_guard = self.reservation.read().await;
+            let reg = reg_guard.as_ref().ok_or("reservations not initialized")?;
+            let mut inputs = Vec::with_capacity(indices.len());
+            for &idx in indices {
+                let mi = reg.get_masked_input(idx).await
+                    .ok_or_else(|| format!("no masked input for index {idx}"))?;
+                inputs.push((idx, mi));
+            }
+            inputs
+        };
+
+        // Load the random-share blob once for all indices
+        let store = self.preproc_store.read().await.clone();
+        let hash = *self.program_hash.read().await;
+        let (store, hash) = match (store, hash) {
+            (Some(s), Some(h)) => (s, h),
+            _ => return Err("preproc store not configured".into()),
+        };
+        let key = PreprocKey::new(
+            hash, F::field_kind(), self.n, self.t, self.party_id, MaterialKind::RandomShare,
+        );
+        let blob = store.load(&key).await?.ok_or("no random shares stored")?;
+
+        let mut result = Vec::with_capacity(indices.len());
+        for (idx, masked_input_bytes) in &masked_inputs {
+            let mask_share = preproc::deserialize_one_robust_share::<F>(
+                &blob.data, blob.meta.item_size, *idx as u32,
+            )?;
+            let masked_input = Self::decode_share(masked_input_bytes)?;
+
+            let input_elem = masked_input.share[0] - mask_share.share[0];
+            let input_share = RobustShare::new(input_elem, mask_share.id, mask_share.degree);
+            result.push((*idx, Self::encode_share(&input_share)?));
+        }
+
+        // Mark as consumed
+        {
+            let reg_guard = self.reservation.read().await;
+            let reg = reg_guard.as_ref().ok_or("reservations not initialized")?;
+            reg.consume(indices).await.map_err(|e| e.to_string())?;
+        }
+        Ok(result)
+    }
+
+    async fn available_masks(&self) -> u64 {
+        let guard = self.reservation.read().await;
+        match guard.as_ref() {
+            Some(reg) => reg.available().await,
+            None => 0,
+        }
+    }
+
+    async fn persist_reservations(&self) -> Result<(), String> {
+        let reg_guard = self.reservation.read().await;
+        let reg = match reg_guard.as_ref() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let store = self.preproc_store.read().await.clone();
+        if let Some(store) = store {
+            reg.persist(store.as_ref()).await.map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
 

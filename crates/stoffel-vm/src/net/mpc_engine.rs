@@ -3,7 +3,10 @@
 
 use crate::net::client_store::ClientInputStore;
 use crate::net::curve::{MpcCurveConfig, MpcFieldKind};
+use crate::net::reservation::ReservationGrant;
+use crate::storage::preproc::PreprocStore;
 use std::any::Any;
+use std::sync::Arc;
 use stoffel_vm_types::core_types::{ShareData, ShareType, Value};
 use stoffelnet::network_utils::ClientId;
 
@@ -19,6 +22,7 @@ bitflags::bitflags! {
         const CLIENT_INPUT     = 0b0000_0100;
         const CONSENSUS        = 0b0000_1000;
         const OPEN_IN_EXP      = 0b0001_0000;
+        const RESERVATION      = 0b0010_0000;
     }
 }
 
@@ -189,6 +193,23 @@ pub trait MpcEngine: Send + Sync {
     /// Try to obtain a reference to the client-ops sub-trait, if supported.
     fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> {
         None
+    }
+
+    /// Try to obtain a reference to the reservation sub-trait, if supported.
+    fn as_reservation(&self) -> Option<&dyn MpcEngineReservation> {
+        None
+    }
+
+    /// Whether this engine supports preprocessing reservation
+    fn supports_reservation(&self) -> bool {
+        self.capabilities().contains(MpcCapabilities::RESERVATION)
+    }
+
+    /// Attach persistent storage for preprocessing material caching.
+    /// Called before `start()`. Engines that support persistence will
+    /// use this store to load/save preprocessing material.
+    fn set_preproc_store(&self, _store: Arc<dyn PreprocStore>, _program_hash: [u8; 32]) {
+        // Default: no-op
     }
 
     /// Support downcasting for concrete engine types
@@ -393,4 +414,55 @@ pub trait MpcEngineClientOps: MpcEngine {
         store: &ClientInputStore,
         client_ids: &[ClientId],
     ) -> Result<usize, String>;
+}
+
+/// Extended MPC engine trait for preprocessing reservation.
+///
+/// Engines that support persistent preprocessing and the masked-input
+/// protocol implement this trait. The reservation lifecycle:
+///
+/// 1. `init_reservations` — set up or restore reservation state
+/// 2. `reserve_masks` — clients reserve index ranges
+/// 3. `get_mask_share` — clients collect per-node mask shares
+/// 4. `submit_masked_input` — clients submit `input + mask`
+/// 5. `consume_masked_inputs` — nodes compute `masked_input − mask_share`
+#[async_trait::async_trait]
+pub trait MpcEngineReservation: MpcEngine {
+    /// Initialize or restore reservation state for a program.
+    async fn init_reservations(
+        &self,
+        program_hash: [u8; 32],
+        capacity: u64,
+    ) -> Result<(), String>;
+
+    /// Reserve `n` consecutive mask indices for a client.
+    async fn reserve_masks(
+        &self,
+        client_id: ClientId,
+        n: u64,
+    ) -> Result<ReservationGrant, String>;
+
+    /// Get this node's mask share at a given index (serialized bytes).
+    async fn get_mask_share(&self, index: u64) -> Result<Vec<u8>, String>;
+
+    /// Accept a masked input at a reserved index.
+    async fn submit_masked_input(
+        &self,
+        client_id: ClientId,
+        index: u64,
+        value: Vec<u8>,
+    ) -> Result<(), String>;
+
+    /// Compute `input_share = masked_input − mask_share` for each index.
+    /// Marks the indices as consumed.
+    async fn consume_masked_inputs(
+        &self,
+        indices: &[u64],
+    ) -> Result<Vec<(u64, Vec<u8>)>, String>;
+
+    /// Number of unreserved mask slots.
+    async fn available_masks(&self) -> u64;
+
+    /// Persist the current reservation state.
+    async fn persist_reservations(&self) -> Result<(), String>;
 }

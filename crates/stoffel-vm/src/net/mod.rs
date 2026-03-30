@@ -21,6 +21,7 @@ pub mod open_registry;
 pub use open_registry::UNKNOWN_SENDER_ID;
 pub mod p2p;
 pub mod program_sync;
+pub mod reservation;
 pub mod session;
 
 // ---------------------------------------------------------------------------
