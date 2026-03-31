@@ -10,7 +10,7 @@ use ark_serialize::{Compress, Validate};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use stoffelmpc_mpc::honeybadger::{
-    fpmul::f256::F2_8,
+    fpmul::f256::Gf2568,
     robust_interpolate::robust_interpolate::RobustShare,
     triple_gen::ShamirBeaverTriple,
 };
@@ -532,7 +532,7 @@ pub fn deserialize_beaver_triples<F: FftField>(
 }
 
 pub fn serialize_prandbit_shares<F: FftField>(
-    shares: &[(RobustShare<F>, F2_8)],
+    shares: &[(RobustShare<F>, Gf2568)],
 ) -> Result<(Vec<u8>, u32), PreprocStoreError> {
     let share_size = robust_share_size::<F>();
     let item_size = share_size + 1;
@@ -548,7 +548,7 @@ pub fn deserialize_prandbit_shares<F: FftField>(
     data: &[u8],
     item_size: u32,
     offset: u32,
-) -> Result<Vec<(RobustShare<F>, F2_8)>, PreprocStoreError> {
+) -> Result<Vec<(RobustShare<F>, Gf2568)>, PreprocStoreError> {
     let is = item_size as usize;
     let share_size = robust_share_size::<F>();
     let start = offset as usize * is;
@@ -556,7 +556,7 @@ pub fn deserialize_prandbit_shares<F: FftField>(
     let mut pos = start;
     while pos + is <= data.len() {
         let share = read_robust_share::<F>(&data[pos..], share_size)?;
-        let f2_8 = F2_8(data[pos + share_size]);
+        let f2_8 = Gf2568(data[pos + share_size]);
         result.push((share, f2_8));
         pos += is;
     }
@@ -739,7 +739,7 @@ mod tests {
     fn prandbit_roundtrip() {
         let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(42);
         let shares: Vec<_> = (0..6)
-            .map(|i| (random_share(&mut rng), F2_8(i as u8)))
+            .map(|i| (random_share(&mut rng), Gf2568(i as u8)))
             .collect();
         let (data, item_size) = serialize_prandbit_shares::<Fr>(&shares).unwrap();
         let decoded = deserialize_prandbit_shares::<Fr>(&data, item_size, 0).unwrap();
