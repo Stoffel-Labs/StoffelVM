@@ -59,7 +59,7 @@ async fn test_vm_mesh_full_integration() {
     let n_triples = program_mul_count;
     let n_random_shares = 2 + 2 * n_triples;
     info!("Number of triples: {:?} {:?}", n_triples, n_random_shares);
-    let instance_id = 99999;
+    let instance_id = 99995;
     let base_port = 9400;
 
     let config = HoneyBadgerQuicConfig {
@@ -2330,7 +2330,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     // We'll use batched preprocessing, so start with a small initial batch
     let initial_n_triples = 32;
     let initial_n_random_shares = MAX_PREPROCESSING_BATCH_SIZE;
-    let instance_id = 66666; // Different instance ID to avoid collision
+    let instance_id = 66665; // Different instance ID to avoid collision
     let base_port = 9800; // Different port range
 
     let config = HoneyBadgerQuicConfig {

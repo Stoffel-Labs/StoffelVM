@@ -61,64 +61,12 @@ struct AvssExpOpenWireMessage {
     partial_point: Vec<u8>,
 }
 
-#[derive(Default, Clone)]
-struct AvssExpOpenAccumulator {
-    /// (share_id, serialized compressed affine point)
-    partial_points: Vec<(usize, Vec<u8>)>,
-    party_ids: Vec<usize>,
-    result: Option<Vec<u8>>,
-    result_cached_at: Option<std::time::Instant>,
-}
-
-const AVSS_EXP_EVICTION_AGE: Duration = Duration::from_secs(60);
-
-static AVSS_EXP_REGISTRY: once_cell::sync::Lazy<
-    parking_lot::Mutex<HashMap<(u64, usize), AvssExpOpenAccumulator>>,
-> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
-
-static AVSS_EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
-
 // ============================================================================
 // Open-in-exp registry for AVSS G2 (BLS12-381 threshold BLS signatures)
 // ============================================================================
 
 /// Wire prefix that identifies an AVSS open-in-exp G2 contribution message.
 const AVSS_G2_EXP_WIRE_PREFIX: &[u8; 4] = b"AXG2";
-
-static AVSS_G2_EXP_REGISTRY: once_cell::sync::Lazy<
-    parking_lot::Mutex<HashMap<(u64, usize), AvssExpOpenAccumulator>>,
-> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
-
-static AVSS_G2_EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
-
-fn insert_remote_avss_exp_partial(
-    instance_id: u64,
-    sender_party_id: usize,
-    share_id: usize,
-    partial_point: Vec<u8>,
-) {
-    let mut reg = AVSS_EXP_REGISTRY.lock();
-    let now = std::time::Instant::now();
-    reg.retain(|_, acc| {
-        acc.result_cached_at
-            .is_none_or(|t| now.duration_since(t) < AVSS_EXP_EVICTION_AGE)
-    });
-    let mut seq = 0usize;
-    loop {
-        let key = (instance_id, seq);
-        let entry = reg.entry(key).or_default();
-        if !entry.party_ids.contains(&sender_party_id) {
-            entry.partial_points.push((share_id, partial_point));
-            entry.party_ids.push(sender_party_id);
-            break;
-        }
-        seq += 1;
-    }
-    drop(reg);
-    AVSS_EXP_NOTIFY.notify_waiters();
-}
 
 /// Inspect an incoming message and, if it carries an AVSS open-in-exp contribution
 /// (`AXOP` prefix), insert it into the accumulator registry and return `Ok(true)`.
@@ -158,40 +106,12 @@ pub fn try_handle_avss_open_exp_wire_message(
         ));
     }
 
-    insert_remote_avss_exp_partial(
-        message.instance_id,
-        message.sender_party_id,
-        message.share_id,
-        message.partial_point,
-    );
+    let registry = match crate::net::open_registry::get_instance_registry(message.instance_id) {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    registry.insert_exp(message.sender_party_id, message.share_id, message.partial_point);
     Ok(true)
-}
-
-fn insert_remote_avss_g2_exp_partial(
-    instance_id: u64,
-    sender_party_id: usize,
-    share_id: usize,
-    partial_point: Vec<u8>,
-) {
-    let mut reg = AVSS_G2_EXP_REGISTRY.lock();
-    let now = std::time::Instant::now();
-    reg.retain(|_, acc| {
-        acc.result_cached_at
-            .is_none_or(|t| now.duration_since(t) < AVSS_EXP_EVICTION_AGE)
-    });
-    let mut seq = 0usize;
-    loop {
-        let key = (instance_id, seq);
-        let entry = reg.entry(key).or_default();
-        if !entry.party_ids.contains(&sender_party_id) {
-            entry.partial_points.push((share_id, partial_point));
-            entry.party_ids.push(sender_party_id);
-            break;
-        }
-        seq += 1;
-    }
-    drop(reg);
-    AVSS_G2_EXP_NOTIFY.notify_waiters();
 }
 
 /// Inspect an incoming message and, if it carries an AVSS G2 open-in-exp contribution
@@ -234,12 +154,11 @@ pub fn try_handle_avss_g2_exp_wire_message(
         ));
     }
 
-    insert_remote_avss_g2_exp_partial(
-        message.instance_id,
-        message.sender_party_id,
-        message.share_id,
-        message.partial_point,
-    );
+    let registry = match crate::net::open_registry::get_instance_registry(message.instance_id) {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    registry.insert_exp_g2(message.sender_party_id, message.share_id, message.partial_point);
     Ok(true)
 }
 
@@ -328,6 +247,8 @@ where
     preproc_store: tokio::sync::RwLock<Option<Arc<dyn crate::storage::preproc::PreprocStore>>>,
     /// Program hash and field kind for keying stored material.
     preproc_config: tokio::sync::RwLock<Option<([u8; 32], crate::net::curve::MpcFieldKind)>>,
+    /// Per-instance open share accumulation registry.
+    open_registry: Arc<crate::net::open_registry::InstanceRegistry>,
 }
 
 impl<F, G> AvssMpcEngine<F, G>
@@ -393,6 +314,7 @@ where
             _marker: PhantomData,
             preproc_store: tokio::sync::RwLock::new(None),
             preproc_config: tokio::sync::RwLock::new(None),
+            open_registry: crate::net::open_registry::InstanceRegistry::register(instance_id),
         }))
     }
 
@@ -574,22 +496,19 @@ where
         self.broadcast_open_avss_exp_payload_sync(wire_message)?;
 
         let required = self.t + 1;
-        let instance_id = self.instance_id;
         let party_id = self.party_id;
+        let open_registry = self.open_registry.clone();
 
         let try_check = |my_sequence: &mut Option<usize>,
                          partial_bytes: &[u8],
                          share_id: usize|
          -> Result<Option<Vec<u8>>, String> {
-            let mut reg = AVSS_EXP_REGISTRY.lock();
+            let mut reg = open_registry.exp.lock();
 
             if my_sequence.is_none() {
                 let mut seq = 0;
                 loop {
-                    let key = (instance_id, seq);
-                    let entry = reg
-                        .entry(key)
-                        .or_insert_with(AvssExpOpenAccumulator::default);
+                    let entry = reg.entry(seq).or_default();
                     if !entry.party_ids.contains(&party_id) {
                         entry
                             .partial_points
@@ -603,9 +522,8 @@ where
             }
 
             let seq = my_sequence.expect("sequence must be set after insertion");
-            let key = (instance_id, seq);
             let entry = reg
-                .get_mut(&key)
+                .get_mut(&seq)
                 .expect("avss exp registry entry must exist after insertion");
 
             if let Some(result) = entry.result.clone() {
@@ -659,7 +577,6 @@ where
                     .map_err(|e| format!("serialize result: {}", e))?;
 
                 entry.result = Some(result_bytes.clone());
-                entry.result_cached_at = Some(std::time::Instant::now());
                 return Ok(Some(result_bytes));
             }
 
@@ -676,7 +593,7 @@ where
                         let mut my_sequence: Option<usize> = None;
 
                         loop {
-                            let notified = AVSS_EXP_NOTIFY.notified();
+                            let notified = open_registry.exp_notify.notified();
 
                             if let Some(result) =
                                 try_check(&mut my_sequence, &partial_bytes, share_id)?
@@ -1799,22 +1716,19 @@ impl ThresholdExpG2
         })?;
 
         let required = self.t + 1;
-        let instance_id = self.instance_id;
         let party_id = self.party_id;
+        let open_registry = self.open_registry.clone();
 
         let try_check = |my_sequence: &mut Option<usize>,
                          partial_bytes: &[u8],
                          share_id: usize|
          -> Result<Option<Vec<u8>>, String> {
-            let mut reg = AVSS_G2_EXP_REGISTRY.lock();
+            let mut reg = open_registry.exp_g2.lock();
 
             if my_sequence.is_none() {
                 let mut seq = 0;
                 loop {
-                    let key = (instance_id, seq);
-                    let entry = reg
-                        .entry(key)
-                        .or_insert_with(AvssExpOpenAccumulator::default);
+                    let entry = reg.entry(seq).or_default();
                     if !entry.party_ids.contains(&party_id) {
                         entry
                             .partial_points
@@ -1828,9 +1742,8 @@ impl ThresholdExpG2
             }
 
             let seq = my_sequence.expect("sequence must be set after insertion");
-            let key = (instance_id, seq);
             let entry = reg
-                .get_mut(&key)
+                .get_mut(&seq)
                 .expect("avss g2 exp registry entry must exist after insertion");
 
             if let Some(result) = entry.result.clone() {
@@ -1886,7 +1799,6 @@ impl ThresholdExpG2
                     .map_err(|e| format!("serialize G2 result: {}", e))?;
 
                 entry.result = Some(result_bytes.clone());
-                entry.result_cached_at = Some(std::time::Instant::now());
                 return Ok(Some(result_bytes));
             }
 
@@ -1903,7 +1815,7 @@ impl ThresholdExpG2
                         let mut my_sequence: Option<usize> = None;
 
                         loop {
-                            let notified = AVSS_G2_EXP_NOTIFY.notified();
+                            let notified = open_registry.exp_g2_notify.notified();
 
                             if let Some(result) =
                                 try_check(&mut my_sequence, &partial_bytes, share_id)?
@@ -1945,75 +1857,6 @@ impl ThresholdExpG2
     }
 }
 
-// ============================================================================
-// Registry for coordinating AVSS sessions across parties
-// ============================================================================
-
-/// Global registry for AVSS share coordination (for in-process multi-party testing).
-///
-/// Only compiled for tests and integration test feature gates; not used in production.
-#[cfg(any(test, feature = "avss_itest"))]
-#[derive(Default)]
-struct AvssRegistry {
-    /// Maps (instance_id, session_id, party_id) to serialized share
-    shares: std::collections::HashMap<(u64, u64, usize), Vec<u8>>,
-    /// Maps (instance_id, session_id) to aggregated public key once agreed
-    public_keys: std::collections::HashMap<(u64, u64), Vec<u8>>,
-}
-
-#[cfg(any(test, feature = "avss_itest"))]
-static AVSS_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<AvssRegistry>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(AvssRegistry::default()));
-
-/// Store a share in the global registry (for testing)
-#[cfg(any(test, feature = "avss_itest"))]
-pub fn registry_store_share(
-    instance_id: u64,
-    session_id: u64,
-    party_id: usize,
-    share_bytes: Vec<u8>,
-) {
-    let mut registry = AVSS_REGISTRY.lock();
-    registry
-        .shares
-        .insert((instance_id, session_id, party_id), share_bytes);
-}
-
-/// Get all shares for a session from the registry (for testing)
-#[cfg(any(test, feature = "avss_itest"))]
-pub fn registry_get_shares(instance_id: u64, session_id: u64) -> Vec<(usize, Vec<u8>)> {
-    let registry = AVSS_REGISTRY.lock();
-    registry
-        .shares
-        .iter()
-        .filter_map(|((inst, sess, party), bytes)| {
-            if *inst == instance_id && *sess == session_id {
-                Some((*party, bytes.clone()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Store agreed public key in registry
-#[cfg(any(test, feature = "avss_itest"))]
-pub fn registry_store_public_key(instance_id: u64, session_id: u64, pk_bytes: Vec<u8>) {
-    let mut registry = AVSS_REGISTRY.lock();
-    registry
-        .public_keys
-        .insert((instance_id, session_id), pk_bytes);
-}
-
-/// Get public key from registry
-#[cfg(any(test, feature = "avss_itest"))]
-pub fn registry_get_public_key(instance_id: u64, session_id: u64) -> Option<Vec<u8>> {
-    let registry = AVSS_REGISTRY.lock();
-    registry
-        .public_keys
-        .get(&(instance_id, session_id))
-        .cloned()
-}
 
 // ============================================================================
 // Unit Tests
@@ -2133,23 +1976,6 @@ mod tests {
         }
 
         assert_eq!(commitments[0], G1::generator() * secret);
-    }
-
-    #[test]
-    fn test_registry_operations() {
-        let instance_id = 100;
-        let session_id = 1;
-
-        registry_store_share(instance_id, session_id, 0, vec![1, 2, 3]);
-        registry_store_share(instance_id, session_id, 1, vec![4, 5, 6]);
-        registry_store_share(instance_id, session_id, 2, vec![7, 8, 9]);
-
-        let shares = registry_get_shares(instance_id, session_id);
-        assert_eq!(shares.len(), 3);
-
-        let pk = vec![10, 11, 12];
-        registry_store_public_key(instance_id, session_id, pk.clone());
-        assert_eq!(registry_get_public_key(instance_id, session_id), Some(pk));
     }
 
     #[test]

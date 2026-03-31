@@ -13,7 +13,6 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::any::TypeId;
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -43,59 +42,7 @@ struct ExpOpenWireMessage {
     partial_point: Vec<u8>,
 }
 
-#[derive(Default, Clone)]
-struct ExpOpenAccumulator {
-    partial_points: Vec<(usize, Vec<u8>)>, // (share_id, serialized affine point)
-    party_ids: Vec<usize>,
-    result: Option<Vec<u8>>,
-    /// Set when `result` is first cached; used for eviction.
-    result_cached_at: Option<std::time::Instant>,
-}
-
-/// Completed entries older than this are evicted on the next insertion.
-const EXP_EVICTION_AGE: Duration = Duration::from_secs(60);
-
-static EXP_REGISTRY: once_cell::sync::Lazy<
-    parking_lot::Mutex<HashMap<(u64, usize), ExpOpenAccumulator>>,
-> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
-
-/// Notified after every insertion into [`EXP_REGISTRY`].
-static EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
-
-/// Clear the exponentiation-domain open registry. Useful between test cases.
-#[allow(dead_code)]
-pub(crate) fn clear_exp_registry() {
-    EXP_REGISTRY.lock().clear();
-}
-
-fn insert_remote_exp_partial(
-    instance_id: u64,
-    sender_party_id: usize,
-    share_id: usize,
-    partial_point: Vec<u8>,
-) {
-    let mut reg = EXP_REGISTRY.lock();
-    // Evict completed entries older than EXP_EVICTION_AGE.
-    let now = std::time::Instant::now();
-    reg.retain(|_, acc| {
-        acc.result_cached_at
-            .is_none_or(|t| now.duration_since(t) < EXP_EVICTION_AGE)
-    });
-    let mut seq = 0usize;
-    loop {
-        let key = (instance_id, seq);
-        let entry = reg.entry(key).or_default();
-        if !entry.party_ids.contains(&sender_party_id) {
-            entry.partial_points.push((share_id, partial_point));
-            entry.party_ids.push(sender_party_id);
-            break;
-        }
-        seq += 1;
-    }
-    drop(reg);
-    EXP_NOTIFY.notify_waiters();
-}
+use crate::net::open_registry::ExpOpenAccumulator;
 
 pub(crate) fn try_handle_open_exp_wire_message(
     authenticated_sender_id: usize,
@@ -131,12 +78,11 @@ pub(crate) fn try_handle_open_exp_wire_message(
         ));
     }
 
-    insert_remote_exp_partial(
-        message.instance_id,
-        message.sender_party_id,
-        message.share_id,
-        message.partial_point,
-    );
+    let registry = match crate::net::open_registry::get_instance_registry(message.instance_id) {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    registry.insert_exp(message.sender_party_id, message.share_id, message.partial_point);
     Ok(true)
 }
 
@@ -165,6 +111,8 @@ where
     program_hash: tokio::sync::RwLock<Option<[u8; 32]>>,
     /// Reservation registry for masked-input protocol.
     reservation: tokio::sync::RwLock<Option<ReservationRegistry>>,
+    /// Per-instance open share accumulation registry.
+    open_registry: Arc<crate::net::open_registry::InstanceRegistry>,
 }
 
 pub type Bls12381HoneyBadgerMpcEngine =
@@ -582,6 +530,8 @@ where
             preproc_store: tokio::sync::RwLock::new(None),
             program_hash: tokio::sync::RwLock::new(None),
             reservation: tokio::sync::RwLock::new(None),
+            open_registry: crate::net::open_registry::get_instance_registry(instance_id)
+                .unwrap_or_else(|| crate::net::open_registry::InstanceRegistry::register(instance_id)),
         }))
     }
 
@@ -609,6 +559,8 @@ where
             preproc_store: tokio::sync::RwLock::new(None),
             program_hash: tokio::sync::RwLock::new(None),
             reservation: tokio::sync::RwLock::new(None),
+            open_registry: crate::net::open_registry::get_instance_registry(instance_id)
+                .unwrap_or_else(|| crate::net::open_registry::InstanceRegistry::register(instance_id)),
         })
     }
 
@@ -719,9 +671,9 @@ where
         self.broadcast_open_exp_payload_sync(wire_message)?;
 
         let required = 2 * self.t + 1;
-        let instance_id = self.instance_id;
         let party_id = self.party_id;
         let n = self.n;
+        let registry = self.open_registry.clone();
 
         // Closure that checks the registry and returns the result or reconstructs.
         // Returns Ok(Some(bytes)) when done, Ok(None) when more contributions needed.
@@ -729,13 +681,12 @@ where
                          partial_bytes: &[u8],
                          share_id: usize|
          -> Result<Option<Vec<u8>>, String> {
-            let mut reg = EXP_REGISTRY.lock();
+            let mut reg = registry.exp.lock();
 
             if my_sequence.is_none() {
                 let mut seq = 0;
                 loop {
-                    let key = (instance_id, seq);
-                    let entry = reg.entry(key).or_insert_with(ExpOpenAccumulator::default);
+                    let entry = reg.entry(seq).or_insert_with(ExpOpenAccumulator::default);
 
                     if !entry.party_ids.contains(&party_id) {
                         entry
@@ -750,9 +701,8 @@ where
             }
 
             let seq = my_sequence.expect("sequence must be set after insertion");
-            let key = (instance_id, seq);
             let entry = reg
-                .get_mut(&key)
+                .get_mut(&seq)
                 .expect("exp registry entry must exist after insertion");
 
             if let Some(result) = entry.result.clone() {
@@ -807,7 +757,6 @@ where
                     .map_err(|e| format!("serialize result: {}", e))?;
 
                 entry.result = Some(result_bytes.clone());
-                entry.result_cached_at = Some(std::time::Instant::now());
                 return Ok(Some(result_bytes));
             }
 
@@ -824,7 +773,7 @@ where
                         let mut my_sequence: Option<usize> = None;
 
                         loop {
-                            let notified = EXP_NOTIFY.notified();
+                            let notified = registry.exp_notify.notified();
 
                             if let Some(result) =
                                 try_check(&mut my_sequence, &partial_bytes, share.id)?
@@ -1084,6 +1033,7 @@ where
 
     fn shutdown(&self) {
         self.ready.store(false, Ordering::SeqCst);
+        crate::net::open_registry::InstanceRegistry::deregister(self.instance_id);
     }
 
     fn party_id(&self) -> usize {
@@ -1277,37 +1227,6 @@ where
 // For multi-process deployments, these protocols would need to use the
 // actual network-based Avid/ABA implementations from mpc-protocols.
 
-/// Registry for RBC broadcasts - maps (instance_id, session_id) to broadcast data
-#[derive(Default)]
-struct RbcRegistry {
-    /// Maps (instance_id, session_id, from_party) to message bytes
-    messages: std::collections::HashMap<(u64, u64, usize), Vec<u8>>,
-    /// Tracks deliveries to receivers: (instance_id, receiver_party, from_party, session_id).
-    delivered: std::collections::HashSet<(u64, usize, usize, u64)>,
-}
-
-/// Registry for ABA sessions - maps (instance_id, session_id) to agreement state
-#[derive(Default)]
-struct AbaRegistry {
-    /// Maps (instance_id, session_id, party_id) to proposed value
-    proposals: std::collections::HashMap<(u64, u64, usize), bool>,
-    /// Maps (instance_id, session_id) to agreed result once consensus is reached
-    results: std::collections::HashMap<(u64, u64), bool>,
-}
-
-static RBC_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<RbcRegistry>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(RbcRegistry::default()));
-
-/// Notified after every insertion into [`RBC_REGISTRY`].
-static RBC_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
-
-static ABA_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<AbaRegistry>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(AbaRegistry::default()));
-
-/// Notified after every insertion into [`ABA_REGISTRY`].
-static ABA_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
 
 impl<F, G> MpcEngineConsensus for HoneyBadgerMpcEngine<F, G>
 where
@@ -1315,13 +1234,13 @@ where
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
     fn rbc_broadcast(&self, message: &[u8]) -> Result<u64, String> {
-        let mut registry = RBC_REGISTRY.lock();
+        let mut registry = self.open_registry.rbc.lock();
 
         // Assign the earliest session index this party has not used yet for this instance.
         let mut session_id = 0u64;
         while registry
             .messages
-            .contains_key(&(self.instance_id, session_id, self.party_id))
+            .contains_key(&(session_id, self.party_id))
         {
             session_id = session_id
                 .checked_add(1)
@@ -1329,11 +1248,11 @@ where
         }
 
         // Store the message for this party's broadcast
-        let key = (self.instance_id, session_id, self.party_id);
+        let key = (session_id, self.party_id);
         registry.messages.insert(key, message.to_vec());
         drop(registry);
 
-        RBC_NOTIFY.notify_waiters();
+        self.open_registry.rbc_notify.notify_waiters();
 
         tracing::info!(
             instance_id = self.instance_id,
@@ -1349,15 +1268,16 @@ where
     fn rbc_receive(&self, from_party: usize, timeout_ms: u64) -> Result<Vec<u8>, String> {
         let instance_id = self.instance_id;
         let party_id = self.party_id;
+        let or = self.open_registry.clone();
 
         let try_deliver = || -> Option<Vec<u8>> {
-            let mut registry = RBC_REGISTRY.lock();
+            let mut registry = or.rbc.lock();
             let mut next: Option<(u64, Vec<u8>)> = None;
-            for ((inst_id, session_id, party), message) in registry.messages.iter() {
-                if *inst_id != instance_id || *party != from_party {
+            for ((session_id, party), message) in registry.messages.iter() {
+                if *party != from_party {
                     continue;
                 }
-                let delivery_key = (instance_id, party_id, from_party, *session_id);
+                let delivery_key = (party_id, from_party, *session_id);
                 if registry.delivered.contains(&delivery_key) {
                     continue;
                 }
@@ -1369,7 +1289,7 @@ where
             if let Some((session_id, message)) = next {
                 registry
                     .delivered
-                    .insert((instance_id, party_id, from_party, session_id));
+                    .insert((party_id, from_party, session_id));
                 tracing::info!(
                     instance_id = instance_id,
                     session_id = session_id,
@@ -1389,7 +1309,7 @@ where
                         let deadline = tokio::time::Instant::now()
                             + tokio::time::Duration::from_millis(timeout_ms);
                         loop {
-                            let notified = RBC_NOTIFY.notified();
+                            let notified = or.rbc_notify.notified();
                             if let Some(msg) = try_deliver() {
                                 return Ok(msg);
                             }
@@ -1427,15 +1347,16 @@ where
     fn rbc_receive_any(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String> {
         let instance_id = self.instance_id;
         let party_id = self.party_id;
+        let or = self.open_registry.clone();
 
         let try_deliver = || -> Option<(usize, Vec<u8>)> {
-            let mut registry = RBC_REGISTRY.lock();
+            let mut registry = or.rbc.lock();
             let mut next: Option<(u64, usize, Vec<u8>)> = None;
-            for ((inst_id, session_id, party), message) in registry.messages.iter() {
-                if *inst_id != instance_id || *party == party_id {
+            for ((session_id, party), message) in registry.messages.iter() {
+                if *party == party_id {
                     continue;
                 }
-                let delivery_key = (instance_id, party_id, *party, *session_id);
+                let delivery_key = (party_id, *party, *session_id);
                 if registry.delivered.contains(&delivery_key) {
                     continue;
                 }
@@ -1448,7 +1369,7 @@ where
             if let Some((session_id, party, message)) = next {
                 registry
                     .delivered
-                    .insert((instance_id, party_id, party, session_id));
+                    .insert((party_id, party, session_id));
                 tracing::info!(
                     instance_id = instance_id,
                     session_id = session_id,
@@ -1468,7 +1389,7 @@ where
                         let deadline = tokio::time::Instant::now()
                             + tokio::time::Duration::from_millis(timeout_ms);
                         loop {
-                            let notified = RBC_NOTIFY.notified();
+                            let notified = or.rbc_notify.notified();
                             if let Some(result) = try_deliver() {
                                 return Ok(result);
                             }
@@ -1503,14 +1424,14 @@ where
     }
 
     fn aba_propose(&self, value: bool) -> Result<u64, String> {
-        let mut registry = ABA_REGISTRY.lock();
+        let mut registry = self.open_registry.aba.lock();
 
         // Assign the earliest session index this party has not proposed in yet.
         // This keeps round indices aligned across parties despite asynchronous ordering.
         let mut session_id = 0u64;
         while registry
             .proposals
-            .contains_key(&(self.instance_id, session_id, self.party_id))
+            .contains_key(&(session_id, self.party_id))
         {
             session_id = session_id
                 .checked_add(1)
@@ -1518,11 +1439,11 @@ where
         }
 
         // Store this party's proposal
-        let key = (self.instance_id, session_id, self.party_id);
+        let key = (session_id, self.party_id);
         registry.proposals.insert(key, value);
         drop(registry);
 
-        ABA_NOTIFY.notify_waiters();
+        self.open_registry.aba_notify.notify_waiters();
 
         tracing::info!(
             instance_id = self.instance_id,
@@ -1538,19 +1459,20 @@ where
     fn aba_result(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
         let instance_id = self.instance_id;
         let required = 2 * self.t + 1;
+        let or = self.open_registry.clone();
 
         let try_check = || -> Option<bool> {
-            let mut registry = ABA_REGISTRY.lock();
+            let mut registry = or.aba.lock();
 
-            if let Some(&result) = registry.results.get(&(instance_id, session_id)) {
+            if let Some(&result) = registry.results.get(&session_id) {
                 return Some(result);
             }
 
             let mut true_count = 0usize;
             let mut false_count = 0usize;
 
-            for ((inst_id, sess_id, _party), &proposal) in registry.proposals.iter() {
-                if *inst_id == instance_id && *sess_id == session_id {
+            for ((sess_id, _party), &proposal) in registry.proposals.iter() {
+                if *sess_id == session_id {
                     if proposal {
                         true_count += 1;
                     } else {
@@ -1560,7 +1482,7 @@ where
             }
 
             if true_count >= required {
-                registry.results.insert((instance_id, session_id), true);
+                registry.results.insert(session_id, true);
                 tracing::info!(
                     instance_id = instance_id,
                     session_id = session_id,
@@ -1572,7 +1494,7 @@ where
             }
 
             if false_count >= required {
-                registry.results.insert((instance_id, session_id), false);
+                registry.results.insert(session_id, false);
                 tracing::info!(
                     instance_id = instance_id,
                     session_id = session_id,
@@ -1593,7 +1515,7 @@ where
                         let deadline = tokio::time::Instant::now()
                             + tokio::time::Duration::from_millis(timeout_ms);
                         loop {
-                            let notified = ABA_NOTIFY.notified();
+                            let notified = or.aba_notify.notified();
                             if let Some(result) = try_check() {
                                 return Ok(result);
                             }
@@ -1907,8 +1829,9 @@ mod tests {
 
     #[test]
     fn open_exp_wire_rejects_mismatched_share_id() {
-        clear_exp_registry();
         let instance_id = next_instance_id();
+        // Register an instance so the wire handler can find it
+        let registry = crate::net::open_registry::InstanceRegistry::register(instance_id);
         let payload = open_exp_test_payload(instance_id, 1, 0, vec![1, 2, 3, 4]);
 
         let err = try_handle_open_exp_wire_message(1, &payload)
@@ -1919,26 +1842,30 @@ mod tests {
             err
         );
         assert!(
-            !EXP_REGISTRY.lock().contains_key(&(instance_id, 0)),
+            !registry.exp.lock().contains_key(&0),
             "rejected payload must not be inserted into the registry"
         );
+        crate::net::open_registry::InstanceRegistry::deregister(instance_id);
     }
 
     #[test]
     fn open_exp_wire_accepts_matching_share_id() {
-        clear_exp_registry();
         let instance_id = next_instance_id();
+        // Register an instance so the wire handler can find it
+        let registry = crate::net::open_registry::InstanceRegistry::register(instance_id);
         let payload = open_exp_test_payload(instance_id, 1, 1, vec![9, 8, 7, 6]);
 
         let handled =
             try_handle_open_exp_wire_message(1, &payload).expect("matching sender/share is valid");
         assert!(handled, "open-exp prefix payload must be handled");
 
-        let reg = EXP_REGISTRY.lock();
+        let reg = registry.exp.lock();
         let entry = reg
-            .get(&(instance_id, 0))
+            .get(&0)
             .expect("entry should be inserted for valid payload");
         assert_eq!(entry.party_ids, vec![1]);
         assert_eq!(entry.partial_points, vec![(1, vec![9, 8, 7, 6])]);
+        drop(reg);
+        crate::net::open_registry::InstanceRegistry::deregister(instance_id);
     }
 }
