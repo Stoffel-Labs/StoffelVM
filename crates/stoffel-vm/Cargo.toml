@@ -69,5 +69,5 @@ tempfile = "3"
 
 [[bench]]
 name = "vm_benchmarks"
-path = "crates/benches"
+path = "../benches/vm_benchmarks.rs"
 harness = false
