@@ -49,7 +49,7 @@ static OPEN_REGISTRY: Lazy<Mutex<HashMap<OpenKey, OpenAccumulator>>> =
 static OPEN_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
 
 const OPEN_REGISTRY_WIRE_PREFIX: &[u8; 4] = b"OPN1";
-const OPEN_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const OPEN_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum OpenRegistryWireMessage {
