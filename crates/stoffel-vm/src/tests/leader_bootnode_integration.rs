@@ -29,7 +29,7 @@ use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
     RoutedNetwork,
 };
-use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
+use crate::tests::test_utils::{acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing};
 use stoffel_vm_types::compiled_binary::CompiledBinary;
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
@@ -49,16 +49,10 @@ const PROGRAM_REGISTERS: usize = 24;
 
 /// Build a federated averaging program that computes element-wise averages.
 ///
-/// This program:
-/// 1. Gets the number of clients from ClientStore
-/// 2. Creates a result array
-/// 3. For each element position:
-///    a. Loads fixed-point shares from all clients
-///    b. Sums shares (as secret shares)
-///    c. Reveals the sum
-///    d. Divides by num_clients to get average
-///    e. Stores result in array
-/// 4. Returns the result array
+/// The VM's current reveal path batches `MOV(secret -> clear)` operations. This
+/// builder mirrors the phased reveal pattern used by the passing mesh test:
+/// compute all secret sums first, queue all reveals second, then read the
+/// revealed values and divide in a final pass.
 fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usize>) {
     let matrix_size = MATRIX_SIZE;
     let mut instructions = Vec::new();
@@ -70,10 +64,11 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     // reg2 = client index (loop counter for summing)
     // reg3 = constant 1
     // reg4 = matrix_size constant
-    // reg5 = element index (outer loop for element-wise processing)
+    // reg5 = element index
     // reg6 = result array reference
-    // reg7 = current element sum/average (clear register for revealed value)
-    // reg8 = scratch
+    // reg7 = scratch / revealed value
+    // reg8 = secret_sums array reference
+    // reg9 = revealed_sums array reference
     // reg16 = current element sum accumulator (secret share)
     // reg17 = scratch for shares
 
@@ -86,32 +81,46 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     instructions.push(Instruction::LDI(3, Value::I64(1))); // reg3 = 1
     instructions.push(Instruction::LDI(4, Value::I64(matrix_size as i64))); // reg4 = matrix_size
 
-    // Step 2: Create result array to store revealed averaged values
+    // Step 2: Create scratch arrays and result array
+    instructions.push(Instruction::LDI(0, Value::I64(matrix_size as i64))); // capacity
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.push(Instruction::CALL("create_array".to_string()));
+    instructions.push(Instruction::MOV(8, 0)); // reg8 = secret_sums array
+
+    instructions.push(Instruction::LDI(0, Value::I64(matrix_size as i64))); // capacity
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.push(Instruction::CALL("create_array".to_string()));
+    instructions.push(Instruction::MOV(9, 0)); // reg9 = revealed_sums array
+
     instructions.push(Instruction::LDI(0, Value::I64(matrix_size as i64))); // capacity
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::CALL("create_array".to_string()));
     instructions.push(Instruction::MOV(6, 0)); // reg6 = result array
 
-    // Step 3: Element-wise loop - for each element position
+    // Phase 1: compute all secret sums without revealing them yet.
     instructions.push(Instruction::LDI(5, Value::I64(0))); // reg5 = 0 (element index)
 
-    let elem_loop = "fp_elem_loop".to_string();
-    let elem_process = "fp_elem_process".to_string();
-    let elem_done = "fp_elem_done".to_string();
+    let phase1_loop = "phase1_loop".to_string();
+    let phase1_process = "phase1_process".to_string();
+    let phase1_done = "phase1_done".to_string();
     let client_sum_loop = "fp_client_sum_loop".to_string();
     let client_sum_process = "fp_client_sum_process".to_string();
     let client_sum_done = "fp_client_sum_done".to_string();
+    let phase2_loop = "phase2_loop".to_string();
+    let phase2_process = "phase2_process".to_string();
+    let phase2_done = "phase2_done".to_string();
+    let phase3_loop = "phase3_loop".to_string();
+    let phase3_process = "phase3_process".to_string();
+    let phase3_done = "phase3_done".to_string();
 
-    // === ELEMENT LOOP: process each matrix position ===
-    labels.insert(elem_loop.clone(), instructions.len());
+    labels.insert(phase1_loop.clone(), instructions.len());
     instructions.push(Instruction::CMP(5, 4)); // Compare element_idx with matrix_size
-    instructions.push(Instruction::JMPLT(elem_process.clone()));
-    instructions.push(Instruction::JMP(elem_done.clone()));
+    instructions.push(Instruction::JMPLT(phase1_process.clone()));
+    instructions.push(Instruction::JMP(phase1_done.clone()));
 
-    labels.insert(elem_process.clone(), instructions.len());
+    labels.insert(phase1_process.clone(), instructions.len());
 
-    // Initialize sum accumulator for this element position
-    // Load first client's share to initialize the secret accumulator
+    // Load first client's share to initialize the secret accumulator.
     instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::PUSHARG(5)); // element_index
@@ -123,14 +132,12 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     // Sum remaining clients for this element
     instructions.push(Instruction::LDI(2, Value::I64(1))); // reg2 = 1 (start from client 1)
 
-    // === CLIENT SUM LOOP: sum shares from all clients for this element ===
     labels.insert(client_sum_loop.clone(), instructions.len());
     instructions.push(Instruction::CMP(2, 1)); // Compare client_idx with num_clients
     instructions.push(Instruction::JMPLT(client_sum_process.clone()));
     instructions.push(Instruction::JMP(client_sum_done.clone()));
 
     labels.insert(client_sum_process.clone(), instructions.len());
-    // Get share for current client, current element
     instructions.push(Instruction::PUSHARG(2)); // client_index
     instructions.push(Instruction::PUSHARG(5)); // element_index
     instructions.push(Instruction::CALL(
@@ -145,28 +152,72 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     instructions.push(Instruction::ADD(2, 2, 3)); // reg2++
     instructions.push(Instruction::JMP(client_sum_loop.clone()));
 
-    // === END CLIENT SUM LOOP ===
     labels.insert(client_sum_done.clone(), instructions.len());
 
-    // Reveal the sum - MOV from secret register to clear register triggers MPC reveal
-    instructions.push(Instruction::MOV(7, 16)); // reg7 = revealed sum
+    // Store the secret sum. This stays secret until phase 2.
+    instructions.push(Instruction::PUSHARG(8)); // secret_sums array ref
+    instructions.push(Instruction::PUSHARG(5)); // index
+    instructions.push(Instruction::PUSHARG(16)); // secret sum
+    instructions.push(Instruction::CALL("set_field".to_string()));
 
-    // Divide by num_clients to get average (operating on clear values)
+    instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
+    instructions.push(Instruction::JMP(phase1_loop.clone()));
+
+    labels.insert(phase1_done.clone(), instructions.len());
+
+    // Phase 2: queue all reveals.
+    instructions.push(Instruction::LDI(5, Value::I64(0))); // reset element index
+
+    labels.insert(phase2_loop.clone(), instructions.len());
+    instructions.push(Instruction::CMP(5, 4));
+    instructions.push(Instruction::JMPLT(phase2_process.clone()));
+    instructions.push(Instruction::JMP(phase2_done.clone()));
+
+    labels.insert(phase2_process.clone(), instructions.len());
+
+    instructions.push(Instruction::PUSHARG(8)); // secret_sums array
+    instructions.push(Instruction::PUSHARG(5)); // index
+    instructions.push(Instruction::CALL("get_field".to_string()));
+    instructions.push(Instruction::MOV(16, 0)); // reg16 = secret sum
+
+    // MOV(secret -> clear) queues the reveal in the current MPC runtime.
+    instructions.push(Instruction::MOV(7, 16));
+    instructions.push(Instruction::PUSHARG(9)); // revealed_sums array
+    instructions.push(Instruction::PUSHARG(5)); // index
+    instructions.push(Instruction::PUSHARG(7)); // pending reveal marker
+    instructions.push(Instruction::CALL("set_field".to_string()));
+
+    instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
+    instructions.push(Instruction::JMP(phase2_loop.clone()));
+
+    labels.insert(phase2_done.clone(), instructions.len());
+
+    // Phase 3: reading the first queued reveal flushes the whole batch.
+    instructions.push(Instruction::LDI(5, Value::I64(0))); // reset element index
+
+    labels.insert(phase3_loop.clone(), instructions.len());
+    instructions.push(Instruction::CMP(5, 4));
+    instructions.push(Instruction::JMPLT(phase3_process.clone()));
+    instructions.push(Instruction::JMP(phase3_done.clone()));
+
+    labels.insert(phase3_process.clone(), instructions.len());
+
+    instructions.push(Instruction::PUSHARG(9)); // revealed_sums array
+    instructions.push(Instruction::PUSHARG(5)); // index
+    instructions.push(Instruction::CALL("get_field".to_string()));
+    instructions.push(Instruction::MOV(7, 0)); // reg7 = revealed sum
+
     instructions.push(Instruction::DIV(7, 7, 1)); // reg7 = sum / num_clients
 
-    // Store the revealed averaged value in the result array (1-indexed)
-    instructions.push(Instruction::ADD(8, 5, 3)); // reg8 = element_index + 1 (1-indexed)
     instructions.push(Instruction::PUSHARG(6)); // result array ref
-    instructions.push(Instruction::PUSHARG(8)); // index (1-based)
+    instructions.push(Instruction::PUSHARG(5)); // index
     instructions.push(Instruction::PUSHARG(7)); // value (revealed average)
     instructions.push(Instruction::CALL("set_field".to_string()));
 
-    // Increment element counter
     instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
-    instructions.push(Instruction::JMP(elem_loop.clone()));
+    instructions.push(Instruction::JMP(phase3_loop.clone()));
 
-    // === END ELEMENT LOOP ===
-    labels.insert(elem_done.clone(), instructions.len());
+    labels.insert(phase3_done.clone(), instructions.len());
 
     // Return the result array
     instructions.push(Instruction::MOV(0, 6));
@@ -209,6 +260,7 @@ fn create_federated_average_binary() -> Vec<u8> {
 async fn test_leader_bootnode_matrix_average_fixed_point() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting Leader Bootnode Matrix Average Fixed-Point Test ===");
     info!(
@@ -618,7 +670,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             if let Some(arr) = vm.state.object_store.get_array(*array_id) {
                 info!("Verifying {} averaged matrix elements:", arr.length());
                 for elem_idx in 0..MATRIX_SIZE {
-                    let idx_val = Value::I64((elem_idx + 1) as i64);
+                    let idx_val = Value::I64(elem_idx as i64);
                     if let Some(elem_val) = arr.get(&idx_val) {
                         let computed_avg: f64 = match elem_val {
                             Value::I64(v) => *v as f64,
@@ -673,7 +725,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             .expect("array exists");
         (0..MATRIX_SIZE)
             .map(|i| {
-                let idx = Value::I64((i + 1) as i64);
+                let idx = Value::I64(i as i64);
                 match arr.get(&idx).expect("element exists") {
                     Value::I64(v) => *v as f64,
                     Value::Float(v) => v.0,
@@ -695,7 +747,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             .get_array(array_id)
             .expect("array exists");
         for (i, &ref_val) in reference_vals.iter().enumerate() {
-            let idx = Value::I64((i + 1) as i64);
+            let idx = Value::I64(i as i64);
             let party_val: f64 = match arr.get(&idx).expect("element exists") {
                 Value::I64(v) => *v as f64,
                 Value::Float(v) => v.0,

@@ -23,7 +23,7 @@ use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
     RoutedNetwork,
 };
-use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
+use crate::tests::test_utils::{acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing};
 use std::collections::HashMap;
 use stoffel_vm_types::core_types::{ShareData, ShareType, Value};
 use stoffel_vm_types::functions::VMFunction;
@@ -34,6 +34,7 @@ use stoffel_vm_types::instructions::Instruction;
 async fn test_vm_mpc_multiplication_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM MPC Integration Test ===");
 

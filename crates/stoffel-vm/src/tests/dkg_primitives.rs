@@ -18,7 +18,7 @@ use crate::net::mpc_engine::MpcEngine;
 use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
 };
-use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
+use crate::tests::test_utils::{acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing};
 
 /// Test: open_share_in_exp on a known value reconstructs correctly.
 ///
@@ -29,6 +29,7 @@ use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
 async fn test_open_share_in_exp_known_value() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     let n = 5;
     let t = 1;
@@ -198,6 +199,7 @@ async fn test_open_share_in_exp_known_value() {
 async fn test_simulated_dkg_flow() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     let n = 5;
     let t = 1;

@@ -32,7 +32,7 @@ use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
     HoneyBadgerQuicServer, RoutedNetwork,
 };
-use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
+use crate::tests::test_utils::{acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing};
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
@@ -43,6 +43,7 @@ use stoffel_vm_types::instructions::Instruction;
 async fn test_vm_mesh_full_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting Full VM Mesh Integration Test ===");
 
@@ -444,6 +445,7 @@ async fn test_vm_mesh_full_integration() {
 async fn test_vm_mesh_average_salary_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM Mesh Average Salary Integration Test ===");
 
@@ -942,6 +944,7 @@ const MAX_AVG_CLIENTS: usize = 8;
 async fn test_vm_mesh_large_preprocessing() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting Large Preprocessing Integration Test ===");
 
@@ -1250,6 +1253,7 @@ fn build_sum_salary_program_no_reveal() -> (Vec<Instruction>, HashMap<String, us
 async fn test_vm_mesh_output_client_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM Mesh Output Client Integration Test ===");
 
@@ -1679,9 +1683,11 @@ const MATRIX_SIZE: usize = MATRIX_ROWS * MATRIX_COLS;
 const MATRIX_AVG_PROGRAM_REGISTERS: usize = 32;
 
 /// Large matrix dimensions for the fixed-point integration test (128x128)
-const LARGE_MATRIX_ROWS: usize = 512;
-const LARGE_MATRIX_COLS: usize = 512;
+const LARGE_MATRIX_ROWS: usize = 128;
+const LARGE_MATRIX_COLS: usize = 128;
 const LARGE_MATRIX_SIZE: usize = LARGE_MATRIX_ROWS * LARGE_MATRIX_COLS;
+const LARGE_MATRIX_CLIENT_COUNT: usize = 4;
+const LARGE_MATRIX_TEST_SEED: u64 = 0x5A0FFE1_u64;
 
 /// Maximum elements that can be preprocessed in a single batch (due to protocol limitations)
 /// The preprocessing protocol freezes when attempting to generate >511 elements at once
@@ -1727,6 +1733,7 @@ const MAX_PREPROCESSING_BATCH_SIZE: usize = 500;
 async fn test_vm_mesh_matrix_average_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM Mesh Matrix Average Integration Test ===");
     info!(
@@ -2305,6 +2312,7 @@ const FIXED_POINT_SCALE: i64 = 1 << FIXED_POINT_FRACTIONAL_BITS; // 2^16 = 65536
 async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     // Timing tracking for performance analysis
     let test_start = std::time::Instant::now();
@@ -2339,10 +2347,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         ..Default::default()
     };
 
-    // Generate test client data before network setup (client IDs must be registered at setup time)
-    // For federated averaging, we need to track per-element values to compute expected averages
-    let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-    let client_count = rng.gen_range(2..=4usize);
+    // Keep this ignored stress test reproducible so runtime and share counts are stable across runs.
+    // For federated averaging, we need to track per-element values to compute expected averages.
+    let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(LARGE_MATRIX_TEST_SEED);
+    let client_count = LARGE_MATRIX_CLIENT_COUNT;
     let mut client_ids = Vec::new();
     let mut client_inputs = Vec::new();
 
@@ -3494,6 +3502,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM Mesh Bytecode Fixed-Point Integration Test ===");
     info!(

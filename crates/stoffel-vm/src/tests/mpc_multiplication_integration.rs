@@ -1064,12 +1064,15 @@ mod tests {
     use stoffelmpc_mpc::common::ProtocolSessionId;
     use stoffelmpc_mpc::honeybadger::{ProtocolType, SessionId};
 
-    use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
+    use crate::tests::test_utils::{
+        acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing,
+    };
 
     #[tokio::test]
     async fn test_preprocessing_client_mul() {
         init_crypto_provider();
         setup_test_tracing();
+        let _hb_itest_lock = acquire_hb_itest_lock().await;
 
         info!("=== Starting Preprocessing-Only Test ===");
 
@@ -1444,6 +1447,7 @@ mod tests {
     async fn test_client_input_only() {
         init_crypto_provider();
         setup_test_tracing();
+        let _hb_itest_lock = acquire_hb_itest_lock().await;
 
         info!("=== Starting Preprocessing-Only Test ===");
 
@@ -1740,6 +1744,7 @@ mod tests {
     async fn test_preprocessing_only() {
         init_crypto_provider();
         setup_test_tracing();
+        let _hb_itest_lock = acquire_hb_itest_lock().await;
 
         info!("=== Starting Preprocessing-Only Test ===");
 
