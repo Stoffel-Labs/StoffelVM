@@ -68,100 +68,6 @@ struct AvssExpOpenWireMessage {
 /// Wire prefix that identifies an AVSS open-in-exp G2 contribution message.
 const AVSS_G2_EXP_WIRE_PREFIX: &[u8; 4] = b"AXG2";
 
-/// Inspect an incoming message and, if it carries an AVSS open-in-exp contribution
-/// (`AXOP` prefix), insert it into the accumulator registry and return `Ok(true)`.
-/// Returns `Ok(false)` for unrelated messages.
-pub fn try_handle_avss_open_exp_wire_message(
-    authenticated_sender_id: usize,
-    payload: &[u8],
-) -> Result<bool, String> {
-    if payload.len() < AVSS_EXP_WIRE_PREFIX.len()
-        || &payload[..AVSS_EXP_WIRE_PREFIX.len()] != AVSS_EXP_WIRE_PREFIX
-    {
-        return Ok(false);
-    }
-
-    let message: AvssExpOpenWireMessage =
-        bincode::deserialize(&payload[AVSS_EXP_WIRE_PREFIX.len()..])
-            .map_err(|e| format!("deserialize avss open-exp payload: {}", e))?;
-
-    if authenticated_sender_id == crate::net::open_registry::UNKNOWN_SENDER_ID {
-        tracing::warn!(
-            sender_party_id = message.sender_party_id,
-            "Rejecting AVSS open-exp wire message from unauthenticated connection"
-        );
-        return Err("avss open-exp wire rejected: sender identity not authenticated".to_string());
-    }
-    if message.sender_party_id != authenticated_sender_id {
-        return Err(format!(
-            "avss open-exp sender mismatch: transport={} payload={}",
-            authenticated_sender_id, message.sender_party_id
-        ));
-    }
-    // In AVSS the share_id equals party_id + 1 (evaluation points are 1-indexed).
-    if message.share_id != message.sender_party_id + 1 {
-        return Err(format!(
-            "avss open-exp share_id mismatch: sender_party_id={} share_id={}",
-            message.sender_party_id, message.share_id
-        ));
-    }
-
-    let registry = match crate::net::open_registry::get_instance_registry(message.instance_id) {
-        Some(r) => r,
-        None => return Ok(false),
-    };
-    registry.insert_exp(message.sender_party_id, message.share_id, message.partial_point);
-    Ok(true)
-}
-
-/// Inspect an incoming message and, if it carries an AVSS G2 open-in-exp contribution
-/// (`AXG2` prefix), insert it into the G2 accumulator registry and return `Ok(true)`.
-/// Returns `Ok(false)` for unrelated messages.
-pub fn try_handle_avss_g2_exp_wire_message(
-    authenticated_sender_id: usize,
-    payload: &[u8],
-) -> Result<bool, String> {
-    if payload.len() < AVSS_G2_EXP_WIRE_PREFIX.len()
-        || &payload[..AVSS_G2_EXP_WIRE_PREFIX.len()] != AVSS_G2_EXP_WIRE_PREFIX
-    {
-        return Ok(false);
-    }
-
-    let message: AvssExpOpenWireMessage =
-        bincode::deserialize(&payload[AVSS_G2_EXP_WIRE_PREFIX.len()..])
-            .map_err(|e| format!("deserialize avss g2 open-exp payload: {}", e))?;
-
-    if authenticated_sender_id == crate::net::open_registry::UNKNOWN_SENDER_ID {
-        tracing::warn!(
-            sender_party_id = message.sender_party_id,
-            "Rejecting AVSS G2 open-exp wire message from unauthenticated connection"
-        );
-        return Err(
-            "avss g2 open-exp wire rejected: sender identity not authenticated".to_string(),
-        );
-    }
-    if message.sender_party_id != authenticated_sender_id {
-        return Err(format!(
-            "avss g2 open-exp sender mismatch: transport={} payload={}",
-            authenticated_sender_id, message.sender_party_id
-        ));
-    }
-    // In AVSS the share_id equals party_id + 1 (evaluation points are 1-indexed).
-    if message.share_id != message.sender_party_id + 1 {
-        return Err(format!(
-            "avss g2 open-exp share_id mismatch: sender_party_id={} share_id={}",
-            message.sender_party_id, message.share_id
-        ));
-    }
-
-    let registry = match crate::net::open_registry::get_instance_registry(message.instance_id) {
-        Some(r) => r,
-        None => return Ok(false),
-    };
-    registry.insert_exp_g2(message.sender_party_id, message.share_id, message.partial_point);
-    Ok(true)
-}
-
 // ============================================================================
 
 /// Default number of random double-sharing pairs to pre-generate.
@@ -247,6 +153,8 @@ where
     preproc_store: tokio::sync::RwLock<Option<Arc<dyn crate::storage::preproc::PreprocStore>>>,
     /// Program hash and field kind for keying stored material.
     preproc_config: tokio::sync::RwLock<Option<([u8; 32], crate::net::curve::MpcFieldKind)>>,
+    /// Router that owns open-message accumulation for this AVSS runtime.
+    open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
     /// Per-instance open share accumulation registry.
     open_registry: Arc<crate::net::open_registry::InstanceRegistry>,
 }
@@ -268,6 +176,31 @@ where
     /// * `pk_map` - AVSS ECDH public keys from all parties
     /// * `input_ids` - Client IDs that will provide inputs (empty if no clients)
     pub async fn new(
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        net: Arc<QuicNetworkManager>,
+        sk_i: F,
+        pk_map: Arc<Vec<G>>,
+        input_ids: Vec<ClientId>,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_with_router(
+            Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
+            instance_id,
+            party_id,
+            n,
+            t,
+            net,
+            sk_i,
+            pk_map,
+            input_ids,
+        )
+        .await
+    }
+
+    pub async fn new_with_router(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
         instance_id: u64,
         party_id: usize,
         n: usize,
@@ -314,8 +247,13 @@ where
             _marker: PhantomData,
             preproc_store: tokio::sync::RwLock::new(None),
             preproc_config: tokio::sync::RwLock::new(None),
-            open_registry: crate::net::open_registry::InstanceRegistry::register(instance_id),
+            open_message_router: open_message_router.clone(),
+            open_registry: open_message_router.register_instance(instance_id),
         }))
+    }
+
+    pub fn open_message_router(&self) -> Arc<crate::net::open_registry::OpenMessageRouter> {
+        self.open_message_router.clone()
     }
 
     #[inline]
@@ -1330,8 +1268,7 @@ where
         let n = self.n;
         let t = self.t;
 
-        crate::net::open_registry::open_share_via_registry(
-            self.instance_id,
+        self.open_registry.open_share_wait(
             self.party_id,
             &type_key,
             share_bytes,
@@ -1374,8 +1311,7 @@ where
         // Use open_share_via_registry with a closure that serializes the secret
         // as a field element, then carries the bytes through Value::String
         // (using unsafe-from-utf8-lossy is fine since we immediately extract).
-        let result = crate::net::open_registry::open_share_via_registry(
-            self.instance_id,
+        let result = self.open_registry.open_share_wait(
             self.party_id,
             &type_key,
             share_bytes,
@@ -1407,7 +1343,7 @@ where
                 }
                 Ok(bytes)
             }
-            _ => Err("unexpected result from open_share_via_registry".to_string()),
+            _ => Err("unexpected result from open_share_wait".to_string()),
         }
     }
 
@@ -1431,8 +1367,7 @@ where
         let n = self.n;
         let t = self.t;
 
-        crate::net::open_registry::batch_open_via_registry(
-            self.instance_id,
+        self.open_registry.batch_open_wait(
             self.party_id,
             &type_key,
             shares,

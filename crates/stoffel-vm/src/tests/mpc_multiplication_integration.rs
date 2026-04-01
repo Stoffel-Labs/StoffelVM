@@ -289,6 +289,7 @@ pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     /// Available after `finalize_network()`.
     pub routed_network: Option<Arc<MpcNetwork>>,
     pub expected_client_ids: Vec<ClientId>,
+    pub open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
 }
 
 impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
@@ -351,6 +352,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             channels,
             routed_network: None,
             expected_client_ids: input_ids,
+            open_message_router: Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
         })
     }
 
@@ -473,31 +475,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
 
         let mut dialer = (*network).clone();
 
-        // Install loopback receive handler
         let local_did = network.local_derived_id();
-        if let Some(lb) = network.get_connection(local_did).await {
-            let txx = self.channels.clone();
-            let nid = self.node_id;
-            tokio::spawn(async move {
-                loop {
-                    match lb.receive().await {
-                        Ok(data) => {
-                            // Loopback sender_id will be resolved after
-                            // assign_party_ids via remote_party_id on the
-                            // loopback connection; for now use UNKNOWN and
-                            // fix up below.
-                            let sender_id = lb.remote_party_id()
-                                .unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
-                            if txx.send((sender_id, data)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                trace!("Node {} loopback reader ended", nid);
-            });
-        }
 
         for peer_addr in &peers {
             // Skip self (our own address is in the list)
@@ -519,29 +497,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                             "Node {} connected to peer at {}",
                             self.node_id, peer_addr
                         );
-                        // Spawn receive handler on dialer connection.
-                        // Between any two servers there are two QUIC connections
-                        // (each side dials the other).  The DashMap may store
-                        // either one as the canonical connection for send().
-                        // We need receive handlers on BOTH so that messages
-                        // arrive regardless of which connection is used.
-                        let txx = self.channels.clone();
-                        let nid = self.node_id;
-                        tokio::spawn(async move {
-                            loop {
-                                match conn.receive().await {
-                                    Ok(data) => {
-                                        let sid = conn.remote_party_id()
-                                            .unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
-                                        if txx.send((sid, data)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                            trace!("Node {} dialer recv handler ended", nid);
-                        });
+                        drop(conn);
                         break;
                     }
                     Err(e) => {
@@ -616,22 +572,24 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             .network
             .as_ref()
             .expect("spawn_server_receive_loops called before start()");
+        let derived_to_party: std::collections::HashMap<PartyId, PartyId> = network
+            .get_sorted_public_keys()
+            .into_iter()
+            .enumerate()
+            .map(|(party_id, pk)| (pk.derive_id(), party_id))
+            .collect();
         let all = network.get_all_server_connections();
         for (derived_id, conn) in all {
-            // Skip loopback (already has a handler from connect_to_peers)
-            if derived_id == network.local_derived_id() {
-                continue;
-            }
             let txx = self.channels.clone();
             let nid = self.node_id;
+            let sender_id = conn
+                .remote_party_id()
+                .unwrap_or_else(|| *derived_to_party.get(&derived_id).unwrap_or(&derived_id));
             tokio::spawn(async move {
                 loop {
                     match conn.receive().await {
                         Ok(data) => {
-                            let sid = conn
-                                .remote_party_id()
-                                .unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
-                            if txx.send((sid, data)).await.is_err() {
+                            if txx.send((sender_id, data)).await.is_err() {
                                 break;
                             }
                         }
@@ -1208,10 +1166,11 @@ mod tests {
                 .routed_network
                 .clone()
                 .expect("routed_network should be set after finalize_network()");
+            let open_message_router = server.open_message_router.clone();
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
-                    match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1219,9 +1178,9 @@ mod tests {
                         }
                         Ok(false) => {}
                     }
-                    match crate::net::hb_engine::try_handle_open_exp_wire_message(
-                        sender_id, &raw_msg,
-                    ) {
+                    match open_message_router
+                        .try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                    {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1577,10 +1536,11 @@ mod tests {
                 .routed_network
                 .clone()
                 .expect("routed_network should be set after finalize_network()");
+            let open_message_router = server.open_message_router.clone();
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
-                    match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1588,9 +1548,9 @@ mod tests {
                         }
                         Ok(false) => {}
                     }
-                    match crate::net::hb_engine::try_handle_open_exp_wire_message(
-                        sender_id, &raw_msg,
-                    ) {
+                    match open_message_router
+                        .try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                    {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1809,10 +1769,11 @@ mod tests {
                 .routed_network
                 .clone()
                 .expect("routed_network should be set after finalize_network()");
+            let open_message_router = server.open_message_router.clone();
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
-                    match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1820,9 +1781,9 @@ mod tests {
                         }
                         Ok(false) => {}
                     }
-                    match crate::net::hb_engine::try_handle_open_exp_wire_message(
-                        sender_id, &raw_msg,
-                    ) {
+                    match open_message_router
+                        .try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                    {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");

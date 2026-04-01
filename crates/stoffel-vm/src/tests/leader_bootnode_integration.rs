@@ -406,10 +406,11 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             .routed_network
             .clone()
             .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -417,7 +418,8 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -559,7 +561,8 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             .party_id
             .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,

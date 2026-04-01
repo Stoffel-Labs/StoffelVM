@@ -970,7 +970,9 @@ where
 
     // Clone 2: the engine node — used for preprocessing initiation only.
     // Created via from_existing_node which wraps it in Arc<Mutex>.
-    let engine = HoneyBadgerMpcEngine::<F, G>::from_existing_node(
+    let open_message_router = Arc::new(stoffel_vm::net::OpenMessageRouter::new());
+    let engine = HoneyBadgerMpcEngine::<F, G>::from_existing_node_with_router(
+        open_message_router.clone(),
         instance_id,
         my_id,
         n,
@@ -981,7 +983,7 @@ where
 
     eprintln!("[party {}] Spawning receive loops (split channels)...", my_id);
     let (mut server_rx, mut client_rx) =
-        spawn_receive_loops_split(net.clone(), my_id, n).await;
+        spawn_receive_loops_split(net.clone(), my_id, n, open_message_router).await;
 
     // Remap transport-derived client IDs to sequential indices for the MPC protocol.
     let client_id_to_index: std::collections::HashMap<ClientId, usize> = input_ids
@@ -1342,6 +1344,7 @@ where
         }
         let peer_id = *peer_id;
         let engine = engine.clone();
+        let open_message_router = engine.open_message_router();
         let tx = msg_tx.clone();
         let conn = conn.clone();
         let net_clone = net.clone();
@@ -1350,13 +1353,19 @@ where
             loop {
                 match conn.receive().await {
                     Ok(data) => {
-                        if let Ok(true) = stoffel_vm::net::open_registry::try_handle_wire_message(authenticated_sender_id, &data) {
+                        if let Ok(true) =
+                            open_message_router.try_handle_wire_message(authenticated_sender_id, &data)
+                        {
                             continue;
                         }
-                        if let Ok(true) = stoffel_vm::net::avss_engine::try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
+                        if let Ok(true) = open_message_router
+                            .try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data)
+                        {
                             continue;
                         }
-                        if let Ok(true) = stoffel_vm::net::avss_engine::try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
+                        if let Ok(true) = open_message_router
+                            .try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data)
+                        {
                             continue;
                         }
                         if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {

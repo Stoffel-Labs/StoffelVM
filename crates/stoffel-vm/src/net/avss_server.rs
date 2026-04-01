@@ -99,6 +99,8 @@ where
     pk_map: Option<Arc<Vec<G>>>,
     /// Configuration
     pub config: AvssQuicConfig,
+    /// Router shared by this server's receive loops and AVSS engine.
+    pub open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
     /// Accept loop task handle
     accept_task: Option<JoinHandle<()>>,
     /// Cancellation token for graceful shutdown
@@ -200,6 +202,7 @@ where
             pk_i,
             pk_map: None,
             config,
+            open_message_router: Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
             accept_task: None,
             shutdown_token: CancellationToken::new(),
         }
@@ -227,6 +230,7 @@ where
             pk_i,
             pk_map: None,
             config,
+            open_message_router: Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
             accept_task: None,
             shutdown_token: CancellationToken::new(),
         }
@@ -523,7 +527,8 @@ where
             .ok_or("Public keys not exchanged yet")?
             .clone();
 
-        AvssMpcEngine::new(
+        AvssMpcEngine::new_with_router(
+            self.open_message_router.clone(),
             self.instance_id,
             self.node_id,
             self.n,
@@ -546,6 +551,7 @@ where
         engine: Arc<AvssMpcEngine<F, G>>,
     ) -> Result<mpsc::Receiver<Vec<u8>>, String> {
         let net = self.network.as_ref().ok_or("Server not started")?.clone();
+        let router = engine.open_message_router();
 
         let (msg_tx, msg_rx) = mpsc::channel::<Vec<u8>>(1000);
 
@@ -561,6 +567,7 @@ where
             let net_clone = net.clone();
             let shutdown_token = self.shutdown_token.clone();
             let authenticated_sender_id = conn.remote_party_id().unwrap_or(peer_id);
+            let router = router.clone();
 
             tokio::spawn(async move {
                 loop {
@@ -572,7 +579,7 @@ where
                         result = conn.receive() => {
                             match result {
                                 Ok(data) => {
-                                    match crate::net::open_registry::try_handle_wire_message(authenticated_sender_id, &data) {
+                                    match router.try_handle_wire_message(authenticated_sender_id, &data) {
                                         Ok(true) => {
                                             continue;
                                         }
@@ -586,7 +593,7 @@ where
                                         Ok(false) => {}
                                     }
 
-                                    match crate::net::avss_engine::try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
+                                    match router.try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
                                         Ok(true) => {
                                             continue;
                                         }
@@ -600,7 +607,7 @@ where
                                         Ok(false) => {}
                                     }
 
-                                    match crate::net::avss_engine::try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
+                                    match router.try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
                                         Ok(true) => {
                                             continue;
                                         }
@@ -663,6 +670,7 @@ where
         String,
     > {
         let net = self.network.as_ref().ok_or("Server not started")?.clone();
+        let router = engine.open_message_router();
 
         let (server_tx, server_rx) = mpsc::channel::<(usize, Vec<u8>)>(65536);
         let (client_tx, client_rx) = mpsc::channel::<(usize, Vec<u8>)>(4096);
@@ -680,6 +688,7 @@ where
             let net_clone = net.clone();
             let shutdown_token = self.shutdown_token.clone();
             let authenticated_sender_id = conn.remote_party_id().unwrap_or(peer_id);
+            let router = router.clone();
 
             tokio::spawn(async move {
                 loop {
@@ -688,13 +697,13 @@ where
                         result = conn.receive() => {
                             match result {
                                 Ok(data) => {
-                                    if let Ok(true) = crate::net::open_registry::try_handle_wire_message(authenticated_sender_id, &data) {
+                                    if let Ok(true) = router.try_handle_wire_message(authenticated_sender_id, &data) {
                                         continue;
                                     }
-                                    if let Ok(true) = crate::net::avss_engine::try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
+                                    if let Ok(true) = router.try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
                                         continue;
                                     }
-                                    if let Ok(true) = crate::net::avss_engine::try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
+                                    if let Ok(true) = router.try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
                                         continue;
                                     }
                                     if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {

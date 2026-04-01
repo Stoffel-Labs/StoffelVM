@@ -1,19 +1,16 @@
 //! Per-instance accumulation registry for `open_share` and `batch_open_shares`.
 //!
-//! Each MPC engine owns an [`InstanceRegistry`] that collects share bytes from
-//! every party and reconstructs secrets once enough contributions arrive.
-//! Registries are scoped per `instance_id` — no cross-session contamination.
-//!
-//! A global [`DashMap`] routes incoming wire messages to the correct instance
-//! by extracting `instance_id` from the payload. The wire message format and
-//! call sites in receive loops are unchanged.
+//! Each MPC engine/session owns an [`OpenMessageRouter`] that routes wire
+//! messages to per-instance [`InstanceRegistry`] values owned by that runtime.
+//! Registries are scoped per `instance_id` within one router — no
+//! cross-session contamination inside the same process.
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -28,8 +25,20 @@ const OPEN_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Sentinel value indicating the sender's party identity is unknown.
 pub const UNKNOWN_SENDER_ID: usize = usize::MAX;
 
-/// Global router: `instance_id → InstanceRegistry`.
-static REGISTRY_MAP: Lazy<DashMap<u64, Arc<InstanceRegistry>>> = Lazy::new(DashMap::new);
+/// HoneyBadger open-in-exp wire prefix.
+const HB_EXP_OPEN_WIRE_PREFIX: &[u8; 4] = b"XOP1";
+/// AVSS open-in-exp wire prefix.
+const AVSS_EXP_WIRE_PREFIX: &[u8; 4] = b"AXOP";
+/// AVSS G2 open-in-exp wire prefix.
+const AVSS_G2_EXP_WIRE_PREFIX: &[u8; 4] = b"AXG2";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpOpenWireMessage {
+    instance_id: u64,
+    sender_party_id: usize,
+    share_id: usize,
+    partial_point: Vec<u8>,
+}
 
 // ---------------------------------------------------------------------------
 // Accumulators
@@ -104,11 +113,6 @@ pub struct AbaState {
 // ---------------------------------------------------------------------------
 
 /// Per-instance registry for all share accumulation and consensus state.
-///
-/// Each MPC engine creates one via [`InstanceRegistry::register`] and holds
-/// the returned `Arc`. Incoming wire messages are routed here by `instance_id`.
-/// On drop (or explicit [`InstanceRegistry::deregister`]), all state for that
-/// instance is removed from the global map.
 pub struct InstanceRegistry {
     instance_id: u64,
     // open share accumulation
@@ -130,15 +134,8 @@ pub struct InstanceRegistry {
 }
 
 impl InstanceRegistry {
-    /// Get or create a registry for the given instance_id.
-    ///
-    /// Multiple engines sharing the same `instance_id` (e.g. 5 parties in one
-    /// process) will share a single `InstanceRegistry`.
-    pub fn register(instance_id: u64) -> Arc<Self> {
-        if let Some(existing) = REGISTRY_MAP.get(&instance_id) {
-            return existing.clone();
-        }
-        let reg = Arc::new(Self {
+    fn new(instance_id: u64) -> Self {
+        Self {
             instance_id,
             single: Mutex::new(HashMap::new()),
             single_notify: Notify::new(),
@@ -152,13 +149,7 @@ impl InstanceRegistry {
             rbc_notify: Notify::new(),
             aba: Mutex::new(AbaState::default()),
             aba_notify: Notify::new(),
-        });
-        REGISTRY_MAP.entry(instance_id).or_insert(reg).clone()
-    }
-
-    /// Remove this instance from the global map, dropping all accumulated state.
-    pub fn deregister(instance_id: u64) {
-        REGISTRY_MAP.remove(&instance_id);
+        }
     }
 
     // -- single open --------------------------------------------------------
@@ -609,6 +600,272 @@ impl InstanceRegistry {
     }
 }
 
+/// Session-local router for open-share and open-in-exponent wire messages.
+///
+/// A single runtime should own one router and pass it to all receive loops and
+/// MPC engines that belong to that runtime. Different runtimes in the same
+/// process should use different routers.
+#[derive(Default)]
+pub struct OpenMessageRouter {
+    registries: DashMap<u64, Weak<InstanceRegistry>>,
+}
+
+impl OpenMessageRouter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get or create a registry for the given instance_id within this router.
+    pub fn register_instance(&self, instance_id: u64) -> Arc<InstanceRegistry> {
+        if let Some(existing) = self.get_instance_registry(instance_id) {
+            return existing;
+        }
+
+        let registry = Arc::new(InstanceRegistry::new(instance_id));
+        match self.registries.entry(instance_id) {
+            Entry::Occupied(mut occupied) => {
+                if let Some(existing) = occupied.get().upgrade() {
+                    existing
+                } else {
+                    occupied.insert(Arc::downgrade(&registry));
+                    registry
+                }
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(Arc::downgrade(&registry));
+                registry
+            }
+        }
+    }
+
+    /// Look up an instance registry within this router.
+    pub fn get_instance_registry(&self, instance_id: u64) -> Option<Arc<InstanceRegistry>> {
+        self.registries
+            .get(&instance_id)
+            .and_then(|entry| entry.value().upgrade())
+    }
+
+    pub fn clear(&self) {
+        self.registries.clear();
+    }
+
+    /// Attempt to consume an incoming transport payload as an open-registry wire message.
+    ///
+    /// Returns `Ok(true)` when the payload is recognized and handled.
+    /// Returns `Ok(false)` when the payload is not an open-registry message,
+    /// or when no registry is registered for the `instance_id`.
+    pub fn try_handle_wire_message(
+        &self,
+        authenticated_sender_id: usize,
+        payload: &[u8],
+    ) -> Result<bool, String> {
+        if payload.len() < OPEN_REGISTRY_WIRE_PREFIX.len()
+            || &payload[..OPEN_REGISTRY_WIRE_PREFIX.len()] != OPEN_REGISTRY_WIRE_PREFIX
+        {
+            return Ok(false);
+        }
+
+        let body = &payload[OPEN_REGISTRY_WIRE_PREFIX.len()..];
+        if body.len() > MAX_WIRE_MESSAGE_LEN {
+            return Err(format!(
+                "open wire payload too large: {} bytes (max {})",
+                body.len(),
+                MAX_WIRE_MESSAGE_LEN
+            ));
+        }
+
+        let decoded: OpenRegistryWireMessage = bincode::deserialize(body)
+            .map_err(|e| format!("deserialize open wire payload: {}", e))?;
+
+        let (instance_id, sender_party_id) = match &decoded {
+            OpenRegistryWireMessage::Single {
+                instance_id,
+                sender_party_id,
+                ..
+            } => (*instance_id, *sender_party_id),
+            OpenRegistryWireMessage::Batch {
+                instance_id,
+                sender_party_id,
+                ..
+            } => (*instance_id, *sender_party_id),
+        };
+
+        if authenticated_sender_id == UNKNOWN_SENDER_ID {
+            tracing::warn!(
+                sender_party_id,
+                "Rejecting open wire message from unauthenticated connection"
+            );
+            return Err("open wire rejected: sender identity not authenticated".to_string());
+        }
+        if sender_party_id != authenticated_sender_id {
+            return Err(format!(
+                "open wire sender mismatch: transport={} payload={}",
+                authenticated_sender_id, sender_party_id
+            ));
+        }
+
+        let registry = match self.get_instance_registry(instance_id) {
+            Some(registry) => registry,
+            None => return Ok(false),
+        };
+
+        match decoded {
+            OpenRegistryWireMessage::Single {
+                type_key,
+                sender_party_id,
+                share,
+                ..
+            } => registry.insert_single(&type_key, sender_party_id, share),
+            OpenRegistryWireMessage::Batch {
+                type_key,
+                sender_party_id,
+                shares,
+                ..
+            } => registry.insert_batch(&type_key, sender_party_id, shares),
+        }
+        Ok(true)
+    }
+
+    pub fn try_handle_hb_open_exp_wire_message(
+        &self,
+        authenticated_sender_id: usize,
+        payload: &[u8],
+    ) -> Result<bool, String> {
+        if payload.len() < HB_EXP_OPEN_WIRE_PREFIX.len()
+            || &payload[..HB_EXP_OPEN_WIRE_PREFIX.len()] != HB_EXP_OPEN_WIRE_PREFIX
+        {
+            return Ok(false);
+        }
+
+        let message: ExpOpenWireMessage =
+            bincode::deserialize(&payload[HB_EXP_OPEN_WIRE_PREFIX.len()..])
+                .map_err(|e| format!("deserialize open-exp payload: {}", e))?;
+
+        if authenticated_sender_id == UNKNOWN_SENDER_ID {
+            tracing::warn!(
+                sender_party_id = message.sender_party_id,
+                "Rejecting open-exp wire message from unauthenticated connection"
+            );
+            return Err("open-exp wire rejected: sender identity not authenticated".to_string());
+        }
+        if message.sender_party_id != authenticated_sender_id {
+            return Err(format!(
+                "open-exp sender mismatch: transport={} payload={}",
+                authenticated_sender_id, message.sender_party_id
+            ));
+        }
+        if message.share_id != message.sender_party_id {
+            return Err(format!(
+                "open-exp share_id mismatch: sender_party_id={} share_id={}",
+                message.sender_party_id, message.share_id
+            ));
+        }
+
+        let registry = match self.get_instance_registry(message.instance_id) {
+            Some(registry) => registry,
+            None => return Ok(false),
+        };
+        registry.insert_exp(message.sender_party_id, message.share_id, message.partial_point);
+        Ok(true)
+    }
+
+    pub fn try_handle_avss_open_exp_wire_message(
+        &self,
+        authenticated_sender_id: usize,
+        payload: &[u8],
+    ) -> Result<bool, String> {
+        self.try_handle_avss_exp_wire_message(
+            authenticated_sender_id,
+            payload,
+            AVSS_EXP_WIRE_PREFIX,
+            false,
+        )
+    }
+
+    pub fn try_handle_avss_g2_exp_wire_message(
+        &self,
+        authenticated_sender_id: usize,
+        payload: &[u8],
+    ) -> Result<bool, String> {
+        self.try_handle_avss_exp_wire_message(
+            authenticated_sender_id,
+            payload,
+            AVSS_G2_EXP_WIRE_PREFIX,
+            true,
+        )
+    }
+
+    fn try_handle_avss_exp_wire_message(
+        &self,
+        authenticated_sender_id: usize,
+        payload: &[u8],
+        prefix: &[u8; 4],
+        use_g2_registry: bool,
+    ) -> Result<bool, String> {
+        if payload.len() < prefix.len() || &payload[..prefix.len()] != prefix {
+            return Ok(false);
+        }
+
+        let message: ExpOpenWireMessage = bincode::deserialize(&payload[prefix.len()..])
+            .map_err(|e| {
+                if use_g2_registry {
+                    format!("deserialize avss g2 open-exp payload: {}", e)
+                } else {
+                    format!("deserialize avss open-exp payload: {}", e)
+                }
+            })?;
+
+        if authenticated_sender_id == UNKNOWN_SENDER_ID {
+            tracing::warn!(
+                sender_party_id = message.sender_party_id,
+                "Rejecting AVSS open-exp wire message from unauthenticated connection"
+            );
+            return Err(if use_g2_registry {
+                "avss g2 open-exp wire rejected: sender identity not authenticated".to_string()
+            } else {
+                "avss open-exp wire rejected: sender identity not authenticated".to_string()
+            });
+        }
+        if message.sender_party_id != authenticated_sender_id {
+            return Err(if use_g2_registry {
+                format!(
+                    "avss g2 open-exp sender mismatch: transport={} payload={}",
+                    authenticated_sender_id, message.sender_party_id
+                )
+            } else {
+                format!(
+                    "avss open-exp sender mismatch: transport={} payload={}",
+                    authenticated_sender_id, message.sender_party_id
+                )
+            });
+        }
+        if message.share_id != message.sender_party_id + 1 {
+            return Err(if use_g2_registry {
+                format!(
+                    "avss g2 open-exp share_id mismatch: sender_party_id={} share_id={}",
+                    message.sender_party_id, message.share_id
+                )
+            } else {
+                format!(
+                    "avss open-exp share_id mismatch: sender_party_id={} share_id={}",
+                    message.sender_party_id, message.share_id
+                )
+            });
+        }
+
+        let registry = match self.get_instance_registry(message.instance_id) {
+            Some(registry) => registry,
+            None => return Ok(false),
+        };
+        if use_g2_registry {
+            registry.insert_exp_g2(message.sender_party_id, message.share_id, message.partial_point);
+        } else {
+            registry.insert_exp(message.sender_party_id, message.share_id, message.partial_point);
+        }
+        Ok(true)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire message encoding (unchanged format)
 // ---------------------------------------------------------------------------
@@ -670,126 +927,6 @@ pub fn encode_batch_share_wire_message(
 }
 
 // ---------------------------------------------------------------------------
-// Wire message handler (same signature, routes via REGISTRY_MAP)
-// ---------------------------------------------------------------------------
-
-/// Attempt to consume an incoming transport payload as an open-registry wire message.
-///
-/// Returns `Ok(true)` when the payload is recognized and handled.
-/// Returns `Ok(false)` when the payload is not an open-registry message,
-/// or when no registry is registered for the `instance_id`.
-pub fn try_handle_wire_message(
-    authenticated_sender_id: usize,
-    payload: &[u8],
-) -> Result<bool, String> {
-    if payload.len() < OPEN_REGISTRY_WIRE_PREFIX.len()
-        || &payload[..OPEN_REGISTRY_WIRE_PREFIX.len()] != OPEN_REGISTRY_WIRE_PREFIX
-    {
-        return Ok(false);
-    }
-
-    let body = &payload[OPEN_REGISTRY_WIRE_PREFIX.len()..];
-    if body.len() > MAX_WIRE_MESSAGE_LEN {
-        return Err(format!(
-            "open wire payload too large: {} bytes (max {})",
-            body.len(),
-            MAX_WIRE_MESSAGE_LEN
-        ));
-    }
-
-    let decoded: OpenRegistryWireMessage =
-        bincode::deserialize(body).map_err(|e| format!("deserialize open wire payload: {}", e))?;
-
-    // Extract instance_id and validate sender
-    let (instance_id, sender_party_id) = match &decoded {
-        OpenRegistryWireMessage::Single { instance_id, sender_party_id, .. } => (*instance_id, *sender_party_id),
-        OpenRegistryWireMessage::Batch { instance_id, sender_party_id, .. } => (*instance_id, *sender_party_id),
-    };
-
-    if authenticated_sender_id == UNKNOWN_SENDER_ID {
-        tracing::warn!(sender_party_id, "Rejecting open wire message from unauthenticated connection");
-        return Err("open wire rejected: sender identity not authenticated".to_string());
-    }
-    if sender_party_id != authenticated_sender_id {
-        return Err(format!(
-            "open wire sender mismatch: transport={} payload={}",
-            authenticated_sender_id, sender_party_id
-        ));
-    }
-
-    // Route to the correct per-instance registry
-    let registry = match REGISTRY_MAP.get(&instance_id) {
-        Some(r) => r.clone(),
-        None => return Ok(false),
-    };
-
-    match decoded {
-        OpenRegistryWireMessage::Single { type_key, sender_party_id, share, .. } => {
-            registry.insert_single(&type_key, sender_party_id, share);
-        }
-        OpenRegistryWireMessage::Batch { type_key, sender_party_id, shares, .. } => {
-            registry.insert_batch(&type_key, sender_party_id, shares);
-        }
-    }
-    Ok(true)
-}
-
-// ---------------------------------------------------------------------------
-// Legacy compat (kept for backward-compatible public API during migration)
-// ---------------------------------------------------------------------------
-
-/// Contribute a single share via a temporary or looked-up instance registry.
-///
-/// Prefer using `registry.open_share_wait()` directly when the engine has a
-/// handle to its `InstanceRegistry`.
-pub fn open_share_via_registry<R>(
-    instance_id: u64,
-    party_id: usize,
-    type_key: &str,
-    share_bytes: &[u8],
-    required: usize,
-    reconstruct: R,
-) -> Result<Value, String>
-where
-    R: FnOnce(&[Vec<u8>]) -> Result<Value, String>,
-{
-    let registry = REGISTRY_MAP
-        .get(&instance_id)
-        .map(|r| r.clone())
-        .ok_or_else(|| format!("no InstanceRegistry for instance_id {instance_id}"))?;
-    registry.open_share_wait(party_id, type_key, share_bytes, required, reconstruct)
-}
-
-/// Batch variant of [`open_share_via_registry`].
-pub fn batch_open_via_registry<R>(
-    instance_id: u64,
-    party_id: usize,
-    type_key: &str,
-    shares: &[Vec<u8>],
-    required: usize,
-    reconstruct_one: R,
-) -> Result<Vec<Value>, String>
-where
-    R: Fn(&[Vec<u8>], usize) -> Result<Value, String>,
-{
-    let registry = REGISTRY_MAP
-        .get(&instance_id)
-        .map(|r| r.clone())
-        .ok_or_else(|| format!("no InstanceRegistry for instance_id {instance_id}"))?;
-    registry.batch_open_wait(party_id, type_key, shares, required, reconstruct_one)
-}
-
-/// Look up the registry for a given instance_id.
-pub fn get_instance_registry(instance_id: u64) -> Option<Arc<InstanceRegistry>> {
-    REGISTRY_MAP.get(&instance_id).map(|r| r.clone())
-}
-
-/// Clear all instance registries. Useful between test cases.
-pub fn clear_registries() {
-    REGISTRY_MAP.clear();
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -799,76 +936,83 @@ mod tests {
 
     #[test]
     fn unknown_sender_single_is_rejected() {
+        let router = OpenMessageRouter::new();
         let msg = encode_single_share_wire_message(1, "test-key", 0, b"share0").unwrap();
-        let result = try_handle_wire_message(UNKNOWN_SENDER_ID, &msg);
+        let result = router.try_handle_wire_message(UNKNOWN_SENDER_ID, &msg);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not authenticated"));
     }
 
     #[test]
     fn unknown_sender_batch_is_rejected() {
+        let router = OpenMessageRouter::new();
         let msg =
             encode_batch_share_wire_message(1, "test-key", 0, &[b"s0".to_vec(), b"s1".to_vec()])
                 .unwrap();
-        let result = try_handle_wire_message(UNKNOWN_SENDER_ID, &msg);
+        let result = router.try_handle_wire_message(UNKNOWN_SENDER_ID, &msg);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not authenticated"));
     }
 
     #[test]
     fn sender_mismatch_single_is_rejected() {
+        let router = OpenMessageRouter::new();
         let msg = encode_single_share_wire_message(1, "test-key", 0, b"share0").unwrap();
-        let result = try_handle_wire_message(1, &msg);
+        let result = router.try_handle_wire_message(1, &msg);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("sender mismatch"));
     }
 
     #[test]
     fn sender_mismatch_batch_is_rejected() {
+        let router = OpenMessageRouter::new();
         let msg = encode_batch_share_wire_message(1, "test-key", 0, &[b"s0".to_vec()]).unwrap();
-        let result = try_handle_wire_message(1, &msg);
+        let result = router.try_handle_wire_message(1, &msg);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("sender mismatch"));
     }
 
     #[test]
     fn valid_single_contribution_is_accepted() {
-        let _reg = InstanceRegistry::register(10001);
+        let router = OpenMessageRouter::new();
+        let _reg = router.register_instance(10001);
         let msg = encode_single_share_wire_message(10001, "test-key", 3, b"share3").unwrap();
-        let result = try_handle_wire_message(3, &msg);
+        let result = router.try_handle_wire_message(3, &msg);
         assert_eq!(result.unwrap(), true);
-        InstanceRegistry::deregister(10001);
     }
 
     #[test]
     fn valid_batch_contribution_is_accepted() {
-        let _reg = InstanceRegistry::register(10002);
+        let router = OpenMessageRouter::new();
+        let _reg = router.register_instance(10002);
         let shares = vec![b"s0".to_vec(), b"s1".to_vec()];
         let msg = encode_batch_share_wire_message(10002, "test-batch", 5, &shares).unwrap();
-        let result = try_handle_wire_message(5, &msg);
+        let result = router.try_handle_wire_message(5, &msg);
         assert_eq!(result.unwrap(), true);
-        InstanceRegistry::deregister(10002);
     }
 
     #[test]
     fn unregistered_instance_returns_false() {
+        let router = OpenMessageRouter::new();
         let msg = encode_single_share_wire_message(99999999, "test-key", 0, b"share").unwrap();
-        let result = try_handle_wire_message(0, &msg);
+        let result = router.try_handle_wire_message(0, &msg);
         assert_eq!(result.unwrap(), false);
     }
 
     #[test]
     fn non_prefixed_message_returns_false() {
-        let result = try_handle_wire_message(0, b"NOT_OPEN_MSG");
+        let router = OpenMessageRouter::new();
+        let result = router.try_handle_wire_message(0, b"NOT_OPEN_MSG");
         assert_eq!(result.unwrap(), false);
     }
 
     #[test]
     fn oversized_payload_is_rejected() {
+        let router = OpenMessageRouter::new();
         let mut msg = Vec::new();
         msg.extend_from_slice(OPEN_REGISTRY_WIRE_PREFIX);
         msg.extend(vec![0u8; MAX_WIRE_MESSAGE_LEN + 1]);
-        let result = try_handle_wire_message(0, &msg);
+        let result = router.try_handle_wire_message(0, &msg);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("too large"));
     }
@@ -889,7 +1033,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_single_insert_wakes_waiters() {
-        let reg = InstanceRegistry::register(20001);
+        let router = OpenMessageRouter::new();
+        let reg = router.register_instance(20001);
 
         let reg2 = reg.clone();
         let waiter = tokio::spawn(async move {
@@ -931,12 +1076,12 @@ mod tests {
 
         assert_eq!(waiter.unwrap().unwrap(), Value::I64(2));
         assert_eq!(finalizer.unwrap().unwrap(), Value::I64(2));
-        InstanceRegistry::deregister(20001);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_batch_insert_wakes_waiters() {
-        let reg = InstanceRegistry::register(20002);
+        let router = OpenMessageRouter::new();
+        let reg = router.register_instance(20002);
 
         let reg2 = reg.clone();
         let waiter = tokio::spawn(async move {
@@ -985,13 +1130,13 @@ mod tests {
 
         assert_eq!(waiter.unwrap().unwrap(), vec![Value::I64(2), Value::I64(2)]);
         assert_eq!(finalizer.unwrap().unwrap(), vec![Value::I64(2), Value::I64(2)]);
-        InstanceRegistry::deregister(20002);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_instances_are_isolated() {
-        let reg_a = InstanceRegistry::register(30001);
-        let reg_b = InstanceRegistry::register(30002);
+        let router = OpenMessageRouter::new();
+        let reg_a = router.register_instance(30001);
+        let reg_b = router.register_instance(30002);
 
         // Insert into instance A
         reg_a.insert_single("key", 0, b"share_a".to_vec());
@@ -1003,8 +1148,5 @@ mod tests {
         let b_count = reg_b.single.lock().get(&(0, "key".to_string())).unwrap().shares.len();
         assert_eq!(a_count, 1);
         assert_eq!(b_count, 1);
-
-        InstanceRegistry::deregister(30001);
-        InstanceRegistry::deregister(30002);
     }
 }

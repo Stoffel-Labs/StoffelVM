@@ -18,7 +18,7 @@ pub mod mpc_engine;
 #[cfg(feature = "honeybadger")]
 pub mod mpc_runner;
 pub mod open_registry;
-pub use open_registry::{InstanceRegistry, UNKNOWN_SENDER_ID};
+pub use open_registry::{InstanceRegistry, OpenMessageRouter, UNKNOWN_SENDER_ID};
 pub mod p2p;
 pub mod program_sync;
 pub mod reservation;

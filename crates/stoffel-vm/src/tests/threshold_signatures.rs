@@ -549,6 +549,7 @@ fn spawn_message_processors<F, G>(
     for (i, node) in nodes.iter_mut().enumerate() {
         let rx = node.rx.take().unwrap();
         let engine = engines[i].clone();
+        let open_message_router = engine.open_message_router();
         let simple_net = node.simple_net.clone().unwrap();
         let node_id = node.node_id;
 
@@ -556,7 +557,7 @@ fn spawn_message_processors<F, G>(
             let mut rx = rx;
             while let Some((sender_id, data)) = rx.recv().await {
                 // 1. Check open registry (Share.open, Share.open_field, Share.batch_open)
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &data) {
+                match open_message_router.try_handle_wire_message(sender_id, &data) {
                     Ok(true) => continue,
                     Err(e) => {
                         error!(
@@ -569,18 +570,16 @@ fn spawn_message_processors<F, G>(
                 }
 
                 // 2. Check AVSS open-in-exp (G1) wire messages
-                match crate::net::avss_engine::try_handle_avss_open_exp_wire_message(
-                    sender_id, &data,
-                ) {
+                match open_message_router
+                    .try_handle_avss_open_exp_wire_message(sender_id, &data)
+                {
                     Ok(true) => continue,
                     Err(_) => {} // Not an open-exp message, continue
                     Ok(false) => {}
                 }
 
                 // 3. Check AVSS G2 open-in-exp wire messages
-                match crate::net::avss_engine::try_handle_avss_g2_exp_wire_message(
-                    sender_id, &data,
-                ) {
+                match open_message_router.try_handle_avss_g2_exp_wire_message(sender_id, &data) {
                     Ok(true) => continue,
                     Err(_) => {}
                     Ok(false) => {}

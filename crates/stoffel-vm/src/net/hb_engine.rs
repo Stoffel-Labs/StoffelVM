@@ -44,48 +44,6 @@ struct ExpOpenWireMessage {
 
 use crate::net::open_registry::ExpOpenAccumulator;
 
-pub(crate) fn try_handle_open_exp_wire_message(
-    authenticated_sender_id: usize,
-    payload: &[u8],
-) -> Result<bool, String> {
-    if payload.len() < EXP_OPEN_WIRE_PREFIX.len()
-        || &payload[..EXP_OPEN_WIRE_PREFIX.len()] != EXP_OPEN_WIRE_PREFIX
-    {
-        return Ok(false);
-    }
-
-    let message: ExpOpenWireMessage = bincode::deserialize(&payload[EXP_OPEN_WIRE_PREFIX.len()..])
-        .map_err(|e| format!("deserialize open-exp payload: {}", e))?;
-
-    if authenticated_sender_id == crate::net::open_registry::UNKNOWN_SENDER_ID {
-        tracing::warn!(
-            sender_party_id = message.sender_party_id,
-            "Rejecting open-exp wire message from unauthenticated connection"
-        );
-        return Err("open-exp wire rejected: sender identity not authenticated".to_string());
-    }
-    if message.sender_party_id != authenticated_sender_id {
-        return Err(format!(
-            "open-exp sender mismatch: transport={} payload={}",
-            authenticated_sender_id, message.sender_party_id
-        ));
-    }
-
-    if message.share_id != message.sender_party_id {
-        return Err(format!(
-            "open-exp share_id mismatch: sender_party_id={} share_id={}",
-            message.sender_party_id, message.share_id
-        ));
-    }
-
-    let registry = match crate::net::open_registry::get_instance_registry(message.instance_id) {
-        Some(r) => r,
-        None => return Ok(false),
-    };
-    registry.insert_exp(message.sender_party_id, message.share_id, message.partial_point);
-    Ok(true)
-}
-
 /// HoneyBadger-backed MPC engine that integrates with the VM.
 /// This wraps a real HoneyBadgerMPCNode and provides MPC operations
 /// (input sharing, multiplication, output reconstruction) to the VM.
@@ -111,6 +69,8 @@ where
     program_hash: tokio::sync::RwLock<Option<[u8; 32]>>,
     /// Reservation registry for masked-input protocol.
     reservation: tokio::sync::RwLock<Option<ReservationRegistry>>,
+    /// Session-local router for open-share/open-exp payloads.
+    open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
     /// Per-instance open share accumulation registry.
     open_registry: Arc<crate::net::open_registry::InstanceRegistry>,
 }
@@ -203,6 +163,10 @@ where
 
         tracing::info!("Loaded preprocessing material from store for program {}", hex::encode(hash));
         Ok(true)
+    }
+
+    pub fn open_message_router(&self) -> Arc<crate::net::open_registry::OpenMessageRouter> {
+        self.open_message_router.clone()
     }
 
     /// Persist current preprocessing material to the store.
@@ -506,6 +470,30 @@ where
         net: Arc<QuicNetworkManager>,
         input_ids: Vec<ClientId>,
     ) -> Result<Arc<Self>, String> {
+        Self::new_with_router(
+            Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
+            instance_id,
+            party_id,
+            n,
+            t,
+            n_triples,
+            n_random,
+            net,
+            input_ids,
+        )
+    }
+
+    pub fn new_with_router(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        n_triples: usize,
+        n_random: usize,
+        net: Arc<QuicNetworkManager>,
+        input_ids: Vec<ClientId>,
+    ) -> Result<Arc<Self>, String> {
         // Create the MPC node options
         let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id)?;
 
@@ -530,14 +518,34 @@ where
             preproc_store: tokio::sync::RwLock::new(None),
             program_hash: tokio::sync::RwLock::new(None),
             reservation: tokio::sync::RwLock::new(None),
-            open_registry: crate::net::open_registry::get_instance_registry(instance_id)
-                .unwrap_or_else(|| crate::net::open_registry::InstanceRegistry::register(instance_id)),
+            open_registry: open_message_router.register_instance(instance_id),
+            open_message_router,
         }))
     }
 
     /// Construct an engine from an existing, network-driven HoneyBadgerMPCNode.
     /// This avoids creating a separate node that isn't wired into the message loop.
     pub fn from_existing_node(
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        net: Arc<QuicNetworkManager>,
+        node: HoneyBadgerMPCNode<F, RBCImpl>,
+    ) -> Arc<Self> {
+        Self::from_existing_node_with_router(
+            Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
+            instance_id,
+            party_id,
+            n,
+            t,
+            net,
+            node,
+        )
+    }
+
+    pub fn from_existing_node_with_router(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
         instance_id: u64,
         party_id: usize,
         n: usize,
@@ -559,8 +567,8 @@ where
             preproc_store: tokio::sync::RwLock::new(None),
             program_hash: tokio::sync::RwLock::new(None),
             reservation: tokio::sync::RwLock::new(None),
-            open_registry: crate::net::open_registry::get_instance_registry(instance_id)
-                .unwrap_or_else(|| crate::net::open_registry::InstanceRegistry::register(instance_id)),
+            open_registry: open_message_router.register_instance(instance_id),
+            open_message_router,
         })
     }
 
@@ -965,13 +973,8 @@ where
         let n = self.n;
         let t = self.t;
 
-        crate::net::open_registry::open_share_via_registry(
-            self.instance_id,
-            self.party_id,
-            &type_key,
-            share_bytes,
-            required,
-            |collected| {
+        self.open_registry
+            .open_share_wait(self.party_id, &type_key, share_bytes, required, |collected| {
                 let mut shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
                 for bytes in collected {
                     shares.push(Self::decode_share(bytes)?);
@@ -987,8 +990,7 @@ where
                 let (_deg, secret) = RobustShare::recover_secret(&shares, n, t)
                     .map_err(|e| format!("recover_secret: {:?}", e))?;
                 Ok(Self::field_to_value(ty, secret))
-            },
-        )
+            })
     }
 
     fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
@@ -1012,13 +1014,8 @@ where
         let n = self.n;
         let t = self.t;
 
-        crate::net::open_registry::batch_open_via_registry(
-            self.instance_id,
-            self.party_id,
-            &type_key,
-            shares,
-            required,
-            |collected, pos| {
+        self.open_registry
+            .batch_open_wait(self.party_id, &type_key, shares, required, |collected, pos| {
                 let mut decoded_shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
                 for bytes in collected {
                     decoded_shares.push(Self::decode_share(bytes)?);
@@ -1027,13 +1024,11 @@ where
                 let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, n, t)
                     .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
                 Ok(Self::field_to_value(ty, secret))
-            },
-        )
+            })
     }
 
     fn shutdown(&self) {
         self.ready.store(false, Ordering::SeqCst);
-        crate::net::open_registry::InstanceRegistry::deregister(self.instance_id);
     }
 
     fn party_id(&self) -> usize {
@@ -1739,12 +1734,14 @@ mod tests {
     }
 
     fn test_engine(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
         instance_id: u64,
         party_id: usize,
         n: usize,
         t: usize,
     ) -> Arc<HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>> {
-        HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::new(
+        HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::new_with_router(
+            open_message_router,
             instance_id,
             party_id,
             n,
@@ -1781,10 +1778,11 @@ mod tests {
         let instance_id = next_instance_id();
         let n = 4;
         let t = 1;
-        let e0 = test_engine(instance_id, 0, n, t);
-        let e1 = test_engine(instance_id, 1, n, t);
-        let e2 = test_engine(instance_id, 2, n, t);
-        let e3 = test_engine(instance_id, 3, n, t);
+        let router = Arc::new(crate::net::open_registry::OpenMessageRouter::new());
+        let e0 = test_engine(router.clone(), instance_id, 0, n, t);
+        let e1 = test_engine(router.clone(), instance_id, 1, n, t);
+        let e2 = test_engine(router.clone(), instance_id, 2, n, t);
+        let e3 = test_engine(router, instance_id, 3, n, t);
 
         let s0 = e0.aba_propose(true).expect("party 0 propose");
         let s1 = e1.aba_propose(true).expect("party 1 propose");
@@ -1808,8 +1806,9 @@ mod tests {
         let instance_id = next_instance_id();
         let n = 4;
         let t = 1;
-        let sender = test_engine(instance_id, 0, n, t);
-        let receiver = test_engine(instance_id, 1, n, t);
+        let router = Arc::new(crate::net::open_registry::OpenMessageRouter::new());
+        let sender = test_engine(router.clone(), instance_id, 0, n, t);
+        let receiver = test_engine(router, instance_id, 1, n, t);
 
         sender.rbc_broadcast(b"first").expect("broadcast first");
         sender.rbc_broadcast(b"second").expect("broadcast second");
@@ -1830,11 +1829,12 @@ mod tests {
     #[test]
     fn open_exp_wire_rejects_mismatched_share_id() {
         let instance_id = next_instance_id();
-        // Register an instance so the wire handler can find it
-        let registry = crate::net::open_registry::InstanceRegistry::register(instance_id);
+        let router = crate::net::open_registry::OpenMessageRouter::new();
+        let registry = router.register_instance(instance_id);
         let payload = open_exp_test_payload(instance_id, 1, 0, vec![1, 2, 3, 4]);
 
-        let err = try_handle_open_exp_wire_message(1, &payload)
+        let err = router
+            .try_handle_hb_open_exp_wire_message(1, &payload)
             .expect_err("mismatched share_id must be rejected");
         assert!(
             err.contains("open-exp share_id mismatch"),
@@ -1845,18 +1845,18 @@ mod tests {
             !registry.exp.lock().contains_key(&0),
             "rejected payload must not be inserted into the registry"
         );
-        crate::net::open_registry::InstanceRegistry::deregister(instance_id);
     }
 
     #[test]
     fn open_exp_wire_accepts_matching_share_id() {
         let instance_id = next_instance_id();
-        // Register an instance so the wire handler can find it
-        let registry = crate::net::open_registry::InstanceRegistry::register(instance_id);
+        let router = crate::net::open_registry::OpenMessageRouter::new();
+        let registry = router.register_instance(instance_id);
         let payload = open_exp_test_payload(instance_id, 1, 1, vec![9, 8, 7, 6]);
 
-        let handled =
-            try_handle_open_exp_wire_message(1, &payload).expect("matching sender/share is valid");
+        let handled = router
+            .try_handle_hb_open_exp_wire_message(1, &payload)
+            .expect("matching sender/share is valid");
         assert!(handled, "open-exp prefix payload must be handled");
 
         let reg = registry.exp.lock();
@@ -1865,7 +1865,5 @@ mod tests {
             .expect("entry should be inserted for valid payload");
         assert_eq!(entry.party_ids, vec![1]);
         assert_eq!(entry.partial_points, vec![(1, vec![9, 8, 7, 6])]);
-        drop(reg);
-        crate::net::open_registry::InstanceRegistry::deregister(instance_id);
     }
 }

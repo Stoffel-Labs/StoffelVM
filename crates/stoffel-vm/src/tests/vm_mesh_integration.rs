@@ -147,10 +147,11 @@ async fn test_vm_mesh_full_integration() {
             .routed_network
             .clone()
             .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -158,7 +159,8 @@ async fn test_vm_mesh_full_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -305,7 +307,8 @@ async fn test_vm_mesh_full_integration() {
         let mut vm = VirtualMachine::new();
 
         // Attach MPC engine to VM, wrapping the already-running HB node for this party
-        let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
+        let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             sorted_pid,
             n_parties,
@@ -534,10 +537,11 @@ async fn test_vm_mesh_average_salary_integration() {
             .routed_network
             .clone()
             .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -545,7 +549,8 @@ async fn test_vm_mesh_average_salary_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -675,15 +680,19 @@ async fn test_vm_mesh_average_salary_integration() {
 
     info!("Creating VMs for average computation...");
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id].network.clone().expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
@@ -1027,10 +1036,11 @@ async fn test_vm_mesh_large_preprocessing() {
             .routed_network
             .clone()
             .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1038,7 +1048,8 @@ async fn test_vm_mesh_large_preprocessing() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1342,10 +1353,11 @@ async fn test_vm_mesh_output_client_integration() {
             .routed_network
             .clone()
             .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1353,7 +1365,8 @@ async fn test_vm_mesh_output_client_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1487,18 +1500,19 @@ async fn test_vm_mesh_output_client_integration() {
     // Step 7: Create VMs and hydrate client stores
     info!("Step 7: Creating VMs...");
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id]
-                .network
-                .clone()
-                .expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
@@ -1851,10 +1865,11 @@ async fn test_vm_mesh_matrix_average_integration() {
             .routed_network
             .clone()
             .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1862,7 +1877,8 @@ async fn test_vm_mesh_matrix_average_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -2000,18 +2016,19 @@ async fn test_vm_mesh_matrix_average_integration() {
     // Step 7: Create VMs and hydrate client stores
     info!("Step 7: Creating VMs and hydrating client stores...");
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id]
-                .network
-                .clone()
-                .expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
@@ -2470,10 +2487,11 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             .routed_network
             .clone()
             .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -2481,7 +2499,8 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -2809,18 +2828,19 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     info!("  Creating {} VMs...", n_parties);
     let vm_create_start = std::time::Instant::now();
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id]
-                .network
-                .clone()
-                .expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
@@ -3713,10 +3733,11 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
             .routed_network
             .clone()
             .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -3724,7 +3745,8 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -3862,18 +3884,19 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     // Step 8: Create VMs and hydrate client stores
     info!("Step 8: Creating VMs and hydrating client stores...");
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id]
-                .network
-                .clone()
-                .expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
