@@ -38,14 +38,15 @@
 //    - Compares regular execution with optimized execution
 //    - Provides a more accurate measurement of the core execution loop
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::collections::HashMap;
+use std::hint::black_box;
 use std::time::Duration;
 use stoffel_vm::core_types::Value;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::functions::VMFunction;
 use stoffel_vm::instructions::Instruction;
-use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
+use stoffel_vm::runtime_hooks::HookEvent;
 
 fn bench_basic_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("Basic Operations");
@@ -313,6 +314,7 @@ fn bench_hook_system(c: &mut Criterion) {
     group.finish();
 }
 
+#[allow(dead_code)]
 fn bench_optimized_hook_system(c: &mut Criterion) {
     let mut group = c.benchmark_group("Optimized Hook System");
 

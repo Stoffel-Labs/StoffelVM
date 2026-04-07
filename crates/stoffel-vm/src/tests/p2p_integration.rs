@@ -1,13 +1,11 @@
 // tests/p2p_integration.rs
 //! Integration tests for QUIC-based peer-to-peer networking.
 
-use crate::net::{NetworkManager, PeerConnection, QuicNetworkManager};
+use crate::net::{NetworkManager, QuicNetworkManager};
 use crate::tests::test_utils::init_crypto_provider;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Duration};
 
 /// Message sent from client to server
@@ -175,10 +173,6 @@ async fn test_ping_pong_three_servers() {
             // Verify we have 3 latency measurements per server
             assert_eq!(latencies.len(), 3, "Should have 3 latency measurements");
 
-            // Verify latencies are reasonable (greater than 0)
-            for latency in latencies {
-                assert!(*latency >= 0, "Latency should be greater than 0");
-            }
         }
     }
 

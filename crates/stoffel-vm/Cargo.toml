@@ -66,5 +66,5 @@ criterion = { version = "0.6.0", features = ["html_reports"] }
 
 [[bench]]
 name = "vm_benchmarks"
-path = "crates/benches"
+path = "../benches/vm_benchmarks.rs"
 harness = false

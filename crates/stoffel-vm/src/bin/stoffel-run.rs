@@ -16,8 +16,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm_types::core_types::Value;
-#[cfg(feature = "avss")]
-use stoffel_vm::net::avss_server::AvssQuicConfig;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffel_vm::net::curve::SupportedMpcField;
 #[cfg(feature = "honeybadger")]
@@ -193,7 +191,7 @@ impl Network for ServerClientAdapter {
         self.inner.node(id)
     }
 
-    fn node_mut(&mut self, id: stoffelnet::network_utils::PartyId) -> Option<&mut Self::NodeType> {
+    fn node_mut(&mut self, _id: stoffelnet::network_utils::PartyId) -> Option<&mut Self::NodeType> {
         unimplemented!("node_mut not needed for server client adapter")
     }
 
@@ -535,7 +533,7 @@ async fn sync_client_set_across_parties(
 
 #[cfg(feature = "honeybadger")]
 async fn run_hb_client_protocol_for_curve<F: PrimeField>(
-    cid: ClientId,
+    _cid: ClientId,
     n: usize,
     t: usize,
     inputs_str: &str,
@@ -1220,7 +1218,6 @@ where
     let mpc_input_ids: Vec<ClientId> = (0..input_ids.len()).collect();
 
     // Generate ECDH key pair for AVSS payload confidentiality
-    use ark_ec::PrimeGroup as _;
     use ark_std::rand::SeedableRng as _;
     let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
     let sk_i = F::rand(&mut rng);
