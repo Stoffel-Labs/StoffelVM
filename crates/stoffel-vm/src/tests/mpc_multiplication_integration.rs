@@ -289,6 +289,7 @@ pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     /// Available after `finalize_network()`.
     pub routed_network: Option<Arc<MpcNetwork>>,
     pub expected_client_ids: Vec<ClientId>,
+    pub open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
 }
 
 impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
@@ -316,7 +317,10 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             node_id, bind_address
         );
         let mut mgr = QuicNetworkManager::new();
-        info!("[HB-QUIC] Node {} calling listen({})", node_id, bind_address);
+        info!(
+            "[HB-QUIC] Node {} calling listen({})",
+            node_id, bind_address
+        );
         mgr.listen(bind_address).await.map_err(|e| {
             error!(
                 "[HB-QUIC] Node {} failed to bind to {}: {}",
@@ -351,6 +355,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             channels,
             routed_network: None,
             expected_client_ids: input_ids,
+            open_message_router: Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
         })
     }
 
@@ -373,7 +378,10 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
     pub async fn add_peer(&mut self, peer_id: PartyId, address: SocketAddr) {
         if let Some(ref mut builder) = self.network_builder {
             builder.add_node_with_party_id(peer_id, address);
-            info!("Added peer {} at {} to node {}", peer_id, address, self.node_id);
+            info!(
+                "Added peer {} at {} to node {}",
+                peer_id, address, self.node_id
+            );
         } else {
             panic!("Cannot add peer after start() on node {}", self.node_id);
         }
@@ -465,39 +473,10 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             .expect("connect_to_peers() called before start()")
             .clone();
 
-        let peers: Vec<SocketAddr> = network
-            .parties()
-            .iter()
-            .map(|p| p.address())
-            .collect();
+        let peers: Vec<SocketAddr> = network.parties().iter().map(|p| p.address()).collect();
 
         let mut dialer = (*network).clone();
-
-        // Install loopback receive handler
         let local_did = network.local_derived_id();
-        if let Some(lb) = network.get_connection(local_did).await {
-            let txx = self.channels.clone();
-            let nid = self.node_id;
-            tokio::spawn(async move {
-                loop {
-                    match lb.receive().await {
-                        Ok(data) => {
-                            // Loopback sender_id will be resolved after
-                            // assign_party_ids via remote_party_id on the
-                            // loopback connection; for now use UNKNOWN and
-                            // fix up below.
-                            let sender_id = lb.remote_party_id()
-                                .unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
-                            if txx.send((sender_id, data)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                trace!("Node {} loopback reader ended", nid);
-            });
-        }
 
         for peer_addr in &peers {
             // Skip self (our own address is in the list)
@@ -515,33 +494,8 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             loop {
                 match dialer.connect_as_server(*peer_addr).await {
                     Ok(conn) => {
-                        info!(
-                            "Node {} connected to peer at {}",
-                            self.node_id, peer_addr
-                        );
-                        // Spawn receive handler on dialer connection.
-                        // Between any two servers there are two QUIC connections
-                        // (each side dials the other).  The DashMap may store
-                        // either one as the canonical connection for send().
-                        // We need receive handlers on BOTH so that messages
-                        // arrive regardless of which connection is used.
-                        let txx = self.channels.clone();
-                        let nid = self.node_id;
-                        tokio::spawn(async move {
-                            loop {
-                                match conn.receive().await {
-                                    Ok(data) => {
-                                        let sid = conn.remote_party_id()
-                                            .unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
-                                        if txx.send((sid, data)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                            trace!("Node {} dialer recv handler ended", nid);
-                        });
+                        info!("Node {} connected to peer at {}", self.node_id, peer_addr);
+                        drop(conn);
                         break;
                     }
                     Err(e) => {
@@ -616,22 +570,24 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             .network
             .as_ref()
             .expect("spawn_server_receive_loops called before start()");
+        let derived_to_party: std::collections::HashMap<PartyId, PartyId> = network
+            .get_sorted_public_keys()
+            .into_iter()
+            .enumerate()
+            .map(|(party_id, pk)| (pk.derive_id(), party_id))
+            .collect();
         let all = network.get_all_server_connections();
         for (derived_id, conn) in all {
-            // Skip loopback (already has a handler from connect_to_peers)
-            if derived_id == network.local_derived_id() {
-                continue;
-            }
             let txx = self.channels.clone();
             let nid = self.node_id;
+            let sender_id = conn
+                .remote_party_id()
+                .unwrap_or_else(|| *derived_to_party.get(&derived_id).unwrap_or(&derived_id));
             tokio::spawn(async move {
                 loop {
                     match conn.receive().await {
                         Ok(data) => {
-                            let sid = conn
-                                .remote_party_id()
-                                .unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
-                            if txx.send((sid, data)).await.is_err() {
+                            if txx.send((sender_id, data)).await.is_err() {
                                 break;
                             }
                         }
@@ -820,9 +776,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                                 match connection.receive().await {
                                     Ok(data) => {
                                         // Use remote_party_id at receive time
-                                        let sid = connection
-                                            .remote_party_id()
-                                            .unwrap_or(i);
+                                        let sid = connection.remote_party_id().unwrap_or(i);
                                         if let Err(e) = actor_tx
                                             .send(ClientActorMessage::ProcessData(sid, data))
                                             .await
@@ -1064,12 +1018,15 @@ mod tests {
     use stoffelmpc_mpc::common::ProtocolSessionId;
     use stoffelmpc_mpc::honeybadger::{ProtocolType, SessionId};
 
-    use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
+    use crate::tests::test_utils::{
+        acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing,
+    };
 
     #[tokio::test]
     async fn test_preprocessing_client_mul() {
         init_crypto_provider();
         setup_test_tracing();
+        let _hb_itest_lock = acquire_hb_itest_lock().await;
 
         info!("=== Starting Preprocessing-Only Test ===");
 
@@ -1173,9 +1130,14 @@ mod tests {
 
         // Finalize network: assign party IDs and recreate HB nodes
         for server in servers.iter_mut() {
-            let pid = server.finalize_network().expect("Failed to finalize network");
+            let pid = server
+                .finalize_network()
+                .expect("Failed to finalize network");
             server.spawn_server_receive_loops();
-            info!("✓ Server {} finalized with party_id={}", server.node_id, pid);
+            info!(
+                "✓ Server {} finalized with party_id={}",
+                server.node_id, pid
+            );
         }
 
         // Register client connections under logical IDs in each server's RoutedNetwork
@@ -1205,10 +1167,11 @@ mod tests {
                 .routed_network
                 .clone()
                 .expect("routed_network should be set after finalize_network()");
+            let open_message_router = server.open_message_router.clone();
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
-                    match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1357,7 +1320,10 @@ mod tests {
                     input_client_id,
                     local_shares,
                     2,
-                    server.routed_network.clone().expect("routed_network should be set"),
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
                 )
                 .await
             {
@@ -1374,7 +1340,10 @@ mod tests {
         let mut handles = Vec::new();
         for pid in 0..n_parties {
             let mut node = servers[pid].node.clone();
-            let net: Arc<RoutedNetwork> = servers[pid].routed_network.clone().expect("routed_network should be set");
+            let net: Arc<RoutedNetwork> = servers[pid]
+                .routed_network
+                .clone()
+                .expect("routed_network should be set");
 
             let (x_shares, y_shares) = {
                 let input_store = node
@@ -1413,7 +1382,10 @@ mod tests {
         // Use the output client ID we defined earlier
         // Each server sends its output shares using the results from mul()
         for (i, server) in servers.iter().enumerate() {
-            let net: Arc<RoutedNetwork> = server.routed_network.clone().expect("routed_network should be set");
+            let net: Arc<RoutedNetwork> = server
+                .routed_network
+                .clone()
+                .expect("routed_network should be set");
 
             // Find the result for this party from the collected mul results
             let shares_mult_for_node = mul_results
@@ -1444,6 +1416,7 @@ mod tests {
     async fn test_client_input_only() {
         init_crypto_provider();
         setup_test_tracing();
+        let _hb_itest_lock = acquire_hb_itest_lock().await;
 
         info!("=== Starting Preprocessing-Only Test ===");
 
@@ -1538,9 +1511,14 @@ mod tests {
 
         // Finalize network: assign party IDs and recreate HB nodes
         for server in servers.iter_mut() {
-            let pid = server.finalize_network().expect("Failed to finalize network");
+            let pid = server
+                .finalize_network()
+                .expect("Failed to finalize network");
             server.spawn_server_receive_loops();
-            info!("✓ Server {} finalized with party_id={}", server.node_id, pid);
+            info!(
+                "✓ Server {} finalized with party_id={}",
+                server.node_id, pid
+            );
         }
 
         // Register client connections under logical IDs in each server's RoutedNetwork
@@ -1573,10 +1551,11 @@ mod tests {
                 .routed_network
                 .clone()
                 .expect("routed_network should be set after finalize_network()");
+            let open_message_router = server.open_message_router.clone();
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
-                    match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1724,7 +1703,10 @@ mod tests {
                     clientid[0],
                     local_shares,
                     2,
-                    server.routed_network.clone().expect("routed_network should be set"),
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
                 )
                 .await
             {
@@ -1740,6 +1722,7 @@ mod tests {
     async fn test_preprocessing_only() {
         init_crypto_provider();
         setup_test_tracing();
+        let _hb_itest_lock = acquire_hb_itest_lock().await;
 
         info!("=== Starting Preprocessing-Only Test ===");
 
@@ -1792,9 +1775,14 @@ mod tests {
 
         // Finalize network: assign party IDs and recreate HB nodes
         for server in servers.iter_mut() {
-            let pid = server.finalize_network().expect("Failed to finalize network");
+            let pid = server
+                .finalize_network()
+                .expect("Failed to finalize network");
             server.spawn_server_receive_loops();
-            info!("✓ Server {} finalized with party_id={}", server.node_id, pid);
+            info!(
+                "✓ Server {} finalized with party_id={}",
+                server.node_id, pid
+            );
         }
 
         // Spawn receive-loop tasks with updated nodes and routed networks
@@ -1804,10 +1792,11 @@ mod tests {
                 .routed_network
                 .clone()
                 .expect("routed_network should be set after finalize_network()");
+            let open_message_router = server.open_message_router.clone();
             let mut rx = recv.remove(0);
             tokio::spawn(async move {
                 while let Some((sender_id, raw_msg)) = rx.recv().await {
-                    match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                    match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open wire message: {e}");

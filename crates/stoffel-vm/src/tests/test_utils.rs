@@ -1,9 +1,11 @@
 //! Shared test utilities for integration tests.
 
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
+use tokio::sync::{Mutex, MutexGuard};
 
 static CRYPTO_INIT: Once = Once::new();
 static TRACING_INIT: Once = Once::new();
+static HB_ITEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Initialize the rustls crypto provider (idempotent, safe to call from multiple tests).
 pub(crate) fn init_crypto_provider() {
@@ -25,4 +27,9 @@ pub(crate) fn setup_test_tracing() {
             .finish();
         let _ = tracing::subscriber::set_global_default(subscriber);
     });
+}
+
+/// Serialize HoneyBadger integration tests that share process-global networking state.
+pub(crate) async fn acquire_hb_itest_lock() -> MutexGuard<'static, ()> {
+    HB_ITEST_LOCK.get_or_init(|| Mutex::new(())).lock().await
 }

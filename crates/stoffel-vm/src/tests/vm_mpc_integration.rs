@@ -23,7 +23,7 @@ use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
     RoutedNetwork,
 };
-use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
+use crate::tests::test_utils::{acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing};
 use std::collections::HashMap;
 use stoffel_vm_types::core_types::{ShareData, ShareType, Value};
 use stoffel_vm_types::functions::VMFunction;
@@ -34,6 +34,7 @@ use stoffel_vm_types::instructions::Instruction;
 async fn test_vm_mpc_multiplication_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM MPC Integration Test ===");
 
@@ -110,10 +111,11 @@ async fn test_vm_mpc_multiplication_integration() {
             .routed_network
             .clone()
             .expect("routed_network should be set after connect_to_peers()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -358,7 +360,10 @@ async fn test_vm_mpc_multiplication_integration() {
             // Load the result share into r0
             Instruction::LDI(
                 0,
-                Value::Share(ShareType::secret_int(64), ShareData::Opaque(result_share_bytes.clone())),
+                Value::Share(
+                    ShareType::secret_int(64),
+                    ShareData::Opaque(result_share_bytes.clone()),
+                ),
             ),
             // Could perform additional operations here (e.g., add constants)
             // For now, just return the share
@@ -384,7 +389,10 @@ async fn test_vm_mpc_multiplication_integration() {
 
     match result {
         Value::Share(ShareType::SecretInt { .. }, result_bytes) => {
-            info!("Received result share: {} bytes", result_bytes.as_bytes().len());
+            info!(
+                "Received result share: {} bytes",
+                result_bytes.as_bytes().len()
+            );
 
             // Decode the result share
             let result_share = RobustShare::<Fr>::deserialize_compressed(result_bytes.as_bytes())

@@ -155,6 +155,7 @@ where
     /// Session counter for multiplication operations
     #[allow(dead_code)]
     mul_session_counter: Arc<Mutex<usize>>,
+    open_registry: Option<Arc<crate::net::open_registry::InstanceRegistry>>,
     group_marker: PhantomData<G>,
 }
 
@@ -446,6 +447,7 @@ where
             node: Arc::new(Mutex::new(node)),
             ready: AtomicBool::new(false),
             mul_session_counter: Arc::new(Mutex::new(0)),
+            open_registry: None,
             group_marker: PhantomData,
         }))
     }
@@ -476,6 +478,33 @@ where
             // Assume the provided node has been preprocessed already in tests; callers can override via start()/preprocess().
             ready: AtomicBool::new(true),
             mul_session_counter: Arc::new(Mutex::new(0)),
+            open_registry: None,
+            group_marker: PhantomData,
+        })
+    }
+
+    /// Construct an engine from an existing node while scoping open-share
+    /// traffic to a shared session-local router.
+    pub fn from_existing_node_with_router(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        net: Arc<QuicNetworkManager>,
+        node: HoneyBadgerMPCNode<F, RBCImpl>,
+    ) -> Arc<Self> {
+        let node = Arc::new(Mutex::new(node));
+        Arc::new(Self {
+            instance_id,
+            party_id,
+            n,
+            t,
+            net,
+            node,
+            ready: AtomicBool::new(true),
+            mul_session_counter: Arc::new(Mutex::new(0)),
+            open_registry: Some(open_message_router.register_instance(instance_id)),
             group_marker: PhantomData,
         })
     }
@@ -537,12 +566,10 @@ where
             if peer_id == self.party_id {
                 continue;
             }
-            self.net.send(peer_id, &payload).await.map_err(|e| {
-                format!(
-                    "Failed to send open payload to party {}: {}",
-                    peer_id, e
-                )
-            })?;
+            self.net
+                .send(peer_id, &payload)
+                .await
+                .map_err(|e| format!("Failed to send open payload to party {}: {}", peer_id, e))?;
         }
         Ok(())
     }
@@ -859,7 +886,12 @@ where
         }
     }
 
-    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<ShareData, String> {
+    fn multiply_share(
+        &self,
+        ty: ShareType,
+        left: &[u8],
+        right: &[u8],
+    ) -> Result<ShareData, String> {
         crate::net::block_on_current(self.multiply_share_async(ty, left, right))
     }
 
@@ -884,30 +916,42 @@ where
         let n = self.n;
         let t = self.t;
 
-        crate::net::open_registry::open_share_via_registry(
-            self.instance_id,
-            self.party_id,
-            &type_key,
-            share_bytes,
-            required,
-            |collected| {
-                let mut shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
-                for bytes in collected {
-                    shares.push(Self::decode_share(bytes)?);
-                }
+        let reconstruct = |collected: &[Vec<u8>]| {
+            let mut shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
+            for bytes in collected {
+                shares.push(Self::decode_share(bytes)?);
+            }
 
-                tracing::debug!(
-                    "open_share reconstruction: n={}, required={}, shares.len()={}",
-                    n,
-                    required,
-                    shares.len()
-                );
+            tracing::debug!(
+                "open_share reconstruction: n={}, required={}, shares.len()={}",
+                n,
+                required,
+                shares.len()
+            );
 
-                let (_deg, secret) = RobustShare::recover_secret(&shares, n, t)
-                    .map_err(|e| format!("recover_secret: {:?}", e))?;
-                Ok(Self::field_to_value(ty, secret))
-            },
-        )
+            let (_deg, secret) = RobustShare::recover_secret(&shares, n, t)
+                .map_err(|e| format!("recover_secret: {:?}", e))?;
+            Ok(Self::field_to_value(ty, secret))
+        };
+
+        if let Some(open_registry) = &self.open_registry {
+            open_registry.open_share_wait(
+                self.party_id,
+                &type_key,
+                share_bytes,
+                required,
+                reconstruct,
+            )
+        } else {
+            crate::net::open_registry::open_share_via_registry(
+                self.instance_id,
+                self.party_id,
+                &type_key,
+                share_bytes,
+                required,
+                reconstruct,
+            )
+        }
     }
 
     fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
@@ -931,23 +975,29 @@ where
         let n = self.n;
         let t = self.t;
 
-        crate::net::open_registry::batch_open_via_registry(
-            self.instance_id,
-            self.party_id,
-            &type_key,
-            shares,
-            required,
-            |collected, pos| {
-                let mut decoded_shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
-                for bytes in collected {
-                    decoded_shares.push(Self::decode_share(bytes)?);
-                }
+        let reconstruct = |collected: &[Vec<u8>], pos: usize| {
+            let mut decoded_shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
+            for bytes in collected {
+                decoded_shares.push(Self::decode_share(bytes)?);
+            }
 
-                let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, n, t)
-                    .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
-                Ok(Self::field_to_value(ty, secret))
-            },
-        )
+            let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, n, t)
+                .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
+            Ok(Self::field_to_value(ty, secret))
+        };
+
+        if let Some(open_registry) = &self.open_registry {
+            open_registry.batch_open_wait(self.party_id, &type_key, shares, required, reconstruct)
+        } else {
+            crate::net::open_registry::batch_open_via_registry(
+                self.instance_id,
+                self.party_id,
+                &type_key,
+                shares,
+                required,
+                reconstruct,
+            )
+        }
     }
 
     fn shutdown(&self) {

@@ -166,7 +166,7 @@ pub fn field_to_value<F: ark_ff::PrimeField>(
     ty: stoffel_vm_types::core_types::ShareType,
     secret: F,
 ) -> stoffel_vm_types::core_types::Value {
-    use stoffel_vm_types::core_types::{Value, F64, BOOLEAN_SECRET_INT_BITS};
+    use stoffel_vm_types::core_types::{Value, BOOLEAN_SECRET_INT_BITS, F64};
 
     match ty {
         stoffel_vm_types::core_types::ShareType::SecretInt { bit_length }

@@ -172,7 +172,6 @@ async fn test_ping_pong_three_servers() {
 
             // Verify we have 3 latency measurements per server
             assert_eq!(latencies.len(), 3, "Should have 3 latency measurements");
-
         }
     }
 

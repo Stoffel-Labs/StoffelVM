@@ -15,7 +15,6 @@ use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
 use stoffel_vm::core_vm::VirtualMachine;
-use stoffel_vm_types::core_types::Value;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffel_vm::net::curve::SupportedMpcField;
 #[cfg(feature = "honeybadger")]
@@ -28,6 +27,7 @@ use stoffel_vm::net::{
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 use stoffel_vm_types::compiled_binary::CompiledBinary;
+use stoffel_vm_types::core_types::Value;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
@@ -77,7 +77,10 @@ impl Network for ClientNetworkAdapter {
         self.inner.send(mapped, message).await
     }
 
-    async fn broadcast(&self, message: &[u8]) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+    async fn broadcast(
+        &self,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
         // Must remap each party_id through our send() to skip the client's own
         // slot in the 6-key sorted list. Using inner.broadcast() directly would
         // iterate over 6 positions (including self) with wrong party mapping.
@@ -169,7 +172,10 @@ impl Network for ServerClientAdapter {
         self.inner.send(recipient, message).await
     }
 
-    async fn broadcast(&self, message: &[u8]) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+    async fn broadcast(
+        &self,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
         self.inner.broadcast(message).await
     }
 
@@ -201,11 +207,7 @@ impl Network for ServerClientAdapter {
         message: &[u8],
     ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
         // Remap sequential index → transport-derived client ID
-        let transport_id = self
-            .client_id_map
-            .get(client)
-            .copied()
-            .unwrap_or(client);
+        let transport_id = self.client_id_map.get(client).copied().unwrap_or(client);
         self.inner.send_to_client(transport_id, message).await
     }
 
@@ -214,11 +216,7 @@ impl Network for ServerClientAdapter {
     }
 
     fn is_client_connected(&self, client: ClientId) -> bool {
-        let transport_id = self
-            .client_id_map
-            .get(client)
-            .copied()
-            .unwrap_or(client);
+        let transport_id = self.client_id_map.get(client).copied().unwrap_or(client);
         self.inner.is_client_connected(transport_id)
     }
 
@@ -563,12 +561,17 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
     while let Some((sender_id, data)) = msg_rx.recv().await {
         // Skip INST messages from other servers (already consumed the first one)
         if data.len() == 13 && data.starts_with(b"INST") {
-            eprintln!("[client {}] Skipping extra INST from sender {}", mpc_cid, sender_id);
+            eprintln!(
+                "[client {}] Skipping extra INST from sender {}",
+                mpc_cid, sender_id
+            );
             continue;
         }
         eprintln!(
             "[client {}] Received {} bytes from sender {} (raw)",
-            mpc_cid, data.len(), sender_id
+            mpc_cid,
+            data.len(),
+            sender_id
         );
 
         let adapter = {
@@ -579,10 +582,7 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
             }
         };
 
-        match mpc_client
-            .process(sender_id, data, Arc::new(adapter))
-            .await
-        {
+        match mpc_client.process(sender_id, data, Arc::new(adapter)).await {
             Ok(()) => {
                 messages_processed += 1;
                 eprintln!(
@@ -591,14 +591,20 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
                 );
             }
             Err(e) => {
-                eprintln!("[client {}] Failed to process message from {}: {:?}", mpc_cid, sender_id, e);
+                eprintln!(
+                    "[client {}] Failed to process message from {}: {:?}",
+                    mpc_cid, sender_id, e
+                );
             }
         }
 
         if messages_processed >= n {
             // Keep connection alive long enough for servers to drain their
             // preprocessing backlog and process our input messages.
-            eprintln!("[client {}] Input protocol complete, holding connection for 300s...", mpc_cid);
+            eprintln!(
+                "[client {}] Input protocol complete, holding connection for 300s...",
+                mpc_cid
+            );
             tokio::time::sleep(Duration::from_secs(300)).await;
             break;
         }
@@ -628,29 +634,61 @@ async fn run_hb_client_for_curve(
     match curve_config {
         MpcCurveConfig::Bls12_381 => {
             run_hb_client_protocol_for_curve::<ark_bls12_381::Fr>(
-                cid, n, t, inputs_str, input_len, instance_id, client_index,
-                local_position, network_for_process, msg_rx,
+                cid,
+                n,
+                t,
+                inputs_str,
+                input_len,
+                instance_id,
+                client_index,
+                local_position,
+                network_for_process,
+                msg_rx,
             )
             .await
         }
         MpcCurveConfig::Bn254 => {
             run_hb_client_protocol_for_curve::<ark_bn254::Fr>(
-                cid, n, t, inputs_str, input_len, instance_id, client_index,
-                local_position, network_for_process, msg_rx,
+                cid,
+                n,
+                t,
+                inputs_str,
+                input_len,
+                instance_id,
+                client_index,
+                local_position,
+                network_for_process,
+                msg_rx,
             )
             .await
         }
         MpcCurveConfig::Curve25519 => {
             run_hb_client_protocol_for_curve::<ark_curve25519::Fr>(
-                cid, n, t, inputs_str, input_len, instance_id, client_index,
-                local_position, network_for_process, msg_rx,
+                cid,
+                n,
+                t,
+                inputs_str,
+                input_len,
+                instance_id,
+                client_index,
+                local_position,
+                network_for_process,
+                msg_rx,
             )
             .await
         }
         MpcCurveConfig::Ed25519 => {
             run_hb_client_protocol_for_curve::<ark_ed25519::Fr>(
-                cid, n, t, inputs_str, input_len, instance_id, client_index,
-                local_position, network_for_process, msg_rx,
+                cid,
+                n,
+                t,
+                inputs_str,
+                input_len,
+                instance_id,
+                client_index,
+                local_position,
+                network_for_process,
+                msg_rx,
             )
             .await
         }
@@ -791,7 +829,10 @@ async fn run_as_client(
         let net = network.lock().await;
         net.compute_local_party_id().unwrap_or(0)
     };
-    eprintln!("[client {}] Local position in sorted key list: {}", cid, local_position);
+    eprintln!(
+        "[client {}] Local position in sorted key list: {}",
+        cid, local_position
+    );
 
     let network_for_process = network.clone();
     let client_id_for_task = cid;
@@ -945,8 +986,8 @@ where
         "[party {}] Creating MPC node opts (n_triples={}, n_random={}, timeout=600s)",
         my_id, n_triples, n_random
     );
-    let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id)
-        .unwrap_or_else(|e| {
+    let mpc_opts =
+        honeybadger_node_opts(n, t, n_triples, n_random, instance_id).unwrap_or_else(|e| {
             eprintln!("Failed to create MPC node options: {}", e);
             std::process::exit(2);
         });
@@ -977,9 +1018,11 @@ where
         mpc_node, // moved, not cloned
     );
 
-    eprintln!("[party {}] Spawning receive loops (split channels)...", my_id);
-    let (mut server_rx, mut client_rx) =
-        spawn_receive_loops_split(net.clone(), my_id, n).await;
+    eprintln!(
+        "[party {}] Spawning receive loops (split channels)...",
+        my_id
+    );
+    let (mut server_rx, mut client_rx) = spawn_receive_loops_split(net.clone(), my_id, n).await;
 
     // Remap transport-derived client IDs to sequential indices for the MPC protocol.
     let client_id_to_index: std::collections::HashMap<ClientId, usize> = input_ids
@@ -1060,7 +1103,11 @@ where
         });
 
         // Access the engine's node for InputServer init
-        eprintln!("[party {}] Initializing InputServer for {} clients...", my_id, client_index_map.len());
+        eprintln!(
+            "[party {}] Initializing InputServer for {} clients...",
+            my_id,
+            client_index_map.len()
+        );
         {
             let mut node = engine.node_handle().lock().await;
             for &(idx, _tid) in &client_index_map {
@@ -1079,24 +1126,39 @@ where
                     .input
                     .init(idx, local_shares, 1, server_adapter.clone())
                     .await
-                    .map_err(|e| format!("Failed to init InputServer for client {}: {:?}", idx, e))?;
-                eprintln!("[party {}] InputServer initialized for client index {}", my_id, idx);
+                    .map_err(|e| {
+                        format!("Failed to init InputServer for client {}: {:?}", idx, e)
+                    })?;
+                eprintln!(
+                    "[party {}] InputServer initialized for client index {}",
+                    my_id, idx
+                );
             }
         }
 
         // Signal readiness to clients
-        eprintln!("[party {}] Sending INST to {} clients...", my_id, client_index_map.len());
+        eprintln!(
+            "[party {}] Sending INST to {} clients...",
+            my_id,
+            client_index_map.len()
+        );
         for &(idx, tid) in &client_index_map {
             let mut inst_msg = Vec::with_capacity(13);
             inst_msg.extend_from_slice(b"INST");
             inst_msg.extend_from_slice(&instance_id.to_le_bytes());
             inst_msg.push(idx as u8);
             if let Err(e) = net.send_to_client(tid, &inst_msg).await {
-                eprintln!("[party {}] Failed to send INST to client {}: {:?}", my_id, tid, e);
+                eprintln!(
+                    "[party {}] Failed to send INST to client {}: {:?}",
+                    my_id, tid, e
+                );
             }
         }
 
-        eprintln!("[party {}] Waiting for all client inputs (timeout=600s)...", my_id);
+        eprintln!(
+            "[party {}] Waiting for all client inputs (timeout=600s)...",
+            my_id
+        );
         let client_inputs = {
             let mut node = engine.node_handle().lock().await;
             node.preprocess
@@ -1112,8 +1174,13 @@ where
                 .find(|(i, _)| *i == idx)
                 .map(|(_, tid)| *tid)
                 .unwrap_or(idx);
-            vm.state.client_store().store_client_input(transport_cid, shares);
-            eprintln!("[party {}] Stored inputs for client {} (index {})", my_id, transport_cid, idx);
+            vm.state
+                .client_store()
+                .store_client_input(transport_cid, shares);
+            eprintln!(
+                "[party {}] Stored inputs for client {} (index {})",
+                my_id, transport_cid, idx
+            );
         }
     }
 
@@ -1231,7 +1298,10 @@ where
     envelope.extend_from_slice(&(my_id as u32).to_le_bytes());
     envelope.extend_from_slice(&pk_bytes);
 
-    eprintln!("[party {}] Exchanging ECDH public keys over existing network...", my_id);
+    eprintln!(
+        "[party {}] Exchanging ECDH public keys over existing network...",
+        my_id
+    );
 
     // Broadcast our PK to all peers via existing connections
     let connections = net.get_all_server_connections();
@@ -1240,7 +1310,10 @@ where
             continue;
         }
         if let Err(e) = conn.send(&envelope).await {
-            eprintln!("[party {}] Failed to send PK to peer {}: {}", my_id, peer_id, e);
+            eprintln!(
+                "[party {}] Failed to send PK to peer {}: {}",
+                my_id, peer_id, e
+            );
         }
     }
 
@@ -1262,7 +1335,9 @@ where
         let conn = conn.clone();
         tokio::spawn(async move {
             match conn.receive().await {
-                Ok(data) => { let _ = tx.send((peer_id, data)).await; }
+                Ok(data) => {
+                    let _ = tx.send((peer_id, data)).await;
+                }
                 Err(e) => {
                     eprintln!("[AVSS] Failed to receive PK from peer {}: {}", peer_id, e);
                 }
@@ -1287,22 +1362,34 @@ where
                     Ok(pk) => {
                         pk_map[sender_id] = pk;
                         received += 1;
-                        eprintln!("[party {}] Received PK from party {} ({}/{})", my_id, sender_id, received, n);
+                        eprintln!(
+                            "[party {}] Received PK from party {} ({}/{})",
+                            my_id, sender_id, received, n
+                        );
                     }
                     Err(e) => {
-                        eprintln!("[party {}] Failed to deserialize PK from party {}: {:?}", my_id, sender_id, e);
+                        eprintln!(
+                            "[party {}] Failed to deserialize PK from party {}: {:?}",
+                            my_id, sender_id, e
+                        );
                     }
                 }
             }
             Ok(None) => break,
             Err(_) => {
-                return Err(format!("Timeout during PK exchange: received {}/{} keys", received, n));
+                return Err(format!(
+                    "Timeout during PK exchange: received {}/{} keys",
+                    received, n
+                ));
             }
         }
     }
 
     if received < n {
-        return Err(format!("PK exchange incomplete: received {}/{} keys", received, n));
+        return Err(format!(
+            "PK exchange incomplete: received {}/{} keys",
+            received, n
+        ));
     }
     eprintln!("[party {}] PK exchange complete ({} keys)", my_id, n);
 
@@ -1347,19 +1434,42 @@ where
             loop {
                 match conn.receive().await {
                     Ok(data) => {
-                        if let Ok(true) = stoffel_vm::net::open_registry::try_handle_wire_message(authenticated_sender_id, &data) {
+                        if let Ok(true) = stoffel_vm::net::open_registry::try_handle_wire_message(
+                            authenticated_sender_id,
+                            &data,
+                        ) {
                             continue;
                         }
-                        if let Ok(true) = stoffel_vm::net::avss_engine::try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
+                        if let Ok(true) =
+                            stoffel_vm::net::avss_engine::try_handle_avss_open_exp_wire_message(
+                                authenticated_sender_id,
+                                &data,
+                            )
+                        {
                             continue;
                         }
-                        if let Ok(true) = stoffel_vm::net::avss_engine::try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
+                        if let Ok(true) =
+                            stoffel_vm::net::avss_engine::try_handle_avss_g2_exp_wire_message(
+                                authenticated_sender_id,
+                                &data,
+                            )
+                        {
                             continue;
                         }
-                        if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {
+                        if let Err(e) = engine
+                            .process_wrapped_message_with_network(
+                                authenticated_sender_id,
+                                &data,
+                                net_clone.clone(),
+                            )
+                            .await
+                        {
                             let _ = tx.send((authenticated_sender_id, data)).await;
                             if !e.contains("deserialize") && !e.contains("process failed") {
-                                eprintln!("[AVSS] Party failed to process message from {}: {}", authenticated_sender_id, e);
+                                eprintln!(
+                                    "[AVSS] Party failed to process message from {}: {}",
+                                    authenticated_sender_id, e
+                                );
                             }
                         }
                     }
@@ -1375,12 +1485,18 @@ where
         let mut spawned = std::collections::HashSet::new();
         loop {
             for (cid, conn) in client_net.get_all_client_connections() {
-                if !spawned.insert(cid) { continue; }
+                if !spawned.insert(cid) {
+                    continue;
+                }
                 let txx = client_tx.clone();
                 tokio::spawn(async move {
                     loop {
                         match conn.receive().await {
-                            Ok(data) => { if txx.send((cid, data)).await.is_err() { break; } }
+                            Ok(data) => {
+                                if txx.send((cid, data)).await.is_err() {
+                                    break;
+                                }
+                            }
                             Err(_) => break,
                         }
                     }
@@ -1458,9 +1574,7 @@ where
                     .lock()
                     .await
                     .take_v_random_shares(1)
-                    .map_err(|e| {
-                        format!("Not enough random shares for client {}: {:?}", idx, e)
-                    })?;
+                    .map_err(|e| format!("Not enough random shares for client {}: {:?}", idx, e))?;
 
                 node.input_server
                     .init(idx, local_shares, 1, server_adapter.clone())
@@ -1662,8 +1776,7 @@ async fn main() {
             }
             "--wait-for-clients" => {
                 if let Some(v) = args_iter.next() {
-                    expected_client_count =
-                        Some(v.parse().expect("Invalid --wait-for-clients"));
+                    expected_client_count = Some(v.parse().expect("Invalid --wait-for-clients"));
                 }
             }
             "--stun-servers" => {
@@ -2332,7 +2445,10 @@ async fn main() {
                         for i in 0..len {
                             match arr.get(&Value::I64(i as i64)) {
                                 Some(Value::U8(b)) => bytes.push(*b),
-                                _ => { is_byte_array = false; break; }
+                                _ => {
+                                    is_byte_array = false;
+                                    break;
+                                }
                             }
                         }
                         if is_byte_array && !bytes.is_empty() {

@@ -18,7 +18,7 @@ use crate::net::mpc_engine::MpcEngine;
 use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
 };
-use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
+use crate::tests::test_utils::{acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing};
 
 /// Test: open_share_in_exp on a known value reconstructs correctly.
 ///
@@ -29,6 +29,7 @@ use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
 async fn test_open_share_in_exp_known_value() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     let n = 5;
     let t = 1;
@@ -64,10 +65,11 @@ async fn test_open_share_in_exp_known_value() {
             .network
             .clone()
             .expect("network should be set after start()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -102,7 +104,8 @@ async fn test_open_share_in_exp_known_value() {
     // Create engines from existing nodes
     let engines: Vec<Arc<HoneyBadgerMpcEngine>> = (0..n)
         .map(|i| {
-            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
+            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+                servers[i].open_message_router.clone(),
                 instance_id,
                 i,
                 n,
@@ -198,6 +201,7 @@ async fn test_open_share_in_exp_known_value() {
 async fn test_simulated_dkg_flow() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     let n = 5;
     let t = 1;
@@ -233,10 +237,11 @@ async fn test_simulated_dkg_flow() {
             .network
             .clone()
             .expect("network should be set after start()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -271,7 +276,8 @@ async fn test_simulated_dkg_flow() {
     // Create engines from existing nodes
     let engines: Vec<Arc<HoneyBadgerMpcEngine>> = (0..n)
         .map(|i| {
-            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
+            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+                servers[i].open_message_router.clone(),
                 instance_id,
                 i,
                 n,

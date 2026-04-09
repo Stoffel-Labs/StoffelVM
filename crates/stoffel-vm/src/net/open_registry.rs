@@ -5,10 +5,13 @@
 //! contributions arrive. The registry handles sequence tracking (so distinct
 //! `open` calls don't collide) and async notification via [`tokio::sync::Notify`].
 
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -746,6 +749,582 @@ where
 pub fn clear_registries() {
     OPEN_REGISTRY.lock().clear();
     BATCH_OPEN_REGISTRY.lock().clear();
+}
+
+type ScopedOpenKey = (usize, String);
+type ScopedBatchKey = (usize, String, usize);
+
+/// Per-instance accumulation registry for HoneyBadger open-share traffic.
+///
+/// This mirrors the global registries above, but scopes sequence assignment and
+/// accumulation to one logical runtime/session.
+pub struct InstanceRegistry {
+    single: Mutex<HashMap<ScopedOpenKey, OpenAccumulator>>,
+    single_notify: Notify,
+    batch: Mutex<HashMap<ScopedBatchKey, BatchOpenAccumulator>>,
+    batch_notify: Notify,
+}
+
+impl InstanceRegistry {
+    fn new() -> Self {
+        Self {
+            single: Mutex::new(HashMap::new()),
+            single_notify: Notify::new(),
+            batch: Mutex::new(HashMap::new()),
+            batch_notify: Notify::new(),
+        }
+    }
+
+    fn insert_single(&self, type_key: &str, sender_party_id: usize, share: Vec<u8>) {
+        let mut reg = self.single.lock();
+        let type_key = type_key.to_owned();
+        let mut seq = 0usize;
+        loop {
+            let entry = reg.entry((seq, type_key.clone())).or_default();
+            if !entry.party_ids.contains(&sender_party_id) {
+                entry.shares.push(share);
+                entry.party_ids.push(sender_party_id);
+                break;
+            }
+            seq += 1;
+        }
+        drop(reg);
+        self.single_notify.notify_waiters();
+    }
+
+    pub fn open_share_wait<R>(
+        &self,
+        party_id: usize,
+        type_key: &str,
+        share_bytes: &[u8],
+        required: usize,
+        reconstruct: R,
+    ) -> Result<Value, String>
+    where
+        R: FnOnce(&[Vec<u8>]) -> Result<Value, String>,
+    {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(self.open_share_async(
+                        party_id,
+                        type_key.to_owned(),
+                        share_bytes.to_vec(),
+                        required,
+                        reconstruct,
+                    ))
+                });
+            }
+        }
+        self.open_share_poll(
+            party_id,
+            type_key.to_owned(),
+            share_bytes,
+            required,
+            reconstruct,
+        )
+    }
+
+    async fn open_share_async<R>(
+        &self,
+        party_id: usize,
+        type_key: String,
+        share_bytes: Vec<u8>,
+        required: usize,
+        reconstruct: R,
+    ) -> Result<Value, String>
+    where
+        R: FnOnce(&[Vec<u8>]) -> Result<Value, String>,
+    {
+        let mut my_sequence: Option<usize> = None;
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(OPEN_REGISTRY_WAIT_TIMEOUT.as_secs());
+
+        loop {
+            let notified = self.single_notify.notified();
+            let mut inserted_local = false;
+
+            {
+                let mut reg = self.single.lock();
+
+                if my_sequence.is_none() {
+                    let mut seq = 0usize;
+                    loop {
+                        let entry = reg.entry((seq, type_key.clone())).or_default();
+                        if !entry.party_ids.contains(&party_id) {
+                            entry.shares.push(share_bytes.clone());
+                            entry.party_ids.push(party_id);
+                            my_sequence = Some(seq);
+                            inserted_local = true;
+                            break;
+                        }
+                        seq += 1;
+                    }
+                }
+
+                let seq = my_sequence.expect("sequence must be set after insertion");
+                let entry = reg
+                    .get_mut(&(seq, type_key.clone()))
+                    .expect("scoped open entry must exist after insertion");
+
+                if let Some(result) = entry.result.clone() {
+                    return Ok(result);
+                }
+
+                if entry.shares.len() >= required {
+                    let collected: Vec<_> = entry.shares.iter().take(required).cloned().collect();
+                    drop(reg);
+                    let value = reconstruct(&collected)?;
+                    let mut reg = self.single.lock();
+                    let entry = reg
+                        .get_mut(&(seq, type_key))
+                        .expect("scoped open entry must exist after insertion");
+                    entry.result = Some(value.clone());
+                    drop(reg);
+                    self.single_notify.notify_waiters();
+                    return Ok(value);
+                }
+
+                let current_count = entry.party_ids.len();
+                drop(reg);
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "Timeout waiting for scoped open_share contributions ({}/{})",
+                        current_count, required
+                    ));
+                }
+            }
+
+            if inserted_local {
+                self.single_notify.notify_waiters();
+            }
+
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        }
+    }
+
+    fn open_share_poll<R>(
+        &self,
+        party_id: usize,
+        type_key: String,
+        share_bytes: &[u8],
+        required: usize,
+        reconstruct: R,
+    ) -> Result<Value, String>
+    where
+        R: FnOnce(&[Vec<u8>]) -> Result<Value, String>,
+    {
+        let mut my_sequence: Option<usize> = None;
+        let deadline = Instant::now() + OPEN_REGISTRY_WAIT_TIMEOUT;
+
+        loop {
+            let mut reg = self.single.lock();
+
+            if my_sequence.is_none() {
+                let mut seq = 0usize;
+                loop {
+                    let entry = reg.entry((seq, type_key.clone())).or_default();
+                    if !entry.party_ids.contains(&party_id) {
+                        entry.shares.push(share_bytes.to_vec());
+                        entry.party_ids.push(party_id);
+                        my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.expect("sequence must be set after insertion");
+            let entry = reg
+                .get_mut(&(seq, type_key.clone()))
+                .expect("scoped open entry must exist after insertion");
+
+            if let Some(result) = entry.result.clone() {
+                return Ok(result);
+            }
+
+            if entry.shares.len() >= required {
+                let collected: Vec<_> = entry.shares.iter().take(required).cloned().collect();
+                drop(reg);
+                let value = reconstruct(&collected)?;
+                let mut reg = self.single.lock();
+                let entry = reg
+                    .get_mut(&(seq, type_key))
+                    .expect("scoped open entry must exist after insertion");
+                entry.result = Some(value.clone());
+                return Ok(value);
+            }
+
+            let current_count = entry.party_ids.len();
+            drop(reg);
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Timeout waiting for scoped open_share contributions ({}/{})",
+                    current_count, required
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn insert_batch(&self, type_key: &str, sender_party_id: usize, shares: Vec<Vec<u8>>) {
+        if shares.is_empty() {
+            return;
+        }
+
+        let batch_size = shares.len();
+        let mut reg = self.batch.lock();
+        let type_key = type_key.to_owned();
+        let mut seq = 0usize;
+        loop {
+            let entry = reg
+                .entry((seq, type_key.clone(), batch_size))
+                .or_insert_with(|| BatchOpenAccumulator::new(batch_size));
+            if !entry.party_ids.contains(&sender_party_id) {
+                for (pos, share_bytes) in shares.into_iter().enumerate() {
+                    entry.shares_per_position[pos].push(share_bytes);
+                }
+                entry.party_ids.push(sender_party_id);
+                break;
+            }
+            seq += 1;
+        }
+        drop(reg);
+        self.batch_notify.notify_waiters();
+    }
+
+    pub fn batch_open_wait<R>(
+        &self,
+        party_id: usize,
+        type_key: &str,
+        shares: &[Vec<u8>],
+        required: usize,
+        reconstruct_one: R,
+    ) -> Result<Vec<Value>, String>
+    where
+        R: Fn(&[Vec<u8>], usize) -> Result<Value, String>,
+    {
+        if shares.is_empty() {
+            return Ok(vec![]);
+        }
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(self.batch_open_async(
+                        party_id,
+                        type_key.to_owned(),
+                        shares.to_vec(),
+                        required,
+                        reconstruct_one,
+                    ))
+                });
+            }
+        }
+
+        self.batch_open_poll(
+            party_id,
+            type_key.to_owned(),
+            shares,
+            required,
+            reconstruct_one,
+        )
+    }
+
+    async fn batch_open_async<R>(
+        &self,
+        party_id: usize,
+        type_key: String,
+        shares: Vec<Vec<u8>>,
+        required: usize,
+        reconstruct_one: R,
+    ) -> Result<Vec<Value>, String>
+    where
+        R: Fn(&[Vec<u8>], usize) -> Result<Value, String>,
+    {
+        let batch_size = shares.len();
+        let mut my_sequence: Option<usize> = None;
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(OPEN_REGISTRY_WAIT_TIMEOUT.as_secs());
+
+        loop {
+            let notified = self.batch_notify.notified();
+            let mut inserted_local = false;
+
+            {
+                let mut reg = self.batch.lock();
+
+                if my_sequence.is_none() {
+                    let mut seq = 0usize;
+                    loop {
+                        let entry = reg
+                            .entry((seq, type_key.clone(), batch_size))
+                            .or_insert_with(|| BatchOpenAccumulator::new(batch_size));
+                        if !entry.party_ids.contains(&party_id) {
+                            for (pos, share_bytes) in shares.iter().enumerate() {
+                                entry.shares_per_position[pos].push(share_bytes.clone());
+                            }
+                            entry.party_ids.push(party_id);
+                            my_sequence = Some(seq);
+                            inserted_local = true;
+                            break;
+                        }
+                        seq += 1;
+                    }
+                }
+
+                let seq = my_sequence.expect("sequence must be set after insertion");
+                let key = (seq, type_key.clone(), batch_size);
+                let entry = reg
+                    .get_mut(&key)
+                    .expect("scoped batch entry must exist after insertion");
+
+                if let Some(results) = entry.results.clone() {
+                    return Ok(results);
+                }
+
+                if entry.party_ids.len() >= required {
+                    let snapshot: Vec<Vec<Vec<u8>>> = entry
+                        .shares_per_position
+                        .iter()
+                        .map(|pos| pos.iter().take(required).cloned().collect())
+                        .collect();
+                    drop(reg);
+
+                    let mut results = Vec::with_capacity(batch_size);
+                    for (pos, collected) in snapshot.iter().enumerate() {
+                        results.push(reconstruct_one(collected, pos)?);
+                    }
+
+                    let mut reg = self.batch.lock();
+                    let entry = reg
+                        .get_mut(&(seq, type_key, batch_size))
+                        .expect("scoped batch entry must exist after insertion");
+                    entry.results = Some(results.clone());
+                    drop(reg);
+                    self.batch_notify.notify_waiters();
+                    return Ok(results);
+                }
+
+                let current_count = entry.party_ids.len();
+                drop(reg);
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "Timeout waiting for scoped batch_open contributions ({}/{})",
+                        current_count, required
+                    ));
+                }
+            }
+
+            if inserted_local {
+                self.batch_notify.notify_waiters();
+            }
+
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        }
+    }
+
+    fn batch_open_poll<R>(
+        &self,
+        party_id: usize,
+        type_key: String,
+        shares: &[Vec<u8>],
+        required: usize,
+        reconstruct_one: R,
+    ) -> Result<Vec<Value>, String>
+    where
+        R: Fn(&[Vec<u8>], usize) -> Result<Value, String>,
+    {
+        let batch_size = shares.len();
+        let mut my_sequence: Option<usize> = None;
+        let deadline = Instant::now() + OPEN_REGISTRY_WAIT_TIMEOUT;
+
+        loop {
+            let mut reg = self.batch.lock();
+
+            if my_sequence.is_none() {
+                let mut seq = 0usize;
+                loop {
+                    let entry = reg
+                        .entry((seq, type_key.clone(), batch_size))
+                        .or_insert_with(|| BatchOpenAccumulator::new(batch_size));
+                    if !entry.party_ids.contains(&party_id) {
+                        for (pos, share_bytes) in shares.iter().enumerate() {
+                            entry.shares_per_position[pos].push(share_bytes.clone());
+                        }
+                        entry.party_ids.push(party_id);
+                        my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.expect("sequence must be set after insertion");
+            let key = (seq, type_key.clone(), batch_size);
+            let entry = reg
+                .get_mut(&key)
+                .expect("scoped batch entry must exist after insertion");
+
+            if let Some(results) = entry.results.clone() {
+                return Ok(results);
+            }
+
+            if entry.party_ids.len() >= required {
+                let snapshot: Vec<Vec<Vec<u8>>> = entry
+                    .shares_per_position
+                    .iter()
+                    .map(|pos| pos.iter().take(required).cloned().collect())
+                    .collect();
+                drop(reg);
+
+                let mut results = Vec::with_capacity(batch_size);
+                for (pos, collected) in snapshot.iter().enumerate() {
+                    results.push(reconstruct_one(collected, pos)?);
+                }
+
+                let mut reg = self.batch.lock();
+                let entry = reg
+                    .get_mut(&(seq, type_key, batch_size))
+                    .expect("scoped batch entry must exist after insertion");
+                entry.results = Some(results.clone());
+                return Ok(results);
+            }
+
+            let current_count = entry.party_ids.len();
+            drop(reg);
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Timeout waiting for scoped batch_open contributions ({}/{})",
+                    current_count, required
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Session-local router for open-share transport payloads.
+#[derive(Default)]
+pub struct OpenMessageRouter {
+    registries: DashMap<u64, Weak<InstanceRegistry>>,
+}
+
+impl OpenMessageRouter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_instance(&self, instance_id: u64) -> Arc<InstanceRegistry> {
+        if let Some(existing) = self.get_instance_registry(instance_id) {
+            return existing;
+        }
+
+        let registry = Arc::new(InstanceRegistry::new());
+        match self.registries.entry(instance_id) {
+            Entry::Occupied(mut occupied) => {
+                if let Some(existing) = occupied.get().upgrade() {
+                    existing
+                } else {
+                    occupied.insert(Arc::downgrade(&registry));
+                    registry
+                }
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(Arc::downgrade(&registry));
+                registry
+            }
+        }
+    }
+
+    pub fn get_instance_registry(&self, instance_id: u64) -> Option<Arc<InstanceRegistry>> {
+        self.registries
+            .get(&instance_id)
+            .and_then(|entry| entry.value().upgrade())
+    }
+
+    pub fn clear(&self) {
+        self.registries.clear();
+    }
+
+    pub fn try_handle_wire_message(
+        &self,
+        authenticated_sender_id: usize,
+        payload: &[u8],
+    ) -> Result<bool, String> {
+        if payload.len() < OPEN_REGISTRY_WIRE_PREFIX.len()
+            || &payload[..OPEN_REGISTRY_WIRE_PREFIX.len()] != OPEN_REGISTRY_WIRE_PREFIX
+        {
+            return Ok(false);
+        }
+
+        let body = &payload[OPEN_REGISTRY_WIRE_PREFIX.len()..];
+        if body.len() > MAX_WIRE_MESSAGE_LEN {
+            return Err(format!(
+                "open wire payload too large: {} bytes (max {})",
+                body.len(),
+                MAX_WIRE_MESSAGE_LEN
+            ));
+        }
+
+        let decoded: OpenRegistryWireMessage = bincode::deserialize(body)
+            .map_err(|e| format!("deserialize open wire payload: {}", e))?;
+
+        let (instance_id, sender_party_id) = match &decoded {
+            OpenRegistryWireMessage::Single {
+                instance_id,
+                sender_party_id,
+                ..
+            } => (*instance_id, *sender_party_id),
+            OpenRegistryWireMessage::Batch {
+                instance_id,
+                sender_party_id,
+                ..
+            } => (*instance_id, *sender_party_id),
+        };
+
+        if authenticated_sender_id == UNKNOWN_SENDER_ID {
+            tracing::warn!(
+                sender_party_id,
+                "Rejecting open wire message from unauthenticated connection"
+            );
+            return Err("open wire rejected: sender identity not authenticated".to_string());
+        }
+        if sender_party_id != authenticated_sender_id {
+            return Err(format!(
+                "open wire sender mismatch: transport={} payload={}",
+                authenticated_sender_id, sender_party_id
+            ));
+        }
+
+        let registry = match self.get_instance_registry(instance_id) {
+            Some(registry) => registry,
+            None => return Ok(false),
+        };
+
+        match decoded {
+            OpenRegistryWireMessage::Single {
+                type_key,
+                sender_party_id,
+                share,
+                ..
+            } => registry.insert_single(&type_key, sender_party_id, share),
+            OpenRegistryWireMessage::Batch {
+                type_key,
+                sender_party_id,
+                shares,
+                ..
+            } => registry.insert_batch(&type_key, sender_party_id, shares),
+        }
+
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
