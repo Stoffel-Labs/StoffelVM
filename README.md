@@ -187,6 +187,8 @@ Run the test suite:
 
 ```bash
 cargo test
+cargo test --all-features
+cargo test -- --ignored
 ```
 
 Build the runtime and CLI in release mode:
