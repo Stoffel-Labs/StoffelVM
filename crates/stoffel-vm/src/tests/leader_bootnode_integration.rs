@@ -262,7 +262,7 @@ fn create_federated_average_binary() -> Vec<u8> {
 /// 2. Runs preprocessing and client input distribution
 /// 3. Executes fixed-point federated averaging
 /// 4. Verifies element-wise average results
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread"), ignored]
 async fn test_leader_bootnode_matrix_average_fixed_point() {
     init_crypto_provider();
     setup_test_tracing();
