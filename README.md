@@ -1,6 +1,5 @@
 # StoffelVM
 ![Discord](https://img.shields.io/discord/1300834528042160150?label=discord)
-[![Telegram](https://img.shields.io/badge/telegram-24A1DE)](https://t.me/+7L0HPi1U8pU1MzQx)
 [![GitHub License](https://img.shields.io/github/license/Stoffel-Labs/StoffelVM)](LICENSE)
 
 This repository contains the core crates of the Stoffel Virtual Machine, a register-based VM built for both local execution and networked multiparty computation (MPC).
