@@ -4,19 +4,28 @@ set -e
 # StoffelVM Docker Entrypoint Script
 # Handles both leader and party node startup with proper coordination
 
+validate_env() {
+    if [ "${STOFFEL_ROLE}" != "client" ] && [ -z "${STOFFEL_AUTH_TOKEN:-}" ]; then
+        echo "ERROR: STOFFEL_AUTH_TOKEN must be set for ${STOFFEL_ROLE} mode."
+        echo "Bootnode and parties require authenticated discovery registration."
+        exit 2
+    fi
+}
+
+validate_env
+
 echo "=========================================="
 echo "StoffelVM Node Startup"
 echo "=========================================="
 echo "Role: ${STOFFEL_ROLE}"
 if [ "${STOFFEL_ROLE}" = "client" ]; then
-    echo "Client ID: ${STOFFEL_CLIENT_ID}"
     echo "Inputs: ${STOFFEL_INPUTS}"
     echo "Servers: ${STOFFEL_SERVERS}"
 else
     echo "Party ID: ${STOFFEL_PARTY_ID}"
     echo "Bind Address: ${STOFFEL_BIND_ADDR}"
     echo "Bootstrap: ${STOFFEL_BOOTSTRAP_ADDR:-N/A}"
-    echo "Expected Clients: ${STOFFEL_EXPECTED_CLIENTS:-none}"
+    echo "Expected Client Count: ${STOFFEL_EXPECTED_CLIENT_COUNT:-none}"
 fi
 echo "N Parties: ${STOFFEL_N_PARTIES}"
 echo "Threshold: ${STOFFEL_THRESHOLD}"
@@ -24,6 +33,7 @@ echo "Program: ${STOFFEL_PROGRAM}"
 echo "Entry: ${STOFFEL_ENTRY}"
 echo "NAT Enabled: ${STOFFEL_ENABLE_NAT:-false}"
 echo "STUN Servers: ${STOFFEL_STUN_SERVERS:-N/A}"
+echo "Auth Token: $( [ -n "${STOFFEL_AUTH_TOKEN:-}" ] && echo "configured" || echo "not set" )"
 echo "=========================================="
 
 # Wait for a host:port to be available (UDP check for QUIC)
@@ -68,7 +78,6 @@ build_command() {
     if [ "${STOFFEL_ROLE}" = "client" ]; then
         # Client mode: connect to servers and submit inputs
         cmd="${cmd} --client"
-        cmd="${cmd} --client-id ${STOFFEL_CLIENT_ID}"
         cmd="${cmd} --inputs ${STOFFEL_INPUTS}"
         cmd="${cmd} --servers ${STOFFEL_SERVERS}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
@@ -100,9 +109,19 @@ build_command() {
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD}"
     fi
 
-    # Add expected clients if specified (for leader and party modes)
-    if [ -n "${STOFFEL_EXPECTED_CLIENTS}" ]; then
-        cmd="${cmd} --expected-clients ${STOFFEL_EXPECTED_CLIENTS}"
+    # Wait for N clients before starting execution (for leader and party modes)
+    if [ -n "${STOFFEL_EXPECTED_CLIENT_COUNT}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
+        cmd="${cmd} --wait-for-clients ${STOFFEL_EXPECTED_CLIENT_COUNT}"
+    fi
+
+    # Add MPC backend if specified
+    if [ -n "${STOFFEL_MPC_BACKEND:-}" ]; then
+        cmd="${cmd} --mpc-backend ${STOFFEL_MPC_BACKEND}"
+    fi
+
+    # Add MPC curve if specified
+    if [ -n "${STOFFEL_MPC_CURVE:-}" ]; then
+        cmd="${cmd} --mpc-curve ${STOFFEL_MPC_CURVE}"
     fi
 
     # Add optional trace flags
@@ -139,7 +158,7 @@ main() {
 
         # Add startup delay to let servers complete preprocessing
         DELAY=${STOFFEL_CLIENT_DELAY:-30}
-        echo "Client ${STOFFEL_CLIENT_ID}: waiting ${DELAY}s for servers to complete preprocessing..."
+        echo "Client: waiting ${DELAY}s for servers to complete preprocessing..."
         sleep $DELAY
 
         # Wait for first server to be reachable
@@ -164,11 +183,9 @@ main() {
         BOOTSTRAP_HOST=$(echo "${STOFFEL_BOOTSTRAP_ADDR}" | cut -d: -f1)
         BOOTSTRAP_PORT=$(echo "${STOFFEL_BOOTSTRAP_ADDR}" | cut -d: -f2)
 
-        # Add startup delay based on party ID to stagger connections
-        # This helps avoid thundering herd issues
-        DELAY=$((STOFFEL_PARTY_ID * 2))
-        echo "Party ${STOFFEL_PARTY_ID}: waiting ${DELAY}s before connecting..."
-        sleep $DELAY
+        # Small fixed delay to let bootnode stabilize
+        echo "Party ${STOFFEL_PARTY_ID}: waiting 2s before connecting..."
+        sleep 2
 
         # Wait for bootnode to be available
         if ! wait_for_host "$BOOTSTRAP_HOST" "$BOOTSTRAP_PORT" 120; then

@@ -4,19 +4,10 @@
 # including program sync, leader node, and client input provision.
 #
 # Usage:
-#   docker-compose build
-#   docker-compose up
-#
-# To build with NAT traversal support:
-#   docker-compose build --build-arg ENABLE_NAT=true
+#   STOFFEL_AUTH_TOKEN=<token> docker-compose up
 #
 # To view logs from a specific party:
 #   docker-compose logs -f party0
-#
-# To run with a different program:
-#   STOFFEL_PROGRAM=/app/programs/your_program.stflb docker-compose up
-#
-# For cross-internet NAT traversal, see docker-compose.nat.yml
 
 services:
   # Party 0 - Leader node (runs bootnode + party 0)
@@ -24,29 +15,28 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party0
     hostname: party0
     environment:
       - STOFFEL_ROLE=leader
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=0
       - STOFFEL_BIND_ADDR=172.28.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_EXPECTED_CLIENT_COUNT=2
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.10
     ports:
-      - "9000:9000/tcp"   # Bootnode port (TCP)
-      - "9000:9000/udp"   # Bootnode port (UDP/QUIC)
-      - "10000:10000/tcp" # Party communication port (TCP)
-      - "10000:10000/udp" # Party communication port (UDP/QUIC)
+      - "9000:9000/tcp"
+      - "9000:9000/udp"
+      - "10000:10000/tcp"
+      - "10000:10000/udp"
     healthcheck:
       test: ["CMD-SHELL", "netstat -tuln | grep -q ':9000' || exit 1"]
       interval: 5s
@@ -59,12 +49,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party1
     hostname: party1
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=1
       - STOFFEL_BIND_ADDR=172.28.0.11:9001
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
@@ -72,7 +61,7 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_EXPECTED_CLIENT_COUNT=2
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -90,12 +79,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party2
     hostname: party2
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=2
       - STOFFEL_BIND_ADDR=172.28.0.12:9002
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
@@ -103,7 +91,7 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_EXPECTED_CLIENT_COUNT=2
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -121,12 +109,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party3
     hostname: party3
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=3
       - STOFFEL_BIND_ADDR=172.28.0.13:9003
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
@@ -134,7 +121,7 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_EXPECTED_CLIENT_COUNT=2
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -152,12 +139,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-party4
     hostname: party4
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=4
       - STOFFEL_BIND_ADDR=172.28.0.14:9004
       - STOFFEL_BOOTSTRAP_ADDR=172.28.0.10:9000
@@ -165,7 +151,7 @@ services:
       - STOFFEL_THRESHOLD=1
       - STOFFEL_PROGRAM=/app/programs/client_mul.stflb
       - STOFFEL_ENTRY=main
-      - STOFFEL_EXPECTED_CLIENTS=0,1
+      - STOFFEL_EXPECTED_CLIENT_COUNT=2
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     networks:
@@ -183,13 +169,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-client0
     hostname: client0
     environment:
       - STOFFEL_ROLE=client
-      - STOFFEL_CLIENT_ID=0
       - STOFFEL_INPUTS=15
       - STOFFEL_SERVERS=172.28.0.10:10000,172.28.0.11:9001,172.28.0.12:9002,172.28.0.13:9003,172.28.0.14:9004
       - STOFFEL_N_PARTIES=5
@@ -217,13 +200,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ENABLE_NAT: ${ENABLE_NAT:-false}
     container_name: stoffel-client1
     hostname: client1
     environment:
       - STOFFEL_ROLE=client
-      - STOFFEL_CLIENT_ID=1
       - STOFFEL_INPUTS=25
       - STOFFEL_SERVERS=172.28.0.10:10000,172.28.0.11:9001,172.28.0.12:9002,172.28.0.13:9003,172.28.0.14:9004
       - STOFFEL_N_PARTIES=5

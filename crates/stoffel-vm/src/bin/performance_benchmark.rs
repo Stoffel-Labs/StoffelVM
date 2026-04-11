@@ -77,9 +77,6 @@ fn main() {
     vm.execute_with_args("benchmark", &args).unwrap();
 
     for &iter_count in &iterations {
-        // Prepare arguments
-        let args = vec![Value::I64(iter_count)];
-
         // Run the benchmark and measure time
         let start = Instant::now();
         let result = vm.execute_for_benchmark("benchmark").unwrap();

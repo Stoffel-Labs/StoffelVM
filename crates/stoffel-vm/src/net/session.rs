@@ -19,6 +19,11 @@ pub struct SessionInfo {
     pub parties: Vec<(PartyId, SocketAddr)>,
     pub n_parties: usize,
     pub threshold: usize,
+    /// TLS-derived IDs for each party, parallel to `parties`.
+    /// Used by peers to pre-register allowlist entries so that
+    /// `accept()` succeeds with `use_tls: true`.
+    #[serde(default)]
+    pub tls_ids: Vec<(PartyId, PartyId)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,14 +44,12 @@ pub enum SessionMessage {
         instance_id: u64,
     },
     /// Sent by bootnode to indicate session is fully confirmed and ready to start
-    SessionStart {
-        instance_id: u64,
-    },
+    SessionStart { instance_id: u64 },
 }
 
 pub fn random_instance_id() -> u64 {
     let mut b = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     u64::from_le_bytes(b)
 }
 
@@ -69,10 +72,15 @@ pub async fn send_ctrl(conn: &mut dyn PeerConnection, msg: &impl Serialize) -> R
 
 pub async fn recv_ctrl<T: for<'a> serde::Deserialize<'a>>(
     conn: &mut dyn PeerConnection,
-    _timeout: Option<Duration>,
+    timeout: Option<Duration>,
 ) -> Result<T, String> {
-    // simple version: ignore timeout for now; QUIC reliable
-    let buf = conn.receive_from_stream(CONTROL_STREAM_ID).await?;
+    let buf = if let Some(limit) = timeout {
+        tokio::time::timeout(limit, conn.receive_from_stream(CONTROL_STREAM_ID))
+            .await
+            .map_err(|_| format!("Timed out waiting for control message after {:?}", limit))??
+    } else {
+        conn.receive_from_stream(CONTROL_STREAM_ID).await?
+    };
     let val: T = bincode::deserialize(&buf).map_err(|e| e.to_string())?;
     Ok(val)
 }
@@ -83,7 +91,7 @@ pub async fn agree_session_with_bootnode(
     bn_conn: &mut dyn PeerConnection,
     my_party: PartyId,
     my_program_id: [u8; 32],
-    entry: &str,
+    _entry: &str,
 ) -> Result<SessionInfo, String> {
     // Request peers and implicit session announce via discovery RequestPeers
     // Then wait for SessionAnnounce
@@ -103,4 +111,84 @@ pub async fn agree_session_with_bootnode(
     };
     send_ctrl(bn_conn, &ack).await?;
     Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::pin::Pin;
+
+    struct DelayedMockConnection {
+        response: Vec<u8>,
+        delay: Duration,
+    }
+
+    impl PeerConnection for DelayedMockConnection {
+        fn send<'a>(
+            &'a mut self,
+            _data: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive<'a>(
+            &'a mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+            let response = self.response.clone();
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(response)
+            })
+        }
+
+        fn send_on_stream<'a>(
+            &'a mut self,
+            _stream_id: u64,
+            _data: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive_from_stream<'a>(
+            &'a mut self,
+            _stream_id: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+            let response = self.response.clone();
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(response)
+            })
+        }
+
+        fn remote_address(&self) -> SocketAddr {
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        }
+
+        fn close<'a>(
+            &'a mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_ctrl_respects_timeout() {
+        let msg = SessionMessage::SessionStart { instance_id: 42 };
+        let bytes = bincode::serialize(&msg).expect("serialize session message");
+        let mut conn = DelayedMockConnection {
+            response: bytes,
+            delay: Duration::from_millis(50),
+        };
+
+        let result: Result<SessionMessage, String> =
+            recv_ctrl(&mut conn, Some(Duration::from_millis(5))).await;
+        assert!(
+            result.is_err(),
+            "recv_ctrl should return timeout error when timeout elapses before data arrival"
+        );
+    }
 }

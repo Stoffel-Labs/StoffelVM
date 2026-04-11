@@ -10,8 +10,8 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 libc = "0.2"
-stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "main" }
-stoffelnet =  { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
+stoffelmpc-mpc = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "dev" }
+stoffelnet = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-networking.git" }
 stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
 
 async-trait = "0.1"
@@ -30,26 +30,41 @@ parking_lot = "0.12"
 once_cell = "1.19.0"
 serde = { version = "1.0", features = ["derive", "default"] }
 ark-ff = "0.5.0"
+ark-ec = "0.5.0"
+ark-poly = "0.5.0"
 uuid = { version = "1.17.0", features = ["v4", "serde"] }
 futures = "0.3.31"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 ark-std = { version = "0.5.0", features = ["getrandom"] }
 ark-bls12-381 = { version = "0.5.0" }
+ark-bn254 = { version = "0.5.0" }
+ark-curve25519 = { version = "0.5.0" }
+ark-ed25519 = { version = "0.5.0" }
 ark-serialize = { version = "0.5.0", features = ["ark-serialize-derive"] }
 bincode = { version = "1.3.3", default-features = true }
 blake3 = "1.5.4"
 hex = "0.4"
 dirs = "5"
 dashmap = "5"
+tokio-util = { version = "0.7", features = ["rt"] }
+bitflags = "2"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["std"] }
+curve25519-dalek = { version = "4", features = ["alloc"] }
 
 [features]
-hb_itest = []
+default = ["honeybadger", "avss"]
+honeybadger = []
+avss = []
+hb_itest = ["honeybadger"]
+avss_itest = ["avss"]
+nat = []
 
 [dev-dependencies]
 criterion = { version = "0.6.0", features = ["html_reports"] }
 
 [[bench]]
 name = "vm_benchmarks"
-path = "crates/benches"
+path = "../benches/vm_benchmarks.rs"
 harness = false

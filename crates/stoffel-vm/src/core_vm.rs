@@ -266,12 +266,13 @@ impl VirtualMachine {
 
             // Get the share bytes from the share value
             let (share_bytes, input_len) = match &ctx.args[1] {
-                Value::Share(_, data) => (data.clone(), 1usize),
+                Value::Share(_, data) => (data.as_bytes().to_vec(), 1usize),
                 _ => return Err("share_value must be a Value::Share".to_string()),
             };
 
             // Send via MPC engine
-            ctx.vm_state.send_output_to_client(client_id, &share_bytes, input_len)?;
+            ctx.vm_state
+                .send_output_to_client(client_id, &share_bytes, input_len)?;
 
             Ok(Value::Bool(true))
         });
@@ -1376,7 +1377,7 @@ mod tests {
                 matches!(event, HookEvent::UpvalueRead(_, _))
                     || matches!(event, HookEvent::UpvalueWrite(_, _, _))
             },
-            move |event, ctx| {
+            move |event, _ctx| {
                 // add 'move' keyword to explicitly capture upvalue_log_clone
                 match event {
                     HookEvent::UpvalueRead(name, value) => {
@@ -1512,7 +1513,7 @@ mod tests {
 
         vm.register_hook(
             |event| matches!(event, HookEvent::ClosureCreated(_, _)),
-            move |event, ctx| {
+            move |event, _ctx| {
                 if let HookEvent::ClosureCreated(func_name, upvalues) = event {
                     println!("CLOSURE CREATED: {} with upvalues:", func_name);
                     for upval in upvalues {
@@ -1527,7 +1528,7 @@ mod tests {
         // 2. Hook for function calls
         vm.register_hook(
             |event| matches!(event, HookEvent::BeforeFunctionCall(_, _)),
-            move |event, ctx| {
+            move |event, _ctx| {
                 if let HookEvent::BeforeFunctionCall(func, args) = event {
                     println!("FUNCTION CALL: {:?} with args: {:?}", func, args);
                 }
@@ -1539,7 +1540,7 @@ mod tests {
         // 3. Hook for function returns
         vm.register_hook(
             |event| matches!(event, HookEvent::AfterFunctionCall(_, _)),
-            move |event, ctx| {
+            move |event, _ctx| {
                 if let HookEvent::AfterFunctionCall(func, result) = event {
                     println!("FUNCTION RETURN: {:?} -> {:?}", func, result);
                 }
@@ -1551,7 +1552,7 @@ mod tests {
         // 4. Hook for register operations
         vm.register_hook(
             |event| matches!(event, HookEvent::RegisterWrite(_, _, _)),
-            move |event, ctx| {
+            move |event, _ctx| {
                 if let HookEvent::RegisterWrite(reg, old, new) = event {
                     println!("REGISTER WRITE: r{} = {:?} (was {:?})", reg, new, old);
                 }
@@ -1565,7 +1566,7 @@ mod tests {
             |event| {
                 matches!(event, HookEvent::StackPush(_)) || matches!(event, HookEvent::StackPop(_))
             },
-            move |event, ctx| {
+            move |event, _ctx| {
                 match event {
                     HookEvent::StackPush(value) => println!("STACK PUSH: {:?}", value),
                     HookEvent::StackPop(value) => println!("STACK POP: {:?}", value),
@@ -1582,7 +1583,7 @@ mod tests {
                 matches!(event, HookEvent::VariableRead(_, _))
                     || matches!(event, HookEvent::VariableWrite(_, _, _))
             },
-            move |event, ctx| {
+            move |event, _ctx| {
                 match event {
                     HookEvent::VariableRead(name, value) => {
                         println!("VARIABLE READ: {} = {:?}", name, value);
@@ -1619,7 +1620,7 @@ mod tests {
 
         // 8. Hook specifically to trace activation records
         vm.register_hook(
-            |event| true, // Any event
+            |_| true, // Any event
             move |event, _ctx| {
                 // This runs on every hook - add these lines to the existing upvalue hook
                 if matches!(event, HookEvent::UpvalueRead(_, _))
@@ -1642,7 +1643,7 @@ mod tests {
                 matches!(event, HookEvent::UpvalueRead(_, _))
                     || matches!(event, HookEvent::UpvalueWrite(_, _, _))
             },
-            move |event, ctx| {
+            move |event, _ctx| {
                 // add 'move' keyword to explicitly capture upvalue_log_clone
                 match event {
                     HookEvent::UpvalueRead(name, value) => {
@@ -1938,10 +1939,9 @@ mod tests {
                                 ))
                             }
                         };
-                        let mut new_value = 0;
                         let mut counter = counter_rc.lock();
                         counter.value += amount;
-                        new_value = counter.value;
+                        let new_value = counter.value;
                         println!("Incremented counter to: {}", new_value);
 
                         Ok(Value::I64(new_value as i64))
@@ -2048,8 +2048,7 @@ mod tests {
         // Then fix the hook registration
         vm.register_hook(
             |event| matches!(event, HookEvent::RegisterWrite(_, _, _)),
-            move |event, ctx| {
-                // Add the ctx parameter
+            move |event, _ctx| {
                 if let HookEvent::RegisterWrite(reg, _, new_value) = event {
                     if let Ok(mut log) =
                         crate::mutex_helpers::lock_mutex_as_result(&register_writes_clone)
@@ -2337,7 +2336,7 @@ mod tests {
             |event| {
                 matches!(event, HookEvent::StackPush(_)) || matches!(event, HookEvent::StackPop(_))
             },
-            move |event, ctx| {
+            move |event, _ctx| {
                 match event {
                     HookEvent::StackPush(value) => {
                         let mut ops = stack_ops_clone.lock();
@@ -2547,7 +2546,7 @@ mod tests {
         // Hook 1: Track instruction execution with depth
         let hook1_id = vm.register_hook(
             |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
-            move |event, ctx| {
+            move |event, _ctx| {
                 if let HookEvent::BeforeInstructionExecute(instruction) = event {
                     let call_depth = call_depth_clone.lock();
                     let depth = *call_depth;
@@ -2607,7 +2606,7 @@ mod tests {
                 matches!(event, HookEvent::BeforeFunctionCall(_, _))
                     || matches!(event, HookEvent::AfterFunctionCall(_, _))
             },
-            move |event, ctx| {
+            move |event, _ctx| {
                 match event {
                     HookEvent::BeforeFunctionCall(_, args) => {
                         let mut call_depth = call_depth_clone.lock();

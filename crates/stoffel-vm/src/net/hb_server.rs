@@ -9,9 +9,10 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::MPCProtocol;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts};
 use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId};
-use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
+use stoffelnet::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 use tracing::{error, info, warn};
@@ -44,7 +45,7 @@ impl Default for HoneyBadgerQuicConfig {
 /// via receive loops.
 pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     /// The underlying MPC node
-    pub node: HoneyBadgerMPCNode<F, Avid>,
+    pub node: HoneyBadgerMPCNode<F, Avid<HbSessionId>>,
     /// Network manager builder - used during setup before start() is called
     network_builder: Option<QuicNetworkManager>,
     /// Network manager Arc - created when start() is called, shared with all tasks
@@ -72,7 +73,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         input_ids: Vec<ClientId>,
     ) -> Result<Self, HoneyBadgerError> {
         // Create the MPC node
-        let mpc_node = <HoneyBadgerMPCNode<F, Avid> as MPCProtocol<
+        let mpc_node = <HoneyBadgerMPCNode<F, Avid<HbSessionId>> as MPCProtocol<
             F,
             RobustShare<F>,
             QuicNetworkManager,
@@ -83,7 +84,10 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             "[HB-QUIC] Initializing network manager for node {} at {}",
             node_id, bind_address
         );
-        let mut base_manager = QuicNetworkManager::with_node_id(node_id);
+        let mut base_manager = QuicNetworkManager::with_config(QuicNetworkConfig {
+            use_tls: false,
+            ..Default::default()
+        });
         info!(
             "[HB-QUIC] Node {} calling listen({})",
             node_id, bind_address
@@ -189,6 +193,34 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                     loop {
                                         match connection.receive().await {
                                             Ok(data) => {
+                                                let sender_id =
+                                                    connection.remote_party_id().unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
+                                                match crate::net::open_registry::try_handle_wire_message(
+                                                    sender_id, &data,
+                                                ) {
+                                                    Ok(true) => continue,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Node {} failed to handle open wire message from {}: {}",
+                                                            conn_node_id, sender_id, e
+                                                        );
+                                                        continue;
+                                                    }
+                                                    Ok(false) => {}
+                                                }
+                                                match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                                                    sender_id, &data,
+                                                ) {
+                                                    Ok(true) => continue,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Node {} failed to handle open_exp wire message from {}: {}",
+                                                            conn_node_id, sender_id, e
+                                                        );
+                                                        continue;
+                                                    }
+                                                    Ok(false) => {}
+                                                }
                                                 info!("[HB-QUIC] Node {} received {} bytes from {}", conn_node_id, data.len(), connection.remote_address());
                                                 if let Err(e) = txx.send(data).await {
                                                     error!("Node {} failed to handle message: {:?}", conn_node_id, e);
@@ -248,7 +280,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
 
             let mut retry_count = 0;
             loop {
-                let connection_result = dialer.connect_as_server(peer_addr, self.node_id).await;
+                let connection_result = dialer.connect_as_server(peer_addr).await;
 
                 match connection_result {
                     Ok(connection) => {
@@ -264,6 +296,35 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                             loop {
                                 match connection.receive().await {
                                     Ok(data) => {
+                                        match crate::net::open_registry::try_handle_wire_message(
+                                            pid_for_task,
+                                            &data,
+                                        ) {
+                                            Ok(true) => continue,
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to handle open wire message from peer {}: {}",
+                                                    pid_for_task, e
+                                                );
+                                                continue;
+                                            }
+                                            Ok(false) => {}
+                                        }
+                                        match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                                            pid_for_task,
+                                            &data,
+                                        ) {
+                                            Ok(true) => continue,
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to handle open_exp wire message from peer {}: {}",
+                                                    pid_for_task, e
+                                                );
+                                                continue;
+                                            }
+                                            Ok(false) => {}
+                                        }
+
                                         if let Err(e) = txx.send(data).await {
                                             error!(
                                                 "Failed to handle message from peer {}: {:?}",
@@ -335,69 +396,277 @@ pub async fn spawn_receive_loops(
     net: Arc<QuicNetworkManager>,
     node_id: PartyId,
     n_parties: usize,
-) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
+) -> mpsc::Receiver<(PartyId, Vec<u8>)> {
+    let (tx, rx) = mpsc::channel::<(PartyId, Vec<u8>)>(65536);
+    let scan_tx = tx.clone();
+    // Note: client messages also go through this channel. If you need
+    // separate client handling, use spawn_receive_loops_split instead.
+    let scan_net = net.clone();
+    tokio::spawn(async move {
+        let mut spawned_server_ids = std::collections::HashSet::new();
+        let mut spawned_client_ids = std::collections::HashSet::new();
 
-    // Get all established connections
-    let connections = net.get_all_connections().await;
-    eprintln!(
-        "[party {}] spawn_receive_loops: found {} connections",
-        node_id,
-        connections.len()
-    );
+        loop {
+            // Server-to-server connections (MPC parties)
+            for (derived_id, connection) in scan_net.get_all_server_connections() {
+                let sender_id = connection.remote_party_id().unwrap_or(derived_id);
+                if sender_id >= n_parties {
+                    tracing::debug!(
+                        party_id = node_id,
+                        derived_id,
+                        sender_id,
+                        n_parties,
+                        "Skipping non-party server connection"
+                    );
+                    continue;
+                }
 
-    // Spawn a receive loop for each MPC peer connection (party IDs 0 to n_parties-1)
-    // Skip bootnode and other non-MPC connections (which have large random UUIDs)
-    for (peer_id, connection) in connections {
-        // Only process connections to MPC peers (party IDs < n_parties)
-        if peer_id >= n_parties {
-            eprintln!(
-                "[party {}] Skipping receive loop for non-MPC connection {} (bootnode/other)",
-                node_id, peer_id
-            );
-            continue;
-        }
-        let txx = tx.clone();
-        let conn_node_id = node_id;
-        let pid = peer_id;
-        eprintln!(
-            "[party {}] Spawning receive loop for peer {}",
-            conn_node_id, pid
-        );
+                if !spawned_server_ids.insert(sender_id) {
+                    continue;
+                }
 
-        tokio::spawn(async move {
-            eprintln!(
-                "[party {}] Receive loop started for peer {}",
-                conn_node_id, pid
-            );
-            loop {
-                match connection.receive().await {
-                    Ok(data) => {
-                        eprintln!(
-                            "[party {}] Received {} bytes from peer {}",
-                            conn_node_id,
-                            data.len(),
-                            pid
-                        );
-                        if let Err(e) = txx.send(data).await {
-                            eprintln!(
-                                "[party {}] Failed to forward message from peer {}: {:?}",
-                                conn_node_id, pid, e
-                            );
-                            break;
+                let txx = scan_tx.clone();
+                let local_party_id = node_id;
+                tracing::info!(
+                    party_id = local_party_id,
+                    derived_id,
+                    sender_id,
+                    "Spawning receive loop for server connection"
+                );
+
+                tokio::spawn(async move {
+                    loop {
+                        match connection.receive().await {
+                            Ok(data) => {
+                                match crate::net::open_registry::try_handle_wire_message(
+                                    sender_id, &data,
+                                ) {
+                                    Ok(true) => continue,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            party_id = local_party_id,
+                                            sender_id,
+                                            error = %e,
+                                            "Failed to handle open wire message"
+                                        );
+                                        continue;
+                                    }
+                                    Ok(false) => {}
+                                }
+
+                                match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                                    sender_id, &data,
+                                ) {
+                                    Ok(true) => continue,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            party_id = local_party_id,
+                                            sender_id,
+                                            error = %e,
+                                            "Failed to handle open_exp wire message"
+                                        );
+                                        continue;
+                                    }
+                                    Ok(false) => {}
+                                }
+
+                                if let Err(e) = txx.send((sender_id, data)).await {
+                                    tracing::warn!(
+                                        party_id = local_party_id,
+                                        sender_id,
+                                        error = ?e,
+                                        "Failed to forward server message"
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::info!(
+                                    party_id = local_party_id,
+                                    sender_id,
+                                    error = %e,
+                                    "Server connection closed"
+                                );
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "[party {}] Connection to peer {} closed: {}",
-                            conn_node_id, pid, e
-                        );
-                        break;
-                    }
-                }
+                });
             }
-        });
-    }
+
+            // Client-to-server connections (external input clients)
+            for (client_id, connection) in scan_net.get_all_client_connections() {
+                if !spawned_client_ids.insert(client_id) {
+                    continue;
+                }
+
+                let txx = scan_tx.clone();
+                let local_party_id = node_id;
+                tracing::info!(
+                    party_id = local_party_id,
+                    client_id,
+                    "Spawning receive loop for client connection"
+                );
+
+                tokio::spawn(async move {
+                    loop {
+                        match connection.receive().await {
+                            Ok(data) => {
+                                if let Err(e) = txx.send((client_id, data)).await {
+                                    tracing::warn!(
+                                        party_id = local_party_id,
+                                        client_id,
+                                        error = ?e,
+                                        "Failed to forward client message"
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::info!(
+                                    party_id = local_party_id,
+                                    client_id,
+                                    error = %e,
+                                    "Client connection closed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
 
     rx
+}
+
+/// Like `spawn_receive_loops` but returns separate channels for server (party-to-party)
+/// messages and client (input provider) messages. This prevents the preprocessing
+/// message backlog from blocking client input delivery.
+pub async fn spawn_receive_loops_split(
+    net: Arc<QuicNetworkManager>,
+    node_id: PartyId,
+    n_parties: usize,
+) -> (
+    mpsc::Receiver<(PartyId, Vec<u8>)>,
+    mpsc::Receiver<(PartyId, Vec<u8>)>,
+) {
+    let (server_tx, server_rx) = mpsc::channel::<(PartyId, Vec<u8>)>(65536);
+    let (client_tx, client_rx) = mpsc::channel::<(PartyId, Vec<u8>)>(4096);
+    let scan_net = net.clone();
+    tokio::spawn(async move {
+        let mut spawned_server_ids = std::collections::HashSet::new();
+        let mut spawned_client_ids = std::collections::HashSet::new();
+
+        loop {
+            // Server-to-server connections (MPC parties)
+            for (derived_id, connection) in scan_net.get_all_server_connections() {
+                let sender_id = connection.remote_party_id().unwrap_or(derived_id);
+                if sender_id >= n_parties {
+                    continue;
+                }
+                if !spawned_server_ids.insert(sender_id) {
+                    continue;
+                }
+
+                let txx = server_tx.clone();
+                let local_party_id = node_id;
+                tracing::info!(
+                    party_id = local_party_id,
+                    sender_id,
+                    "Spawning server receive loop"
+                );
+
+                tokio::spawn(async move {
+                    loop {
+                        match connection.receive().await {
+                            Ok(data) => {
+                                match crate::net::open_registry::try_handle_wire_message(
+                                    sender_id, &data,
+                                ) {
+                                    Ok(true) => continue,
+                                    Err(_) => continue,
+                                    Ok(false) => {}
+                                }
+                                match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                                    sender_id, &data,
+                                ) {
+                                    Ok(true) => continue,
+                                    Err(_) => continue,
+                                    Ok(false) => {}
+                                }
+                                if let Err(e) = txx.send((sender_id, data)).await {
+                                    tracing::warn!(
+                                        party_id = local_party_id,
+                                        sender_id,
+                                        error = ?e,
+                                        "Failed to forward server message"
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+
+            // Client-to-server connections — separate channel
+            let all_clients = scan_net.get_all_client_connections();
+            if !all_clients.is_empty() && spawned_client_ids.is_empty() {
+                eprintln!(
+                    "[party {}] Found {} client connections to monitor",
+                    node_id,
+                    all_clients.len()
+                );
+            }
+            for (cid, connection) in all_clients {
+                if !spawned_client_ids.insert(cid) {
+                    continue;
+                }
+
+                let txx = client_tx.clone();
+                let local_party_id = node_id;
+                tracing::info!(
+                    party_id = local_party_id,
+                    client_id = cid,
+                    "Spawning client receive loop (separate channel)"
+                );
+
+                tokio::spawn(async move {
+                    loop {
+                        match connection.receive().await {
+                            Ok(data) => {
+                                if let Err(e) = txx.send((cid, data)).await {
+                                    tracing::warn!(
+                                        party_id = local_party_id,
+                                        client_id = cid,
+                                        error = ?e,
+                                        "Failed to forward client message"
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::info!(
+                                    party_id = local_party_id,
+                                    client_id = cid,
+                                    error = %e,
+                                    "Client connection closed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    (server_rx, client_rx)
 }

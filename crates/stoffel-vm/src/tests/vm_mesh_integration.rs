@@ -15,11 +15,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
-use stoffelmpc_mpc::honeybadger::ProtocolType;
 use stoffelmpc_mpc::common::SecretSharingScheme;
+use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::honeybadger::output::output::OutputClient;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+use stoffelmpc_mpc::honeybadger::ProtocolType;
 use stoffelmpc_mpc::honeybadger::WrappedMessage;
 use stoffelnet::network_utils::ClientId;
 use tokio::sync::Mutex;
@@ -29,36 +29,13 @@ use crate::core_vm::VirtualMachine;
 use crate::net::hb_engine::HoneyBadgerMpcEngine;
 use crate::net::mpc_engine::MpcEngine;
 use crate::tests::mpc_multiplication_integration::{
-    HoneyBadgerQuicConfig, HoneyBadgerQuicServer, setup_honeybadger_quic_clients,
-    setup_honeybadger_quic_network,
+    setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
+    HoneyBadgerQuicServer, RoutedNetwork,
 };
+use crate::tests::test_utils::{acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing};
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
-
-fn init_crypto_provider() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-    });
-}
-
-fn setup_test_tracing() {
-    use std::sync::Once;
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let subscriber = FmtSubscriber::builder()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-            .with_test_writer()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-}
 
 // Use a multi-thread Tokio runtime to allow synchronous bridges inside the VM's MPC engine
 // (the engine uses block_in_place + block_on to wait for async MPC ops when called from sync VM code)
@@ -66,6 +43,7 @@ fn setup_test_tracing() {
 async fn test_vm_mesh_full_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting Full VM Mesh Integration Test ===");
 
@@ -86,7 +64,7 @@ async fn test_vm_mesh_full_integration() {
     let base_port = 9400;
 
     let config = HoneyBadgerQuicConfig {
-        mpc_timeout: Duration::from_secs(10),
+        mpc_timeout: Duration::from_secs(90),
         connection_retry_delay: Duration::from_millis(100),
         ..Default::default()
     };
@@ -99,6 +77,10 @@ async fn test_vm_mesh_full_integration() {
         "Step 1: Creating {} MPC servers in mesh topology...",
         n_parties
     );
+    // Pass None for client IDs — the accept loop must NOT spawn client receive
+    // handlers (they'd use the wrong sender ID for multi-client setups).
+    // Client IDs are set on servers before finalize_network() so the HB node
+    // is created with the correct client registration.
     let (mut servers, mut recv) = setup_honeybadger_quic_network::<Fr>(
         n_parties,
         threshold,
@@ -107,7 +89,7 @@ async fn test_vm_mesh_full_integration() {
         instance_id,
         base_port,
         config.clone(),
-        Some(client_ids.clone()),
+        None,
     )
     .await
     .expect("Failed to create servers");
@@ -126,31 +108,74 @@ async fn test_vm_mesh_full_integration() {
         .collect();
     let expected_product = (client_scalar_inputs[0] * client_scalar_inputs[1]) as i64;
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only; receive loops come later)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
-        // Must call start() first to create the network Arc
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+        info!("  Started server {}", server.node_id);
+    }
 
+    // Step 3: Connect servers in mesh
+    info!("Step 3: Connecting servers in mesh topology...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Set client IDs on servers before finalize_network() so the HB node
+    // is created with correct client registration.
+    for server in servers.iter_mut() {
+        server.expected_client_ids = client_ids.clone();
+    }
+
+    // Step 3a: Finalize network — assign_party_ids(), recreate HB nodes with
+    // correct sorted-key party IDs, and build MpcNetwork wrappers.
+    info!("Step 3a: Finalizing network...");
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
+    }
+
+    // Step 3b: Spawn receive-loop tasks for the message dispatch channel.
+    info!("Step 3b: Spawning receive-loop tasks...");
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server.network.clone().expect("network should be set after start()");
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
+            .clone()
+            .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
         });
     }
-
-    // Step 3: Connect servers in mesh
-    info!("Step 3: Connecting servers in mesh topology...");
-    for server in &servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Step 4: Create and connect real MPC clients that will submit inputs
     info!("Step 4: Creating and connecting MPC clients...");
@@ -176,6 +201,45 @@ async fn test_vm_mesh_full_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 5: Run preprocessing
     info!("Step 5: Running preprocessing on all servers...");
     let preprocessing_handles: Vec<_> = servers
@@ -183,7 +247,10 @@ async fn test_vm_mesh_full_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
+                .clone()
+                .expect("routed_network should be set after finalize_network()");
 
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
@@ -213,7 +280,15 @@ async fn test_vm_mesh_full_integration() {
                 .node
                 .preprocess
                 .input
-                .init(*client_id, local_shares, 1, server.network.clone().expect("network should be set"))
+                .init(
+                    *client_id,
+                    local_shares,
+                    1,
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
+                )
                 .await
                 .expect("input.init failed");
             info!(
@@ -229,25 +304,29 @@ async fn test_vm_mesh_full_integration() {
     // Use Arc<parking_lot::Mutex<...>> so we can execute VMs concurrently from blocking tasks
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
 
-    for party_id in 0..n_parties {
+    for (idx, server) in servers.iter().enumerate() {
+        let sorted_pid = server
+            .party_id
+            .expect("party_id should be set after finalize");
         let mut vm = VirtualMachine::new();
 
         // Attach MPC engine to VM, wrapping the already-running HB node for this party
-        let mpc_engine = HoneyBadgerMpcEngine::from_existing_node(
+        let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
-            party_id,
+            sorted_pid,
             n_parties,
             threshold,
-            servers[party_id].network.clone().expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
 
         vm.state.mpc_engine = Some(mpc_engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
 
         info!(
-            "✓ VM {} created with MPC engine (wrapped server node)",
-            party_id
+            "✓ VM {} (party_id={}) created with MPC engine",
+            idx, sorted_pid
         );
     }
 
@@ -259,7 +338,7 @@ async fn test_vm_mesh_full_integration() {
                 .node
                 .preprocess
                 .input
-                .wait_for_all_inputs(Duration::from_secs(30))
+                .wait_for_all_inputs(Duration::from_secs(90))
                 .await
                 .expect("Failed to get client inputs");
             input_store
@@ -301,31 +380,32 @@ async fn test_vm_mesh_full_integration() {
     // Step 10: Execute VM programs on all parties (this triggers MPC multiplication)
     info!("Step 10: Executing VM programs on all parties...");
 
-    use futures::FutureExt;
     let handles: Vec<_> = vms
         .iter()
         .enumerate()
         .map(|(pid, vm_arc)| {
             let vm_arc = vm_arc.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut vm = vm_arc.lock();
-                let val = vm
-                    .execute("multiply_client_inputs")
-                    .map_err(|e| format!("VM execution failed at party {}: {}", pid, e))?;
-                Ok::<(usize, Value), String>((pid, val))
-            })
-            .map(move |join_res| match join_res {
-                Ok(inner) => inner,
-                Err(e) => Err(format!("Join error executing VM {}: {:?}", pid, e)),
+            tokio::spawn(async move {
+                tokio::task::block_in_place(|| {
+                    let mut vm = vm_arc.lock();
+                    let val = vm
+                        .execute("multiply_client_inputs")
+                        .map_err(|e| format!("VM execution failed at party {}: {}", pid, e))?;
+                    Ok::<(usize, Value), String>((pid, val))
+                })
             })
         })
         .collect();
 
     // Put a timeout guard to avoid infinite hangs in CI
     let join_all_fut = futures::future::join_all(handles);
-    let joined = tokio::time::timeout(Duration::from_secs(30), join_all_fut)
+    let joined = tokio::time::timeout(Duration::from_secs(120), join_all_fut)
         .await
         .expect("Timed out waiting for VMs to execute; possible deadlock if parties didn't run concurrently");
+    let joined: Vec<_> = joined
+        .into_iter()
+        .map(|r| r.expect("VM task panicked"))
+        .collect();
 
     let mut party_results: Vec<(usize, Value)> = Vec::new();
     for res in joined {
@@ -375,6 +455,7 @@ async fn test_vm_mesh_full_integration() {
 async fn test_vm_mesh_average_salary_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM Mesh Average Salary Integration Test ===");
 
@@ -402,7 +483,7 @@ async fn test_vm_mesh_average_salary_integration() {
     let mut client_inputs = Vec::new();
     let mut expected_sum = 0i64;
     for idx in 0..client_count {
-        let client_id = 500 + idx as ClientId;
+        let client_id = 50 + idx as ClientId;
         client_ids.push(client_id);
         let salary = rng.gen_range(40_000i64..=200_000i64);
         expected_sum += salary;
@@ -437,27 +518,61 @@ async fn test_vm_mesh_average_salary_integration() {
     );
 
     info!("Starting servers for average test...");
-    for (i, server) in servers.iter_mut().enumerate() {
-        // Must call start() first to create the network Arc
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    info!("Connecting servers...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server.network.clone().expect("network should be set after start()");
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
+            .clone()
+            .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
         });
     }
-
-    info!("Connecting servers...");
-    for server in &servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     info!("Creating {} salary clients...", client_count);
     let mut clients = setup_honeybadger_quic_clients::<Fr>(
@@ -480,13 +595,55 @@ async fn test_vm_mesh_average_salary_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     info!("Running preprocessing for average test...");
     let preprocessing_handles: Vec<_> = servers
         .iter()
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
+                .clone()
+                .expect("routed_network should be set after finalize_network()");
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 node.run_preprocessing(network, &mut rng)
@@ -513,7 +670,15 @@ async fn test_vm_mesh_average_salary_integration() {
                 .node
                 .preprocess
                 .input
-                .init(*client_id, local_shares, 2, server.network.clone().expect("network should be set"))
+                .init(
+                    *client_id,
+                    local_shares,
+                    2,
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
+                )
                 .await
                 .expect("input.init failed");
         }
@@ -524,15 +689,19 @@ async fn test_vm_mesh_average_salary_integration() {
 
     info!("Creating VMs for average computation...");
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id].network.clone().expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
@@ -550,7 +719,7 @@ async fn test_vm_mesh_average_salary_integration() {
                 .node
                 .preprocess
                 .input
-                .wait_for_all_inputs(Duration::from_secs(30))
+                .wait_for_all_inputs(Duration::from_secs(90))
                 .await
                 .expect("Failed to get client inputs");
             if let Some(shares) = input_store.get(&first_client) {
@@ -559,8 +728,12 @@ async fn test_vm_mesh_average_salary_integration() {
         }
 
         // Verify that individual client shares can be reconstructed
-        let result = RobustShare::recover_secret(&all_shares_for_client, n_parties);
-        assert!(result.is_ok(), "Failed to reconstruct individual client shares: {:?}", result.err());
+        let result = RobustShare::recover_secret(&all_shares_for_client, n_parties, threshold);
+        assert!(
+            result.is_ok(),
+            "Failed to reconstruct individual client shares: {:?}",
+            result.err()
+        );
     }
 
     for (party_id, vm_arc) in vms.iter().enumerate() {
@@ -621,8 +794,12 @@ async fn test_vm_mesh_average_salary_integration() {
                 salary_sums.push(s);
             }
         }
-        let result = RobustShare::recover_secret(&salary_sums, n_parties);
-        assert!(result.is_ok(), "Failed to reconstruct summed shares: {:?}", result.err());
+        let result = RobustShare::recover_secret(&salary_sums, n_parties, threshold);
+        assert!(
+            result.is_ok(),
+            "Failed to reconstruct summed shares: {:?}",
+            result.err()
+        );
     }
 
     info!("Executing average salary program on all parties...");
@@ -706,30 +883,30 @@ fn build_average_salary_program() -> (Vec<Instruction>, HashMap<String, usize>) 
     instructions.push(Instruction::CALL(
         "ClientStore.get_number_clients".to_string(),
     ));
-    instructions.push(Instruction::MOV(1, 0));  // reg1 = num_clients
+    instructions.push(Instruction::MOV(1, 0)); // reg1 = num_clients
 
     // Initialize loop counter to 0
-    instructions.push(Instruction::LDI(2, Value::I64(0)));  // reg2 = 0 (loop counter)
-    instructions.push(Instruction::LDI(3, Value::I64(1)));  // reg3 = 1 (constant for increments)
+    instructions.push(Instruction::LDI(2, Value::I64(0))); // reg2 = 0 (loop counter)
+    instructions.push(Instruction::LDI(3, Value::I64(1))); // reg3 = 1 (constant for increments)
 
     // Load first client's shares to initialize accumulators (client index 0)
     // This avoids creating an incompatible "zero share" via clear->secret conversion
-    instructions.push(Instruction::LDI(0, Value::I64(0)));  // client_index = 0
+    instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
-    instructions.push(Instruction::LDI(4, Value::I64(0)));  // share_index = 0 (salary)
+    instructions.push(Instruction::LDI(4, Value::I64(0))); // share_index = 0 (salary)
     instructions.push(Instruction::PUSHARG(4));
     instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
-    instructions.push(Instruction::MOV(16, 0));  // reg16 = first client's salary share
+    instructions.push(Instruction::MOV(16, 0)); // reg16 = first client's salary share
 
-    instructions.push(Instruction::LDI(0, Value::I64(0)));  // client_index = 0
+    instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
-    instructions.push(Instruction::LDI(4, Value::I64(1)));  // share_index = 1 (count)
+    instructions.push(Instruction::LDI(4, Value::I64(1))); // share_index = 1 (count)
     instructions.push(Instruction::PUSHARG(4));
     instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
-    instructions.push(Instruction::MOV(17, 0));  // reg17 = first client's count share
+    instructions.push(Instruction::MOV(17, 0)); // reg17 = first client's count share
 
     // Start loop from index 1 (already processed index 0)
-    instructions.push(Instruction::LDI(2, Value::I64(1)));  // reg2 = 1 (loop counter starts at 1)
+    instructions.push(Instruction::LDI(2, Value::I64(1))); // reg2 = 1 (loop counter starts at 1)
 
     let loop_label = "avg_loop_start".to_string();
     let process_label = "avg_process".to_string();
@@ -742,34 +919,34 @@ fn build_average_salary_program() -> (Vec<Instruction>, HashMap<String, usize>) 
 
     labels.insert(process_label.clone(), instructions.len());
     // Get salary share (index 0) for current client
-    instructions.push(Instruction::MOV(0, 2));  // reg0 = client_index
+    instructions.push(Instruction::MOV(0, 2)); // reg0 = client_index
     instructions.push(Instruction::PUSHARG(0));
-    instructions.push(Instruction::LDI(4, Value::I64(0)));  // share_index = 0 (salary)
+    instructions.push(Instruction::LDI(4, Value::I64(0))); // share_index = 0 (salary)
     instructions.push(Instruction::PUSHARG(4));
     instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
-    instructions.push(Instruction::MOV(18, 0));  // reg18 = salary share
+    instructions.push(Instruction::MOV(18, 0)); // reg18 = salary share
 
     // Get count share (index 1) for current client
-    instructions.push(Instruction::MOV(0, 2));  // reg0 = client_index
+    instructions.push(Instruction::MOV(0, 2)); // reg0 = client_index
     instructions.push(Instruction::PUSHARG(0));
-    instructions.push(Instruction::LDI(4, Value::I64(1)));  // share_index = 1 (count)
+    instructions.push(Instruction::LDI(4, Value::I64(1))); // share_index = 1 (count)
     instructions.push(Instruction::PUSHARG(4));
     instructions.push(Instruction::CALL("ClientStore.take_share".to_string()));
-    instructions.push(Instruction::MOV(19, 0));  // reg19 = count share
+    instructions.push(Instruction::MOV(19, 0)); // reg19 = count share
 
     // Accumulate: reg16 += reg18, reg17 += reg19
     instructions.push(Instruction::ADD(16, 16, 18));
     instructions.push(Instruction::ADD(17, 17, 19));
-    instructions.push(Instruction::ADD(2, 2, 3));  // reg2++ (increment loop counter)
+    instructions.push(Instruction::ADD(2, 2, 3)); // reg2++ (increment loop counter)
     instructions.push(Instruction::JMP(loop_label.clone()));
 
     labels.insert(done_label.clone(), instructions.len());
 
     // Compute average: total_salary / total_count
-    instructions.push(Instruction::MOV(2, 16));  // reg2 = total salary (secret)
-    instructions.push(Instruction::MOV(3, 17));  // reg3 = total count (secret)
-    instructions.push(Instruction::DIV(4, 2, 3));  // reg4 = salary / count (secret division)
-    instructions.push(Instruction::MOV(0, 4));  // Move result to reg0 (triggers reveal)
+    instructions.push(Instruction::MOV(2, 16)); // reg2 = total salary (secret)
+    instructions.push(Instruction::MOV(3, 17)); // reg3 = total count (secret)
+    instructions.push(Instruction::DIV(4, 2, 3)); // reg4 = salary / count (secret division)
+    instructions.push(Instruction::MOV(0, 4)); // Move result to reg0 (triggers reveal)
     instructions.push(Instruction::RET(0));
 
     (instructions, labels)
@@ -785,6 +962,7 @@ const MAX_AVG_CLIENTS: usize = 8;
 async fn test_vm_mesh_large_preprocessing() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting Large Preprocessing Integration Test ===");
 
@@ -793,20 +971,20 @@ async fn test_vm_mesh_large_preprocessing() {
     // Use same parameters as test_vm_mesh_full_integration
     let n_triples = 32;
     let n_random_shares = 2 + 2 * n_triples; // = 8
-    let instance_id = 77777; // Unique instance ID
+    let instance_id = 77780; // Unique instance ID
     let base_port = 9700; // Unique port range (far from 9400/9450/9500/9550)
 
     let config = HoneyBadgerQuicConfig {
-        mpc_timeout: Duration::from_secs(30),
+        mpc_timeout: Duration::from_secs(90),
         connection_retry_delay: Duration::from_millis(100),
         ..Default::default()
     };
 
     // Define client IDs before network setup (client IDs must be registered at setup time)
-    let client_ids: Vec<ClientId> = vec![300, 301];
+    let client_ids: Vec<ClientId> = vec![30, 31];
     let client_inputs: Vec<Vec<Fr>> = vec![
-        vec![Fr::from(10u64)], // Client 300 input
-        vec![Fr::from(20u64)], // Client 301 input
+        vec![Fr::from(10u64)], // Client 30 input
+        vec![Fr::from(20u64)], // Client 31 input
     ];
 
     info!(
@@ -837,31 +1015,65 @@ async fn test_vm_mesh_large_preprocessing() {
         })
         .collect();
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    // Step 3: Connect servers in mesh
+    info!("Step 3: Connecting servers in mesh topology...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    info!("✓ All {} servers connected in mesh", n_parties);
+
+    // Step 3a: Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server.network.clone().expect("network should be set after start()");
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
+            .clone()
+            .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
         });
     }
-
-    // Step 3: Connect servers in mesh
-    info!("Step 3: Connecting servers in mesh topology...");
-    for server in &servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    info!("✓ All {} servers connected in mesh", n_parties);
 
     // Step 4: Create and connect MPC clients (required for preprocessing protocol)
     info!("Step 4: Creating and connecting MPC clients...");
@@ -888,6 +1100,45 @@ async fn test_vm_mesh_large_preprocessing() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 5: Run preprocessing (matching the exact pattern from test_vm_mesh_full_integration)
     info!("Step 5: Running preprocessing on all servers...");
     let preprocessing_handles: Vec<_> = servers
@@ -895,7 +1146,10 @@ async fn test_vm_mesh_large_preprocessing() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
+                .clone()
+                .expect("routed_network should be set after finalize_network()");
 
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
@@ -1021,6 +1275,7 @@ fn build_sum_salary_program_no_reveal() -> (Vec<Instruction>, HashMap<String, us
 async fn test_vm_mesh_output_client_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM Mesh Output Client Integration Test ===");
 
@@ -1030,7 +1285,7 @@ async fn test_vm_mesh_output_client_integration() {
     let n_random_shares = 8 + 2 * n_triples;
     let instance_id = 66666;
     let base_port = 9650;
-    let output_client_id: ClientId = 999; // Designated output recipient
+    let output_client_id: ClientId = 99; // Designated output recipient
 
     let config = HoneyBadgerQuicConfig {
         mpc_timeout: Duration::from_secs(30),
@@ -1045,7 +1300,7 @@ async fn test_vm_mesh_output_client_integration() {
     let mut client_inputs = Vec::new();
     let mut expected_sum = 0i64;
     for idx in 0..client_count {
-        let client_id = 600 + idx as ClientId;
+        let client_id = 60 + idx as ClientId;
         client_ids.push(client_id);
         let salary = rng.gen_range(50_000i64..=150_000i64);
         expected_sum += salary;
@@ -1080,33 +1335,64 @@ async fn test_vm_mesh_output_client_integration() {
         })
         .collect();
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    // Step 3: Connect servers
+    info!("Step 3: Connecting servers...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 3a: Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
         });
     }
-
-    // Step 3: Connect servers
-    info!("Step 3: Connecting servers...");
-    for server in &servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Step 4: Create input clients
     info!("Step 4: Creating {} input clients...", client_count);
@@ -1131,6 +1417,45 @@ async fn test_vm_mesh_output_client_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 5: Run preprocessing
     info!("Step 5: Running preprocessing...");
     let preprocessing_handles: Vec<_> = servers
@@ -1138,10 +1463,10 @@ async fn test_vm_mesh_output_client_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 node.run_preprocessing(network, &mut rng)
@@ -1174,9 +1499,9 @@ async fn test_vm_mesh_output_client_integration() {
                     local_shares,
                     1,
                     server
-                        .network
+                        .routed_network
                         .clone()
-                        .expect("network should be set"),
+                        .expect("routed_network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -1188,18 +1513,19 @@ async fn test_vm_mesh_output_client_integration() {
     // Step 7: Create VMs and hydrate client stores
     info!("Step 7: Creating VMs...");
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id]
-                .network
-                .clone()
-                .expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
@@ -1212,7 +1538,7 @@ async fn test_vm_mesh_output_client_integration() {
                 .node
                 .preprocess
                 .input
-                .wait_for_all_inputs(Duration::from_secs(30))
+                .wait_for_all_inputs(Duration::from_secs(90))
                 .await
                 .expect("Failed to get client inputs");
             input_store
@@ -1261,7 +1587,7 @@ async fn test_vm_mesh_output_client_integration() {
             Ok(Value::Share(_, data)) => {
                 // Decode the share from the returned bytes
                 let share: RobustShare<Fr> =
-                    ark_serialize::CanonicalDeserialize::deserialize_compressed(data.as_slice())
+                    ark_serialize::CanonicalDeserialize::deserialize_compressed(data.as_bytes())
                         .expect("Failed to deserialize share");
                 info!(
                     "Party {} returned share: id={}, degree={}",
@@ -1282,7 +1608,10 @@ async fn test_vm_mesh_output_client_integration() {
     // Note: In a real deployment, the OutputServer would send shares via network
     // to the OutputClient. Here we simulate the output protocol by directly
     // processing the output messages at the client.
-    info!("Step 10: Setting up output protocol for client {}...", output_client_id);
+    info!(
+        "Step 10: Setting up output protocol for client {}...",
+        output_client_id
+    );
 
     // Create the output client
     let output_client = Arc::new(Mutex::new(
@@ -1293,16 +1622,17 @@ async fn test_vm_mesh_output_client_integration() {
     // Simulate each server sending its output share to the client
     // In production, OutputServer.init() sends via network; here we directly
     // create and process the OutputMessage at the client
-    for (party_id, _server) in servers.iter().enumerate() {
-        let share = result_shares[party_id].clone();
+    for share in &result_shares {
+        let sender_id = share.id;
 
         // Serialize the share as OutputServer would
         let mut payload = Vec::new();
-        ark_serialize::CanonicalSerialize::serialize_compressed(&vec![share], &mut payload)
+        ark_serialize::CanonicalSerialize::serialize_compressed(&vec![share.clone()], &mut payload)
             .expect("Failed to serialize share");
 
         // Create the OutputMessage that would be sent over network
-        let output_msg = stoffelmpc_mpc::honeybadger::output::OutputMessage::new(party_id, payload);
+        let output_msg =
+            stoffelmpc_mpc::honeybadger::output::OutputMessage::new(sender_id, payload);
 
         // Process the message at the output client
         let mut client = output_client.lock().await;
@@ -1312,8 +1642,8 @@ async fn test_vm_mesh_output_client_integration() {
             .expect("OutputClient failed to process message");
 
         info!(
-            "✓ Simulated server {} sending output share to client {}",
-            party_id, output_client_id
+            "✓ Simulated server party {} sending output share to client {}",
+            sender_id, output_client_id
         );
     }
 
@@ -1428,6 +1758,7 @@ const MAX_PREPROCESSING_BATCH_SIZE: usize = 500;
 async fn test_vm_mesh_matrix_average_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM Mesh Matrix Average Integration Test ===");
     info!(
@@ -1464,7 +1795,7 @@ async fn test_vm_mesh_matrix_average_integration() {
     );
 
     for idx in 0..client_count {
-        let client_id = 700 + idx as ClientId;
+        let client_id = 70 + idx as ClientId;
         client_ids.push(client_id);
 
         // Generate a random matrix (values between 1-100)
@@ -1516,33 +1847,64 @@ async fn test_vm_mesh_matrix_average_integration() {
         })
         .collect();
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    // Step 3: Connect servers
+    info!("Step 3: Connecting servers in mesh topology...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 3a: Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
         });
     }
-
-    // Step 3: Connect servers
-    info!("Step 3: Connecting servers in mesh topology...");
-    for server in &servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Step 4: Create input clients
     info!("Step 4: Creating {} matrix input clients...", client_count);
@@ -1568,6 +1930,45 @@ async fn test_vm_mesh_matrix_average_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 5: Run preprocessing
     info!("Step 5: Running preprocessing...");
     let preprocessing_handles: Vec<_> = servers
@@ -1575,10 +1976,10 @@ async fn test_vm_mesh_matrix_average_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 node.run_preprocessing(network, &mut rng)
@@ -1592,8 +1993,10 @@ async fn test_vm_mesh_matrix_average_integration() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Step 6: Initialize input protocol for each client
-    info!("Step 6: Initializing input protocol for {} clients with {} shares each...",
-          client_count, MATRIX_SIZE);
+    info!(
+        "Step 6: Initializing input protocol for {} clients with {} shares each...",
+        client_count, MATRIX_SIZE
+    );
     for (idx, server) in servers.iter_mut().enumerate() {
         for client_id in &client_ids {
             let local_shares = server
@@ -1612,9 +2015,9 @@ async fn test_vm_mesh_matrix_average_integration() {
                     local_shares,
                     MATRIX_SIZE,
                     server
-                        .network
+                        .routed_network
                         .clone()
-                        .expect("network should be set"),
+                        .expect("routed_network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -1626,18 +2029,19 @@ async fn test_vm_mesh_matrix_average_integration() {
     // Step 7: Create VMs and hydrate client stores
     info!("Step 7: Creating VMs and hydrating client stores...");
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id]
-                .network
-                .clone()
-                .expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
@@ -1725,7 +2129,10 @@ async fn test_vm_mesh_matrix_average_integration() {
                 assert!(
                     diff <= 1,
                     "Party {} average mismatch: got {}, expected {} (diff {})",
-                    pid, computed_avg, expected_average, diff
+                    pid,
+                    computed_avg,
+                    expected_average,
+                    diff
                 );
                 info!(
                     "✓ Party {} computed average {} (expected {})",
@@ -1753,7 +2160,10 @@ async fn test_vm_mesh_matrix_average_integration() {
         "Successfully computed federated average of {} matrices ({}x{}) from {} clients",
         client_count, MATRIX_ROWS, MATRIX_COLS, client_count
     );
-    info!("Total sum: {}, Total elements: {}, Average: {}", total_sum, total_elements, expected_average);
+    info!(
+        "Total sum: {}, Total elements: {}, Average: {}",
+        total_sum, total_elements, expected_average
+    );
 }
 
 /// Build a program that computes the overall average of all matrix elements from all clients
@@ -1932,6 +2342,7 @@ const FIXED_POINT_SCALE: i64 = 1 << FIXED_POINT_FRACTIONAL_BITS; // 2^16 = 65536
 async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     // Timing tracking for performance analysis
     let test_start = std::time::Instant::now();
@@ -1943,8 +2354,14 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         "Matrix dimensions: {}x{} = {} elements per client",
         LARGE_MATRIX_ROWS, LARGE_MATRIX_COLS, LARGE_MATRIX_SIZE
     );
-    info!("Fixed-point scale: 2^{} = {}", FIXED_POINT_FRACTIONAL_BITS, FIXED_POINT_SCALE);
-    info!("Max preprocessing batch size: {}", MAX_PREPROCESSING_BATCH_SIZE);
+    info!(
+        "Fixed-point scale: 2^{} = {}",
+        FIXED_POINT_FRACTIONAL_BITS, FIXED_POINT_SCALE
+    );
+    info!(
+        "Max preprocessing batch size: {}",
+        MAX_PREPROCESSING_BATCH_SIZE
+    );
 
     let n_parties = 5;
     let threshold = 1;
@@ -1952,7 +2369,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     let initial_n_triples = 32;
     let initial_n_random_shares = MAX_PREPROCESSING_BATCH_SIZE;
     let instance_id = 66666; // Different instance ID to avoid collision
-    let base_port = 9800;   // Different port range
+    let base_port = 9800; // Different port range
 
     let config = HoneyBadgerQuicConfig {
         mpc_timeout: Duration::from_secs(60), // Longer timeout for large matrix
@@ -1976,7 +2393,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     );
 
     for idx in 0..client_count {
-        let client_id = 800 + idx as ClientId;
+        let client_id = 80 + idx as ClientId;
         client_ids.push(client_id);
 
         // Generate random matrix with decimal values (e.g., 1.5, 42.75)
@@ -2005,7 +2422,8 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     }
 
     // Calculate expected element-wise averages (just show first few for large matrices)
-    let expected_averages: Vec<f64> = element_sums.iter()
+    let expected_averages: Vec<f64> = element_sums
+        .iter()
         .map(|sum| sum / client_count as f64)
         .collect();
 
@@ -2046,42 +2464,71 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     step_timings.push(("Step 1: Create MPC servers", step_start.elapsed()));
     step_start = std::time::Instant::now();
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
-
-        let mut node = server.node.clone();
-        let network = server
-            .network
-            .clone()
-            .expect("network should be set after start()");
-        let mut rx = recv.remove(0);
-
-        tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
-                    tracing::error!("Node {i} failed to process message: {e:?}");
-                }
-            }
-        });
     }
 
     step_timings.push(("Step 2: Start servers", step_start.elapsed()));
     step_start = std::time::Instant::now();
 
-    // Step 3: Connect servers (PARALLELIZED)
+    // Step 3: Connect servers
     info!("Step 3: Connecting servers in mesh topology...");
-    let connect_handles: Vec<_> = servers.iter()
-        .map(|server| server.connect_to_peers())
-        .collect();
-    let connect_results = futures::future::join_all(connect_handles).await;
-    for (i, result) in connect_results.into_iter().enumerate() {
-        result.unwrap_or_else(|e| panic!("Server {} failed to connect: {:?}", i, e));
+    for (i, server) in servers.iter_mut().enumerate() {
+        server
+            .connect_to_peers()
+            .await
+            .unwrap_or_else(|e| panic!("Server {} failed to connect: {:?}", i, e));
     }
     info!("  ✓ All {} servers connected to mesh", n_parties);
-    // Brief pause to ensure all connections are fully established
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 3a: Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
+        let mut node = server.node.clone();
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
+            .clone()
+            .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
+        let mut rx = recv.remove(0);
+        tokio::spawn(async move {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
+                    tracing::error!("Node {i} failed to process message: {e:?}");
+                }
+            }
+        });
+    }
 
     step_timings.push(("Step 3: Connect servers", step_start.elapsed()));
     step_start = std::time::Instant::now();
@@ -2090,7 +2537,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     // NOTE: We create clients early to register client IDs, but delay connect_to_servers()
     // until after preprocessing and input.init(). This prevents QUIC connection timeouts
     // during the potentially long preprocessing phase.
-    info!("Step 4: Creating {} matrix input clients (will connect after preprocessing)...", client_count);
+    info!(
+        "Step 4: Creating {} matrix input clients (will connect after preprocessing)...",
+        client_count
+    );
     let mut clients = setup_honeybadger_quic_clients::<Fr>(
         client_ids.clone(),
         server_addresses.clone(),
@@ -2120,14 +2570,19 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     let total_random_shares_needed = client_count * LARGE_MATRIX_SIZE;
     // Use batch size closer to the 511 limit for fewer iterations
     let optimized_batch_size = 510;
-    let total_batches = (total_random_shares_needed + optimized_batch_size - 1) / optimized_batch_size;
+    let total_batches =
+        (total_random_shares_needed + optimized_batch_size - 1) / optimized_batch_size;
 
     info!("Step 5: Running OPTIMIZED batched preprocessing...");
-    info!("  Need {} total shares, batch size {}, ~{} batches expected",
-          total_random_shares_needed, optimized_batch_size, total_batches);
+    info!(
+        "  Need {} total shares, batch size {}, ~{} batches expected",
+        total_random_shares_needed, optimized_batch_size, total_batches
+    );
 
     // External accumulators for each server - avoids O(n²) drain/restore
-    let mut accumulated_shares: Vec<Vec<_>> = (0..n_parties).map(|_| Vec::with_capacity(total_random_shares_needed)).collect();
+    let mut accumulated_shares: Vec<Vec<_>> = (0..n_parties)
+        .map(|_| Vec::with_capacity(total_random_shares_needed))
+        .collect();
     let mut total_accumulated = 0usize;
     let mut batch_idx = 0;
     let start_time = std::time::Instant::now();
@@ -2144,16 +2599,26 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         // Log progress every 10 batches to reduce output spam
         if batch_idx % 10 == 1 || batch_idx == 1 {
             let elapsed = start_time.elapsed().as_secs_f32();
-            let rate = if elapsed > 0.0 { total_accumulated as f32 / elapsed } else { 0.0 };
-            info!("  Batch {}/{}: accumulated {}/{} shares ({:.0} shares/sec)...",
-                  batch_idx, total_batches, total_accumulated, total_random_shares_needed, rate);
+            let rate = if elapsed > 0.0 {
+                total_accumulated as f32 / elapsed
+            } else {
+                0.0
+            };
+            info!(
+                "  Batch {}/{}: accumulated {}/{} shares ({:.0} shares/sec)...",
+                batch_idx, total_batches, total_accumulated, total_random_shares_needed, rate
+            );
         }
 
         // Set preprocessing parameters for this batch
         // OPTIMIZATION: Only generate triples once (first batch) - they're expensive!
         for server in servers.iter_mut() {
             server.node.params.n_random_shares = batch_size;
-            server.node.params.n_triples = if !triples_generated { triples_needed } else { 0 };
+            server.node.params.n_triples = if !triples_generated {
+                triples_needed
+            } else {
+                0
+            };
         }
         triples_generated = true;
 
@@ -2163,10 +2628,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             .enumerate()
             .map(|(i, server)| {
                 let mut node = server.node.clone();
-                let network = server
-                    .network
+                let network: std::sync::Arc<RoutedNetwork> = server
+                    .routed_network
                     .clone()
-                    .expect("network should be set after start()");
+                    .expect("routed_network should be set after finalize_network()");
                 tokio::spawn(async move {
                     let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                     node.run_preprocessing(network, &mut rng)
@@ -2179,11 +2644,15 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         // Wait for all servers to complete this batch
         let results = futures::future::join_all(preprocessing_handles).await;
         for result in results {
-            result.expect("Task panicked").expect("Preprocessing failed");
+            result
+                .expect("Task panicked")
+                .expect("Preprocessing failed");
         }
 
         // Extract newly generated shares from each server and add to external accumulator
-        let extract_futures: Vec<_> = servers.iter().enumerate()
+        let extract_futures: Vec<_> = servers
+            .iter()
+            .enumerate()
             .map(|(server_idx, server)| async move {
                 let mut material = server.node.preprocessing_material.lock().await;
                 let share_count = material.len().1;
@@ -2207,18 +2676,27 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
 
         // Safety limit to prevent infinite loops
         if batch_idx > 2000 {
-            panic!("Too many preprocessing batches ({}) - something is wrong", batch_idx);
+            panic!(
+                "Too many preprocessing batches ({}) - something is wrong",
+                batch_idx
+            );
         }
     }
 
     let elapsed = start_time.elapsed();
-    info!("  ✓ Generated {} shares in {} batches ({:.1}s, {:.0} shares/sec)",
-          total_accumulated, batch_idx, elapsed.as_secs_f32(),
-          total_accumulated as f32 / elapsed.as_secs_f32());
+    info!(
+        "  ✓ Generated {} shares in {} batches ({:.1}s, {:.0} shares/sec)",
+        total_accumulated,
+        batch_idx,
+        elapsed.as_secs_f32(),
+        total_accumulated as f32 / elapsed.as_secs_f32()
+    );
 
     // Add all accumulated shares back to preprocessing material in one operation
     info!("  Finalizing: adding accumulated shares to preprocessing material...");
-    let finalize_futures: Vec<_> = servers.iter().zip(accumulated_shares.into_iter())
+    let finalize_futures: Vec<_> = servers
+        .iter()
+        .zip(accumulated_shares.into_iter())
         .map(|(server, shares)| async move {
             let mut material = server.node.preprocessing_material.lock().await;
             let count = shares.len();
@@ -2227,8 +2705,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         })
         .collect();
     let finalize_results = futures::future::join_all(finalize_futures).await;
-    info!("  ✓ All {} servers now have {} random shares each",
-          n_parties, finalize_results[0]);
+    info!(
+        "  ✓ All {} servers now have {} random shares each",
+        n_parties, finalize_results[0]
+    );
 
     info!("✓ All preprocessing complete");
 
@@ -2239,14 +2719,20 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     // IMPORTANT: Connect clients RIGHT BEFORE input.init() to avoid QUIC connection timeouts.
     // input.init() sends random shares to clients, so clients must be connected first.
     info!("Step 6: Connecting clients and initializing input protocol...");
-    info!("  Connecting {} clients to servers (parallel)...", client_count);
+    info!(
+        "  Connecting {} clients to servers (parallel)...",
+        client_count
+    );
 
     // OPTIMIZATION: Connect all clients in parallel
-    let client_connect_handles: Vec<_> = clients.iter_mut()
+    let client_connect_handles: Vec<_> = clients
+        .iter_mut()
         .map(|client| {
             let client_id = client.client_id;
             async move {
-                client.connect_to_servers().await
+                client
+                    .connect_to_servers()
+                    .await
                     .map_err(|e| format!("Client {} failed to connect: {:?}", client_id, e))?;
                 Ok::<_, String>(client_id)
             }
@@ -2262,15 +2748,61 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     // Brief pause to ensure connections are stable
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // OPTIMIZATION: Initialize input protocol for all servers in parallel
     // Each server initializes input protocol for all clients
-    info!("  Initializing input protocol for {} clients with {} shares each (parallel per server)...",
-          client_count, LARGE_MATRIX_SIZE);
+    info!(
+        "  Initializing input protocol for {} clients with {} shares each (parallel per server)...",
+        client_count, LARGE_MATRIX_SIZE
+    );
 
-    let input_init_handles: Vec<_> = servers.iter_mut().enumerate()
+    let input_init_handles: Vec<_> = servers
+        .iter_mut()
+        .enumerate()
         .map(|(idx, server)| {
             let client_ids = client_ids.clone();
-            let network = server.network.clone().expect("network should be set");
+            let network = server
+                .routed_network
+                .clone()
+                .expect("routed_network should be set");
             let preprocessing_material = server.node.preprocessing_material.clone();
             let mut preprocess_input = server.node.preprocess.input.clone();
 
@@ -2282,12 +2814,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                         .take_random_shares(LARGE_MATRIX_SIZE)
                         .expect("Failed to take random shares");
                     preprocess_input
-                        .init(
-                            *client_id,
-                            local_shares,
-                            LARGE_MATRIX_SIZE,
-                            network.clone(),
-                        )
+                        .init(*client_id, local_shares, LARGE_MATRIX_SIZE, network.clone())
                         .await
                         .expect("input.init failed");
                     // RELEASE MODE FIX: yield to allow client tasks to progress
@@ -2316,32 +2843,42 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     info!("  Creating {} VMs...", n_parties);
     let vm_create_start = std::time::Instant::now();
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id]
-                .network
-                .clone()
-                .expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
     }
-    info!("  ✓ {} VMs created in {:.2}s", n_parties, vm_create_start.elapsed().as_secs_f32());
+    info!(
+        "  ✓ {} VMs created in {:.2}s",
+        n_parties,
+        vm_create_start.elapsed().as_secs_f32()
+    );
 
     // Step 7b: Wait for all inputs in PARALLEL across all parties
     // This is the slow part - waiting for clients to process 16K shares each
     let input_timeout = Duration::from_secs(300);
-    info!("  Waiting for client inputs (timeout: {}s, {} elements per client)...",
-          input_timeout.as_secs(), LARGE_MATRIX_SIZE);
+    info!(
+        "  Waiting for client inputs (timeout: {}s, {} elements per client)...",
+        input_timeout.as_secs(),
+        LARGE_MATRIX_SIZE
+    );
 
     let wait_start = std::time::Instant::now();
-    let wait_handles: Vec<_> = servers.iter().enumerate()
+    let wait_handles: Vec<_> = servers
+        .iter()
+        .enumerate()
         .map(|(party_id, server)| {
             let mut input = server.node.preprocess.input.clone();
             async move {
@@ -2359,12 +2896,16 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         .collect();
 
     let all_shares = futures::future::join_all(wait_handles).await;
-    info!("  ✓ All inputs received in {:.2}s", wait_start.elapsed().as_secs_f32());
+    info!(
+        "  ✓ All inputs received in {:.2}s",
+        wait_start.elapsed().as_secs_f32()
+    );
 
     // Step 7c: Hydrate client stores with received shares
     // OPTIMIZATION: Use drain() to move ownership instead of cloning ~65K shares
     let hydrate_start = std::time::Instant::now();
-    let mut shares_by_party: Vec<Vec<(ClientId, Vec<RobustShare<Fr>>)>> = vec![Vec::new(); n_parties];
+    let mut shares_by_party: Vec<Vec<(ClientId, Vec<RobustShare<Fr>>)>> =
+        vec![Vec::new(); n_parties];
     for result in all_shares {
         let (party_id, shares) = result.expect("Failed to get client inputs");
         shares_by_party[party_id] = shares;
@@ -2379,7 +2920,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             store.store_client_input(client_id, shares);
         }
     }
-    info!("  ✓ Client stores hydrated in {:.2}s", hydrate_start.elapsed().as_secs_f32());
+    info!(
+        "  ✓ Client stores hydrated in {:.2}s",
+        hydrate_start.elapsed().as_secs_f32()
+    );
 
     step_timings.push(("Step 7: Create VMs & hydrate stores", step_start.elapsed()));
     step_start = std::time::Instant::now();
@@ -2394,7 +2938,8 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     //
     // Using fixed-point mode since this test uses scaled fixed-point values
     info!("Step 8: Registering federated averaging program (using manual loops)...");
-    let (fed_avg_program, labels) = build_manual_federated_average_program_with_type(LARGE_MATRIX_SIZE, true);
+    let (fed_avg_program, labels) =
+        build_manual_federated_average_program_with_type(LARGE_MATRIX_SIZE, true);
     for vm_arc in &vms {
         let avg_fn = VMFunction::new(
             "federated_average".to_string(),
@@ -2444,7 +2989,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         results.push((pid, val));
     }
 
-    step_timings.push(("Step 9: Execute program (batch reveal)", step_start.elapsed()));
+    step_timings.push((
+        "Step 9: Execute program (batch reveal)",
+        step_start.elapsed(),
+    ));
     step_start = std::time::Instant::now();
 
     // Step 10: Verify results
@@ -2473,7 +3021,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         if let Value::Array(array_id) = first_val {
             let vm = vms[*first_pid].lock();
             if let Some(arr) = vm.state.object_store.get_array(*array_id) {
-                info!("Verifying {} averaged matrix elements (sampling first 10 and last 10):", arr.length());
+                info!(
+                    "Verifying {} averaged matrix elements (sampling first 10 and last 10):",
+                    arr.length()
+                );
                 let sample_indices: Vec<usize> = (0..10)
                     .chain((LARGE_MATRIX_SIZE - 10)..LARGE_MATRIX_SIZE)
                     .collect();
@@ -2486,7 +3037,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                         let computed_avg: f64 = match elem_val {
                             Value::I64(v) => *v as f64,
                             Value::Float(v) => v.0,
-                            other => panic!("Element {} has unexpected type: {:?}", elem_idx, other),
+                            other => {
+                                panic!("Element {} has unexpected type: {:?}", elem_idx, other)
+                            }
                         };
 
                         let expected = expected_averages[elem_idx];
@@ -2498,7 +3051,11 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                         assert!(
                             diff <= 0.01,
                             "Element [{},{}] mismatch: got {:.4}, expected {:.4} (diff {:.4})",
-                            row, col, computed_avg, expected, diff
+                            row,
+                            col,
+                            computed_avg,
+                            expected,
+                            diff
                         );
                         info!(
                             "  ✓ [{},{}] = {:.4} (expected {:.4})",
@@ -2508,7 +3065,11 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                         panic!("Element {} not found in result array", elem_idx);
                     }
                 }
-                info!("  ... (verified {} sampled elements out of {})", sample_indices.len(), LARGE_MATRIX_SIZE);
+                info!(
+                    "  ... (verified {} sampled elements out of {})",
+                    sample_indices.len(),
+                    LARGE_MATRIX_SIZE
+                );
             } else {
                 panic!("Array {} not found in VM object store", array_id);
             }
@@ -2536,8 +3097,13 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             Value::Array(id) => *id,
             _ => panic!("Expected array"),
         };
-        let arr = vm.state.object_store.get_array(array_id).expect("array exists");
-        sample_indices.iter()
+        let arr = vm
+            .state
+            .object_store
+            .get_array(array_id)
+            .expect("array exists");
+        sample_indices
+            .iter()
             .map(|&i| {
                 let idx = Value::I64(i as i64);
                 match arr.get(&idx).expect("element exists") {
@@ -2555,8 +3121,14 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             Value::Array(id) => *id,
             _ => panic!("Expected array"),
         };
-        let arr = vm.state.object_store.get_array(array_id).expect("array exists");
-        for (sample_idx, (&i, &ref_val)) in sample_indices.iter().zip(reference_vals.iter()).enumerate() {
+        let arr = vm
+            .state
+            .object_store
+            .get_array(array_id)
+            .expect("array exists");
+        for (sample_idx, (&i, &ref_val)) in
+            sample_indices.iter().zip(reference_vals.iter()).enumerate()
+        {
             let idx = Value::I64(i as i64);
             let party_val: f64 = match arr.get(&idx).expect("element exists") {
                 Value::I64(v) => *v as f64,
@@ -2568,10 +3140,18 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             assert!(
                 diff < 0.0001,
                 "Party {} sample {} (element {}) mismatch: got {}, expected {} (diff {})",
-                pid, sample_idx, i, party_val, ref_val, diff
+                pid,
+                sample_idx,
+                i,
+                party_val,
+                ref_val,
+                diff
             );
         }
-        info!("  ✓ Party {} results match reference ({} samples)", pid, sample_size);
+        info!(
+            "  ✓ Party {} results match reference ({} samples)",
+            pid, sample_size
+        );
     }
 
     step_timings.push(("Step 10: Verify results", step_start.elapsed()));
@@ -2594,9 +3174,18 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     info!("=== TIMING BREAKDOWN ===");
     for (step_name, duration) in &step_timings {
         let pct = (duration.as_secs_f64() / total_elapsed.as_secs_f64()) * 100.0;
-        info!("  {:40} {:>8.2}s ({:>5.1}%)", step_name, duration.as_secs_f64(), pct);
+        info!(
+            "  {:40} {:>8.2}s ({:>5.1}%)",
+            step_name,
+            duration.as_secs_f64(),
+            pct
+        );
     }
-    info!("  {:40} {:>8.2}s (100.0%)", "TOTAL", total_elapsed.as_secs_f64());
+    info!(
+        "  {:40} {:>8.2}s (100.0%)",
+        "TOTAL",
+        total_elapsed.as_secs_f64()
+    );
     info!("");
 
     info!("=== VM Mesh Large Matrix (128x128) Federated Averaging Integration Test PASSED ===");
@@ -2604,7 +3193,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         "Successfully computed federated average of {} matrices ({}x{} = {} elements) from {} clients",
         client_count, LARGE_MATRIX_ROWS, LARGE_MATRIX_COLS, LARGE_MATRIX_SIZE, client_count
     );
-    info!("All {} parties computed identical element-wise averages", n_parties);
+    info!(
+        "All {} parties computed identical element-wise averages",
+        n_parties
+    );
 }
 
 /// Build a program that computes the overall average using fixed-point shares
@@ -2612,7 +3204,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
 /// Uses ClientStore.take_share_fixed to load shares as SecretFixedPoint type.
 /// After summing and revealing, the result is still in fixed-point format
 /// and needs to be unscaled for the final average.
-fn build_matrix_average_program_fixed_point(matrix_size: usize) -> (Vec<Instruction>, HashMap<String, usize>) {
+fn build_matrix_average_program_fixed_point(
+    matrix_size: usize,
+) -> (Vec<Instruction>, HashMap<String, usize>) {
     let mut instructions = Vec::new();
     let mut labels = HashMap::new();
 
@@ -2652,7 +3246,9 @@ fn build_matrix_average_program_fixed_point(matrix_size: usize) -> (Vec<Instruct
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::LDI(5, Value::I64(0))); // element_index = 0
     instructions.push(Instruction::PUSHARG(5));
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string())); // Fixed-point share
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    )); // Fixed-point share
     instructions.push(Instruction::MOV(16, 0)); // reg16 = first share (accumulator)
 
     // Start inner loop from element index 1
@@ -2679,7 +3275,9 @@ fn build_matrix_average_program_fixed_point(matrix_size: usize) -> (Vec<Instruct
     instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string())); // Fixed-point share
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    )); // Fixed-point share
     instructions.push(Instruction::MOV(18, 0)); // reg18 = share
 
     // Accumulate
@@ -2715,7 +3313,9 @@ fn build_matrix_average_program_fixed_point(matrix_size: usize) -> (Vec<Instruct
     // Get fixed-point share for current client, current element
     instructions.push(Instruction::PUSHARG(2)); // client_index
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string())); // Fixed-point share
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    )); // Fixed-point share
     instructions.push(Instruction::MOV(18, 0)); // reg18 = share
 
     // Accumulate: reg16 += reg18
@@ -2765,7 +3365,10 @@ fn build_matrix_average_program_fixed_point(matrix_size: usize) -> (Vec<Instruct
 /// - Divide each sum by `num_clients` to get the average
 /// - Store results in an array and return it
 /// - Send averaged values back to each client
-fn build_federated_average_program(matrix_size: usize, _num_clients: usize) -> (Vec<Instruction>, HashMap<String, usize>) {
+fn build_federated_average_program(
+    matrix_size: usize,
+    _num_clients: usize,
+) -> (Vec<Instruction>, HashMap<String, usize>) {
     let mut instructions = Vec::new();
     let mut labels = HashMap::new();
 
@@ -2781,18 +3384,20 @@ fn build_federated_average_program(matrix_size: usize, _num_clients: usize) -> (
     // reg8 = scratch
     // reg9 = current client index for output sending
     // reg10 = client_id for output
-    // reg11 = 800 (base client id)
+    // reg11 = 80 (base client id)
     // reg16 = current element sum accumulator (secret share)
     // reg17 = scratch for shares
     // reg18 = scratch for shares
 
     // Step 1: Get number of clients and initialize constants
-    instructions.push(Instruction::CALL("ClientStore.get_number_clients".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.get_number_clients".to_string(),
+    ));
     instructions.push(Instruction::MOV(1, 0)); // reg1 = num_clients
 
     instructions.push(Instruction::LDI(3, Value::I64(1))); // reg3 = 1
     instructions.push(Instruction::LDI(4, Value::I64(matrix_size as i64))); // reg4 = matrix_size
-    instructions.push(Instruction::LDI(11, Value::I64(800))); // reg11 = base client id
+    instructions.push(Instruction::LDI(11, Value::I64(80))); // reg11 = base client id
 
     // Step 2: Create result array to store revealed averaged values (for verification)
     instructions.push(Instruction::LDI(0, Value::I64(matrix_size as i64))); // capacity
@@ -2829,7 +3434,9 @@ fn build_federated_average_program(matrix_size: usize, _num_clients: usize) -> (
     instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    ));
     instructions.push(Instruction::MOV(16, 0)); // reg16 = first share (accumulator)
 
     // Sum remaining clients for this element
@@ -2845,7 +3452,9 @@ fn build_federated_average_program(matrix_size: usize, _num_clients: usize) -> (
     // Get share for current client, current element
     instructions.push(Instruction::PUSHARG(2)); // client_index
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    ));
     instructions.push(Instruction::MOV(17, 0)); // reg17 = share
 
     // Accumulate: reg16 += reg17
@@ -2928,6 +3537,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM Mesh Bytecode Fixed-Point Integration Test ===");
     info!(
@@ -2940,7 +3550,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     let threshold = 1;
     let n_triples = 32;
     let n_random_shares = 64 + MATRIX_SIZE * 8;
-    let instance_id = 77777;
+    let instance_id = 77781;
     let base_port = 9850;
 
     let config = HoneyBadgerQuicConfig {
@@ -2955,8 +3565,8 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/tests/binaries/matrix_average_fixed_point.stflb"
     );
-    let compiled_binary = load_from_file(bytecode_path)
-        .expect("Failed to load compiled bytecode from .stflb file");
+    let compiled_binary =
+        load_from_file(bytecode_path).expect("Failed to load compiled bytecode from .stflb file");
     let mut vm_functions = to_vm_functions(&compiled_binary);
 
     info!("  Loaded {} functions from bytecode:", vm_functions.len());
@@ -2965,7 +3575,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         // The compute_matrix_sum function uses registers 16, 17 (secret registers)
         // but may have been compiled with only 8 registers.
         // We need to ensure the register count is sufficient for the instructions.
-        let max_reg = func.instructions.iter()
+        let max_reg = func
+            .instructions
+            .iter()
             .filter_map(|instr| {
                 // Extract register numbers from instructions
                 match instr {
@@ -2987,12 +3599,20 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         // Ensure we have enough registers (add some padding for safety)
         let required_regs = max_reg + 1;
         if func.register_count < required_regs {
-            info!("    - {} (adjusting register_count from {} to {} based on instruction analysis)",
-                  func.name, func.register_count, required_regs.max(32));
+            info!(
+                "    - {} (adjusting register_count from {} to {} based on instruction analysis)",
+                func.name,
+                func.register_count,
+                required_regs.max(32)
+            );
             func.register_count = required_regs.max(32); // Use at least 32 registers for MPC programs
         } else {
-            info!("    - {} ({} instructions, {} registers)",
-                  func.name, func.instructions.len(), func.register_count);
+            info!(
+                "    - {} ({} instructions, {} registers)",
+                func.name,
+                func.instructions.len(),
+                func.register_count
+            );
         }
     }
 
@@ -3010,7 +3630,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     );
 
     for idx in 0..client_count {
-        let client_id = 900 + idx as ClientId;
+        let client_id = 90 + idx as ClientId;
         client_ids.push(client_id);
 
         // Generate random matrix with decimal values
@@ -3040,8 +3660,11 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     info!("");
     info!("=== Client Input Matrices ===");
     for (idx, matrix) in client_matrices_f64.iter().enumerate() {
-        let client_id = 900 + idx as ClientId;
-        info!("Client {} matrix ({}x{}):", client_id, MATRIX_ROWS, MATRIX_COLS);
+        let client_id = 90 + idx as ClientId;
+        info!(
+            "Client {} matrix ({}x{}):",
+            client_id, MATRIX_ROWS, MATRIX_COLS
+        );
         for row in 0..MATRIX_ROWS {
             let row_values: Vec<String> = (0..MATRIX_COLS)
                 .map(|col| format!("{:8.2}", matrix[row * MATRIX_COLS + col]))
@@ -3082,7 +3705,10 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         .collect();
 
     info!("");
-    info!("=== Expected Federated Average Matrix (element-wise mean of {} clients) ===", client_count);
+    info!(
+        "=== Expected Federated Average Matrix (element-wise mean of {} clients) ===",
+        client_count
+    );
     for row in 0..MATRIX_ROWS {
         let row_values: Vec<String> = (0..MATRIX_COLS)
             .map(|col| format!("{:8.4}", expected_averages[row * MATRIX_COLS + col]))
@@ -3093,33 +3719,64 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 
     info!("Expected total scaled sum: {}", total_sum);
 
-    // Step 3: Start servers and spawn message processors
+    // Step 3: Start servers (accept loops only)
     info!("Step 3: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
 
+    // Step 4: Connect servers
+    info!("Step 4: Connecting servers in mesh topology...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 4a: Finalize network and spawn receive loops
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
+    }
+
+    // Spawn receive-loop tasks
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
-
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
         });
     }
-
-    // Step 4: Connect servers
-    info!("Step 4: Connecting servers in mesh topology...");
-    for server in &servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Step 5: Create input clients
     info!("Step 5: Creating {} matrix input clients...", client_count);
@@ -3145,6 +3802,45 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    // The accept loop in start() tags ALL unknown connections with expected_clients[0],
+    // which is wrong for multi-client setups. We spawn explicit handlers here instead.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 6: Run preprocessing
     info!("Step 6: Running preprocessing...");
     let preprocessing_handles: Vec<_> = servers
@@ -3152,10 +3848,10 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 node.run_preprocessing(network, &mut rng)
@@ -3191,9 +3887,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                     local_shares,
                     MATRIX_SIZE,
                     server
-                        .network
+                        .routed_network
                         .clone()
-                        .expect("network should be set"),
+                        .expect("routed_network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -3205,18 +3901,19 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     // Step 8: Create VMs and hydrate client stores
     info!("Step 8: Creating VMs and hydrating client stores...");
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id]
-                .network
-                .clone()
-                .expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.network.clone().expect("network should be set"),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
@@ -3301,7 +3998,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                 // For now, we'll skip this test if the bytecode doesn't work
                 // This allows us to test that the bytecode loading infrastructure works
                 // even if the specific bytecode program has issues
-                info!("Note: Bytecode execution failed. This may indicate the .stflb file needs to be regenerated.");
+                info!(
+                    "Note: Bytecode execution failed. This may indicate the .stflb file needs to be regenerated."
+                );
                 info!("Error details: {}", e);
 
                 // Cleanup and return early
@@ -3314,7 +4013,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 
                 info!("");
                 info!("=== VM Mesh Bytecode Fixed-Point Integration Test SKIPPED ===");
-                info!("The bytecode file may need to be regenerated with compatible program logic.");
+                info!(
+                    "The bytecode file may need to be regenerated with compatible program logic."
+                );
                 return;
             }
         }
@@ -3346,14 +4047,20 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                 assert!(
                     diff < 0.0001,
                     "Party {} returned different float result: {} vs {}",
-                    pid, party_val.0, ref_val.0
+                    pid,
+                    party_val.0,
+                    ref_val.0
                 );
             }
             (Some(Value::Array(_)), Value::Array(_)) => {
                 // Arrays verified below with detailed comparison
             }
             _ => {
-                info!("  Party {} result type: {:?}", pid, std::mem::discriminant(val));
+                info!(
+                    "  Party {} result type: {:?}",
+                    pid,
+                    std::mem::discriminant(val)
+                );
             }
         }
     }
@@ -3456,7 +4163,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 ///    - Divides by num_clients
 ///    - Stores in result array
 /// 4. Returns the result array
-fn build_manual_federated_average_program(num_elements: usize) -> (Vec<Instruction>, HashMap<String, usize>) {
+fn build_manual_federated_average_program(
+    num_elements: usize,
+) -> (Vec<Instruction>, HashMap<String, usize>) {
     build_manual_federated_average_program_with_type(num_elements, false)
 }
 
@@ -3468,7 +4177,10 @@ fn build_manual_federated_average_program(num_elements: usize) -> (Vec<Instructi
 /// destination register, but with the same dest_reg for all reveals, only the last value survives.
 ///
 /// This function is kept for reference and testing single-element reveals.
-fn build_manual_federated_average_program_with_type(num_elements: usize, use_fixed_point: bool) -> (Vec<Instruction>, HashMap<String, usize>) {
+fn build_manual_federated_average_program_with_type(
+    num_elements: usize,
+    use_fixed_point: bool,
+) -> (Vec<Instruction>, HashMap<String, usize>) {
     let mut instructions = Vec::new();
     let mut labels = HashMap::new();
 
@@ -3498,7 +4210,9 @@ fn build_manual_federated_average_program_with_type(num_elements: usize, use_fix
     // ==========================================
 
     // Get number of clients
-    instructions.push(Instruction::CALL("ClientStore.get_number_clients".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.get_number_clients".to_string(),
+    ));
     instructions.push(Instruction::MOV(1, 0)); // reg1 = num_clients
 
     // Initialize constants

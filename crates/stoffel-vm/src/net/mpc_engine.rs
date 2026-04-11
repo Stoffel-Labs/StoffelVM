@@ -2,9 +2,25 @@
 // Minimal trait needed by VMState and current HoneyBadger engine.
 
 use crate::net::client_store::ClientInputStore;
+use crate::net::curve::{MpcCurveConfig, MpcFieldKind};
 use std::any::Any;
-use stoffel_vm_types::core_types::{ShareType, Value};
+use stoffel_vm_types::core_types::{ShareData, ShareType, Value};
 use stoffelnet::network_utils::ClientId;
+
+bitflags::bitflags! {
+    /// Capability flags advertised by an [`MpcEngine`] implementation.
+    ///
+    /// Engines return these from [`MpcEngine::capabilities()`]. The individual
+    /// `supports_*()` convenience methods delegate to this bitfield.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MpcCapabilities: u32 {
+        const MULTIPLICATION   = 0b0000_0001;
+        const ELLIPTIC_CURVES  = 0b0000_0010;
+        const CLIENT_INPUT     = 0b0000_0100;
+        const CONSENSUS        = 0b0000_1000;
+        const OPEN_IN_EXP      = 0b0001_0000;
+    }
+}
 
 /// Core MPC engine trait for synchronous VM operations
 ///
@@ -24,10 +40,11 @@ pub trait MpcEngine: Send + Sync {
     fn start(&self) -> Result<(), String>;
 
     /// Create a secret share from a clear value
-    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<Vec<u8>, String>;
+    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<ShareData, String>;
 
     /// Perform secure multiplication of two shares (requires MPC interaction)
-    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String>;
+    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8])
+        -> Result<ShareData, String>;
 
     /// Reconstruct a secret from shares (requires collecting shares from other parties)
     /// This broadcasts to all parties - all parties learn the secret.
@@ -46,9 +63,43 @@ pub trait MpcEngine: Send + Sync {
     /// Vector of revealed values in the same order as input shares
     fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
         // Default implementation: sequential fallback
-        shares.iter()
-            .map(|s| self.open_share(ty, s))
-            .collect()
+        shares.iter().map(|s| self.open_share(ty, s)).collect()
+    }
+
+    /// Generate random bytes as a secret-shared value.
+    ///
+    /// The engine uses its preprocessing pool (e.g. RanSha protocol) to produce
+    /// jointly-random shares that no single party knows.
+    fn random_share(&self, _ty: ShareType) -> Result<ShareData, String> {
+        Err("random_share not implemented for this engine".to_string())
+    }
+
+    /// Reveal a share in the exponent: reconstructs `[secret] * generator`
+    /// via Lagrange interpolation in the group.
+    ///
+    /// Each party computes `share_i * generator`, then all parties exchange
+    /// partial points and reconstruct the public point.
+    fn open_share_in_exp(
+        &self,
+        _ty: ShareType,
+        _share_bytes: &[u8],
+        _generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        Err("open_share_in_exp not implemented for this engine".to_string())
+    }
+
+    /// Reconstruct a secret from shares and return the raw field element bytes
+    /// instead of converting to a VM `Value`.
+    ///
+    /// This is used by `Share.open_field` to get the serialized field element
+    /// for cryptographic operations (e.g. threshold signatures).
+    fn open_share_as_field(&self, _ty: ShareType, _share_bytes: &[u8]) -> Result<Vec<u8>, String> {
+        Err("open_share_as_field not implemented for this engine".to_string())
+    }
+
+    /// Whether this engine supports `open_share_in_exp`.
+    fn supports_open_share_in_exp(&self) -> bool {
+        self.capabilities().contains(MpcCapabilities::OPEN_IN_EXP)
     }
 
     /// Send output share(s) to a specific client for private reconstruction
@@ -79,18 +130,62 @@ pub trait MpcEngine: Send + Sync {
     }
 
     /// Get the party ID for this node
-    fn party_id(&self) -> usize {
-        0 // Default, implementations should override
-    }
+    fn party_id(&self) -> usize;
 
     /// Get the number of parties in the MPC network
-    fn n_parties(&self) -> usize {
-        1 // Default, implementations should override
-    }
+    fn n_parties(&self) -> usize;
 
     /// Get the threshold parameter
-    fn threshold(&self) -> usize {
-        0 // Default, implementations should override
+    fn threshold(&self) -> usize;
+
+    /// MPC curve in use by this engine.
+    fn curve_config(&self) -> MpcCurveConfig {
+        MpcCurveConfig::default()
+    }
+
+    /// Share field used by this engine.
+    fn field_kind(&self) -> MpcFieldKind {
+        self.curve_config().field_kind()
+    }
+
+    /// Advertise which optional operations this engine supports.
+    ///
+    /// The default is empty (no optional capabilities). Implementations should
+    /// override this to set the appropriate flags.
+    fn capabilities(&self) -> MpcCapabilities {
+        MpcCapabilities::empty()
+    }
+
+    /// Whether this engine supports secure multiplication
+    fn supports_multiplication(&self) -> bool {
+        self.capabilities()
+            .contains(MpcCapabilities::MULTIPLICATION)
+    }
+
+    /// Whether this engine supports elliptic curve operations
+    fn supports_elliptic_curves(&self) -> bool {
+        self.capabilities()
+            .contains(MpcCapabilities::ELLIPTIC_CURVES)
+    }
+
+    /// Whether this engine supports client input operations
+    fn supports_client_input(&self) -> bool {
+        self.capabilities().contains(MpcCapabilities::CLIENT_INPUT)
+    }
+
+    /// Whether this engine supports consensus (RBC/ABA)
+    fn supports_consensus(&self) -> bool {
+        self.capabilities().contains(MpcCapabilities::CONSENSUS)
+    }
+
+    /// Try to obtain a reference to the consensus sub-trait, if supported.
+    fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> {
+        None
+    }
+
+    /// Try to obtain a reference to the client-ops sub-trait, if supported.
+    fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> {
+        None
     }
 
     /// Support downcasting for concrete engine types
@@ -115,7 +210,7 @@ pub trait AsyncMpcEngine: MpcEngine {
         ty: ShareType,
         left: &[u8],
         right: &[u8],
-    ) -> Result<Vec<u8>, String>;
+    ) -> Result<ShareData, String>;
 
     /// Reconstruct a secret from shares asynchronously
     async fn open_share_async(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String>;
@@ -130,6 +225,21 @@ pub trait AsyncMpcEngine: MpcEngine {
     ) -> Result<Vec<Value>, String> {
         // Default implementation uses the sync version
         self.batch_open_shares(ty, shares)
+    }
+
+    /// Generate random bytes as a secret-shared value (async).
+    async fn random_share_async(&self, ty: ShareType) -> Result<ShareData, String> {
+        self.random_share(ty)
+    }
+
+    /// Reveal a share in the exponent asynchronously.
+    async fn open_share_in_exp_async(
+        &self,
+        ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.open_share_in_exp(ty, share_bytes, generator_bytes)
     }
 
     /// Send output share(s) to a specific client asynchronously
@@ -227,8 +337,11 @@ pub trait AsyncMpcEngineConsensus: MpcEngineConsensus {
     async fn rbc_broadcast_async(&self, message: &[u8]) -> Result<u64, String>;
 
     /// Receive a reliable broadcast from a specific party (async)
-    async fn rbc_receive_async(&self, from_party: usize, timeout_ms: u64)
-        -> Result<Vec<u8>, String>;
+    async fn rbc_receive_async(
+        &self,
+        from_party: usize,
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>, String>;
 
     /// Receive a reliable broadcast from any party (async)
     async fn rbc_receive_any_async(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String>;
@@ -240,7 +353,11 @@ pub trait AsyncMpcEngineConsensus: MpcEngineConsensus {
     async fn aba_result_async(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String>;
 
     /// Propose and wait for agreement (async)
-    async fn aba_propose_and_wait_async(&self, value: bool, timeout_ms: u64) -> Result<bool, String> {
+    async fn aba_propose_and_wait_async(
+        &self,
+        value: bool,
+        timeout_ms: u64,
+    ) -> Result<bool, String> {
         let session_id = self.aba_propose_async(value).await?;
         self.aba_result_async(session_id, timeout_ms).await
     }

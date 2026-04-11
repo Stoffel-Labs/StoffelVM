@@ -1,0 +1,182 @@
+# StoffelVM 5-Node AVSS DKG Test Environment
+# This docker-compose file sets up a 5-node MPC network using the AVSS backend
+# to perform distributed key generation. Each party runs Share.random() to
+# generate a jointly-random secret, then extracts the public key from
+# commitment[0]. All parties should output the same public key.
+#
+# Usage:
+#   STOFFEL_AUTH_TOKEN=<token> docker-compose -f docker-compose.avss.yml up
+#
+# To use a different elliptic curve (default: bls12-381):
+#   STOFFEL_AUTH_TOKEN=<token> STOFFEL_MPC_CURVE=bn254 docker-compose -f docker-compose.avss.yml up
+#
+# Supported curves: bls12-381, bn254, curve25519, ed25519
+#
+# To view logs from a specific party:
+#   docker-compose -f docker-compose.avss.yml logs -f party0
+
+services:
+  # Party 0 - Leader node (runs bootnode + party 0)
+  party0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stoffel-avss-party0
+    hostname: party0
+    environment:
+      - STOFFEL_ROLE=leader
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
+      - STOFFEL_PARTY_ID=0
+      - STOFFEL_BIND_ADDR=172.29.0.10:9000
+      - STOFFEL_N_PARTIES=5
+      - STOFFEL_THRESHOLD=1
+      - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
+      - STOFFEL_ENTRY=main
+      - STOFFEL_MPC_BACKEND=avss
+      - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    networks:
+      stoffel-avss-net:
+        ipv4_address: 172.29.0.10
+    ports:
+      - "19000:9000/tcp"
+      - "19000:9000/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -tuln | grep -q ':9000' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # Party 1
+  party1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stoffel-avss-party1
+    hostname: party1
+    environment:
+      - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
+      - STOFFEL_PARTY_ID=1
+      - STOFFEL_BIND_ADDR=172.29.0.11:9001
+      - STOFFEL_BOOTSTRAP_ADDR=172.29.0.10:9000
+      - STOFFEL_N_PARTIES=5
+      - STOFFEL_THRESHOLD=1
+      - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
+      - STOFFEL_ENTRY=main
+      - STOFFEL_MPC_BACKEND=avss
+      - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    networks:
+      stoffel-avss-net:
+        ipv4_address: 172.29.0.11
+    depends_on:
+      party0:
+        condition: service_healthy
+    ports:
+      - "19001:9001/tcp"
+      - "19001:9001/udp"
+
+  # Party 2
+  party2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stoffel-avss-party2
+    hostname: party2
+    environment:
+      - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
+      - STOFFEL_PARTY_ID=2
+      - STOFFEL_BIND_ADDR=172.29.0.12:9002
+      - STOFFEL_BOOTSTRAP_ADDR=172.29.0.10:9000
+      - STOFFEL_N_PARTIES=5
+      - STOFFEL_THRESHOLD=1
+      - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
+      - STOFFEL_ENTRY=main
+      - STOFFEL_MPC_BACKEND=avss
+      - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    networks:
+      stoffel-avss-net:
+        ipv4_address: 172.29.0.12
+    depends_on:
+      party0:
+        condition: service_healthy
+    ports:
+      - "19002:9002/tcp"
+      - "19002:9002/udp"
+
+  # Party 3
+  party3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stoffel-avss-party3
+    hostname: party3
+    environment:
+      - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
+      - STOFFEL_PARTY_ID=3
+      - STOFFEL_BIND_ADDR=172.29.0.13:9003
+      - STOFFEL_BOOTSTRAP_ADDR=172.29.0.10:9000
+      - STOFFEL_N_PARTIES=5
+      - STOFFEL_THRESHOLD=1
+      - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
+      - STOFFEL_ENTRY=main
+      - STOFFEL_MPC_BACKEND=avss
+      - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    networks:
+      stoffel-avss-net:
+        ipv4_address: 172.29.0.13
+    depends_on:
+      party0:
+        condition: service_healthy
+    ports:
+      - "19003:9003/tcp"
+      - "19003:9003/udp"
+
+  # Party 4
+  party4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stoffel-avss-party4
+    hostname: party4
+    environment:
+      - STOFFEL_ROLE=party
+      - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
+      - STOFFEL_PARTY_ID=4
+      - STOFFEL_BIND_ADDR=172.29.0.14:9004
+      - STOFFEL_BOOTSTRAP_ADDR=172.29.0.10:9000
+      - STOFFEL_N_PARTIES=5
+      - STOFFEL_THRESHOLD=1
+      - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
+      - STOFFEL_ENTRY=main
+      - STOFFEL_MPC_BACKEND=avss
+      - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    networks:
+      stoffel-avss-net:
+        ipv4_address: 172.29.0.14
+    depends_on:
+      party0:
+        condition: service_healthy
+    ports:
+      - "19004:9004/tcp"
+      - "19004:9004/udp"
+
+networks:
+  stoffel-avss-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+          gateway: 172.29.0.1

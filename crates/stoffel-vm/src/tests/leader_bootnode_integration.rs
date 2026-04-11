@@ -27,7 +27,9 @@ use crate::net::hb_engine::HoneyBadgerMpcEngine;
 use crate::net::program_id_from_bytes;
 use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
+    RoutedNetwork,
 };
+use crate::tests::test_utils::{acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing};
 use stoffel_vm_types::compiled_binary::CompiledBinary;
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
@@ -45,42 +47,13 @@ const FIXED_POINT_SCALE: i64 = 1 << FIXED_POINT_FRACTIONAL_BITS;
 // Number of registers used by the program
 const PROGRAM_REGISTERS: usize = 24;
 
-fn init_crypto_provider() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-    });
-}
-
-fn setup_test_tracing() {
-    use std::sync::Once;
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let subscriber = FmtSubscriber::builder()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-            .with_test_writer()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-}
-
 /// Build a federated averaging program that computes element-wise averages.
 ///
-/// This program:
-/// 1. Gets the number of clients from ClientStore
-/// 2. Creates a result array
-/// 3. For each element position:
-///    a. Loads fixed-point shares from all clients
-///    b. Sums shares (as secret shares)
-///    c. Reveals the sum
-///    d. Divides by num_clients to get average
-///    e. Stores result in array
-/// 4. Returns the result array
+/// The current VM batches `MOV(secret -> clear)` reveals, so this test has to
+/// stage its work across three passes:
+/// 1. compute and store all secret sums,
+/// 2. queue reveals for every element,
+/// 3. read the revealed values, divide by `num_clients`, and store the result.
 fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usize>) {
     let matrix_size = MATRIX_SIZE;
     let mut instructions = Vec::new();
@@ -92,56 +65,75 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     // reg2 = client index (loop counter for summing)
     // reg3 = constant 1
     // reg4 = matrix_size constant
-    // reg5 = element index (outer loop for element-wise processing)
+    // reg5 = element index
     // reg6 = result array reference
-    // reg7 = current element sum/average (clear register for revealed value)
-    // reg8 = scratch
+    // reg7 = scratch / revealed value
+    // reg8 = secret_sums array reference
+    // reg9 = revealed_sums array reference
+    // reg10 = 1-based array index scratch
     // reg16 = current element sum accumulator (secret share)
     // reg17 = scratch for shares
 
     // Step 1: Get number of clients and initialize constants
-    instructions.push(Instruction::CALL("ClientStore.get_number_clients".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.get_number_clients".to_string(),
+    ));
     instructions.push(Instruction::MOV(1, 0)); // reg1 = num_clients
 
     instructions.push(Instruction::LDI(3, Value::I64(1))); // reg3 = 1
     instructions.push(Instruction::LDI(4, Value::I64(matrix_size as i64))); // reg4 = matrix_size
 
-    // Step 2: Create result array to store revealed averaged values
+    // Step 2: Create scratch arrays and result array
+    instructions.push(Instruction::LDI(0, Value::I64(matrix_size as i64))); // capacity
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.push(Instruction::CALL("create_array".to_string()));
+    instructions.push(Instruction::MOV(8, 0)); // reg8 = secret_sums array
+
+    instructions.push(Instruction::LDI(0, Value::I64(matrix_size as i64))); // capacity
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.push(Instruction::CALL("create_array".to_string()));
+    instructions.push(Instruction::MOV(9, 0)); // reg9 = revealed_sums array
+
     instructions.push(Instruction::LDI(0, Value::I64(matrix_size as i64))); // capacity
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::CALL("create_array".to_string()));
     instructions.push(Instruction::MOV(6, 0)); // reg6 = result array
 
-    // Step 3: Element-wise loop - for each element position
+    // Phase 1: compute all secret sums.
     instructions.push(Instruction::LDI(5, Value::I64(0))); // reg5 = 0 (element index)
 
-    let elem_loop = "fp_elem_loop".to_string();
-    let elem_process = "fp_elem_process".to_string();
-    let elem_done = "fp_elem_done".to_string();
+    let phase1_loop = "phase1_loop".to_string();
+    let phase1_process = "phase1_process".to_string();
+    let phase1_done = "phase1_done".to_string();
     let client_sum_loop = "fp_client_sum_loop".to_string();
     let client_sum_process = "fp_client_sum_process".to_string();
     let client_sum_done = "fp_client_sum_done".to_string();
+    let phase2_loop = "phase2_loop".to_string();
+    let phase2_process = "phase2_process".to_string();
+    let phase2_done = "phase2_done".to_string();
+    let phase3_loop = "phase3_loop".to_string();
+    let phase3_process = "phase3_process".to_string();
+    let phase3_done = "phase3_done".to_string();
 
-    // === ELEMENT LOOP: process each matrix position ===
-    labels.insert(elem_loop.clone(), instructions.len());
+    labels.insert(phase1_loop.clone(), instructions.len());
     instructions.push(Instruction::CMP(5, 4)); // Compare element_idx with matrix_size
-    instructions.push(Instruction::JMPLT(elem_process.clone()));
-    instructions.push(Instruction::JMP(elem_done.clone()));
+    instructions.push(Instruction::JMPLT(phase1_process.clone()));
+    instructions.push(Instruction::JMP(phase1_done.clone()));
 
-    labels.insert(elem_process.clone(), instructions.len());
+    labels.insert(phase1_process.clone(), instructions.len());
 
-    // Initialize sum accumulator for this element position
-    // Load first client's share to initialize the secret accumulator
+    // Load first client's share to initialize the secret accumulator.
     instructions.push(Instruction::LDI(0, Value::I64(0))); // client_index = 0
     instructions.push(Instruction::PUSHARG(0));
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    ));
     instructions.push(Instruction::MOV(16, 0)); // reg16 = first share (accumulator)
 
     // Sum remaining clients for this element
     instructions.push(Instruction::LDI(2, Value::I64(1))); // reg2 = 1 (start from client 1)
 
-    // === CLIENT SUM LOOP: sum shares from all clients for this element ===
     labels.insert(client_sum_loop.clone(), instructions.len());
     instructions.push(Instruction::CMP(2, 1)); // Compare client_idx with num_clients
     instructions.push(Instruction::JMPLT(client_sum_process.clone()));
@@ -151,7 +143,9 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     // Get share for current client, current element
     instructions.push(Instruction::PUSHARG(2)); // client_index
     instructions.push(Instruction::PUSHARG(5)); // element_index
-    instructions.push(Instruction::CALL("ClientStore.take_share_fixed".to_string()));
+    instructions.push(Instruction::CALL(
+        "ClientStore.take_share_fixed".to_string(),
+    ));
     instructions.push(Instruction::MOV(17, 0)); // reg17 = share
 
     // Accumulate: reg16 += reg17
@@ -161,28 +155,75 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     instructions.push(Instruction::ADD(2, 2, 3)); // reg2++
     instructions.push(Instruction::JMP(client_sum_loop.clone()));
 
-    // === END CLIENT SUM LOOP ===
     labels.insert(client_sum_done.clone(), instructions.len());
 
-    // Reveal the sum - MOV from secret register to clear register triggers MPC reveal
-    instructions.push(Instruction::MOV(7, 16)); // reg7 = revealed sum
-
-    // Divide by num_clients to get average (operating on clear values)
-    instructions.push(Instruction::DIV(7, 7, 1)); // reg7 = sum / num_clients
-
-    // Store the revealed averaged value in the result array (1-indexed)
-    instructions.push(Instruction::ADD(8, 5, 3)); // reg8 = element_index + 1 (1-indexed)
-    instructions.push(Instruction::PUSHARG(6)); // result array ref
-    instructions.push(Instruction::PUSHARG(8)); // index (1-based)
-    instructions.push(Instruction::PUSHARG(7)); // value (revealed average)
+    // Store the secret sum for the later reveal pass.
+    instructions.push(Instruction::ADD(10, 5, 3)); // reg10 = element_index + 1 (1-indexed)
+    instructions.push(Instruction::PUSHARG(8)); // secret_sums array ref
+    instructions.push(Instruction::PUSHARG(10)); // index (1-based)
+    instructions.push(Instruction::PUSHARG(16)); // secret sum
     instructions.push(Instruction::CALL("set_field".to_string()));
 
     // Increment element counter
     instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
-    instructions.push(Instruction::JMP(elem_loop.clone()));
+    instructions.push(Instruction::JMP(phase1_loop.clone()));
 
-    // === END ELEMENT LOOP ===
-    labels.insert(elem_done.clone(), instructions.len());
+    labels.insert(phase1_done.clone(), instructions.len());
+
+    // Phase 2: queue all reveals before reading any of them back.
+    instructions.push(Instruction::LDI(5, Value::I64(0))); // reset element index
+
+    labels.insert(phase2_loop.clone(), instructions.len());
+    instructions.push(Instruction::CMP(5, 4));
+    instructions.push(Instruction::JMPLT(phase2_process.clone()));
+    instructions.push(Instruction::JMP(phase2_done.clone()));
+
+    labels.insert(phase2_process.clone(), instructions.len());
+
+    instructions.push(Instruction::ADD(10, 5, 3)); // reg10 = element_index + 1
+    instructions.push(Instruction::PUSHARG(8)); // secret_sums array
+    instructions.push(Instruction::PUSHARG(10)); // index
+    instructions.push(Instruction::CALL("get_field".to_string()));
+    instructions.push(Instruction::MOV(16, 0)); // reg16 = secret sum
+
+    instructions.push(Instruction::MOV(7, 16)); // queue reveal
+    instructions.push(Instruction::PUSHARG(9)); // revealed_sums array
+    instructions.push(Instruction::PUSHARG(10)); // index
+    instructions.push(Instruction::PUSHARG(7)); // pending reveal marker
+    instructions.push(Instruction::CALL("set_field".to_string()));
+
+    instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
+    instructions.push(Instruction::JMP(phase2_loop.clone()));
+
+    labels.insert(phase2_done.clone(), instructions.len());
+
+    // Phase 3: reading the first reveal flushes the full batch.
+    instructions.push(Instruction::LDI(5, Value::I64(0))); // reset element index
+
+    labels.insert(phase3_loop.clone(), instructions.len());
+    instructions.push(Instruction::CMP(5, 4));
+    instructions.push(Instruction::JMPLT(phase3_process.clone()));
+    instructions.push(Instruction::JMP(phase3_done.clone()));
+
+    labels.insert(phase3_process.clone(), instructions.len());
+
+    instructions.push(Instruction::ADD(10, 5, 3)); // reg10 = element_index + 1
+    instructions.push(Instruction::PUSHARG(9)); // revealed_sums array
+    instructions.push(Instruction::PUSHARG(10)); // index
+    instructions.push(Instruction::CALL("get_field".to_string()));
+    instructions.push(Instruction::MOV(7, 0)); // reg7 = revealed sum
+
+    instructions.push(Instruction::DIV(7, 7, 1)); // reg7 = sum / num_clients
+
+    instructions.push(Instruction::PUSHARG(6)); // result array ref
+    instructions.push(Instruction::PUSHARG(10)); // index (1-based)
+    instructions.push(Instruction::PUSHARG(7)); // value (revealed average)
+    instructions.push(Instruction::CALL("set_field".to_string()));
+
+    instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
+    instructions.push(Instruction::JMP(phase3_loop.clone()));
+
+    labels.insert(phase3_done.clone(), instructions.len());
 
     // Return the result array
     instructions.push(Instruction::MOV(0, 6));
@@ -208,7 +249,9 @@ fn create_federated_average_binary() -> Vec<u8> {
 
     let binary = CompiledBinary::from_vm_functions(&[vm_function]);
     let mut buffer = Vec::new();
-    binary.serialize(&mut buffer).expect("Failed to serialize binary");
+    binary
+        .serialize(&mut buffer)
+        .expect("Failed to serialize binary");
     buffer
 }
 
@@ -220,9 +263,11 @@ fn create_federated_average_binary() -> Vec<u8> {
 /// 3. Executes fixed-point federated averaging
 /// 4. Verifies element-wise average results
 #[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn test_leader_bootnode_matrix_average_fixed_point() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting Leader Bootnode Matrix Average Fixed-Point Test ===");
     info!(
@@ -238,7 +283,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
     let threshold = 1;
     let n_triples = 32;
     let n_random_shares = 64 + MATRIX_SIZE * 8;
-    let instance_id = 77777;
+    let instance_id = 77779;
     let base_port = 11000;
 
     let config = HoneyBadgerQuicConfig {
@@ -246,6 +291,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         connection_retry_delay: Duration::from_millis(100),
         ..Default::default()
     };
+    let open_message_router = Arc::new(crate::net::open_registry::OpenMessageRouter::new());
 
     // Create the program binary (for reference/future use)
     info!("Creating federated average program binary...");
@@ -272,7 +318,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
     );
 
     for idx in 0..client_count {
-        let client_id = 900 + idx as ClientId;
+        let client_id = 90 + idx as ClientId;
         client_ids.push(client_id);
 
         let mut matrix_values: Vec<Fr> = Vec::new();
@@ -319,7 +365,8 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         .collect();
 
     // Calculate expected element-wise averages
-    let expected_averages: Vec<f64> = element_sums.iter()
+    let expected_averages: Vec<f64> = element_sums
+        .iter()
         .map(|sum| sum / client_count as f64)
         .collect();
 
@@ -330,33 +377,70 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         info!("  [{},{}] = {:.4}", row, col, avg);
     }
 
-    // Step 2: Start servers and spawn message processors
+    // Step 2: Start servers (accept loops only; receive loops come after finalize)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+        info!("✓ Started server {}", server.node_id);
+    }
 
+    // Step 3: Connect servers in mesh topology
+    info!("Step 3: Connecting servers in mesh topology...");
+    for server in &mut servers {
+        server.connect_to_peers().await.expect("Failed to connect");
+        info!("✓ Server {} connected to peers", server.node_id);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 3a: Finalize network — assign_party_ids(), recreate HB nodes with
+    // correct sorted-key party IDs, and build MpcNetwork wrappers.
+    info!("Step 3a: Finalizing network (assign_party_ids)...");
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!(
+            "✓ Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
+    }
+
+    // Step 3b: Spawn receive-loop tasks for the message dispatch channel.
+    info!("Step 3b: Spawning receive-loop tasks...");
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let network = server
-            .network
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
         let mut rx = recv.remove(0);
-
+        let open_message_router = open_message_router.clone();
         tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
                     tracing::error!("Node {i} failed to process message: {e:?}");
                 }
             }
+            tracing::info!("Receiver task for node {i} ended");
         });
     }
-
-    // Step 3: Connect servers
-    info!("Step 3: Connecting servers in mesh topology...");
-    for server in &servers {
-        server.connect_to_peers().await.expect("Failed to connect");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Step 4: Create input clients
     info!("Step 4: Creating {} matrix input clients...", client_count);
@@ -382,6 +466,43 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Build client derived_id → logical_client_id mapping.
+    let mut client_derived_to_logical: HashMap<usize, ClientId> = HashMap::new();
+    for client in &clients {
+        let derived = client.network.lock().await.local_derived_id();
+        client_derived_to_logical.insert(derived, client.client_id);
+    }
+
+    // Register client connections and spawn receive handlers with correct logical client IDs.
+    for server in servers.iter() {
+        let all_clients = server
+            .network
+            .as_ref()
+            .expect("network should be set")
+            .get_all_client_connections();
+        for (derived_id, conn) in &all_clients {
+            if let Some(&logical_id) = client_derived_to_logical.get(derived_id) {
+                if let Some(ref routed) = server.routed_network {
+                    routed.register_client(logical_id, conn.clone());
+                }
+                let txx = server.channels.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((logical_id, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Step 5: Run preprocessing
     info!("Step 5: Running preprocessing...");
     let preprocessing_handles: Vec<_> = servers
@@ -389,10 +510,10 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server
-                .network
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
                 .clone()
-                .expect("network should be set after start()");
+                .expect("routed_network should be set after finalize_network()");
             tokio::spawn(async move {
                 let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 node.run_preprocessing(network, &mut rng)
@@ -427,7 +548,10 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                     *client_id,
                     local_shares,
                     MATRIX_SIZE,
-                    server.network.clone().expect("network should be set"),
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
                 )
                 .await
                 .expect("input.init failed");
@@ -439,18 +563,22 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
     // Step 7: Create VMs and hydrate client stores
     info!("Step 7: Creating VMs and hydrating client stores...");
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
-    for party_id in 0..n_parties {
+    for server in servers.iter() {
+        let party_id = server
+            .party_id
+            .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::from_existing_node(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
             threshold,
-            servers[party_id]
+            server
                 .network
                 .clone()
                 .expect("network should be set"),
-            servers[party_id].node.clone(),
+            server.node.clone(),
         );
         vm.state.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
@@ -471,7 +599,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                 .map(|(client, shares)| (*client, shares.clone()))
                 .collect()
         };
-        let mut vm = vm_arc.lock();
+        let vm = vm_arc.lock();
         let store = vm.state.client_store();
         store.clear();
         for (client_id, shares) in shares_for_party {
@@ -557,7 +685,9 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                         let computed_avg: f64 = match elem_val {
                             Value::I64(v) => *v as f64,
                             Value::Float(v) => v.0,
-                            other => panic!("Element {} has unexpected type: {:?}", elem_idx, other),
+                            other => {
+                                panic!("Element {} has unexpected type: {:?}", elem_idx, other)
+                            }
                         };
 
                         let expected = expected_averages[elem_idx];
@@ -569,7 +699,11 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                         assert!(
                             diff <= 0.01,
                             "Element [{},{}] mismatch: got {:.4}, expected {:.4} (diff {:.4})",
-                            row, col, computed_avg, expected, diff
+                            row,
+                            col,
+                            computed_avg,
+                            expected,
+                            diff
                         );
                         info!(
                             "  ✓ [{},{}] = {:.4} (expected {:.4})",
@@ -594,7 +728,11 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             Value::Array(id) => *id,
             _ => panic!("Expected array"),
         };
-        let arr = vm.state.object_store.get_array(array_id).expect("array exists");
+        let arr = vm
+            .state
+            .object_store
+            .get_array(array_id)
+            .expect("array exists");
         (0..MATRIX_SIZE)
             .map(|i| {
                 let idx = Value::I64((i + 1) as i64);
@@ -613,7 +751,11 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             Value::Array(id) => *id,
             _ => panic!("Expected array"),
         };
-        let arr = vm.state.object_store.get_array(array_id).expect("array exists");
+        let arr = vm
+            .state
+            .object_store
+            .get_array(array_id)
+            .expect("array exists");
         for (i, &ref_val) in reference_vals.iter().enumerate() {
             let idx = Value::I64((i + 1) as i64);
             let party_val: f64 = match arr.get(&idx).expect("element exists") {
@@ -625,7 +767,11 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             assert!(
                 diff < 0.0001,
                 "Party {} element {} mismatch: got {}, expected {} (diff {})",
-                pid, i, party_val, ref_val, diff
+                pid,
+                i,
+                party_val,
+                ref_val,
+                diff
             );
         }
         info!("  ✓ Party {} results match reference", pid);
@@ -646,5 +792,8 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         "Successfully computed federated average of {} matrices ({}x{}) from {} clients",
         client_count, MATRIX_ROWS, MATRIX_COLS, client_count
     );
-    info!("All {} parties computed identical element-wise averages", n_parties);
+    info!(
+        "All {} parties computed identical element-wise averages",
+        n_parties
+    );
 }

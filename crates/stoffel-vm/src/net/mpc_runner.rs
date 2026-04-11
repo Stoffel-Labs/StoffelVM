@@ -10,7 +10,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use stoffel_vm::net::mpc_runner::MpcRunner;
 //!
 //! let runner = MpcRunner::new(vm, mpc_engine);
@@ -24,7 +24,9 @@ use crate::net::mpc_engine::{MpcEngine, MpcEngineClientOps};
 use ark_bls12_381::Fr;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use stoffelmpc_mpc::common::rbc::rbc::Avid as RBCImpl;
+use stoffelmpc_mpc::common::rbc::rbc::Avid;
+use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
+type RBCImpl = Avid<HbSessionId>;
 use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNode;
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::task::JoinHandle;
@@ -120,7 +122,7 @@ impl MpcRunner {
         node: HoneyBadgerMPCNode<Fr, RBCImpl>,
     ) -> Self {
         let mut vm = VirtualMachine::new();
-        let mpc_engine = HoneyBadgerMpcEngine::from_existing_node(
+        let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             instance_id,
             party_id,
             n_parties,
@@ -147,7 +149,7 @@ impl MpcRunner {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```text
     /// let handle = tokio::spawn(async move {
     ///     while let Some(raw_msg) = receiver.recv().await {
     ///         node.process(raw_msg, network.clone()).await.ok();
@@ -321,7 +323,7 @@ impl MpcRunnerBuilder {
         node: HoneyBadgerMPCNode<Fr, RBCImpl>,
     ) -> MpcRunner {
         let mut vm = VirtualMachine::new();
-        let mpc_engine = HoneyBadgerMpcEngine::from_existing_node(
+        let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node(
             self.instance_id,
             self.party_id,
             self.n_parties,

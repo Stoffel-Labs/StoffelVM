@@ -1,42 +1,177 @@
 use crate::net::client_store::ClientInputStore;
+use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
 use crate::net::mpc::honeybadger_node_opts;
-use crate::net::mpc_engine::{AsyncMpcEngineConsensus, MpcEngine, MpcEngineClientOps, MpcEngineConsensus};
-use ark_bls12_381::Fr;
-use ark_ff::PrimeField;
+use crate::net::mpc_engine::{
+    AsyncMpcEngineConsensus, MpcEngine, MpcEngineClientOps, MpcEngineConsensus,
+};
+use ark_ec::{CurveGroup, PrimeGroup};
+use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
+use serde::{Deserialize, Serialize};
+use std::any::TypeId;
+use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::time::Duration;
-use stoffel_vm_types::core_types::{BOOLEAN_SECRET_INT_BITS, F64, ShareType, Value};
+use stoffel_vm_types::core_types::{ShareData, ShareType, Value, BOOLEAN_SECRET_INT_BITS};
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerError, HoneyBadgerMPCNode};
-use stoffelnet::network_utils::ClientId;
+use stoffelnet::network_utils::{ClientId, Network};
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
 
 // RBC/SSS type aliases used by HB implementation
-use stoffelmpc_mpc::common::rbc::rbc::Avid as RBCImpl;
+use stoffelmpc_mpc::common::rbc::rbc::Avid;
+use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
+type RBCImpl = Avid<HbSessionId>;
+
+const EXP_OPEN_WIRE_PREFIX: &[u8; 4] = b"XOP1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpOpenWireMessage {
+    instance_id: u64,
+    sender_party_id: usize,
+    share_id: usize,
+    partial_point: Vec<u8>,
+}
+
+#[derive(Default, Clone)]
+struct ExpOpenAccumulator {
+    partial_points: Vec<(usize, Vec<u8>)>, // (share_id, serialized affine point)
+    party_ids: Vec<usize>,
+    result: Option<Vec<u8>>,
+    /// Set when `result` is first cached; used for eviction.
+    result_cached_at: Option<std::time::Instant>,
+}
+
+/// Completed entries older than this are evicted on the next insertion.
+const EXP_EVICTION_AGE: Duration = Duration::from_secs(60);
+
+static EXP_REGISTRY: once_cell::sync::Lazy<
+    parking_lot::Mutex<HashMap<(u64, usize), ExpOpenAccumulator>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Notified after every insertion into [`EXP_REGISTRY`].
+static EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
+    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+
+/// Clear the exponentiation-domain open registry. Useful between test cases.
+#[allow(dead_code)]
+pub(crate) fn clear_exp_registry() {
+    EXP_REGISTRY.lock().clear();
+}
+
+fn insert_remote_exp_partial(
+    instance_id: u64,
+    sender_party_id: usize,
+    share_id: usize,
+    partial_point: Vec<u8>,
+) {
+    let mut reg = EXP_REGISTRY.lock();
+    // Evict completed entries older than EXP_EVICTION_AGE.
+    let now = std::time::Instant::now();
+    reg.retain(|_, acc| {
+        acc.result_cached_at
+            .is_none_or(|t| now.duration_since(t) < EXP_EVICTION_AGE)
+    });
+    let mut seq = 0usize;
+    loop {
+        let key = (instance_id, seq);
+        let entry = reg.entry(key).or_default();
+        if !entry.party_ids.contains(&sender_party_id) {
+            entry.partial_points.push((share_id, partial_point));
+            entry.party_ids.push(sender_party_id);
+            break;
+        }
+        seq += 1;
+    }
+    drop(reg);
+    EXP_NOTIFY.notify_waiters();
+}
+
+pub(crate) fn try_handle_open_exp_wire_message(
+    authenticated_sender_id: usize,
+    payload: &[u8],
+) -> Result<bool, String> {
+    if payload.len() < EXP_OPEN_WIRE_PREFIX.len()
+        || &payload[..EXP_OPEN_WIRE_PREFIX.len()] != EXP_OPEN_WIRE_PREFIX
+    {
+        return Ok(false);
+    }
+
+    let message: ExpOpenWireMessage = bincode::deserialize(&payload[EXP_OPEN_WIRE_PREFIX.len()..])
+        .map_err(|e| format!("deserialize open-exp payload: {}", e))?;
+
+    if authenticated_sender_id == crate::net::open_registry::UNKNOWN_SENDER_ID {
+        tracing::warn!(
+            sender_party_id = message.sender_party_id,
+            "Rejecting open-exp wire message from unauthenticated connection"
+        );
+        return Err("open-exp wire rejected: sender identity not authenticated".to_string());
+    }
+    if message.sender_party_id != authenticated_sender_id {
+        return Err(format!(
+            "open-exp sender mismatch: transport={} payload={}",
+            authenticated_sender_id, message.sender_party_id
+        ));
+    }
+
+    if message.share_id != message.sender_party_id {
+        return Err(format!(
+            "open-exp share_id mismatch: sender_party_id={} share_id={}",
+            message.sender_party_id, message.share_id
+        ));
+    }
+
+    insert_remote_exp_partial(
+        message.instance_id,
+        message.sender_party_id,
+        message.share_id,
+        message.partial_point,
+    );
+    Ok(true)
+}
 
 /// HoneyBadger-backed MPC engine that integrates with the VM.
 /// This wraps a real HoneyBadgerMPCNode and provides MPC operations
 /// (input sharing, multiplication, output reconstruction) to the VM.
-pub struct HoneyBadgerMpcEngine {
+pub struct HoneyBadgerMpcEngine<F = ark_bls12_381::Fr, G = ark_bls12_381::G1Projective>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     instance_id: u64,
     party_id: usize,
     n: usize,
     t: usize,
     net: Arc<QuicNetworkManager>,
-    node: Arc<Mutex<HoneyBadgerMPCNode<Fr, RBCImpl>>>,
+    node: Arc<Mutex<HoneyBadgerMPCNode<F, RBCImpl>>>,
     ready: AtomicBool,
     /// Session counter for multiplication operations
+    #[allow(dead_code)]
     mul_session_counter: Arc<Mutex<usize>>,
+    open_registry: Option<Arc<crate::net::open_registry::InstanceRegistry>>,
+    group_marker: PhantomData<G>,
 }
 
-impl HoneyBadgerMpcEngine {
+pub type Bls12381HoneyBadgerMpcEngine =
+    HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>;
+pub type Bn254HoneyBadgerMpcEngine = HoneyBadgerMpcEngine<ark_bn254::Fr, ark_bn254::G1Projective>;
+pub type Curve25519HoneyBadgerMpcEngine =
+    HoneyBadgerMpcEngine<ark_curve25519::Fr, ark_curve25519::EdwardsProjective>;
+pub type Ed25519HoneyBadgerMpcEngine =
+    HoneyBadgerMpcEngine<ark_ed25519::Fr, ark_ed25519::EdwardsProjective>;
+
+impl<F, G> HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     /// Fully async startup + preprocessing
     pub async fn start_async(&self) -> Result<(), String> {
         self.preprocess().await
@@ -59,7 +194,7 @@ impl HoneyBadgerMpcEngine {
         ty: ShareType,
         left: &[u8],
         right: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<ShareData, String> {
         if !self.is_ready() {
             return Err("MPC engine not ready".into());
         }
@@ -77,17 +212,19 @@ impl HoneyBadgerMpcEngine {
                 // Lock node and perform multiplication
                 // node.mul() returns the result directly (via internal wait_for_result)
                 let mut node = self.node.lock().await;
-                let result_shares = node.mul(x_shares, y_shares, self.net.clone())
+                let result_shares = node
+                    .mul(x_shares, y_shares, self.net.clone())
                     .await
                     .map_err(|e| format!("MPC multiplication failed: {:?}", e))?;
 
                 // Get the first result share
-                let result_share = result_shares.into_iter().next()
+                let result_share = result_shares
+                    .into_iter()
+                    .next()
                     .ok_or_else(|| "Multiplication returned no shares".to_string())?;
 
-                Self::encode_share(&result_share)
+                Self::encode_share(&result_share).map(ShareData::Opaque)
             }
-            _ => Err("Unsupported share type for multiply_share".to_string()),
         }
     }
 
@@ -113,7 +250,7 @@ impl HoneyBadgerMpcEngine {
     pub async fn init_client_input(
         &self,
         client_id: ClientId,
-        shares: Vec<RobustShare<Fr>>,
+        shares: Vec<RobustShare<F>>,
     ) -> Result<(), String> {
         if !self.is_ready() {
             return Err("MPC engine not ready".into());
@@ -140,10 +277,10 @@ impl HoneyBadgerMpcEngine {
     async fn reserve_random_shares(
         &self,
         num_shares: usize,
-    ) -> Result<Vec<RobustShare<Fr>>, String> {
+    ) -> Result<Vec<RobustShare<F>>, String> {
         loop {
             let attempt = {
-                let mut node = self.node.lock().await;
+                let node = self.node.lock().await;
                 let mut prep_material = node.preprocessing_material.lock().await;
                 prep_material.take_random_shares(num_shares)
             };
@@ -184,7 +321,7 @@ impl HoneyBadgerMpcEngine {
     pub async fn get_client_shares(
         &self,
         client_id: ClientId,
-    ) -> Result<Vec<RobustShare<Fr>>, String> {
+    ) -> Result<Vec<RobustShare<F>>, String> {
         let all_inputs = self.wait_for_inputs().await?;
         all_inputs
             .get(&client_id)
@@ -208,7 +345,7 @@ impl HoneyBadgerMpcEngine {
     /// Note: This method waits for all inputs to be received before returning.
     pub async fn get_all_client_inputs(
         &self,
-    ) -> Result<Vec<(ClientId, Vec<RobustShare<Fr>>)>, String> {
+    ) -> Result<Vec<(ClientId, Vec<RobustShare<F>>)>, String> {
         let all_inputs = self.wait_for_inputs().await?;
         Ok(all_inputs
             .into_iter()
@@ -219,7 +356,9 @@ impl HoneyBadgerMpcEngine {
     /// Wait for all client inputs to be received
     ///
     /// Uses the InputServer's wait_for_all_inputs method with a default timeout.
-    async fn wait_for_inputs(&self) -> Result<std::collections::HashMap<ClientId, Vec<RobustShare<Fr>>>, String> {
+    async fn wait_for_inputs(
+        &self,
+    ) -> Result<std::collections::HashMap<ClientId, Vec<RobustShare<F>>>, String> {
         let mut node = self.node.lock().await;
         node.preprocess
             .input
@@ -271,11 +410,7 @@ impl HoneyBadgerMpcEngine {
                     count += 1;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to get shares for client {}: {}",
-                        client_id,
-                        e
-                    );
+                    tracing::warn!("Failed to get shares for client {}: {}", client_id, e);
                 }
             }
         }
@@ -293,12 +428,12 @@ impl HoneyBadgerMpcEngine {
         input_ids: Vec<ClientId>,
     ) -> Result<Arc<Self>, String> {
         // Create the MPC node options
-        let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
+        let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id)?;
 
         // Create the MPC node
-        let node = <HoneyBadgerMPCNode<Fr, RBCImpl> as MPCProtocol<
-            Fr,
-            RobustShare<Fr>,
+        let node = <HoneyBadgerMPCNode<F, RBCImpl> as MPCProtocol<
+            F,
+            RobustShare<F>,
             QuicNetworkManager,
         >>::setup(party_id, mpc_opts, input_ids)
         .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
@@ -312,6 +447,8 @@ impl HoneyBadgerMpcEngine {
             node: Arc::new(Mutex::new(node)),
             ready: AtomicBool::new(false),
             mul_session_counter: Arc::new(Mutex::new(0)),
+            open_registry: None,
+            group_marker: PhantomData,
         }))
     }
 
@@ -323,7 +460,7 @@ impl HoneyBadgerMpcEngine {
         n: usize,
         t: usize,
         net: Arc<QuicNetworkManager>,
-        node: HoneyBadgerMPCNode<Fr, RBCImpl>,
+        node: HoneyBadgerMPCNode<F, RBCImpl>,
     ) -> Arc<Self> {
         // Wrap the provided node so this engine can access it via async locks.
         // Note: This currently clones/moves a node instance rather than sharing the
@@ -341,15 +478,298 @@ impl HoneyBadgerMpcEngine {
             // Assume the provided node has been preprocessed already in tests; callers can override via start()/preprocess().
             ready: AtomicBool::new(true),
             mul_session_counter: Arc::new(Mutex::new(0)),
+            open_registry: None,
+            group_marker: PhantomData,
         })
     }
 
+    /// Construct an engine from an existing node while scoping open-share
+    /// traffic to a shared session-local router.
+    pub fn from_existing_node_with_router(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        net: Arc<QuicNetworkManager>,
+        node: HoneyBadgerMPCNode<F, RBCImpl>,
+    ) -> Arc<Self> {
+        let node = Arc::new(Mutex::new(node));
+        Arc::new(Self {
+            instance_id,
+            party_id,
+            n,
+            t,
+            net,
+            node,
+            ready: AtomicBool::new(true),
+            mul_session_counter: Arc::new(Mutex::new(0)),
+            open_registry: Some(open_message_router.register_instance(instance_id)),
+            group_marker: PhantomData,
+        })
+    }
+
+    /// Returns a handle to the inner MPC node for direct access (e.g., InputServer init).
+    pub fn node_handle(&self) -> &Arc<Mutex<HoneyBadgerMPCNode<F, RBCImpl>>> {
+        &self.node
+    }
+
+    /// Pull one pre-generated random share from the preprocessing pool.
+    /// If the pool is empty, `reserve_random_shares` auto-regenerates via
+    /// the RanSha protocol over the network.
+    pub async fn random_share_async_impl(&self, _ty: ShareType) -> Result<ShareData, String> {
+        let shares = self.reserve_random_shares(1).await?;
+        Self::encode_share(&shares[0]).map(ShareData::Opaque)
+    }
+
+    fn encode_open_exp_wire_message(
+        instance_id: u64,
+        sender_party_id: usize,
+        share_id: usize,
+        partial_point: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let payload = ExpOpenWireMessage {
+            instance_id,
+            sender_party_id,
+            share_id,
+            partial_point: partial_point.to_vec(),
+        };
+        let encoded = bincode::serialize(&payload)
+            .map_err(|e| format!("serialize open-exp payload: {}", e))?;
+        let mut out = Vec::with_capacity(EXP_OPEN_WIRE_PREFIX.len() + encoded.len());
+        out.extend_from_slice(EXP_OPEN_WIRE_PREFIX);
+        out.extend_from_slice(&encoded);
+        Ok(out)
+    }
+
+    async fn broadcast_open_exp_payload(&self, payload: Vec<u8>) -> Result<(), String> {
+        for peer_id in 0..self.n {
+            if peer_id == self.party_id {
+                continue;
+            }
+            self.net.send(peer_id, &payload).await.map_err(|e| {
+                format!(
+                    "Failed to send open-exp payload to party {}: {}",
+                    peer_id, e
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn broadcast_open_exp_payload_sync(&self, payload: Vec<u8>) -> Result<(), String> {
+        crate::net::block_on_current(self.broadcast_open_exp_payload(payload))
+    }
+
+    async fn broadcast_open_registry_payload(&self, payload: Vec<u8>) -> Result<(), String> {
+        for peer_id in 0..self.n {
+            if peer_id == self.party_id {
+                continue;
+            }
+            self.net
+                .send(peer_id, &payload)
+                .await
+                .map_err(|e| format!("Failed to send open payload to party {}: {}", peer_id, e))?;
+        }
+        Ok(())
+    }
+
+    fn broadcast_open_registry_payload_sync(&self, payload: Vec<u8>) -> Result<(), String> {
+        crate::net::block_on_current(self.broadcast_open_registry_payload(payload))
+    }
+
+    /// Reveal a share in the exponent using transport-backed contribution exchange.
+    ///
+    /// Each party computes `share_value * generator`, broadcasts its partial point,
+    /// and reconstructs `[secret] * generator` once `2t+1` contributions are available.
+    pub fn open_share_in_exp_impl(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        // Decode the share
+        let share = Self::decode_share(share_bytes)?;
+
+        // Decode the generator point
+        let generator = G::deserialize_compressed(&generator_bytes[..])
+            .map_err(|e| format!("deserialize generator: {}", e))?;
+
+        // Compute partial point: share_value * generator
+        let partial_point = generator * share.share[0];
+
+        // Serialize the partial point
+        let mut partial_bytes = Vec::new();
+        partial_point
+            .into_affine()
+            .serialize_compressed(&mut partial_bytes)
+            .map_err(|e| format!("serialize partial point: {}", e))?;
+
+        let wire_message = Self::encode_open_exp_wire_message(
+            self.instance_id,
+            self.party_id,
+            share.id,
+            &partial_bytes,
+        )?;
+        self.broadcast_open_exp_payload_sync(wire_message)?;
+
+        let required = 2 * self.t + 1;
+        let instance_id = self.instance_id;
+        let party_id = self.party_id;
+        let n = self.n;
+
+        // Closure that checks the registry and returns the result or reconstructs.
+        // Returns Ok(Some(bytes)) when done, Ok(None) when more contributions needed.
+        let try_check = |my_sequence: &mut Option<usize>,
+                         partial_bytes: &[u8],
+                         share_id: usize|
+         -> Result<Option<Vec<u8>>, String> {
+            let mut reg = EXP_REGISTRY.lock();
+
+            if my_sequence.is_none() {
+                let mut seq = 0;
+                loop {
+                    let key = (instance_id, seq);
+                    let entry = reg.entry(key).or_insert_with(ExpOpenAccumulator::default);
+
+                    if !entry.party_ids.contains(&party_id) {
+                        entry
+                            .partial_points
+                            .push((share_id, partial_bytes.to_vec()));
+                        entry.party_ids.push(party_id);
+                        *my_sequence = Some(seq);
+                        break;
+                    }
+                    seq += 1;
+                }
+            }
+
+            let seq = my_sequence.expect("sequence must be set after insertion");
+            let key = (instance_id, seq);
+            let entry = reg
+                .get_mut(&key)
+                .expect("exp registry entry must exist after insertion");
+
+            if let Some(result) = entry.result.clone() {
+                return Ok(Some(result));
+            }
+
+            if entry.partial_points.len() >= required {
+                let collected: Vec<(usize, Vec<u8>)> = entry
+                    .partial_points
+                    .iter()
+                    .take(required)
+                    .cloned()
+                    .collect();
+
+                let mut points: Vec<(usize, G)> = Vec::with_capacity(collected.len());
+                for (sid, bytes) in &collected {
+                    let pt = <G as CurveGroup>::Affine::deserialize_compressed(&bytes[..])
+                        .map_err(|e| format!("deserialize partial point: {}", e))?;
+                    points.push((*sid, pt.into()));
+                }
+
+                let domain = GeneralEvaluationDomain::<F>::new(n)
+                    .ok_or_else(|| "No suitable FFT domain".to_string())?;
+                let eval_points: Vec<(usize, F)> = points
+                    .iter()
+                    .map(|(id, _)| (*id, domain.element(*id)))
+                    .collect();
+
+                let mut result = G::zero();
+                for (i, (_id_i, pt_i)) in points.iter().enumerate() {
+                    let x_i = eval_points[i].1;
+                    let mut lambda = F::from(1u64);
+                    for (j, _) in points.iter().enumerate() {
+                        if i == j {
+                            continue;
+                        }
+                        let x_j = eval_points[j].1;
+                        let num = -x_j;
+                        let den = x_i - x_j;
+                        lambda *= num
+                            * den
+                                .inverse()
+                                .ok_or_else(|| "zero denominator in Lagrange".to_string())?;
+                    }
+                    result += *pt_i * lambda;
+                }
+
+                let mut result_bytes = Vec::new();
+                result
+                    .into_affine()
+                    .serialize_compressed(&mut result_bytes)
+                    .map_err(|e| format!("serialize result: {}", e))?;
+
+                entry.result = Some(result_bytes.clone());
+                entry.result_cached_at = Some(std::time::Instant::now());
+                return Ok(Some(result_bytes));
+            }
+
+            Ok(None)
+        };
+
+        // Use async Notify when a multi-thread tokio runtime is available.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let deadline =
+                            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+                        let mut my_sequence: Option<usize> = None;
+
+                        loop {
+                            let notified = EXP_NOTIFY.notified();
+
+                            if let Some(result) =
+                                try_check(&mut my_sequence, &partial_bytes, share.id)?
+                            {
+                                return Ok(result);
+                            }
+
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(format!(
+                                    "Timeout waiting for open_share_in_exp contributions"
+                                ));
+                            }
+
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep_until(deadline) => {}
+                            }
+                        }
+                    })
+                });
+            }
+        }
+
+        // Polling fallback.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut my_sequence: Option<usize> = None;
+        loop {
+            if let Some(result) = try_check(&mut my_sequence, &partial_bytes, share.id)? {
+                return Ok(result);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "Timeout waiting for open_share_in_exp contributions"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[allow(dead_code)]
     fn ensure_rt() -> Result<tokio::runtime::Handle, String> {
         tokio::runtime::Handle::try_current()
             .map_err(|e| format!("Tokio runtime not available: {}", e))
     }
 
-    fn encode_share(share: &RobustShare<Fr>) -> Result<Vec<u8>, String> {
+    fn field_to_value(ty: ShareType, secret: F) -> Value {
+        crate::net::curve::field_to_value(ty, secret)
+    }
+
+    fn encode_share(share: &RobustShare<F>) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         share
             .serialize_compressed(&mut out)
@@ -357,8 +777,8 @@ impl HoneyBadgerMpcEngine {
         Ok(out)
     }
 
-    fn decode_share(bytes: &[u8]) -> Result<RobustShare<Fr>, String> {
-        RobustShare::<Fr>::deserialize_compressed(bytes)
+    fn decode_share(bytes: &[u8]) -> Result<RobustShare<F>, String> {
+        RobustShare::<F>::deserialize_compressed(bytes)
             .map_err(|e| format!("deserialize share: {}", e))
     }
 
@@ -375,9 +795,9 @@ impl HoneyBadgerMpcEngine {
         // Deserialize shares from bytes
         // If input_len == 1, try to deserialize as a single RobustShare first
         // (Value::Share stores a single share's bytes)
-        let shares: Vec<RobustShare<Fr>> = if input_len == 1 {
+        let shares: Vec<RobustShare<F>> = if input_len == 1 {
             // Try to deserialize as a single share
-            let single_share: RobustShare<Fr> =
+            let single_share: RobustShare<F> =
                 CanonicalDeserialize::deserialize_compressed(shares_bytes)
                     .map_err(|e| format!("Failed to deserialize single share: {:?}", e))?;
             vec![single_share]
@@ -404,7 +824,11 @@ impl HoneyBadgerMpcEngine {
     }
 }
 
-impl MpcEngine for HoneyBadgerMpcEngine {
+impl<F, G> MpcEngine for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     fn protocol_name(&self) -> &'static str {
         "honeybadger-mpc"
     }
@@ -421,16 +845,16 @@ impl MpcEngine for HoneyBadgerMpcEngine {
         Ok(())
     }
 
-    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<Vec<u8>, String> {
+    fn input_share(&self, ty: ShareType, clear: &Value) -> Result<ShareData, String> {
         // Minimal support: ShareType::Int over Fr via direct embedding (u64 -> Fr).
         match (ty, clear) {
             (ShareType::SecretInt { .. }, Value::I64(v)) => {
-                let secret = Fr::from(*v as u64);
-                let mut rng = ark_std::test_rng();
+                let secret = crate::net::curve::field_from_i64::<F>(*v);
+                let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
                 let my = &shares[self.party_id];
-                Self::encode_share(my)
+                Self::encode_share(my).map(ShareData::Opaque)
             }
             (
                 ShareType::SecretInt {
@@ -438,12 +862,12 @@ impl MpcEngine for HoneyBadgerMpcEngine {
                 },
                 Value::Bool(b),
             ) => {
-                let secret = if *b { Fr::from(1u64) } else { Fr::from(0u64) };
-                let mut rng = ark_std::test_rng();
+                let secret = if *b { F::from(1u64) } else { F::from(0u64) };
+                let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
                 let my = &shares[self.party_id];
-                Self::encode_share(my)
+                Self::encode_share(my).map(ShareData::Opaque)
             }
             (ShareType::SecretFixedPoint { precision }, Value::Float(fp)) => {
                 // Convert f64 to fixed-point scaled integer
@@ -451,310 +875,128 @@ impl MpcEngine for HoneyBadgerMpcEngine {
                 let f = precision.f();
                 let scale = (1u64 << f) as f64;
                 let scaled_value = (fp.0 * scale) as i64;
-                // Map to field (handle negative values by wrapping)
-                let secret = if scaled_value >= 0 {
-                    Fr::from(scaled_value as u64)
-                } else {
-                    // For negative values, use field modular arithmetic
-                    -Fr::from((-scaled_value) as u64)
-                };
-                let mut rng = ark_std::test_rng();
+                let secret = crate::net::curve::field_from_i64(scaled_value);
+                let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
                 let shares = RobustShare::compute_shares(secret, self.n, self.t, None, &mut rng)
                     .map_err(|e| format!("compute_shares: {:?}", e))?;
                 let my = &shares[self.party_id];
-                Self::encode_share(my)
+                Self::encode_share(my).map(ShareData::Opaque)
             }
             _ => Err("Unsupported type for input_share".to_string()),
         }
     }
 
-    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
-        // Execute the async version without attempting to create a nested runtime.
-        // If we're already inside a Tokio runtime (which is the case in #[tokio::test]
-        // and most server code), use block_in_place on a multi-thread runtime to
-        // synchronously wait for the future without deadlocking.
-        // Otherwise, create a fresh runtime and block_on.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                // Inside a Tokio runtime; avoid panic by using block_in_place on multi-thread.
-                // If the runtime is current_thread, block_in_place will panic; in that case,
-                // return a clear error to guide callers (our tests use multi-thread runtime).
-                #[allow(deprecated)]
-                {
-                    // RuntimeFlavor is available on stable Tokio; use it to guard block_in_place
-                    match handle.runtime_flavor() {
-                        tokio::runtime::RuntimeFlavor::MultiThread => {
-                            tokio::task::block_in_place(|| {
-                                handle.block_on(self.multiply_share_async(ty, left, right))
-                            })
-                        }
-                        tokio::runtime::RuntimeFlavor::CurrentThread => {
-                            Err("MPC multiply_share called from a single-thread Tokio runtime; synchronous waiting is unsupported in this context".to_string())
-                        }
-                        _ => {
-                            // Any other (future) runtime flavor: conservatively refuse to block synchronously.
-                            Err("MPC multiply_share called from an unsupported Tokio runtime flavor for synchronous waiting".to_string())
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                // No Tokio runtime active; create a lightweight current-thread runtime and block.
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.multiply_share_async(ty, left, right))
-            }
-        }
+    fn multiply_share(
+        &self,
+        ty: ShareType,
+        left: &[u8],
+        right: &[u8],
+    ) -> Result<ShareData, String> {
+        crate::net::block_on_current(self.multiply_share_async(ty, left, right))
     }
 
     fn open_share(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Value, String> {
-        // In-process aggregator using a global registry of shares; reconstruct when 2t+1 are present.
-        // Each open operation gets a unique session ID to prevent different values being mixed together.
-        //
-        // CRITICAL: All parties must agree on which accumulator to use for each open operation.
-        // We achieve this by having each party find the first accumulator (by sequence number)
-        // that they haven't contributed to yet. Since all parties execute the same bytecode
-        // in the same order, they will all converge on the same accumulator for each open.
-        #[derive(Default, Clone)]
-        struct OpenAccumulator {
-            shares: Vec<Vec<u8>>,
-            party_ids: Vec<usize>, // Track which parties have contributed
-            result: Option<Value>,
-        }
-
-        // Registry: maps (instance_id, sequence, type_string) to accumulator
-        static REGISTRY: once_cell::sync::Lazy<
-            parking_lot::Mutex<std::collections::HashMap<(u64, usize, String), OpenAccumulator>>,
-        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
         let type_key = match ty {
-            ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
+            ShareType::SecretInt { bit_length } => format!("hb-int-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
-                format!("fixed-{}-{}", precision.k(), precision.f())
+                format!("hb-fixed-{}-{}", precision.k(), precision.f())
             }
         };
 
+        // Broadcast our share to all peers so they can reconstruct too
+        let wire_message = crate::net::open_registry::encode_single_share_wire_message(
+            self.instance_id,
+            &type_key,
+            self.party_id,
+            share_bytes,
+        )?;
+        self.broadcast_open_registry_payload_sync(wire_message)?;
+
         let required = 2 * self.t + 1;
-        let mut my_sequence: Option<usize> = None;
+        let n = self.n;
+        let t = self.t;
 
-        loop {
-            let mut reg = REGISTRY.lock();
-
-            // If we haven't contributed yet, find the right accumulator
-            if my_sequence.is_none() {
-                // Find the first sequence number where this party hasn't contributed
-                let mut seq = 0;
-                loop {
-                    let key = (self.instance_id, seq, type_key.clone());
-                    let entry = reg.entry(key).or_insert_with(OpenAccumulator::default);
-
-                    if !entry.party_ids.contains(&self.party_id) {
-                        // This party hasn't contributed here yet - use this accumulator
-                        entry.shares.push(share_bytes.to_vec());
-                        entry.party_ids.push(self.party_id);
-                        my_sequence = Some(seq);
-                        break;
-                    }
-                    seq += 1;
-                }
+        let reconstruct = |collected: &[Vec<u8>]| {
+            let mut shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
+            for bytes in collected {
+                shares.push(Self::decode_share(bytes)?);
             }
 
-            let seq = my_sequence.unwrap();
-            let key = (self.instance_id, seq, type_key.clone());
-            let entry = reg.get_mut(&key).unwrap();
+            tracing::debug!(
+                "open_share reconstruction: n={}, required={}, shares.len()={}",
+                n,
+                required,
+                shares.len()
+            );
 
-            // Check if result is ready
-            if let Some(result) = entry.result.clone() {
-                return Ok(result);
-            }
+            let (_deg, secret) = RobustShare::recover_secret(&shares, n, t)
+                .map_err(|e| format!("recover_secret: {:?}", e))?;
+            Ok(Self::field_to_value(ty, secret))
+        };
 
-            // Check if we have enough shares to reconstruct
-            if entry.shares.len() >= required {
-                let collected: Vec<_> = entry.shares.iter().take(required).cloned().collect();
-                let mut shares: Vec<RobustShare<Fr>> = Vec::with_capacity(collected.len());
-                for bytes in &collected {
-                    shares.push(Self::decode_share(bytes)?);
-                }
-
-                // Debug: log share IDs, degrees, and values being used for reconstruction
-                tracing::info!(
-                    "open_share reconstruction: n={}, t={}, required={}, shares.len()={}",
-                    self.n, self.t, required, shares.len()
-                );
-
-                // Sort shares by ID for interpolation debugging
-                let mut sorted_shares = shares.clone();
-                sorted_shares.sort_by_key(|s| s.id);
-
-                for (i, share) in sorted_shares.iter().enumerate() {
-                    tracing::info!(
-                        "  sorted_share[{}]: id={}, degree={}, value={:?}",
-                        i, share.id, share.degree,
-                        share.share[0].into_bigint().0 // All limbs of the share value
-                    );
-                }
-
-                let (_deg, secret) = RobustShare::recover_secret(&shares, self.n)
-                    .map_err(|e| format!("recover_secret: {:?}", e))?;
-                let value = match ty {
-                    ShareType::SecretInt { .. } if ty.is_boolean() => {
-                        use ark_ff::Zero;
-                        Value::Bool(!secret.is_zero())
-                    }
-                    ShareType::SecretInt { .. } => {
-                        let limbs: [u64; 4] = secret.into_bigint().0;
-                        Value::I64(limbs[0] as i64)
-                    }
-                    ShareType::SecretFixedPoint { precision } => {
-                        let limbs: [u64; 4] = secret.into_bigint().0;
-                        let scaled_value = limbs[0] as i64;
-                        // Convert from fixed-point scaled integer back to f64
-                        let f = precision.f();
-                        let scale = (1u64 << f) as f64;
-                        let float_value = scaled_value as f64 / scale;
-                        Value::Float(F64(float_value))
-                    }
-                };
-                entry.result = Some(value.clone());
-                return Ok(value);
-            }
-
-            drop(reg);
-            std::thread::sleep(Duration::from_millis(5));
+        if let Some(open_registry) = &self.open_registry {
+            open_registry.open_share_wait(
+                self.party_id,
+                &type_key,
+                share_bytes,
+                required,
+                reconstruct,
+            )
+        } else {
+            crate::net::open_registry::open_share_via_registry(
+                self.instance_id,
+                self.party_id,
+                &type_key,
+                share_bytes,
+                required,
+                reconstruct,
+            )
         }
     }
 
     fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
-        if shares.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Batch accumulator: collects shares from all parties for all positions in a batch
-        #[derive(Clone)]
-        struct BatchOpenAccumulator {
-            batch_size: usize,
-            // shares_per_position[pos][contribution_idx] = share_bytes from some party
-            shares_per_position: Vec<Vec<Vec<u8>>>,
-            // Which parties have contributed to this batch
-            party_ids: Vec<usize>,
-            // Cached results once computed
-            results: Option<Vec<Value>>,
-        }
-
-        impl BatchOpenAccumulator {
-            fn new(batch_size: usize) -> Self {
-                Self {
-                    batch_size,
-                    shares_per_position: vec![Vec::new(); batch_size],
-                    party_ids: Vec::new(),
-                    results: None,
-                }
-            }
-        }
-
-        // Registry: maps (instance_id, batch_sequence, type_key, batch_size) to accumulator
-        static BATCH_REGISTRY: once_cell::sync::Lazy<
-            parking_lot::Mutex<std::collections::HashMap<(u64, usize, String, usize), BatchOpenAccumulator>>,
-        > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
         let type_key = match ty {
-            ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
+            ShareType::SecretInt { bit_length } => format!("hb-batch-int-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
-                format!("fixed-{}-{}", precision.k(), precision.f())
+                format!("hb-batch-fixed-{}-{}", precision.k(), precision.f())
             }
         };
 
-        let batch_size = shares.len();
+        // Broadcast our shares to all peers
+        let wire_message = crate::net::open_registry::encode_batch_share_wire_message(
+            self.instance_id,
+            &type_key,
+            self.party_id,
+            shares,
+        )?;
+        self.broadcast_open_registry_payload_sync(wire_message)?;
+
         let required = 2 * self.t + 1;
-        let mut my_sequence: Option<usize> = None;
+        let n = self.n;
+        let t = self.t;
 
-        loop {
-            let mut reg = BATCH_REGISTRY.lock();
-
-            // If we haven't contributed yet, find the right batch accumulator
-            if my_sequence.is_none() {
-                let mut seq = 0;
-                loop {
-                    let key = (self.instance_id, seq, type_key.clone(), batch_size);
-                    let entry = reg.entry(key).or_insert_with(|| BatchOpenAccumulator::new(batch_size));
-
-                    if !entry.party_ids.contains(&self.party_id) {
-                        // This party hasn't contributed to this batch yet
-                        // Add all shares for all positions
-                        for (pos, share_bytes) in shares.iter().enumerate() {
-                            entry.shares_per_position[pos].push(share_bytes.clone());
-                        }
-                        entry.party_ids.push(self.party_id);
-                        my_sequence = Some(seq);
-                        break;
-                    }
-                    seq += 1;
-                }
+        let reconstruct = |collected: &[Vec<u8>], pos: usize| {
+            let mut decoded_shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
+            for bytes in collected {
+                decoded_shares.push(Self::decode_share(bytes)?);
             }
 
-            let seq = my_sequence.unwrap();
-            let key = (self.instance_id, seq, type_key.clone(), batch_size);
-            let entry = reg.get_mut(&key).unwrap();
+            let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, n, t)
+                .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
+            Ok(Self::field_to_value(ty, secret))
+        };
 
-            // Check if results are ready
-            if let Some(results) = entry.results.clone() {
-                return Ok(results);
-            }
-
-            // Check if we have enough contributions from parties
-            if entry.party_ids.len() >= required {
-                // Reconstruct all positions in the batch
-                let mut results = Vec::with_capacity(batch_size);
-
-                for pos in 0..batch_size {
-                    let collected: Vec<_> = entry.shares_per_position[pos]
-                        .iter()
-                        .take(required)
-                        .cloned()
-                        .collect();
-
-                    let mut decoded_shares: Vec<RobustShare<Fr>> = Vec::with_capacity(collected.len());
-                    for bytes in &collected {
-                        decoded_shares.push(Self::decode_share(bytes)?);
-                    }
-
-                    let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, self.n)
-                        .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
-
-                    let value = match ty {
-                        ShareType::SecretInt { .. } if ty.is_boolean() => {
-                            use ark_ff::Zero;
-                            Value::Bool(!secret.is_zero())
-                        }
-                        ShareType::SecretInt { .. } => {
-                            let limbs: [u64; 4] = secret.into_bigint().0;
-                            Value::I64(limbs[0] as i64)
-                        }
-                        ShareType::SecretFixedPoint { precision } => {
-                            let limbs: [u64; 4] = secret.into_bigint().0;
-                            let scaled_value = limbs[0] as i64;
-                            let f = precision.f();
-                            let scale = (1u64 << f) as f64;
-                            let float_value = scaled_value as f64 / scale;
-                            Value::Float(F64(float_value))
-                        }
-                    };
-                    results.push(value);
-                }
-
-                tracing::info!(
-                    "batch_open_shares: reconstructed {} values in batch (instance={}, seq={})",
-                    batch_size, self.instance_id, seq
-                );
-
-                entry.results = Some(results.clone());
-                return Ok(results);
-            }
-
-            drop(reg);
-            std::thread::sleep(Duration::from_millis(5));
+        if let Some(open_registry) = &self.open_registry {
+            open_registry.batch_open_wait(self.party_id, &type_key, shares, required, reconstruct)
+        } else {
+            crate::net::open_registry::batch_open_via_registry(
+                self.instance_id,
+                self.party_id,
+                &type_key,
+                shares,
+                required,
+                reconstruct,
+            )
         }
     }
 
@@ -774,8 +1016,50 @@ impl MpcEngine for HoneyBadgerMpcEngine {
         self.t
     }
 
+    fn curve_config(&self) -> MpcCurveConfig {
+        if TypeId::of::<G>() == TypeId::of::<ark_bls12_381::G1Projective>() {
+            MpcCurveConfig::Bls12_381
+        } else if TypeId::of::<G>() == TypeId::of::<ark_bn254::G1Projective>() {
+            MpcCurveConfig::Bn254
+        } else if TypeId::of::<G>() == TypeId::of::<ark_curve25519::EdwardsProjective>() {
+            MpcCurveConfig::Curve25519
+        } else if TypeId::of::<G>() == TypeId::of::<ark_ed25519::EdwardsProjective>() {
+            MpcCurveConfig::Ed25519
+        } else {
+            F::CURVE_CONFIG
+        }
+    }
+
+    fn capabilities(&self) -> crate::net::mpc_engine::MpcCapabilities {
+        use crate::net::mpc_engine::MpcCapabilities;
+        MpcCapabilities::MULTIPLICATION
+            | MpcCapabilities::OPEN_IN_EXP
+            | MpcCapabilities::CLIENT_INPUT
+            | MpcCapabilities::CONSENSUS
+    }
+
+    fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> {
+        Some(self)
+    }
+    fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> {
+        Some(self)
+    }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    fn random_share(&self, ty: ShareType) -> Result<ShareData, String> {
+        crate::net::block_on_current(self.random_share_async_impl(ty))
+    }
+
+    fn open_share_in_exp(
+        &self,
+        ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.open_share_in_exp_impl(ty, share_bytes, generator_bytes)
     }
 
     fn send_output_to_client(
@@ -784,47 +1068,26 @@ impl MpcEngine for HoneyBadgerMpcEngine {
         shares: &[u8],
         input_len: usize,
     ) -> Result<(), String> {
-        // Execute the async version, handling runtime context appropriately
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                #[allow(deprecated)]
-                match handle.runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(self.send_output_to_client_async_impl(
-                                client_id, shares, input_len,
-                            ))
-                        })
-                    }
-                    tokio::runtime::RuntimeFlavor::CurrentThread => {
-                        Err("send_output_to_client called from a single-thread Tokio runtime; synchronous waiting is unsupported".to_string())
-                    }
-                    _ => {
-                        Err("send_output_to_client called from an unsupported Tokio runtime flavor".to_string())
-                    }
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.send_output_to_client_async_impl(client_id, shares, input_len))
-            }
-        }
+        crate::net::block_on_current(
+            self.send_output_to_client_async_impl(client_id, shares, input_len),
+        )
     }
 }
 
 use crate::net::mpc_engine::AsyncMpcEngine;
 
 #[async_trait::async_trait]
-impl AsyncMpcEngine for HoneyBadgerMpcEngine {
+impl<F, G> AsyncMpcEngine for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     async fn multiply_share_async(
         &self,
         ty: ShareType,
         left: &[u8],
         right: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<ShareData, String> {
         self.multiply_share_async(ty, left, right).await
     }
 
@@ -850,9 +1113,26 @@ impl AsyncMpcEngine for HoneyBadgerMpcEngine {
         self.send_output_to_client_async_impl(client_id, shares, input_len)
             .await
     }
+
+    async fn random_share_async(&self, ty: ShareType) -> Result<ShareData, String> {
+        self.random_share_async_impl(ty).await
+    }
+
+    async fn open_share_in_exp_async(
+        &self,
+        ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.open_share_in_exp_impl(ty, share_bytes, generator_bytes)
+    }
 }
 
-impl MpcEngineClientOps for HoneyBadgerMpcEngine {
+impl<F, G> MpcEngineClientOps for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     fn get_client_ids_sync(&self) -> Vec<ClientId> {
         // Use the async/sync bridging pattern
         match tokio::runtime::Handle::try_current() {
@@ -877,29 +1157,7 @@ impl MpcEngineClientOps for HoneyBadgerMpcEngine {
     }
 
     fn hydrate_client_inputs_sync(&self, store: &ClientInputStore) -> Result<usize, String> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                #[allow(deprecated)]
-                match handle.runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(self.hydrate_client_inputs(store))
-                        })
-                    }
-                    tokio::runtime::RuntimeFlavor::CurrentThread => {
-                        Err("Cannot hydrate client inputs from single-thread Tokio runtime".to_string())
-                    }
-                    _ => Err("Unsupported Tokio runtime flavor".to_string()),
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.hydrate_client_inputs(store))
-            }
-        }
+        crate::net::block_on_current(self.hydrate_client_inputs(store))
     }
 
     fn hydrate_client_inputs_for_sync(
@@ -907,29 +1165,7 @@ impl MpcEngineClientOps for HoneyBadgerMpcEngine {
         store: &ClientInputStore,
         client_ids: &[ClientId],
     ) -> Result<usize, String> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                #[allow(deprecated)]
-                match handle.runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(self.hydrate_client_inputs_for(store, client_ids))
-                        })
-                    }
-                    tokio::runtime::RuntimeFlavor::CurrentThread => {
-                        Err("Cannot hydrate client inputs from single-thread Tokio runtime".to_string())
-                    }
-                    _ => Err("Unsupported Tokio runtime flavor".to_string()),
-                }
-            }
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to build Tokio runtime: {}", e))?;
-                rt.block_on(self.hydrate_client_inputs_for(store, client_ids))
-            }
-        }
+        crate::net::block_on_current(self.hydrate_client_inputs_for(store, client_ids))
     }
 }
 
@@ -949,8 +1185,8 @@ impl MpcEngineClientOps for HoneyBadgerMpcEngine {
 struct RbcRegistry {
     /// Maps (instance_id, session_id, from_party) to message bytes
     messages: std::collections::HashMap<(u64, u64, usize), Vec<u8>>,
-    /// Session counter for generating unique session IDs
-    session_counter: u64,
+    /// Tracks deliveries to receivers: (instance_id, receiver_party, from_party, session_id).
+    delivered: std::collections::HashSet<(u64, usize, usize, u64)>,
 }
 
 /// Registry for ABA sessions - maps (instance_id, session_id) to agreement state
@@ -960,27 +1196,47 @@ struct AbaRegistry {
     proposals: std::collections::HashMap<(u64, u64, usize), bool>,
     /// Maps (instance_id, session_id) to agreed result once consensus is reached
     results: std::collections::HashMap<(u64, u64), bool>,
-    /// Session counter for generating unique session IDs
-    session_counter: u64,
 }
 
 static RBC_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<RbcRegistry>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(RbcRegistry::default()));
 
+/// Notified after every insertion into [`RBC_REGISTRY`].
+static RBC_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
+    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+
 static ABA_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<AbaRegistry>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(AbaRegistry::default()));
 
-impl MpcEngineConsensus for HoneyBadgerMpcEngine {
+/// Notified after every insertion into [`ABA_REGISTRY`].
+static ABA_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
+    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+
+impl<F, G> MpcEngineConsensus for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     fn rbc_broadcast(&self, message: &[u8]) -> Result<u64, String> {
         let mut registry = RBC_REGISTRY.lock();
 
-        // Generate a unique session ID
-        let session_id = registry.session_counter;
-        registry.session_counter += 1;
+        // Assign the earliest session index this party has not used yet for this instance.
+        let mut session_id = 0u64;
+        while registry
+            .messages
+            .contains_key(&(self.instance_id, session_id, self.party_id))
+        {
+            session_id = session_id
+                .checked_add(1)
+                .ok_or_else(|| "RBC session id overflow".to_string())?;
+        }
 
         // Store the message for this party's broadcast
         let key = (self.instance_id, session_id, self.party_id);
         registry.messages.insert(key, message.to_vec());
+        drop(registry);
+
+        RBC_NOTIFY.notify_waiters();
 
         tracing::info!(
             instance_id = self.instance_id,
@@ -994,84 +1250,182 @@ impl MpcEngineConsensus for HoneyBadgerMpcEngine {
     }
 
     fn rbc_receive(&self, from_party: usize, timeout_ms: u64) -> Result<Vec<u8>, String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let instance_id = self.instance_id;
+        let party_id = self.party_id;
 
-        loop {
-            {
-                let registry = RBC_REGISTRY.lock();
-
-                // Look for a message from the specified party
-                // We need to find the session where from_party broadcast
-                for ((inst_id, _session_id, party), message) in registry.messages.iter() {
-                    if *inst_id == self.instance_id && *party == from_party {
-                        tracing::info!(
-                            instance_id = self.instance_id,
-                            from_party = from_party,
-                            message_len = message.len(),
-                            "RBC receive found message"
-                        );
-                        return Ok(message.clone());
-                    }
+        let try_deliver = || -> Option<Vec<u8>> {
+            let mut registry = RBC_REGISTRY.lock();
+            let mut next: Option<(u64, Vec<u8>)> = None;
+            for ((inst_id, session_id, party), message) in registry.messages.iter() {
+                if *inst_id != instance_id || *party != from_party {
+                    continue;
+                }
+                let delivery_key = (instance_id, party_id, from_party, *session_id);
+                if registry.delivered.contains(&delivery_key) {
+                    continue;
+                }
+                match next {
+                    Some((best_session, _)) if *session_id >= best_session => {}
+                    _ => next = Some((*session_id, message.clone())),
                 }
             }
+            if let Some((session_id, message)) = next {
+                registry
+                    .delivered
+                    .insert((instance_id, party_id, from_party, session_id));
+                tracing::info!(
+                    instance_id = instance_id,
+                    session_id = session_id,
+                    from_party = from_party,
+                    message_len = message.len(),
+                    "RBC receive delivered message"
+                );
+                return Some(message);
+            }
+            None
+        };
 
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let deadline = tokio::time::Instant::now()
+                            + tokio::time::Duration::from_millis(timeout_ms);
+                        loop {
+                            let notified = RBC_NOTIFY.notified();
+                            if let Some(msg) = try_deliver() {
+                                return Ok(msg);
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(format!(
+                                    "RBC receive timeout waiting for message from party {}",
+                                    from_party
+                                ));
+                            }
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep_until(deadline) => {}
+                            }
+                        }
+                    })
+                });
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(msg) = try_deliver() {
+                return Ok(msg);
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
                     "RBC receive timeout waiting for message from party {}",
                     from_party
                 ));
             }
-
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
     fn rbc_receive_any(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let instance_id = self.instance_id;
+        let party_id = self.party_id;
 
-        // Track which parties we've already received from
-        let mut received_from = std::collections::HashSet::new();
-
-        loop {
-            {
-                let registry = RBC_REGISTRY.lock();
-
-                // Look for any message we haven't received yet
-                for ((inst_id, _session_id, party), message) in registry.messages.iter() {
-                    if *inst_id == self.instance_id
-                        && *party != self.party_id
-                        && !received_from.contains(party)
-                    {
-                        received_from.insert(*party);
-                        tracing::info!(
-                            instance_id = self.instance_id,
-                            from_party = *party,
-                            message_len = message.len(),
-                            "RBC receive_any found message"
-                        );
-                        return Ok((*party, message.clone()));
-                    }
+        let try_deliver = || -> Option<(usize, Vec<u8>)> {
+            let mut registry = RBC_REGISTRY.lock();
+            let mut next: Option<(u64, usize, Vec<u8>)> = None;
+            for ((inst_id, session_id, party), message) in registry.messages.iter() {
+                if *inst_id != instance_id || *party == party_id {
+                    continue;
+                }
+                let delivery_key = (instance_id, party_id, *party, *session_id);
+                if registry.delivered.contains(&delivery_key) {
+                    continue;
+                }
+                match next {
+                    Some((best_session, best_party, _))
+                        if (*session_id, *party) >= (best_session, best_party) => {}
+                    _ => next = Some((*session_id, *party, message.clone())),
                 }
             }
-
-            if std::time::Instant::now() >= deadline {
-                return Err("RBC receive_any timeout waiting for message from any party".to_string());
+            if let Some((session_id, party, message)) = next {
+                registry
+                    .delivered
+                    .insert((instance_id, party_id, party, session_id));
+                tracing::info!(
+                    instance_id = instance_id,
+                    session_id = session_id,
+                    from_party = party,
+                    message_len = message.len(),
+                    "RBC receive_any delivered message"
+                );
+                return Some((party, message));
             }
+            None
+        };
 
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let deadline = tokio::time::Instant::now()
+                            + tokio::time::Duration::from_millis(timeout_ms);
+                        loop {
+                            let notified = RBC_NOTIFY.notified();
+                            if let Some(result) = try_deliver() {
+                                return Ok(result);
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(
+                                    "RBC receive_any timeout waiting for message from any party"
+                                        .to_string(),
+                                );
+                            }
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep_until(deadline) => {}
+                            }
+                        }
+                    })
+                });
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(result) = try_deliver() {
+                return Ok(result);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "RBC receive_any timeout waiting for message from any party".to_string()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
     fn aba_propose(&self, value: bool) -> Result<u64, String> {
         let mut registry = ABA_REGISTRY.lock();
 
-        // Generate a unique session ID
-        let session_id = registry.session_counter;
-        registry.session_counter += 1;
+        // Assign the earliest session index this party has not proposed in yet.
+        // This keeps round indices aligned across parties despite asynchronous ordering.
+        let mut session_id = 0u64;
+        while registry
+            .proposals
+            .contains_key(&(self.instance_id, session_id, self.party_id))
+        {
+            session_id = session_id
+                .checked_add(1)
+                .ok_or_else(|| "ABA session id overflow".to_string())?;
+        }
 
         // Store this party's proposal
         let key = (self.instance_id, session_id, self.party_id);
         registry.proposals.insert(key, value);
+        drop(registry);
+
+        ABA_NOTIFY.notify_waiters();
 
         tracing::info!(
             instance_id = self.instance_id,
@@ -1085,72 +1439,105 @@ impl MpcEngineConsensus for HoneyBadgerMpcEngine {
     }
 
     fn aba_result(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-        let required = 2 * self.t + 1; // Need 2t+1 proposals for agreement
+        let instance_id = self.instance_id;
+        let required = 2 * self.t + 1;
 
-        loop {
-            {
-                let mut registry = ABA_REGISTRY.lock();
+        let try_check = || -> Option<bool> {
+            let mut registry = ABA_REGISTRY.lock();
 
-                // Check if result is already computed
-                if let Some(&result) = registry.results.get(&(self.instance_id, session_id)) {
-                    return Ok(result);
-                }
+            if let Some(&result) = registry.results.get(&(instance_id, session_id)) {
+                return Some(result);
+            }
 
-                // Count proposals for this session
-                let mut true_count = 0usize;
-                let mut false_count = 0usize;
+            let mut true_count = 0usize;
+            let mut false_count = 0usize;
 
-                for ((inst_id, sess_id, _party), &proposal) in registry.proposals.iter() {
-                    if *inst_id == self.instance_id && *sess_id == session_id {
-                        if proposal {
-                            true_count += 1;
-                        } else {
-                            false_count += 1;
-                        }
+            for ((inst_id, sess_id, _party), &proposal) in registry.proposals.iter() {
+                if *inst_id == instance_id && *sess_id == session_id {
+                    if proposal {
+                        true_count += 1;
+                    } else {
+                        false_count += 1;
                     }
-                }
-
-                // ABA agreement rule: if 2t+1 parties agree on a value, that's the result
-                if true_count >= required {
-                    registry.results.insert((self.instance_id, session_id), true);
-                    tracing::info!(
-                        instance_id = self.instance_id,
-                        session_id = session_id,
-                        result = true,
-                        true_count = true_count,
-                        "ABA agreement reached"
-                    );
-                    return Ok(true);
-                }
-
-                if false_count >= required {
-                    registry.results.insert((self.instance_id, session_id), false);
-                    tracing::info!(
-                        instance_id = self.instance_id,
-                        session_id = session_id,
-                        result = false,
-                        false_count = false_count,
-                        "ABA agreement reached"
-                    );
-                    return Ok(false);
                 }
             }
 
+            if true_count >= required {
+                registry.results.insert((instance_id, session_id), true);
+                tracing::info!(
+                    instance_id = instance_id,
+                    session_id = session_id,
+                    result = true,
+                    true_count = true_count,
+                    "ABA agreement reached"
+                );
+                return Some(true);
+            }
+
+            if false_count >= required {
+                registry.results.insert((instance_id, session_id), false);
+                tracing::info!(
+                    instance_id = instance_id,
+                    session_id = session_id,
+                    result = false,
+                    false_count = false_count,
+                    "ABA agreement reached"
+                );
+                return Some(false);
+            }
+
+            None
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let deadline = tokio::time::Instant::now()
+                            + tokio::time::Duration::from_millis(timeout_ms);
+                        loop {
+                            let notified = ABA_NOTIFY.notified();
+                            if let Some(result) = try_check() {
+                                return Ok(result);
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(format!(
+                                    "ABA result timeout waiting for agreement on session {}",
+                                    session_id
+                                ));
+                            }
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep_until(deadline) => {}
+                            }
+                        }
+                    })
+                });
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(result) = try_check() {
+                return Ok(result);
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
                     "ABA result timeout waiting for agreement on session {}",
                     session_id
                 ));
             }
-
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
 
 #[async_trait::async_trait]
-impl AsyncMpcEngineConsensus for HoneyBadgerMpcEngine {
+impl<F, G> AsyncMpcEngineConsensus for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     async fn rbc_broadcast_async(&self, message: &[u8]) -> Result<u64, String> {
         // Use sync version since registry operations are quick
         self.rbc_broadcast(message)
@@ -1175,5 +1562,142 @@ impl AsyncMpcEngineConsensus for HoneyBadgerMpcEngine {
 
     async fn aba_result_async(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
         self.aba_result(session_id, timeout_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn next_instance_id() -> u64 {
+        static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1_000_000);
+        NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn test_engine(
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+    ) -> Arc<HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>> {
+        HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::new(
+            instance_id,
+            party_id,
+            n,
+            t,
+            1,
+            1,
+            Arc::new(QuicNetworkManager::new()),
+            Vec::new(),
+        )
+        .expect("engine construction should succeed")
+    }
+
+    fn open_exp_test_payload(
+        instance_id: u64,
+        sender_party_id: usize,
+        share_id: usize,
+        partial_point: Vec<u8>,
+    ) -> Vec<u8> {
+        let payload = ExpOpenWireMessage {
+            instance_id,
+            sender_party_id,
+            share_id,
+            partial_point,
+        };
+        let encoded = bincode::serialize(&payload).expect("serialize test payload");
+        let mut wire = Vec::with_capacity(EXP_OPEN_WIRE_PREFIX.len() + encoded.len());
+        wire.extend_from_slice(EXP_OPEN_WIRE_PREFIX);
+        wire.extend_from_slice(&encoded);
+        wire
+    }
+
+    #[test]
+    fn aba_same_round_uses_shared_session_and_converges() {
+        let instance_id = next_instance_id();
+        let n = 4;
+        let t = 1;
+        let e0 = test_engine(instance_id, 0, n, t);
+        let e1 = test_engine(instance_id, 1, n, t);
+        let e2 = test_engine(instance_id, 2, n, t);
+        let e3 = test_engine(instance_id, 3, n, t);
+
+        let s0 = e0.aba_propose(true).expect("party 0 propose");
+        let s1 = e1.aba_propose(true).expect("party 1 propose");
+        let s2 = e2.aba_propose(true).expect("party 2 propose");
+        let s3 = e3.aba_propose(true).expect("party 3 propose");
+
+        assert_eq!(s0, s1, "same ABA round must share one session id");
+        assert_eq!(s1, s2, "same ABA round must share one session id");
+        assert_eq!(s2, s3, "same ABA round must share one session id");
+
+        let r0 = e0.aba_result(s0, 50).expect("party 0 agreement");
+        let r1 = e1.aba_result(s1, 50).expect("party 1 agreement");
+        let r2 = e2.aba_result(s2, 50).expect("party 2 agreement");
+        let r3 = e3.aba_result(s3, 50).expect("party 3 agreement");
+
+        assert!(r0 && r1 && r2 && r3, "all parties should decide true");
+    }
+
+    #[test]
+    fn rbc_receive_delivers_new_broadcast_each_call_in_order() {
+        let instance_id = next_instance_id();
+        let n = 4;
+        let t = 1;
+        let sender = test_engine(instance_id, 0, n, t);
+        let receiver = test_engine(instance_id, 1, n, t);
+
+        sender.rbc_broadcast(b"first").expect("broadcast first");
+        sender.rbc_broadcast(b"second").expect("broadcast second");
+
+        let first = receiver.rbc_receive(0, 50).expect("receive first");
+        let second = receiver.rbc_receive(0, 50).expect("receive second");
+
+        assert_eq!(
+            first, b"first",
+            "first receive should return first broadcast"
+        );
+        assert_eq!(
+            second, b"second",
+            "second receive should return second broadcast"
+        );
+    }
+
+    #[test]
+    fn open_exp_wire_rejects_mismatched_share_id() {
+        clear_exp_registry();
+        let instance_id = next_instance_id();
+        let payload = open_exp_test_payload(instance_id, 1, 0, vec![1, 2, 3, 4]);
+
+        let err = try_handle_open_exp_wire_message(1, &payload)
+            .expect_err("mismatched share_id must be rejected");
+        assert!(
+            err.contains("open-exp share_id mismatch"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            !EXP_REGISTRY.lock().contains_key(&(instance_id, 0)),
+            "rejected payload must not be inserted into the registry"
+        );
+    }
+
+    #[test]
+    fn open_exp_wire_accepts_matching_share_id() {
+        clear_exp_registry();
+        let instance_id = next_instance_id();
+        let payload = open_exp_test_payload(instance_id, 1, 1, vec![9, 8, 7, 6]);
+
+        let handled =
+            try_handle_open_exp_wire_message(1, &payload).expect("matching sender/share is valid");
+        assert!(handled, "open-exp prefix payload must be handled");
+
+        let reg = EXP_REGISTRY.lock();
+        let entry = reg
+            .get(&(instance_id, 0))
+            .expect("entry should be inserted for valid payload");
+        assert_eq!(entry.party_ids, vec![1]);
+        assert_eq!(entry.partial_points, vec![(1, vec![9, 8, 7, 6])]);
     }
 }

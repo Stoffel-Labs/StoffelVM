@@ -1,27 +1,1645 @@
 use std::env;
 use std::net::SocketAddr;
 use std::process::exit;
+use std::str::FromStr;
 
-use ark_bls12_381::Fr;
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+use ark_ec::{CurveGroup, PrimeGroup};
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+use ark_ff::PrimeField;
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+use std::collections::HashSet;
 use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
 use stoffel_vm::core_vm::VirtualMachine;
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+use stoffel_vm::net::curve::SupportedMpcField;
+#[cfg(feature = "honeybadger")]
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
+#[cfg(feature = "honeybadger")]
+use stoffel_vm::net::{honeybadger_node_opts, spawn_receive_loops_split};
 use stoffel_vm::net::{
-    honeybadger_node_opts, program_id_from_bytes, register_and_wait_for_session_with_program,
-    run_bootnode_with_config, spawn_receive_loops,
+    program_id_from_bytes, register_and_wait_for_session_with_program, run_bootnode_with_config,
 };
+use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 use stoffel_vm_types::compiled_binary::CompiledBinary;
+use stoffel_vm_types::core_types::Value;
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffelmpc_mpc::common::MPCProtocol;
+#[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+#[cfg(feature = "honeybadger")]
+use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
+#[cfg(feature = "honeybadger")]
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
-use stoffelnet::transports::quic::{NetworkManager, QuicNetworkConfig, QuicNetworkManager};
+use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
+
+/// Network adapter for MPC clients that remaps party IDs from 5-space (0..n-1)
+/// to 6-space (0..n with client's position excluded).
+///
+/// The client's QuicNetworkManager includes the client's own public key in the
+/// sorted key list, creating n+1 entries. The MPC protocol expects n parties.
+/// This wrapper adjusts send() to skip the client's own position.
+#[cfg(feature = "honeybadger")]
+struct ClientNetworkAdapter {
+    inner: QuicNetworkManager,
+    /// The client's position in the (n+1)-key sorted list
+    local_position: usize,
+}
+
+#[cfg(feature = "honeybadger")]
+#[async_trait::async_trait]
+impl Network for ClientNetworkAdapter {
+    type NodeType = <QuicNetworkManager as Network>::NodeType;
+    type NetworkConfig = <QuicNetworkManager as Network>::NetworkConfig;
+
+    async fn send(
+        &self,
+        recipient: stoffelnet::network_utils::PartyId,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        // Remap: 5-space party_id → 6-space position (skip our own slot)
+        let mapped = if recipient >= self.local_position {
+            recipient + 1
+        } else {
+            recipient
+        };
+        self.inner.send(mapped, message).await
+    }
+
+    async fn broadcast(
+        &self,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        // Must remap each party_id through our send() to skip the client's own
+        // slot in the 6-key sorted list. Using inner.broadcast() directly would
+        // iterate over 6 positions (including self) with wrong party mapping.
+        let n = self.party_count();
+        let mut total = 0usize;
+        for party_id in 0..n {
+            match self.send(party_id, message).await {
+                Ok(bytes) => total += bytes,
+                Err(e) => {
+                    tracing::debug!("client broadcast to party {} failed: {:?}", party_id, e);
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    fn parties(&self) -> Vec<&Self::NodeType> {
+        self.inner.parties()
+    }
+
+    fn parties_mut(&mut self) -> Vec<&mut Self::NodeType> {
+        self.inner.parties_mut()
+    }
+
+    fn config(&self) -> &Self::NetworkConfig {
+        self.inner.config()
+    }
+
+    fn node(&self, id: stoffelnet::network_utils::PartyId) -> Option<&Self::NodeType> {
+        self.inner.node(id)
+    }
+
+    fn node_mut(&mut self, id: stoffelnet::network_utils::PartyId) -> Option<&mut Self::NodeType> {
+        self.inner.node_mut(id)
+    }
+
+    async fn send_to_client(
+        &self,
+        client: ClientId,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        self.inner.send_to_client(client, message).await
+    }
+
+    fn clients(&self) -> Vec<ClientId> {
+        self.inner.clients()
+    }
+
+    fn is_client_connected(&self, client: ClientId) -> bool {
+        self.inner.is_client_connected(client)
+    }
+
+    fn local_party_id(&self) -> stoffelnet::network_utils::PartyId {
+        self.inner.local_party_id()
+    }
+
+    fn party_count(&self) -> usize {
+        // Return n (not n+1) — exclude the client from the party count
+        self.inner.party_count().saturating_sub(1)
+    }
+
+    fn verified_ordering(&self) -> Option<stoffelnet::network_utils::VerifiedOrdering> {
+        self.inner.verified_ordering()
+    }
+}
+
+/// Network adapter for MPC servers that remaps sequential client indices
+/// (0, 1, ...) back to transport-derived client IDs for send_to_client().
+/// The MPC protocol uses small indices (because session_id only has 8 bits),
+/// but the network layer needs transport-derived IDs to route messages.
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+struct ServerClientAdapter {
+    inner: Arc<QuicNetworkManager>,
+    /// Maps sequential index → transport-derived client ID
+    client_id_map: Vec<ClientId>,
+}
+
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+#[async_trait::async_trait]
+impl Network for ServerClientAdapter {
+    type NodeType = <QuicNetworkManager as Network>::NodeType;
+    type NetworkConfig = <QuicNetworkManager as Network>::NetworkConfig;
+
+    async fn send(
+        &self,
+        recipient: stoffelnet::network_utils::PartyId,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        self.inner.send(recipient, message).await
+    }
+
+    async fn broadcast(
+        &self,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        self.inner.broadcast(message).await
+    }
+
+    fn parties(&self) -> Vec<&Self::NodeType> {
+        self.inner.parties()
+    }
+
+    fn parties_mut(&mut self) -> Vec<&mut Self::NodeType> {
+        // Safety: we hold Arc, can't get &mut easily; the MPC protocol
+        // never calls this on the server adapter.
+        unimplemented!("parties_mut not needed for server client adapter")
+    }
+
+    fn config(&self) -> &Self::NetworkConfig {
+        self.inner.config()
+    }
+
+    fn node(&self, id: stoffelnet::network_utils::PartyId) -> Option<&Self::NodeType> {
+        self.inner.node(id)
+    }
+
+    fn node_mut(&mut self, _id: stoffelnet::network_utils::PartyId) -> Option<&mut Self::NodeType> {
+        unimplemented!("node_mut not needed for server client adapter")
+    }
+
+    async fn send_to_client(
+        &self,
+        client: ClientId,
+        message: &[u8],
+    ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
+        // Remap sequential index → transport-derived client ID
+        let transport_id = self.client_id_map.get(client).copied().unwrap_or(client);
+        self.inner.send_to_client(transport_id, message).await
+    }
+
+    fn clients(&self) -> Vec<ClientId> {
+        self.inner.clients()
+    }
+
+    fn is_client_connected(&self, client: ClientId) -> bool {
+        let transport_id = self.client_id_map.get(client).copied().unwrap_or(client);
+        self.inner.is_client_connected(transport_id)
+    }
+
+    fn local_party_id(&self) -> stoffelnet::network_utils::PartyId {
+        self.inner.local_party_id()
+    }
+
+    fn party_count(&self) -> usize {
+        self.inner.party_count()
+    }
+
+    fn verified_ordering(&self) -> Option<stoffelnet::network_utils::VerifiedOrdering> {
+        self.inner.verified_ordering()
+    }
+}
+
+fn is_flag_present(raw_args: &[String], flag: &str) -> bool {
+    raw_args
+        .iter()
+        .any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")))
+}
+
+fn fail_removed_flag(raw_args: &[String], old_flag: &str, replacement_hint: &str) {
+    if is_flag_present(raw_args, old_flag) {
+        eprintln!("Error: `{}` was removed. {}", old_flag, replacement_hint);
+        exit(2);
+    }
+}
+
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+fn parse_inputs_as_field<F: PrimeField>(inputs_str: &str) -> Vec<F> {
+    inputs_str
+        .split(',')
+        .map(|s| {
+            let s = s.trim();
+            let val: i64 = s.parse().unwrap_or_else(|_| {
+                eprintln!("Invalid input value: {}", s);
+                exit(2);
+            });
+            stoffel_vm::net::field_from_i64::<F>(val)
+        })
+        .collect()
+}
+
+/// Connect to all MPC servers with retry logic, spawning a receive loop per connection.
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+async fn connect_to_all_servers(
+    network: &Arc<tokio::sync::Mutex<QuicNetworkManager>>,
+    server_addrs: &[SocketAddr],
+    msg_tx: mpsc::Sender<(usize, Vec<u8>)>,
+) {
+    let max_retries = 10;
+    let retry_delay = Duration::from_millis(500);
+    let mut connected_servers = Vec::with_capacity(server_addrs.len());
+
+    for (server_idx, &addr) in server_addrs.iter().enumerate() {
+        let mut retry_count = 0;
+
+        loop {
+            eprintln!(
+                "[client] Connecting to server {} at {} (attempt {}/{})",
+                server_idx,
+                addr,
+                retry_count + 1,
+                max_retries
+            );
+
+            let connection_result = {
+                let mut net = network.lock().await;
+                net.connect_as_client(addr).await
+            };
+
+            match connection_result {
+                Ok(connection) => {
+                    eprintln!("[client] Connected to server {} at {}", server_idx, addr);
+                    connected_servers.push((addr, connection));
+                    break;
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count >= max_retries {
+                        eprintln!(
+                            "[client] Failed to connect to server {} at {} after {} attempts: {}",
+                            server_idx, addr, retry_count, e
+                        );
+                        exit(21);
+                    }
+                    eprintln!(
+                        "[client] Connection attempt {} failed: {}, retrying...",
+                        retry_count, e
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                }
+            }
+        }
+    }
+
+    let (assigned_party_ids, local_party_id) = {
+        let net = network.lock().await;
+        let assigned = net.assign_party_ids();
+        let local = net.compute_local_party_id();
+        (assigned, local)
+    };
+    eprintln!(
+        "[client] Assigned authenticated party IDs for {} connections",
+        assigned_party_ids
+    );
+
+    let mut seen_peers = HashSet::new();
+    for (addr, connection) in connected_servers {
+        let authenticated_peer = connection.remote_party_id().unwrap_or_else(|| {
+            eprintln!(
+                "[client] Connected server {} has no authenticated party identity",
+                addr
+            );
+            exit(24);
+        });
+        let peer = local_party_id.map_or(authenticated_peer, |local_id| {
+            if authenticated_peer == local_id {
+                eprintln!(
+                    "[client] Connected server {} resolved to local authenticated identity {}",
+                    addr, authenticated_peer
+                );
+                exit(24);
+            }
+            if authenticated_peer > local_id {
+                authenticated_peer - 1
+            } else {
+                authenticated_peer
+            }
+        });
+
+        if !seen_peers.insert(peer) {
+            eprintln!(
+                "[client] Duplicate authenticated party identity {} detected for server {}",
+                peer, addr
+            );
+            exit(24);
+        }
+
+        let tx = msg_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match connection.receive().await {
+                    Ok(data) => {
+                        if let Err(e) = tx.send((peer, data)).await {
+                            eprintln!("[client] Failed to forward message: {:?}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[client] Connection to server {} closed: {}", peer, e);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+const CLIENT_SET_SYNC_PREFIX: &[u8; 4] = b"CSS1";
+
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClientSetSyncMessage {
+    sender_party_id: usize,
+    client_ids: Vec<ClientId>,
+}
+
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+fn normalize_client_ids(mut ids: Vec<ClientId>) -> Vec<ClientId> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+fn encode_client_set_sync(msg: &ClientSetSyncMessage) -> Result<Vec<u8>, String> {
+    let payload = bincode::serialize(msg)
+        .map_err(|e| format!("Failed to serialize client-set sync payload: {}", e))?;
+    let mut out = Vec::with_capacity(CLIENT_SET_SYNC_PREFIX.len() + payload.len());
+    out.extend_from_slice(CLIENT_SET_SYNC_PREFIX);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+fn decode_client_set_sync(bytes: &[u8]) -> Result<ClientSetSyncMessage, String> {
+    if bytes.len() < CLIENT_SET_SYNC_PREFIX.len()
+        || &bytes[..CLIENT_SET_SYNC_PREFIX.len()] != CLIENT_SET_SYNC_PREFIX
+    {
+        return Err("Unexpected message prefix while waiting for client-set sync".to_string());
+    }
+
+    bincode::deserialize(&bytes[CLIENT_SET_SYNC_PREFIX.len()..])
+        .map_err(|e| format!("Failed to deserialize client-set sync payload: {}", e))
+}
+
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+async fn sync_client_set_across_parties(
+    net: Arc<QuicNetworkManager>,
+    my_id: usize,
+    n_parties: usize,
+    local_client_ids: &[ClientId],
+) -> Result<(), String> {
+    if n_parties <= 1 {
+        return Ok(());
+    }
+
+    let normalized_local = normalize_client_ids(local_client_ids.to_vec());
+    let sync_payload = encode_client_set_sync(&ClientSetSyncMessage {
+        sender_party_id: my_id,
+        client_ids: normalized_local.clone(),
+    })?;
+
+    eprintln!(
+        "[party {}] Broadcasting client-set sync payload: {:?}",
+        my_id, normalized_local
+    );
+
+    for peer_id in 0..n_parties {
+        if peer_id == my_id {
+            continue;
+        }
+        net.send(peer_id, &sync_payload)
+            .await
+            .map_err(|e| format!("Failed to send client-set sync to party {}: {}", peer_id, e))?;
+    }
+
+    let mut confirmed_parties: HashSet<usize> = HashSet::new();
+    let expected_confirmations = n_parties - 1;
+    let receive_deadline = std::time::Instant::now() + Duration::from_secs(20);
+
+    while confirmed_parties.len() < expected_confirmations {
+        if std::time::Instant::now() >= receive_deadline {
+            return Err(format!(
+                "Timed out waiting for client-set sync confirmations ({}/{})",
+                confirmed_parties.len(),
+                expected_confirmations
+            ));
+        }
+
+        let mut progressed = false;
+        for (derived_id, connection) in net.get_all_server_connections() {
+            let sender_id = connection.remote_party_id().unwrap_or(derived_id);
+            if sender_id >= n_parties
+                || sender_id == my_id
+                || confirmed_parties.contains(&sender_id)
+            {
+                continue;
+            }
+
+            let remaining = receive_deadline.saturating_duration_since(std::time::Instant::now());
+            let wait_for = remaining.min(Duration::from_millis(500));
+            if wait_for.is_zero() {
+                continue;
+            }
+
+            match tokio::time::timeout(wait_for, connection.receive()).await {
+                Ok(Ok(data)) => {
+                    let sync = decode_client_set_sync(&data).map_err(|e| {
+                        format!(
+                            "Failed to decode client-set sync from party {}: {}",
+                            sender_id, e
+                        )
+                    })?;
+
+                    if sync.sender_party_id != sender_id {
+                        return Err(format!(
+                            "Client-set sync sender mismatch: transport sender={} payload sender={}",
+                            sender_id, sync.sender_party_id
+                        ));
+                    }
+
+                    let normalized_remote = normalize_client_ids(sync.client_ids);
+                    if normalized_remote != normalized_local {
+                        return Err(format!(
+                            "Client-set mismatch with party {}: local={:?}, remote={:?}",
+                            sender_id, normalized_local, normalized_remote
+                        ));
+                    }
+
+                    confirmed_parties.insert(sender_id);
+                    progressed = true;
+                    eprintln!(
+                        "[party {}] Client-set sync confirmed with party {}",
+                        my_id, sender_id
+                    );
+                }
+                Ok(Err(e)) => {
+                    return Err(format!(
+                        "Failed to receive client-set sync from party {}: {}",
+                        sender_id, e
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+
+        if !progressed {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    eprintln!(
+        "[party {}] Client-set sync complete with {} peers",
+        my_id, expected_confirmations
+    );
+    Ok(())
+}
+
+#[cfg(feature = "honeybadger")]
+async fn run_hb_client_protocol_for_curve<F: PrimeField>(
+    _cid: ClientId,
+    n: usize,
+    t: usize,
+    inputs_str: &str,
+    input_len: usize,
+    instance_id: u64,
+    client_index: u8,
+    local_position: usize,
+    network_for_process: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
+    mut msg_rx: mpsc::Receiver<(usize, Vec<u8>)>,
+) -> Result<(), String> {
+    let instance_id = instance_id as u32;
+    // Use the sequential client_index (0, 1, ...) as the MPC identity,
+    // not the transport-derived cid, because the session_id only has
+    // 8 bits for the client_id field.
+    let mpc_cid = client_index as usize;
+    let mut mpc_client = HoneyBadgerMPCClient::<F, Avid<HbSessionId>>::new(
+        mpc_cid,
+        n,
+        t,
+        instance_id,
+        parse_inputs_as_field::<F>(inputs_str),
+        input_len,
+    )
+    .map_err(|e| format!("Failed to create MPC client: {:?}", e))?;
+
+    let mut messages_processed = 0usize;
+    while let Some((sender_id, data)) = msg_rx.recv().await {
+        // Skip INST messages from other servers (already consumed the first one)
+        if data.len() == 13 && data.starts_with(b"INST") {
+            eprintln!(
+                "[client {}] Skipping extra INST from sender {}",
+                mpc_cid, sender_id
+            );
+            continue;
+        }
+        eprintln!(
+            "[client {}] Received {} bytes from sender {} (raw)",
+            mpc_cid,
+            data.len(),
+            sender_id
+        );
+
+        let adapter = {
+            let guard = network_for_process.lock().await;
+            ClientNetworkAdapter {
+                inner: (*guard).clone(),
+                local_position,
+            }
+        };
+
+        match mpc_client.process(sender_id, data, Arc::new(adapter)).await {
+            Ok(()) => {
+                messages_processed += 1;
+                eprintln!(
+                    "[client {}] Successfully processed message #{} from server {}",
+                    mpc_cid, messages_processed, sender_id
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[client {}] Failed to process message from {}: {:?}",
+                    mpc_cid, sender_id, e
+                );
+            }
+        }
+
+        if messages_processed >= n {
+            // Keep connection alive long enough for servers to drain their
+            // preprocessing backlog and process our input messages.
+            eprintln!(
+                "[client {}] Input protocol complete, holding connection for 300s...",
+                mpc_cid
+            );
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            break;
+        }
+    }
+
+    eprintln!(
+        "[client {}] Message processing done ({} messages)",
+        mpc_cid, messages_processed
+    );
+    Ok(())
+}
+
+#[cfg(feature = "honeybadger")]
+async fn run_hb_client_for_curve(
+    curve_config: MpcCurveConfig,
+    cid: ClientId,
+    n: usize,
+    t: usize,
+    inputs_str: &str,
+    input_len: usize,
+    instance_id: u64,
+    client_index: u8,
+    local_position: usize,
+    network_for_process: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
+    msg_rx: mpsc::Receiver<(usize, Vec<u8>)>,
+) -> Result<(), String> {
+    match curve_config {
+        MpcCurveConfig::Bls12_381 => {
+            run_hb_client_protocol_for_curve::<ark_bls12_381::Fr>(
+                cid,
+                n,
+                t,
+                inputs_str,
+                input_len,
+                instance_id,
+                client_index,
+                local_position,
+                network_for_process,
+                msg_rx,
+            )
+            .await
+        }
+        MpcCurveConfig::Bn254 => {
+            run_hb_client_protocol_for_curve::<ark_bn254::Fr>(
+                cid,
+                n,
+                t,
+                inputs_str,
+                input_len,
+                instance_id,
+                client_index,
+                local_position,
+                network_for_process,
+                msg_rx,
+            )
+            .await
+        }
+        MpcCurveConfig::Curve25519 => {
+            run_hb_client_protocol_for_curve::<ark_curve25519::Fr>(
+                cid,
+                n,
+                t,
+                inputs_str,
+                input_len,
+                instance_id,
+                client_index,
+                local_position,
+                network_for_process,
+                msg_rx,
+            )
+            .await
+        }
+        MpcCurveConfig::Ed25519 => {
+            run_hb_client_protocol_for_curve::<ark_ed25519::Fr>(
+                cid,
+                n,
+                t,
+                inputs_str,
+                input_len,
+                instance_id,
+                client_index,
+                local_position,
+                network_for_process,
+                msg_rx,
+            )
+            .await
+        }
+    }
+}
+
+#[cfg(feature = "honeybadger")]
+async fn run_as_client(
+    n_parties: Option<usize>,
+    threshold: Option<usize>,
+    mpc_backend: Option<&str>,
+    mpc_curve: Option<&str>,
+    client_inputs: Option<String>,
+    server_addrs: Vec<SocketAddr>,
+) {
+    let n = n_parties.unwrap_or_else(|| {
+        eprintln!("Error: --n-parties is required in client mode");
+        exit(2);
+    });
+    let t = threshold.unwrap_or(1);
+
+    if let Some(backend_name) = mpc_backend {
+        let parsed_backend = MpcBackendKind::from_str(backend_name).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            exit(2);
+        });
+        if !matches!(parsed_backend, MpcBackendKind::HoneyBadger) {
+            eprintln!(
+                "Error: client mode only supports honeybadger backend (got {})",
+                parsed_backend.name()
+            );
+            exit(2);
+        }
+    }
+
+    let inputs_str = client_inputs.unwrap_or_else(|| {
+        eprintln!("Error: --inputs is required in client mode (comma-separated values)");
+        exit(2);
+    });
+    let input_len = inputs_str.split(',').count();
+
+    if server_addrs.is_empty() {
+        eprintln!("Error: --servers is required in client mode (comma-separated addresses)");
+        eprintln!("Example: --servers 172.18.0.2:9000,172.18.0.3:9000,172.18.0.4:9000,172.18.0.5:9000,172.18.0.6:9000");
+        exit(2);
+    }
+
+    if server_addrs.len() != n {
+        eprintln!(
+            "Warning: number of servers ({}) doesn't match n_parties ({})",
+            server_addrs.len(),
+            n
+        );
+    }
+
+    let curve_config = if let Some(name) = mpc_curve {
+        MpcCurveConfig::from_str(name).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            exit(2);
+        })
+    } else {
+        MpcCurveConfig::default()
+    };
+
+    eprintln!(
+        "[client] Client mode (curve={}, n={}, t={}, {} inputs, {} servers)",
+        curve_config.name(),
+        n,
+        t,
+        input_len,
+        server_addrs.len()
+    );
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls crypto");
+
+    let network = Arc::new(tokio::sync::Mutex::new(QuicNetworkManager::new()));
+
+    for (party_id, &addr) in server_addrs.iter().enumerate() {
+        network.lock().await.add_node_with_party_id(party_id, addr);
+        eprintln!("[client] Added server party {} at {}", party_id, addr);
+    }
+
+    let (msg_tx, mut msg_rx) = mpsc::channel::<(usize, Vec<u8>)>(1000);
+
+    eprintln!("[client] Connecting to {} servers...", server_addrs.len());
+    connect_to_all_servers(&network, &server_addrs, msg_tx.clone()).await;
+
+    let cid = {
+        let net = network.lock().await;
+        net.local_derived_id()
+    };
+    eprintln!("[client {}] Derived transport client ID", cid);
+
+    // Read INST message from servers: [b"INST" | instance_id:u64 | client_index:u8]
+    let (instance_id, client_index) = {
+        let timeout_dur = Duration::from_secs(600);
+        let mut result: Option<(u64, u8)> = None;
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        while result.is_none() {
+            match tokio::time::timeout_at(deadline, msg_rx.recv()).await {
+                Ok(Some((_sender, data))) => {
+                    if data.len() == 13 && &data[0..4] == b"INST" {
+                        let id_bytes: [u8; 8] = data[4..12].try_into().unwrap();
+                        let inst_id = u64::from_le_bytes(id_bytes);
+                        let idx = data[12];
+                        result = Some((inst_id, idx));
+                    }
+                    // If not an INST message, discard
+                }
+                Ok(None) => {
+                    eprintln!("[client {}] Channel closed before receiving INST", cid);
+                    exit(25);
+                }
+                Err(_) => {
+                    eprintln!("[client {}] Timeout waiting for INST from server", cid);
+                    exit(25);
+                }
+            }
+        }
+        let (id, idx) = result.unwrap();
+        eprintln!(
+            "[client {}] Received INST: instance_id={}, client_index={}",
+            cid, id, idx
+        );
+        (id, idx)
+    };
+
+    eprintln!(
+        "[client {}] Connected to all servers, starting input protocol...",
+        cid
+    );
+
+    // Get the client's position in the (n+1)-key sorted list so we can
+    // remap party IDs when sending (skip our own slot).
+    let local_position = {
+        let net = network.lock().await;
+        net.compute_local_party_id().unwrap_or(0)
+    };
+    eprintln!(
+        "[client {}] Local position in sorted key list: {}",
+        cid, local_position
+    );
+
+    let network_for_process = network.clone();
+    let client_id_for_task = cid;
+    let inputs_for_task = inputs_str.clone();
+    let process_handle = tokio::spawn(async move {
+        run_hb_client_for_curve(
+            curve_config,
+            client_id_for_task,
+            n,
+            t,
+            &inputs_for_task,
+            input_len,
+            instance_id,
+            client_index,
+            local_position,
+            network_for_process,
+            msg_rx,
+        )
+        .await
+    });
+
+    let timeout_duration = Duration::from_secs(600);
+    match tokio::time::timeout(timeout_duration, process_handle).await {
+        Ok(Ok(Ok(()))) => {
+            eprintln!(
+                "[client {}] Successfully submitted inputs to MPC network",
+                cid
+            );
+        }
+        Ok(Ok(Err(e))) => {
+            eprintln!("[client {}] Input protocol failed: {}", cid, e);
+            exit(22);
+        }
+        Ok(Err(e)) => {
+            eprintln!("[client {}] Input task error: {:?}", cid, e);
+            exit(22);
+        }
+        Err(_) => {
+            eprintln!(
+                "[client {}] Timeout waiting for input protocol to complete",
+                cid
+            );
+            exit(23);
+        }
+    }
+}
+
+#[cfg(feature = "honeybadger")]
+async fn setup_hb_party_for_curve<F, G>(
+    vm: &mut VirtualMachine,
+    net: Arc<QuicNetworkManager>,
+    my_id: usize,
+    n: usize,
+    t: usize,
+    instance_id: u64,
+    expected_client_count: Option<usize>,
+) -> Result<(), String>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
+    // ---- Phase 1: Wait for clients ----
+    let mut input_ids: Vec<ClientId> = Vec::new();
+
+    if let Some(expected_count) = expected_client_count {
+        if expected_count == 0 {
+            return Err("--wait-for-clients count must be greater than 0".to_string());
+        }
+
+        eprintln!(
+            "[party {}] Waiting for {} transport-derived clients...",
+            my_id, expected_count
+        );
+
+        let mut accept_net = (*net).clone();
+        let accept_party_id = my_id;
+        tokio::spawn(async move {
+            loop {
+                match accept_net.accept().await {
+                    Ok(_) => {
+                        eprintln!("[party {}] Accepted client connection", accept_party_id);
+                    }
+                    Err(e) => {
+                        eprintln!("[party {}] Accept error: {}", accept_party_id, e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+
+        let connect_timeout = Duration::from_secs(600);
+        let check_interval = Duration::from_millis(250);
+        let start = std::time::Instant::now();
+
+        loop {
+            let mut connected_clients = net.clients();
+            connected_clients.sort_unstable();
+            connected_clients.dedup();
+
+            eprintln!(
+                "[party {}] {} of {} expected clients connected: {:?}",
+                my_id,
+                connected_clients.len(),
+                expected_count,
+                connected_clients
+            );
+
+            if connected_clients.len() > expected_count {
+                return Err(format!(
+                    "Expected exactly {} clients, but {} are connected: {:?}",
+                    expected_count,
+                    connected_clients.len(),
+                    connected_clients
+                ));
+            }
+
+            if connected_clients.len() == expected_count {
+                input_ids = connected_clients;
+                break;
+            }
+
+            if start.elapsed() > connect_timeout {
+                return Err(format!(
+                    "Timeout waiting for {} clients; connected so far: {:?}",
+                    expected_count,
+                    net.clients()
+                ));
+            }
+
+            tokio::time::sleep(check_interval).await;
+        }
+
+        eprintln!(
+            "[party {}] Using transport-derived input IDs: {:?}",
+            my_id, input_ids
+        );
+
+        sync_client_set_across_parties(net.clone(), my_id, n, &input_ids).await?;
+    }
+
+    // ---- Phase 2: Setup MPC node and preprocess ----
+    //
+    // CRITICAL: We use exactly TWO clones of the MPC node to avoid the
+    // double-processing bug where init_ransha() is called multiple times:
+    //   - Clone 1 (`processing_node`): handles incoming messages via process()
+    //   - Clone 2 (inside `engine`): initiates preprocessing via run_preprocessing()
+    // Both share the same Arc<Mutex> stores, but only ONE processes each message.
+    let n_triples = 1;
+    let n_random = 4;
+    eprintln!(
+        "[party {}] Creating MPC node opts (n_triples={}, n_random={}, timeout=600s)",
+        my_id, n_triples, n_random
+    );
+    let mpc_opts =
+        honeybadger_node_opts(n, t, n_triples, n_random, instance_id).unwrap_or_else(|e| {
+            eprintln!("Failed to create MPC node options: {}", e);
+            std::process::exit(2);
+        });
+
+    // Use sequential indices (0..n_clients) as client IDs for the MPC protocol
+    // because the session_id only has 8 bits for the client_id field.
+    let mpc_input_ids: Vec<ClientId> = (0..input_ids.len()).collect();
+    let mpc_node = <HoneyBadgerMPCNode<F, Avid<HbSessionId>> as MPCProtocol<
+        F,
+        RobustShare<F>,
+        QuicNetworkManager,
+    >>::setup(my_id, mpc_opts, mpc_input_ids)
+    .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
+    eprintln!("[party {}] MPC node setup complete", my_id);
+
+    // Clone 1: the processing node — MOVED into the processing loop task.
+    // This is the ONLY clone that calls process() on incoming messages.
+    let mut processing_node = mpc_node.clone();
+
+    // Clone 2: the engine node — used for preprocessing initiation only.
+    // Created via from_existing_node which wraps it in Arc<Mutex>.
+    let engine = HoneyBadgerMpcEngine::<F, G>::from_existing_node(
+        instance_id,
+        my_id,
+        n,
+        t,
+        net.clone(),
+        mpc_node, // moved, not cloned
+    );
+
+    eprintln!(
+        "[party {}] Spawning receive loops (split channels)...",
+        my_id
+    );
+    let (mut server_rx, mut client_rx) = spawn_receive_loops_split(net.clone(), my_id, n).await;
+
+    // Remap transport-derived client IDs to sequential indices for the MPC protocol.
+    let client_id_to_index: std::collections::HashMap<ClientId, usize> = input_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, &tid)| (tid, idx))
+        .collect();
+
+    // Single processing loop using tokio::select! for both server and client messages.
+    // Only this task calls process() — no other task touches the processing_node.
+    let processing_net = net.clone();
+    let process_party_id = my_id;
+    tokio::spawn(async move {
+        let mut msg_count = 0u64;
+        loop {
+            tokio::select! {
+                Some((sender_id, raw_msg)) = server_rx.recv() => {
+                    msg_count += 1;
+                    if msg_count <= 5 || msg_count % 1000 == 0 {
+                        eprintln!(
+                            "[party {}] Processing message #{} from sender {} ({} bytes)",
+                            process_party_id, msg_count, sender_id, raw_msg.len()
+                        );
+                    }
+                    if let Err(e) = processing_node
+                        .process(sender_id, raw_msg, processing_net.clone())
+                        .await
+                    {
+                        eprintln!(
+                            "[party {}] Failed to process message from {}: {:?}",
+                            process_party_id, sender_id, e
+                        );
+                    }
+                }
+                Some((client_id, raw_msg)) = client_rx.recv() => {
+                    // Remap transport client ID → sequential index
+                    let mpc_sender_id = client_id_to_index
+                        .get(&client_id)
+                        .copied()
+                        .unwrap_or(client_id);
+                    if let Err(e) = processing_node
+                        .process(mpc_sender_id, raw_msg, processing_net.clone())
+                        .await
+                    {
+                        eprintln!(
+                            "[party {}] Failed to process client message from {} (idx {}): {:?}",
+                            process_party_id, client_id, mpc_sender_id, e
+                        );
+                    }
+                }
+                else => break,
+            }
+        }
+    });
+
+    // Brief delay to let receive loops discover connections
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    eprintln!("[party {}] Starting MPC preprocessing...", my_id);
+    engine
+        .preprocess()
+        .await
+        .map_err(|e| format!("MPC preprocessing failed: {}", e))?;
+    eprintln!("[party {}] MPC preprocessing complete!", my_id);
+
+    if !input_ids.is_empty() {
+        let client_index_map: Vec<(usize, ClientId)> = input_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, &tid)| (idx, tid))
+            .collect();
+
+        // Create a server-side network adapter that remaps sequential client
+        // indices to transport-derived client IDs for send_to_client().
+        let server_adapter = Arc::new(ServerClientAdapter {
+            inner: net.clone(),
+            client_id_map: client_index_map.iter().map(|(_, tid)| *tid).collect(),
+        });
+
+        // Access the engine's node for InputServer init
+        eprintln!(
+            "[party {}] Initializing InputServer for {} clients...",
+            my_id,
+            client_index_map.len()
+        );
+        {
+            let mut node = engine.node_handle().lock().await;
+            for &(idx, _tid) in &client_index_map {
+                let local_shares = node
+                    .preprocessing_material
+                    .lock()
+                    .await
+                    .take_random_shares(1)
+                    .map_err(|e| format!("Not enough random shares for client {}: {:?}", idx, e))?;
+
+                eprintln!(
+                    "[party {}] Sending random shares to client index {} (server_id={})",
+                    my_id, idx, node.id
+                );
+                node.preprocess
+                    .input
+                    .init(idx, local_shares, 1, server_adapter.clone())
+                    .await
+                    .map_err(|e| {
+                        format!("Failed to init InputServer for client {}: {:?}", idx, e)
+                    })?;
+                eprintln!(
+                    "[party {}] InputServer initialized for client index {}",
+                    my_id, idx
+                );
+            }
+        }
+
+        // Signal readiness to clients
+        eprintln!(
+            "[party {}] Sending INST to {} clients...",
+            my_id,
+            client_index_map.len()
+        );
+        for &(idx, tid) in &client_index_map {
+            let mut inst_msg = Vec::with_capacity(13);
+            inst_msg.extend_from_slice(b"INST");
+            inst_msg.extend_from_slice(&instance_id.to_le_bytes());
+            inst_msg.push(idx as u8);
+            if let Err(e) = net.send_to_client(tid, &inst_msg).await {
+                eprintln!(
+                    "[party {}] Failed to send INST to client {}: {:?}",
+                    my_id, tid, e
+                );
+            }
+        }
+
+        eprintln!(
+            "[party {}] Waiting for all client inputs (timeout=600s)...",
+            my_id
+        );
+        let client_inputs = {
+            let mut node = engine.node_handle().lock().await;
+            node.preprocess
+                .input
+                .wait_for_all_inputs(Duration::from_secs(600))
+                .await
+                .map_err(|e| format!("Failed to receive client inputs: {:?}", e))?
+        };
+
+        for (idx, shares) in client_inputs {
+            let transport_cid = client_index_map
+                .iter()
+                .find(|(i, _)| *i == idx)
+                .map(|(_, tid)| *tid)
+                .unwrap_or(idx);
+            vm.state
+                .client_store()
+                .store_client_input(transport_cid, shares);
+            eprintln!(
+                "[party {}] Stored inputs for client {} (index {})",
+                my_id, transport_cid, idx
+            );
+        }
+    }
+
+    vm.state.set_mpc_engine(engine);
+    Ok(())
+}
+
+#[cfg(feature = "avss")]
+async fn setup_avss_party_for_curve<F, G>(
+    vm: &mut VirtualMachine,
+    net: Arc<QuicNetworkManager>,
+    my_id: usize,
+    n: usize,
+    t: usize,
+    instance_id: u64,
+    expected_client_count: Option<usize>,
+) -> Result<(), String>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
+    // ---- Phase 1: Wait for clients ----
+    let mut input_ids: Vec<ClientId> = Vec::new();
+
+    if let Some(expected_count) = expected_client_count {
+        if expected_count == 0 {
+            return Err("--wait-for-clients count must be greater than 0".to_string());
+        }
+
+        eprintln!(
+            "[party {}] Waiting for {} clients (AVSS)...",
+            my_id, expected_count
+        );
+
+        let mut accept_net = (*net).clone();
+        let accept_party_id = my_id;
+        tokio::spawn(async move {
+            loop {
+                match accept_net.accept().await {
+                    Ok(_) => {
+                        eprintln!("[party {}] Accepted client connection", accept_party_id);
+                    }
+                    Err(e) => {
+                        eprintln!("[party {}] Accept error: {}", accept_party_id, e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+
+        let connect_timeout = Duration::from_secs(600);
+        let check_interval = Duration::from_millis(250);
+        let start = std::time::Instant::now();
+
+        loop {
+            let mut connected_clients = net.clients();
+            connected_clients.sort_unstable();
+            connected_clients.dedup();
+
+            eprintln!(
+                "[party {}] {} of {} expected clients connected: {:?}",
+                my_id,
+                connected_clients.len(),
+                expected_count,
+                connected_clients
+            );
+
+            if connected_clients.len() > expected_count {
+                return Err(format!(
+                    "Expected exactly {} clients, but {} are connected: {:?}",
+                    expected_count,
+                    connected_clients.len(),
+                    connected_clients
+                ));
+            }
+
+            if connected_clients.len() == expected_count {
+                input_ids = connected_clients;
+                break;
+            }
+
+            if start.elapsed() > connect_timeout {
+                return Err(format!(
+                    "Timeout waiting for {} clients; connected so far: {:?}",
+                    expected_count,
+                    net.clients()
+                ));
+            }
+
+            tokio::time::sleep(check_interval).await;
+        }
+
+        eprintln!(
+            "[party {}] Using transport-derived input IDs: {:?}",
+            my_id, input_ids
+        );
+
+        sync_client_set_across_parties(net.clone(), my_id, n, &input_ids).await?;
+    }
+
+    // ---- Phase 2: ECDH key exchange over existing network ----
+    let mpc_input_ids: Vec<ClientId> = (0..input_ids.len()).collect();
+
+    // Generate ECDH key pair for AVSS payload confidentiality
+    use ark_std::rand::SeedableRng as _;
+    let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+    let sk_i = F::rand(&mut rng);
+    let pk_i: G = G::generator() * sk_i;
+
+    // Serialize our public key into an envelope: [party_id: u32][pk_bytes]
+    let mut pk_bytes = Vec::new();
+    pk_i.serialize_compressed(&mut pk_bytes)
+        .map_err(|e| format!("Failed to serialize ECDH public key: {:?}", e))?;
+    let mut envelope = Vec::with_capacity(4 + pk_bytes.len());
+    envelope.extend_from_slice(&(my_id as u32).to_le_bytes());
+    envelope.extend_from_slice(&pk_bytes);
+
+    eprintln!(
+        "[party {}] Exchanging ECDH public keys over existing network...",
+        my_id
+    );
+
+    // Broadcast our PK to all peers via existing connections
+    let connections = net.get_all_server_connections();
+    for (peer_id, conn) in &connections {
+        if *peer_id == my_id {
+            continue;
+        }
+        if let Err(e) = conn.send(&envelope).await {
+            eprintln!(
+                "[party {}] Failed to send PK to peer {}: {}",
+                my_id, peer_id, e
+            );
+        }
+    }
+
+    // Collect PKs from all peers
+    let mut pk_map: Vec<G> = vec![G::default(); n];
+    pk_map[my_id] = pk_i;
+    let mut received = 1usize;
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(my_id);
+
+    let (pk_tx, mut pk_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(n);
+
+    for (peer_id, conn) in &connections {
+        if *peer_id == my_id {
+            continue;
+        }
+        let peer_id = *peer_id;
+        let tx = pk_tx.clone();
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            match conn.receive().await {
+                Ok(data) => {
+                    let _ = tx.send((peer_id, data)).await;
+                }
+                Err(e) => {
+                    eprintln!("[AVSS] Failed to receive PK from peer {}: {}", peer_id, e);
+                }
+            }
+        });
+    }
+    drop(pk_tx);
+
+    let pk_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while received < n {
+        let remaining = pk_deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, pk_rx.recv()).await {
+            Ok(Some((_peer_id, data))) => {
+                if data.len() < 4 {
+                    continue;
+                }
+                let sender_id = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+                if sender_id >= n || !seen.insert(sender_id) {
+                    continue;
+                }
+                match G::deserialize_compressed(&data[4..]) {
+                    Ok(pk) => {
+                        pk_map[sender_id] = pk;
+                        received += 1;
+                        eprintln!(
+                            "[party {}] Received PK from party {} ({}/{})",
+                            my_id, sender_id, received, n
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[party {}] Failed to deserialize PK from party {}: {:?}",
+                            my_id, sender_id, e
+                        );
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return Err(format!(
+                    "Timeout during PK exchange: received {}/{} keys",
+                    received, n
+                ));
+            }
+        }
+    }
+
+    if received < n {
+        return Err(format!(
+            "PK exchange incomplete: received {}/{} keys",
+            received, n
+        ));
+    }
+    eprintln!("[party {}] PK exchange complete ({} keys)", my_id, n);
+
+    let pk_map = Arc::new(pk_map);
+
+    // ---- Phase 3: Create engine directly with existing network ----
+    use stoffel_vm::net::avss_engine::AvssMpcEngine;
+    let engine = AvssMpcEngine::<F, G>::new(
+        instance_id,
+        my_id,
+        n,
+        t,
+        net.clone(),
+        sk_i,
+        pk_map,
+        mpc_input_ids,
+    )
+    .await
+    .map_err(|e| format!("Failed to create AVSS engine: {}", e))?;
+
+    engine
+        .start_async()
+        .await
+        .map_err(|e| format!("Failed to start AVSS engine: {}", e))?;
+
+    // ---- Phase 4: Spawn message loops on existing connections ----
+    // Server message loops
+    let (msg_tx, _server_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(65536);
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(4096);
+
+    for (peer_id, conn) in &connections {
+        if *peer_id == my_id {
+            continue;
+        }
+        let peer_id = *peer_id;
+        let engine = engine.clone();
+        let tx = msg_tx.clone();
+        let conn = conn.clone();
+        let net_clone = net.clone();
+        let authenticated_sender_id = conn.remote_party_id().unwrap_or(peer_id);
+        tokio::spawn(async move {
+            loop {
+                match conn.receive().await {
+                    Ok(data) => {
+                        if let Ok(true) = stoffel_vm::net::open_registry::try_handle_wire_message(
+                            authenticated_sender_id,
+                            &data,
+                        ) {
+                            continue;
+                        }
+                        if let Ok(true) =
+                            stoffel_vm::net::avss_engine::try_handle_avss_open_exp_wire_message(
+                                authenticated_sender_id,
+                                &data,
+                            )
+                        {
+                            continue;
+                        }
+                        if let Ok(true) =
+                            stoffel_vm::net::avss_engine::try_handle_avss_g2_exp_wire_message(
+                                authenticated_sender_id,
+                                &data,
+                            )
+                        {
+                            continue;
+                        }
+                        if let Err(e) = engine
+                            .process_wrapped_message_with_network(
+                                authenticated_sender_id,
+                                &data,
+                                net_clone.clone(),
+                            )
+                            .await
+                        {
+                            let _ = tx.send((authenticated_sender_id, data)).await;
+                            if !e.contains("deserialize") && !e.contains("process failed") {
+                                eprintln!(
+                                    "[AVSS] Party failed to process message from {}: {}",
+                                    authenticated_sender_id, e
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Client connection monitor
+    let client_net = net.clone();
+    tokio::spawn(async move {
+        let mut spawned = std::collections::HashSet::new();
+        loop {
+            for (cid, conn) in client_net.get_all_client_connections() {
+                if !spawned.insert(cid) {
+                    continue;
+                }
+                let txx = client_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match conn.receive().await {
+                            Ok(data) => {
+                                if txx.send((cid, data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+
+    // Route client messages through the AVSS node's process()
+    if !input_ids.is_empty() {
+        let client_id_to_index: std::collections::HashMap<ClientId, usize> = input_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, &tid)| (tid, idx))
+            .collect();
+
+        let processing_engine = engine.clone();
+        let processing_net = net.clone();
+        tokio::spawn(async move {
+            while let Some((client_id, raw_msg)) = client_rx.recv().await {
+                let mpc_sender_id = client_id_to_index
+                    .get(&client_id)
+                    .copied()
+                    .unwrap_or(client_id);
+                if let Err(e) = processing_engine
+                    .process_wrapped_message_with_network(
+                        mpc_sender_id,
+                        &raw_msg,
+                        processing_net.clone(),
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "[party {}] Failed to process client message from {} (idx {}): {:?}",
+                        processing_engine.party_id(),
+                        client_id,
+                        mpc_sender_id,
+                        e
+                    );
+                }
+            }
+        });
+    }
+
+    // ---- Phase 5: Preprocessing ----
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    eprintln!("[party {}] Starting AVSS preprocessing...", my_id);
+    engine.preprocess().await?;
+    eprintln!("[party {}] AVSS preprocessing complete!", my_id);
+
+    // ---- Phase 6: Client input initialization ----
+    if !input_ids.is_empty() {
+        let client_index_map: Vec<(usize, ClientId)> = input_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, &tid)| (idx, tid))
+            .collect();
+
+        let server_adapter = Arc::new(ServerClientAdapter {
+            inner: net.clone(),
+            client_id_map: client_index_map.iter().map(|(_, tid)| *tid).collect(),
+        });
+
+        eprintln!(
+            "[party {}] Initializing AVSS InputServer for {} clients...",
+            my_id,
+            client_index_map.len()
+        );
+        {
+            let mut node = engine.node_handle().lock().await;
+            for &(idx, _tid) in &client_index_map {
+                let local_shares = node
+                    .preprocessing_material
+                    .lock()
+                    .await
+                    .take_v_random_shares(1)
+                    .map_err(|e| format!("Not enough random shares for client {}: {:?}", idx, e))?;
+
+                node.input_server
+                    .init(idx, local_shares, 1, server_adapter.clone())
+                    .await
+                    .map_err(|e| {
+                        format!("Failed to init InputServer for client {}: {:?}", idx, e)
+                    })?;
+                eprintln!(
+                    "[party {}] InputServer initialized for client index {}",
+                    my_id, idx
+                );
+            }
+        }
+
+        // Signal readiness to clients
+        eprintln!(
+            "[party {}] Sending INST to {} clients...",
+            my_id,
+            client_index_map.len()
+        );
+        for &(idx, tid) in &client_index_map {
+            let mut inst_msg = Vec::with_capacity(13);
+            inst_msg.extend_from_slice(b"INST");
+            inst_msg.extend_from_slice(&instance_id.to_le_bytes());
+            inst_msg.push(idx as u8);
+            if let Err(e) = net.send_to_client(tid, &inst_msg).await {
+                eprintln!(
+                    "[party {}] Failed to send INST to client {}: {:?}",
+                    my_id, tid, e
+                );
+            }
+        }
+
+        // Wait for all client inputs
+        eprintln!(
+            "[party {}] Waiting for all client inputs (timeout=600s)...",
+            my_id
+        );
+        let client_inputs = {
+            let mut node = engine.node_handle().lock().await;
+            node.input_server
+                .wait_for_all_inputs(Duration::from_secs(600))
+                .await
+                .map_err(|e| format!("Failed to receive client inputs: {:?}", e))?
+        };
+
+        for (idx, shares) in client_inputs {
+            let transport_cid = client_index_map
+                .iter()
+                .find(|(i, _)| *i == idx)
+                .map(|(_, tid)| *tid)
+                .unwrap_or(idx);
+            vm.state
+                .client_store()
+                .store_client_input_feldman(transport_cid, shares);
+            eprintln!(
+                "[party {}] Stored inputs for client {} (index {})",
+                my_id, transport_cid, idx
+            );
+        }
+    }
+
+    vm.state.set_mpc_engine(engine);
+    Ok(())
+}
 
 // Use a Tokio runtime for async operations
 #[tokio::main]
@@ -33,7 +1651,7 @@ async fn main() {
         print_usage_and_exit();
     }
 
-    let mut path_opt: Option<String> = None;
+    let path_opt: Option<String>;
     let mut entry: String = "main".to_string();
 
     let mut trace_instr = false;
@@ -47,12 +1665,13 @@ async fn main() {
     let mut bootstrap_addr: Option<SocketAddr> = None;
     let mut n_parties: Option<usize> = None;
     let mut threshold: Option<usize> = None;
-    let mut client_id: Option<usize> = None;
     let mut client_inputs: Option<String> = None;
-    let mut expected_clients: Option<String> = None;
-    let mut enable_nat: bool = false;
-    let mut stun_servers: Vec<SocketAddr> = Vec::new();
+    let mut expected_client_count: Option<usize> = None;
+    let mut _enable_nat: bool = false;
+    let mut _stun_servers: Vec<SocketAddr> = Vec::new();
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
+    let mut mpc_backend: Option<String> = None;
+    let mut mpc_curve: Option<String> = None;
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -70,7 +1689,7 @@ async fn main() {
         } else if arg == "--client" {
             as_client = true;
         } else if arg == "--nat" {
-            enable_nat = true;
+            _enable_nat = true;
         } else if let Some(_rest) = arg.strip_prefix("--bind") {
             // support "--bind" and "--bind=.."
             // actual value parsed later from positional with key
@@ -78,13 +1697,35 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--bootstrap") {
         } else if let Some(_rest) = arg.strip_prefix("--n-parties") {
         } else if let Some(_rest) = arg.strip_prefix("--threshold") {
-        } else if let Some(_rest) = arg.strip_prefix("--client-id") {
         } else if let Some(_rest) = arg.strip_prefix("--inputs") {
-        } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
+        } else if let Some(_rest) = arg.strip_prefix("--wait-for-clients") {
         } else if let Some(_rest) = arg.strip_prefix("--stun-servers") {
         } else if let Some(_rest) = arg.strip_prefix("--servers") {
+        } else if let Some(_rest) = arg.strip_prefix("--mpc-backend") {
+        } else if let Some(_rest) = arg.strip_prefix("--mpc-curve") {
         }
     }
+
+    fail_removed_flag(
+        &raw_args,
+        "--client-id",
+        "Client IDs are now transport-derived. Remove `--client-id`.",
+    );
+    fail_removed_flag(
+        &raw_args,
+        "--expected-clients",
+        "Use `--wait-for-clients <n>` instead.",
+    );
+    fail_removed_flag(
+        &raw_args,
+        "--expected-client-count",
+        "Renamed to `--wait-for-clients <n>`.",
+    );
+    fail_removed_flag(
+        &raw_args,
+        "--adkg-curve",
+        "Use `--mpc-curve <name>` instead.",
+    );
 
     // collect positional args (non-flags)
     let mut positional = raw_args
@@ -128,24 +1769,19 @@ async fn main() {
                     threshold = Some(v.parse().expect("Invalid --threshold"));
                 }
             }
-            "--client-id" => {
-                if let Some(v) = args_iter.next() {
-                    client_id = Some(v.parse().expect("Invalid --client-id"));
-                }
-            }
             "--inputs" => {
                 if let Some(v) = args_iter.next() {
                     client_inputs = Some(v);
                 }
             }
-            "--expected-clients" => {
+            "--wait-for-clients" => {
                 if let Some(v) = args_iter.next() {
-                    expected_clients = Some(v);
+                    expected_client_count = Some(v.parse().expect("Invalid --wait-for-clients"));
                 }
             }
             "--stun-servers" => {
                 if let Some(v) = args_iter.next() {
-                    stun_servers = v
+                    _stun_servers = v
                         .split(',')
                         .filter_map(|s| {
                             let s = s.trim();
@@ -171,6 +1807,16 @@ async fn main() {
                         .collect();
                 }
             }
+            "--mpc-backend" => {
+                if let Some(v) = args_iter.next() {
+                    mpc_backend = Some(v);
+                }
+            }
+            "--mpc-curve" => {
+                if let Some(v) = args_iter.next() {
+                    mpc_curve = Some(v);
+                }
+            }
             _ => {}
         }
     }
@@ -193,197 +1839,71 @@ async fn main() {
 
     // Client mode: connect to MPC servers and provide inputs
     if as_client {
-        let cid = client_id.unwrap_or_else(|| {
-            eprintln!("Error: --client-id is required in client mode");
-            exit(2);
-        });
-
-        let n = n_parties.unwrap_or_else(|| {
-            eprintln!("Error: --n-parties is required in client mode");
-            exit(2);
-        });
-        let t = threshold.unwrap_or(1);
-
-        // Parse inputs (comma-separated integers or fixed-point values)
-        let inputs_str = client_inputs.unwrap_or_else(|| {
-            eprintln!("Error: --inputs is required in client mode (comma-separated values)");
-            exit(2);
-        });
-        let input_values: Vec<Fr> = inputs_str
-            .split(',')
-            .map(|s| {
-                let s = s.trim();
-                // Support integer and fixed-point (interpret as integer for now)
-                let val: i64 = s.parse().unwrap_or_else(|_| {
-                    eprintln!("Invalid input value: {}", s);
-                    exit(2);
-                });
-                Fr::from(val as u64)
-            })
-            .collect();
-
-        let input_len = input_values.len();
-
-        // Server addresses are required
-        if server_addrs.is_empty() {
-            eprintln!("Error: --servers is required in client mode (comma-separated addresses)");
-            eprintln!("Example: --servers 172.18.0.2:9000,172.18.0.3:9000,172.18.0.4:9000,172.18.0.5:9000,172.18.0.6:9000");
+        #[cfg(feature = "honeybadger")]
+        run_as_client(
+            n_parties,
+            threshold,
+            mpc_backend.as_deref(),
+            mpc_curve.as_deref(),
+            client_inputs,
+            server_addrs,
+        )
+        .await;
+        #[cfg(not(feature = "honeybadger"))]
+        {
+            eprintln!("Error: client mode requires the 'honeybadger' feature");
             exit(2);
         }
+        return;
+    }
 
-        if server_addrs.len() != n {
-            eprintln!("Warning: number of servers ({}) doesn't match n_parties ({})", server_addrs.len(), n);
+    // Resolve MPC backend kind
+    let backend_kind = if let Some(ref name) = mpc_backend {
+        match MpcBackendKind::from_str(name) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                exit(2);
+            }
         }
+    } else {
+        MpcBackendKind::default_backend()
+    };
 
-        eprintln!(
-            "[client {}] Client mode (n={}, t={}, {} inputs, {} servers)",
-            cid, n, t, input_len, server_addrs.len()
-        );
-
-        // Install crypto provider for quinn/rustls
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("install rustls crypto");
-
-        // Create the MPC client
-        // Instance ID 0 is fine for client - it doesn't participate in the instance negotiation
-        let instance_id = 0u32;
-        let mut mpc_client = match HoneyBadgerMPCClient::<Fr, Avid>::new(
-            cid,
-            n,
-            t,
-            instance_id,
-            input_values.clone(),
-            input_len,
-        ) {
+    let curve_config = if let Some(ref name) = mpc_curve {
+        match MpcCurveConfig::from_str(name) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[client {}] Failed to create MPC client: {:?}", cid, e);
-                exit(20);
-            }
-        };
-
-        // Create network manager for client connections
-        let network = Arc::new(tokio::sync::Mutex::new(QuicNetworkManager::new()));
-
-        // Add all server addresses as nodes (party IDs 0 to n-1)
-        for (party_id, &addr) in server_addrs.iter().enumerate() {
-            network.lock().await.add_node_with_party_id(party_id, addr);
-            eprintln!("[client {}] Added server party {} at {}", cid, party_id, addr);
-        }
-
-        // Create channel for receiving messages
-        let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(1000);
-
-        // Connect to all servers as a client
-        eprintln!("[client {}] Connecting to {} servers...", cid, server_addrs.len());
-        for (party_id, &addr) in server_addrs.iter().enumerate() {
-            let mut retry_count = 0;
-            let max_retries = 10;
-            let retry_delay = Duration::from_millis(500);
-
-            loop {
-                eprintln!("[client {}] Connecting to server {} at {} (attempt {}/{})",
-                         cid, party_id, addr, retry_count + 1, max_retries);
-
-                let connection_result = {
-                    let mut net = network.lock().await;
-                    net.connect_as_client(addr, cid).await
-                };
-
-                match connection_result {
-                    Ok(connection) => {
-                        eprintln!("[client {}] Connected to server {} at {}", cid, party_id, addr);
-
-                        // Spawn message handler for this connection
-                        let tx = msg_tx.clone();
-                        let client_id = cid;
-
-                        tokio::spawn(async move {
-                            loop {
-                                match connection.receive().await {
-                                    Ok(data) => {
-                                        if let Err(e) = tx.send(data).await {
-                                            eprintln!("[client {}] Failed to forward message: {:?}", client_id, e);
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[client {}] Connection to server closed: {}", client_id, e);
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        break;
-                    }
-                    Err(e) => {
-                        retry_count += 1;
-                        if retry_count >= max_retries {
-                            eprintln!("[client {}] Failed to connect to server {} at {} after {} attempts: {}",
-                                     cid, party_id, addr, retry_count, e);
-                            exit(21);
-                        }
-                        eprintln!("[client {}] Connection attempt {} failed: {}, retrying...", cid, retry_count, e);
-                        tokio::time::sleep(retry_delay).await;
-                    }
-                }
+                eprintln!("Error: {}", e);
+                exit(2);
             }
         }
+    } else {
+        MpcCurveConfig::default()
+    };
 
-        eprintln!("[client {}] Connected to all servers, starting input protocol...", cid);
+    if let Err(e) = curve_config.validate_for_backend(backend_kind) {
+        eprintln!("Error: {}", e);
+        exit(2);
+    }
 
-        // Spawn a task to process incoming messages
-        // The client receives mask shares from servers and broadcasts masked inputs
-        // Once the broadcast is complete, the client's job is done
-        let network_for_process = network.clone();
-        let client_id_for_task = cid;
-        let process_handle = tokio::spawn(async move {
-            let mut messages_processed = 0;
-            while let Some(data) = msg_rx.recv().await {
-                // Clone network and drop lock before processing
-                let network_clone = {
-                    let guard = network_for_process.lock().await;
-                    (*guard).clone()
-                };
-
-                if let Err(e) = mpc_client.process(data, Arc::new(network_clone)).await {
-                    eprintln!("[client {}] Failed to process message: {:?}", client_id_for_task, e);
-                }
-
-                messages_processed += 1;
-
-                // The client has done its job once it processes messages from all servers
-                // and broadcasts its masked inputs. We give it some time to complete.
-                if messages_processed >= n {
-                    eprintln!("[client {}] Processed {} messages, input submission likely complete",
-                             client_id_for_task, messages_processed);
-                    // Give some time for any final messages
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    break;
-                }
-            }
-            eprintln!("[client {}] Message processing complete ({} messages)",
-                     client_id_for_task, messages_processed);
-        });
-
-        // Wait for input protocol to complete with timeout
-        let timeout_duration = Duration::from_secs(120);
-        match tokio::time::timeout(timeout_duration, process_handle).await {
-            Ok(Ok(_)) => {
-                eprintln!("[client {}] Successfully submitted inputs to MPC network", cid);
-            }
-            Ok(Err(e)) => {
-                eprintln!("[client {}] Input task error: {:?}", cid, e);
-                exit(22);
-            }
-            Err(_) => {
-                eprintln!("[client {}] Timeout waiting for input protocol to complete", cid);
-                exit(23);
-            }
+    // Validate incompatible flag combinations
+    if !backend_kind.supports_client_input() {
+        if as_client {
+            eprintln!(
+                "Error: {} backend does not support client mode",
+                backend_kind.name()
+            );
+            exit(2);
         }
+    }
 
-        return;
+    if expected_client_count.is_some() && !backend_kind.supports_client_input() {
+        eprintln!(
+            "Error: {} backend does not support --wait-for-clients",
+            backend_kind.name()
+        );
+        exit(2);
     }
 
     path_opt = if !positional.is_empty() {
@@ -399,7 +1919,7 @@ async fn main() {
 
     // Optional: bring up networking in party mode if bootstrap provided or if leader
     let mut net_opt: Option<Arc<QuicNetworkManager>> = None;
-    let mut program_id: [u8; 32] = [0u8; 32];
+    let program_id: [u8; 32];
     let mut agreed_entry = entry.clone();
     let mut session_instance_id: Option<u64> = None;
     let mut session_n_parties: Option<usize> = None;
@@ -449,8 +1969,7 @@ async fn main() {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Now connect to ourselves as the bootnode
-        // Use with_node_id so connections are indexed by party ID (0-4), not random UUIDs
-        let mut mgr = QuicNetworkManager::with_node_id(my_id);
+        let mut mgr = QuicNetworkManager::new();
         // Listen on a different port for peer connections
         let party_bind: SocketAddr = format!("{}:{}", bind.ip(), bind.port() + 1000)
             .parse()
@@ -496,7 +2015,11 @@ async fn main() {
 
         eprintln!(
             "[leader/party {}] Session started: instance_id={}, n={}, t={}, entry={}",
-            my_id, session_info.instance_id, session_info.n_parties, session_info.threshold, agreed_entry
+            my_id,
+            session_info.instance_id,
+            session_info.n_parties,
+            session_info.threshold,
+            agreed_entry
         );
 
         let net = Arc::new(mgr);
@@ -526,8 +2049,7 @@ async fn main() {
         let t = threshold.unwrap_or(1);
 
         // Prepare QUIC manager
-        // Use with_node_id so connections are indexed by party ID (0-4), not random UUIDs
-        let mut mgr = QuicNetworkManager::with_node_id(my_id);
+        let mut mgr = QuicNetworkManager::new();
         // Listen so peers can connect back directly
         if let Err(e) = mgr.listen(bind).await {
             eprintln!("Failed to listen on {}: {}", bind, e);
@@ -574,7 +2096,11 @@ async fn main() {
 
         eprintln!(
             "[party {}] Session started: instance_id={}, n={}, t={}, entry={}",
-            my_id, session_info.instance_id, session_info.n_parties, session_info.threshold, agreed_entry
+            my_id,
+            session_info.instance_id,
+            session_info.n_parties,
+            session_info.threshold,
+            agreed_entry
         );
 
         let net = Arc::new(mgr);
@@ -762,9 +2288,11 @@ async fn main() {
         );
     }
 
-    // If in party mode, configure async HoneyBadger engine and preprocess
+    // If in party mode, configure MPC engine based on selected backend
     if let Some(net) = net_opt.clone() {
-        let my_id = party_id.unwrap_or(0usize);
+        // Use the network-derived party ID (sorted public key index), not the
+        // bootnode-assigned one, because send() routes via sorted public keys.
+        let my_id = net.local_party_id();
         // Use session parameters (already agreed upon with bootnode)
         let n = session_n_parties.unwrap_or_else(|| net.parties().len());
         let t = session_threshold.unwrap_or(1);
@@ -773,31 +2301,16 @@ async fn main() {
             session_instance_id.expect("session instance_id should be set in party mode");
 
         eprintln!(
-            "[party {}] Creating MPC engine: instance_id={}, n={}, t={}",
-            my_id, instance_id, n, t
+            "[party {}] Creating MPC engine (backend={}): instance_id={}, n={}, t={}",
+            my_id,
+            backend_kind.name(),
+            instance_id,
+            n,
+            t
         );
 
-        // Parse expected client IDs (comma-separated)
-        let input_ids: Vec<ClientId> = expected_clients
-            .as_ref()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|id| id.trim().parse::<ClientId>().ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if !input_ids.is_empty() {
-            eprintln!(
-                "[party {}] Expecting inputs from {} clients: {:?}",
-                my_id,
-                input_ids.len(),
-                input_ids
-            );
-        }
-
-        // Debug: print established connections
-        let connections = net.get_all_connections().await;
+        // Debug: print established connections (server connections are to other MPC parties)
+        let connections = net.get_all_server_connections();
         let conn_ids: Vec<_> = connections.iter().map(|(id, _)| *id).collect();
         eprintln!(
             "[party {}] Connections before MPC: {:?} ({} total)",
@@ -806,207 +2319,97 @@ async fn main() {
             connections.len()
         );
 
-        // Create HoneyBadger MPC node options
-        let n_triples = 8;
-        let n_random = 16;
-        let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id);
-
-        // Create the MPC node directly with expected client IDs
-        let mut mpc_node = match <HoneyBadgerMPCNode<Fr, Avid> as MPCProtocol<
-            Fr,
-            RobustShare<Fr>,
-            QuicNetworkManager,
-        >>::setup(my_id, mpc_opts, input_ids.clone())
-        {
-            Ok(node) => node,
-            Err(e) => {
-                eprintln!("Failed to create MPC node: {:?}", e);
-                exit(13);
-            }
-        };
-
-        // Spawn receive loops for MPC peer connections only
-        eprintln!("[party {}] Spawning receive loops for {} MPC peers...", my_id, n);
-        let mut msg_rx = spawn_receive_loops(net.clone(), my_id, n).await;
-
-        // Clone node for the message processing task
-        let mut processing_node = mpc_node.clone();
-        let processing_net = net.clone();
-        let processing_party_id = my_id;
-
-        // Spawn message processing task
-        tokio::spawn(async move {
-            eprintln!(
-                "[party {}] Message processing task started",
-                processing_party_id
-            );
-            while let Some(raw_msg) = msg_rx.recv().await {
-                if let Err(e) = processing_node.process(raw_msg, processing_net.clone()).await {
-                    eprintln!(
-                        "[party {}] Failed to process message: {:?}",
-                        processing_party_id, e
-                    );
+        match backend_kind {
+            #[cfg(feature = "honeybadger")]
+            MpcBackendKind::HoneyBadger => {
+                macro_rules! setup_hb {
+                    ($F:ty, $G:ty) => {{
+                        if let Err(e) = setup_hb_party_for_curve::<$F, $G>(
+                            &mut vm,
+                            net.clone(),
+                            my_id,
+                            n,
+                            t,
+                            instance_id,
+                            expected_client_count,
+                        )
+                        .await
+                        {
+                            eprintln!("[party {}] HoneyBadger setup failed: {}", my_id, e);
+                            exit(13);
+                        }
+                    }};
                 }
-            }
-            eprintln!(
-                "[party {}] Message processing task ended",
-                processing_party_id
-            );
-        });
 
-        // Create engine wrapping the same node (shared via internal Arc state)
-        let engine =
-            HoneyBadgerMpcEngine::from_existing_node(instance_id, my_id, n, t, net.clone(), mpc_node.clone());
-
-        // Run preprocessing
-        eprintln!("[party {}] Starting MPC preprocessing...", my_id);
-        if let Err(e) = engine.preprocess().await {
-            eprintln!("MPC preprocessing failed: {}", e);
-            exit(14);
-        }
-        eprintln!("[party {}] MPC preprocessing complete", my_id);
-
-        // If we have expected clients, start client accept loop and wait for connections
-        if !input_ids.is_empty() {
-            eprintln!("[party {}] Waiting for {} clients to connect...", my_id, input_ids.len());
-
-            // Spawn client accept loop - this will accept incoming client connections
-            // and register them in the network's client_connections
-            // We need a mutable copy for accept(), but client_connections is shared via Arc<DashMap>
-            let mut accept_net = (*net).clone();
-            let expected_client_ids = input_ids.clone();
-            let accept_party_id = my_id;
-            let accept_mpc_node = mpc_node.clone();
-            let net_for_processing = net.clone();
-
-            tokio::spawn(async move {
-                eprintln!("[party {}] Client accept loop started", accept_party_id);
-                loop {
-                    // Accept incoming connection (this blocks until a connection arrives)
-                    match accept_net.accept().await {
-                        Ok(connection) => {
-                            // Connection is automatically registered by stoffelnet
-                            // based on the ROLE:CLIENT:{id} handshake
-                            eprintln!("[party {}] Accepted a client connection", accept_party_id);
-
-                            // Spawn a handler for this client's messages
-                            let client_mpc_node = accept_mpc_node.clone();
-                            let client_net = net_for_processing.clone();
-                            tokio::spawn(async move {
-                                loop {
-                                    match connection.receive().await {
-                                        Ok(data) => {
-                                            // Process the message through the MPC node
-                                            if let Err(e) = client_mpc_node.clone().process(data, client_net.clone()).await {
-                                                eprintln!("[party] Failed to process client message: {:?}", e);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[party] Client connection closed: {}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("[party {}] Accept error: {}", accept_party_id, e);
-                            // Don't break - keep accepting
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
+                match curve_config {
+                    MpcCurveConfig::Bls12_381 => {
+                        setup_hb!(ark_bls12_381::Fr, ark_bls12_381::G1Projective)
+                    }
+                    MpcCurveConfig::Bn254 => {
+                        setup_hb!(ark_bn254::Fr, ark_bn254::G1Projective)
+                    }
+                    MpcCurveConfig::Curve25519 => {
+                        setup_hb!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
+                    }
+                    MpcCurveConfig::Ed25519 => {
+                        setup_hb!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective)
                     }
                 }
-            });
 
-            // Wait for all expected clients to connect with timeout
-            let connect_timeout = Duration::from_secs(60);
-            let check_interval = Duration::from_millis(500);
-            let start = std::time::Instant::now();
-
-            loop {
-                let connected_clients: Vec<ClientId> = net.clients();
-                let connected_count = connected_clients.iter()
-                    .filter(|&cid| expected_client_ids.contains(cid))
-                    .count();
-
-                eprintln!("[party {}] {} of {} expected clients connected: {:?}",
-                         my_id, connected_count, expected_client_ids.len(), connected_clients);
-
-                if connected_count >= expected_client_ids.len() {
-                    eprintln!("[party {}] All expected clients connected!", my_id);
-                    break;
-                }
-
-                if start.elapsed() > connect_timeout {
-                    eprintln!("[party {}] Timeout waiting for clients. Connected: {:?}, Expected: {:?}",
-                             my_id, connected_clients, expected_client_ids);
-                    exit(15);
-                }
-
-                tokio::time::sleep(check_interval).await;
+                eprintln!(
+                    "[party {}] HoneyBadger MPC engine set, starting VM execution...",
+                    my_id
+                );
             }
 
-            eprintln!("[party {}] Initializing InputServer for {} clients...", my_id, input_ids.len());
+            #[cfg(feature = "avss")]
+            MpcBackendKind::Avss => {
+                eprintln!(
+                    "[party {}] Setting up AVSS backend (curve: {})...",
+                    my_id,
+                    curve_config.name()
+                );
 
-            // Initialize input server for each expected client
-            // Each client needs random shares for their inputs (assume 1 input per client for now)
-            for &cid in &input_ids {
-                // Take random shares from preprocessing material
-                let local_shares = match mpc_node
-                    .preprocessing_material
-                    .lock()
-                    .await
-                    .take_random_shares(1) // 1 input per client
-                {
-                    Ok(shares) => shares,
-                    Err(e) => {
-                        eprintln!("[party {}] Not enough random shares for client {}: {:?}", my_id, cid, e);
-                        exit(15);
+                macro_rules! setup_avss {
+                    ($F:ty, $G:ty) => {{
+                        if let Err(e) = setup_avss_party_for_curve::<$F, $G>(
+                            &mut vm,
+                            net.clone(),
+                            my_id,
+                            n,
+                            t,
+                            instance_id,
+                            expected_client_count,
+                        )
+                        .await
+                        {
+                            eprintln!("[party {}] AVSS setup failed: {}", my_id, e);
+                            exit(13);
+                        }
+                    }};
+                }
+
+                match curve_config {
+                    MpcCurveConfig::Bls12_381 => {
+                        setup_avss!(ark_bls12_381::Fr, ark_bls12_381::G1Projective)
                     }
-                };
-
-                if let Err(e) = mpc_node
-                    .preprocess
-                    .input
-                    .init(cid, local_shares, 1, net.clone())
-                    .await
-                {
-                    eprintln!("[party {}] Failed to init InputServer for client {}: {:?}", my_id, cid, e);
-                    exit(15);
+                    MpcCurveConfig::Bn254 => {
+                        setup_avss!(ark_bn254::Fr, ark_bn254::G1Projective)
+                    }
+                    MpcCurveConfig::Curve25519 => {
+                        setup_avss!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
+                    }
+                    MpcCurveConfig::Ed25519 => {
+                        setup_avss!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective)
+                    }
                 }
-                eprintln!("[party {}] InputServer initialized for client {}", my_id, cid);
-            }
 
-            // Wait for all client inputs with timeout
-            eprintln!("[party {}] Waiting for client inputs (timeout: 60s)...", my_id);
-            let client_inputs = match mpc_node
-                .preprocess
-                .input
-                .wait_for_all_inputs(Duration::from_secs(60))
-                .await
-            {
-                Ok(inputs) => inputs,
-                Err(e) => {
-                    eprintln!("[party {}] Failed to receive client inputs: {:?}", my_id, e);
-                    exit(16);
-                }
-            };
-
-            eprintln!(
-                "[party {}] Received inputs from {} clients",
-                my_id,
-                client_inputs.len()
-            );
-
-            // Store client inputs in the VM's client store
-            for (cid, shares) in client_inputs {
-                vm.state.client_store().store_client_input(cid, shares);
-                eprintln!("[party {}] Stored inputs for client {}", my_id, cid);
+                eprintln!(
+                    "[party {}] AVSS engine set, starting VM execution...",
+                    my_id
+                );
             }
         }
-
-        vm.state.set_mpc_engine(engine);
-        eprintln!("[party {}] MPC engine set, starting VM execution...", my_id);
     }
 
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
@@ -1014,7 +2417,52 @@ async fn main() {
     // Execute entry function
     match vm.execute(&agreed_entry) {
         Ok(result) => {
-            println!("Program returned: {:?}", result);
+            // Auto-reveal if the program returned an unrevealed share
+            let result = if let Value::Share(ty, ref sd) = result {
+                if let Some(engine) = vm.state.mpc_engine() {
+                    eprintln!("Program returned a secret share, revealing...");
+                    match engine.open_share(ty, sd.as_bytes()) {
+                        Ok(revealed) => revealed,
+                        Err(e) => {
+                            eprintln!("Failed to reveal returned share: {}", e);
+                            result
+                        }
+                    }
+                } else {
+                    result
+                }
+            } else {
+                result
+            };
+            // Pretty-print the result
+            match &result {
+                Value::Array(arr_id) => {
+                    if let Some(arr) = vm.state.object_store.get_array(*arr_id) {
+                        let len = arr.length();
+                        // Check if it's a byte array (all U8 values)
+                        let mut bytes = Vec::with_capacity(len);
+                        let mut is_byte_array = true;
+                        for i in 0..len {
+                            match arr.get(&Value::I64(i as i64)) {
+                                Some(Value::U8(b)) => bytes.push(*b),
+                                _ => {
+                                    is_byte_array = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if is_byte_array && !bytes.is_empty() {
+                            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                            println!("Program returned: byte[{}] 0x{}", bytes.len(), hex);
+                        } else {
+                            println!("Program returned: {:?}", result);
+                        }
+                    } else {
+                        println!("Program returned: {:?}", result);
+                    }
+                }
+                _ => println!("Program returned: {:?}", result),
+            }
         }
         Err(err) => {
             eprintln!("Execution error in '{}': {}", agreed_entry, err);
@@ -1041,12 +2489,19 @@ Flags:
   --party-id <usize>      Party id (party mode, 0-indexed)
   --bootstrap <addr:port> Bootnode address (party mode or client mode)
   --n-parties <usize>     Number of parties for MPC (required in party/leader/client mode)
-  --threshold <usize>     Threshold t for HoneyBadger (default: 1)
-  --client-id <usize>     Client ID (client mode)
+  --threshold <usize>     Threshold t (default: 1)
+  --mpc-backend <name>    MPC backend: honeybadger (default) or avss
+  --mpc-curve <name>      MPC curve: bls12-381 (default), bn254, curve25519, ed25519
   --inputs <values>       Comma-separated input values (client mode)
   --servers <addrs>       Comma-separated server addresses (client mode)
-  --expected-clients <ids> Comma-separated client IDs expected (party/leader mode)
+  --wait-for-clients <n>
+                          Number of client inputs to collect before starting computation
+                          (HoneyBadger only; ALPN handles routing, this controls coordination)
   -h, --help              Show this help
+
+Required environment:
+  STOFFEL_AUTH_TOKEN      Shared secret required by bootnode and all parties for
+                          authenticated discovery registration
 
 Multi-Party Execution:
   In party mode, all parties register with the bootnode and wait until
@@ -1064,41 +2519,49 @@ Examples:
 
   # Multi-party execution (5 parties, threshold 1) - Leader mode (recommended)
   # Terminal 1: Leader (bootnode + party 0)
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --leader --bind 127.0.0.1:9000 --n-parties 5 --threshold 1
 
   # Terminals 2-5: Other parties
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --threshold 1
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 2 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9003 --n-parties 5 --threshold 1
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 3 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9004 --n-parties 5 --threshold 1
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 4 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9005 --n-parties 5 --threshold 1
 
   # Alternative: Separate bootnode (6 processes total)
   # Terminal 1: Bootnode only
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run --bootnode --bind 127.0.0.1:9000 --n-parties 5
 
   # Terminals 2-6: All parties
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 0 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9001 --n-parties 5 --threshold 1
+  STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --threshold 1
   # ... etc
 
-  # Multi-party execution with client inputs
-  # Terminal 1: Leader with expected clients
-  stoffel-run program.stfbin main --leader --bind 127.0.0.1:9000 --n-parties 5 --threshold 1 --expected-clients 100,101
+  # Multi-party execution with client inputs (transport-derived IDs)
+  # Terminal 1: Leader with expected client count
+  stoffel-run program.stfbin main --leader --bind 127.0.0.1:9000 --n-parties 5 --threshold 1 --wait-for-clients 2
 
-  # Terminals 2-5: Other parties (same expected-clients)
-  stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --expected-clients 100,101
+  # Terminals 2-5: Other parties (same expected-client-count)
+  stoffel-run program.stfbin main --party-id 1 --bootstrap 127.0.0.1:9000 --bind 127.0.0.1:9002 --n-parties 5 --wait-for-clients 2
   # ... etc
 
   # Client mode: provide inputs to the MPC network
   # Note: clients connect directly to party servers, not the bootnode
-  stoffel-run --client --client-id 100 --inputs 10,20 --servers 127.0.0.1:10000,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004,127.0.0.1:9005 --n-parties 5
-  stoffel-run --client --client-id 101 --inputs 30,40 --servers 127.0.0.1:10000,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004,127.0.0.1:9005 --n-parties 5
+  stoffel-run --client --inputs 10,20 --servers 127.0.0.1:10000,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004,127.0.0.1:9005 --n-parties 5
+  stoffel-run --client --inputs 30,40 --servers 127.0.0.1:10000,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004,127.0.0.1:9005 --n-parties 5
 
   # Docker example with client inputs:
-  # Start parties with expected-clients:
-  # docker run ... -e STOFFEL_EXPECTED_CLIENTS=100,101 stoffelvm:latest
+  # Start parties with expected-client-count:
+  # docker run ... -e STOFFEL_EXPECTED_CLIENT_COUNT=2 stoffelvm:latest
   # Then run clients connecting to the party servers:
-  stoffel-run --client --client-id 100 --inputs 42 --servers 172.18.0.2:9000,172.18.0.3:9000,172.18.0.4:9000,172.18.0.5:9000,172.18.0.6:9000 --n-parties 5
+  stoffel-run --client --inputs 42 --servers 172.18.0.2:9000,172.18.0.3:9000,172.18.0.4:9000,172.18.0.5:9000,172.18.0.6:9000 --n-parties 5
 "#
     );
     exit(1);

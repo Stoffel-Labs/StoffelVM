@@ -21,43 +21,20 @@ use tracing::info;
 use crate::core_vm::VirtualMachine;
 use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
+    RoutedNetwork,
 };
+use crate::tests::test_utils::{acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing};
 use std::collections::HashMap;
-use stoffel_vm_types::core_types::{ShareType, Value};
+use stoffel_vm_types::core_types::{ShareData, ShareType, Value};
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
-
-/// Helper to initialize crypto provider
-fn init_crypto_provider() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-    });
-}
-
-/// Helper for test tracing setup
-fn setup_test_tracing() {
-    use std::sync::Once;
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let subscriber = FmtSubscriber::builder()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-            .with_test_writer()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-}
 
 // Use a multi-thread runtime to allow synchronous bridges inside the VM's MPC engine
 #[tokio::test(flavor = "multi_thread")]
 async fn test_vm_mpc_multiplication_integration() {
     init_crypto_provider();
     setup_test_tracing();
+    let _hb_itest_lock = acquire_hb_itest_lock().await;
 
     info!("=== Starting VM MPC Integration Test ===");
 
@@ -92,29 +69,17 @@ async fn test_vm_mpc_multiplication_integration() {
     .expect("Failed to create servers");
     info!("✓ Created {} servers", servers.len());
 
-    // Step 2: Start all servers
+    // Step 2: Start all servers (accept loops only; receive loops come after step 3)
     info!("Step 2: Starting servers...");
-    for (i, server) in servers.iter_mut().enumerate() {
+    for server in servers.iter_mut() {
         // Must call start() first to create the network Arc
         server.start().await.expect("Failed to start server");
-
-        let mut node = server.node.clone();
-        let network = server.network.clone().expect("network should be set after start()");
-        let mut rx = recv.remove(0);
-        tokio::spawn(async move {
-            while let Some(raw_msg) = rx.recv().await {
-                if let Err(e) = node.process(raw_msg, network.clone()).await {
-                    tracing::error!("Node {i} failed to process message: {e:?}");
-                }
-            }
-            tracing::info!("Receiver task for node {i} ended");
-        });
         info!("✓ Started server {}", server.node_id);
     }
 
     // Step 3: Connect servers to each other
     info!("Step 3: Connecting servers to each other...");
-    for server in &servers {
+    for server in servers.iter_mut() {
         server
             .connect_to_peers()
             .await
@@ -124,15 +89,68 @@ async fn test_vm_mpc_multiplication_integration() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    // Step 3a: Finalize network — assign_party_ids(), recreate HB nodes with
+    // correct sorted-key party IDs, and build MpcNetwork wrappers.
+    info!("Step 3a: Finalizing network (assign_party_ids)...");
+    for server in servers.iter_mut() {
+        let pid = server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+        info!(
+            "✓ Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
+    }
+
+    // Step 3b: Spawn receive-loop tasks for the message dispatch channel.
+    info!("Step 3b: Spawning receive-loop tasks...");
+    for (i, server) in servers.iter().enumerate() {
+        let mut node = server.node.clone();
+        let network: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
+            .clone()
+            .expect("routed_network should be set after connect_to_peers()");
+        let open_message_router = server.open_message_router.clone();
+        let mut rx = recv.remove(0);
+        tokio::spawn(async move {
+            while let Some((sender_id, raw_msg)) = rx.recv().await {
+                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+                if let Err(e) = node.process(sender_id, raw_msg, network.clone()).await {
+                    tracing::error!("Node {i} failed to process message: {e:?}");
+                }
+            }
+            tracing::info!("Receiver task for node {i} ended");
+        });
+    }
+
     // Step 4: Run preprocessing
     info!("Step 4: Running preprocessing on all servers...");
-    let preprocessing_timeout = Duration::from_secs(30);
+    let preprocessing_timeout = Duration::from_secs(120);
     let preprocessing_handles: Vec<_> = servers
         .iter()
         .enumerate()
         .map(|(i, server)| {
             let mut node = server.node.clone();
-            let network = server.network.clone().expect("network should be set after start()");
+            let network: std::sync::Arc<RoutedNetwork> = server
+                .routed_network
+                .clone()
+                .expect("routed_network should be set after connect_to_peers()");
 
             tokio::spawn(async move {
                 info!("[Server {}] Starting preprocessing...", i);
@@ -205,6 +223,32 @@ async fn test_vm_mpc_multiplication_integration() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Register client connections under logical IDs in each server's RoutedNetwork.
+    // QuicNetworkManager stores client connections under a QUIC-derived peer ID
+    // (from TLS public key), but the HoneyBadger input protocol uses logical
+    // client IDs. Bridge the gap by copying the accepted client connections into
+    // the RoutedNetwork's logical-ID map.
+    for server in servers.iter() {
+        if let Some(ref routed) = server.routed_network {
+            let all_clients = server
+                .network
+                .as_ref()
+                .expect("network should be set")
+                .get_all_client_connections();
+            // Map all QUIC-derived client connections to the logical client_id.
+            // With a single client this is unambiguous.
+            for (_, conn) in &all_clients {
+                routed.register_client(client_id, conn.clone());
+            }
+            info!(
+                "Server {} registered {} client connection(s) under logical ID {}",
+                server.node_id,
+                all_clients.len(),
+                client_id
+            );
+        }
+    }
+
     // Step 5b: Initialize input protocol on all servers for the client
     info!("Step 5b: Initializing client inputs on all servers...");
     for (i, server) in servers.iter_mut().enumerate() {
@@ -219,10 +263,21 @@ async fn test_vm_mpc_multiplication_integration() {
             .node
             .preprocess
             .input
-            .init(client_id, local_shares, 2, server.network.clone().expect("network should be set"))
+            .init(
+                client_id,
+                local_shares,
+                2,
+                server
+                    .routed_network
+                    .clone()
+                    .expect("routed_network should be set after connect_to_peers()"),
+            )
             .await
             .expect("input.init failed");
-        info!("✓ Server {} initialized input protocol for client {}", i, client_id);
+        info!(
+            "✓ Server {} initialized input protocol for client {}",
+            i, client_id
+        );
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -235,12 +290,17 @@ async fn test_vm_mpc_multiplication_integration() {
     let mut multiplication_handles = Vec::new();
     for (pid, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
-        let net = server.network.clone().expect("network should be set");
+        let net: std::sync::Arc<RoutedNetwork> = server
+            .routed_network
+            .clone()
+            .expect("routed_network should be set after connect_to_peers()");
 
         let handle = tokio::spawn(async move {
             // Get input shares for this party
             let (x_shares, y_shares) = {
-                let input_store = node.preprocess.input
+                let input_store = node
+                    .preprocess
+                    .input
                     .wait_for_all_inputs(std::time::Duration::from_secs(30))
                     .await
                     .expect("Failed to get client inputs");
@@ -249,7 +309,8 @@ async fn test_vm_mpc_multiplication_integration() {
             };
 
             // Perform multiplication - returns the result shares directly
-            let result = node.mul(x_shares, y_shares, net.clone())
+            let result = node
+                .mul(x_shares, y_shares, net.clone())
                 .await
                 .expect("mul failed");
 
@@ -273,7 +334,8 @@ async fn test_vm_mpc_multiplication_integration() {
     let mut vm = VirtualMachine::new();
 
     // Get the result share from party 0 (from the collected results)
-    let result_share = results.iter()
+    let result_share = results
+        .iter()
         .find(|(pid, _)| *pid == 0)
         .map(|(_, shares)| shares[0].clone())
         .expect("Party 0 result not found");
@@ -298,7 +360,10 @@ async fn test_vm_mpc_multiplication_integration() {
             // Load the result share into r0
             Instruction::LDI(
                 0,
-                Value::Share(ShareType::secret_int(64), result_share_bytes.clone()),
+                Value::Share(
+                    ShareType::secret_int(64),
+                    ShareData::Opaque(result_share_bytes.clone()),
+                ),
             ),
             // Could perform additional operations here (e.g., add constants)
             // For now, just return the share
@@ -324,10 +389,13 @@ async fn test_vm_mpc_multiplication_integration() {
 
     match result {
         Value::Share(ShareType::SecretInt { .. }, result_bytes) => {
-            info!("Received result share: {} bytes", result_bytes.len());
+            info!(
+                "Received result share: {} bytes",
+                result_bytes.as_bytes().len()
+            );
 
             // Decode the result share
-            let result_share = RobustShare::<Fr>::deserialize_compressed(&result_bytes[..])
+            let result_share = RobustShare::<Fr>::deserialize_compressed(result_bytes.as_bytes())
                 .expect("Failed to deserialize result share");
 
             info!("Result share decoded successfully");
