@@ -1960,10 +1960,11 @@ async fn main() {
 
                 coord.wait_for_pp().await.unwrap();
                 coord.wait_for_input_mask_init().await.unwrap();
-                let indices = coord
-                    .obtain_mask_indices(input_values.len() as u64)
-                    .await
-                    .unwrap();
+                let mut indices = Vec::new();
+                for i in 0..input_values.len() as u64 {
+                    coord.reserve_mask_index(i).await.unwrap();
+                    indices.push(i);
+                }
                 eprintln!("[on-chain client] obtained index {}", indices[0]);
 
                 let base_nonce = coord.base_nonce().await;
@@ -2014,10 +2015,11 @@ async fn main() {
 
                 coord.wait_for_pp().await.unwrap();
                 coord.wait_for_input_mask_init().await.unwrap();
-                let indices = coord
-                    .obtain_mask_indices(input_values.len() as u64)
-                    .await
-                    .unwrap();
+                let mut indices = Vec::new();
+                for i in 0..input_values.len() as u64 {
+                    coord.reserve_mask_index(i).await.unwrap();
+                    indices.push(i);
+                }
 
                 let rpc_addrs: Vec<(String, u16)> = server_addrs
                     .iter()
@@ -2656,7 +2658,7 @@ async fn main() {
             match vm.execute(&agreed_entry) {
                 Ok(result) => {
                     let output_share = match &result {
-                        Value::Share(_ty, share_bytes) => share_bytes.clone(),
+                        Value::Share(_ty, share_data) => share_data.as_bytes().to_vec(),
                         _ => {
                             println!("Program returned: {:?}", result);
                             vec![]
@@ -2988,7 +2990,7 @@ async fn main() {
             if let Some(ref mut coord) = coord_opt {
                 // Coordinator output delivery
                 let output_share = match &result {
-                    Value::Share(_ty, share_bytes) => share_bytes.clone(),
+                    Value::Share(_ty, share_data) => share_data.as_bytes().to_vec(),
                     _ => {
                         println!("Program returned: {:?}", result);
                         vec![]
