@@ -27,10 +27,6 @@ WORKDIR /build
 # Copy the entire project (we need all crates for workspace build)
 COPY . .
 
-# The VM depends on a sibling coordinator checkout at /stoffel-mpc-coordinator.
-# Pull that source from the compose-provided additional build context.
-COPY --from=coordsrc . /stoffel-mpc-coordinator
-
 # Configure git for private repos if using SSH
 # For private GitHub repos, mount SSH keys during build:
 #   docker build --ssh default .

@@ -16,8 +16,6 @@
 x-stoffel-build: &stoffel-build
   context: .
   dockerfile: Dockerfile
-  additional_contexts:
-    coordsrc: ../stoffel-mpc-coordinator
 
 x-party-common: &party-common
   build: *stoffel-build
@@ -55,8 +53,6 @@ services:
     build:
       context: .
       dockerfile: docker/coordinator.Dockerfile
-      additional_contexts:
-        coordsrc: ../stoffel-mpc-coordinator
     container_name: stoffel-coordinator-reserve-index
     hostname: coordinator
     command:

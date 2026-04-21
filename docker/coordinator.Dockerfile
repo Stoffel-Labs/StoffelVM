@@ -10,14 +10,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-COPY --from=coordsrc . /build/stoffel-mpc-coordinator
-
+COPY .cargo /build/.cargo
 COPY docker/coordinator-wrapper /build/coordinator-wrapper
-
-# The reserve-index coordinator currently locks the Solidity SDK to a broken
-# branch tip; pin the copied checkout to a known-good revision for this image.
-RUN sed -i 's|stoffel-solidity-bindings = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", branch = "test-coord" }|stoffel-solidity-bindings = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git", rev = "e8f3dad12ff448045617ab484a23c8e1e408d103" }|' /build/stoffel-mpc-coordinator/Cargo.toml && \
-    rm -f /build/stoffel-mpc-coordinator/Cargo.lock
 
 WORKDIR /build/coordinator-wrapper
 RUN cargo build --release
