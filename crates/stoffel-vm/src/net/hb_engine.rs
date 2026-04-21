@@ -126,7 +126,14 @@ where
             _ => return Ok(false),
         };
 
-        let base = PreprocKey::new(hash, F::field_kind(), self.n, self.t, self.party_id, MaterialKind::BeaverTriple);
+        let base = PreprocKey::new(
+            hash,
+            F::field_kind(),
+            self.n,
+            self.t,
+            self.party_id,
+            MaterialKind::BeaverTriple,
+        );
         let k_rs = base.with_kind(MaterialKind::RandomShare);
         let k_pb = base.with_kind(MaterialKind::PRandBit);
         let k_pi = base.with_kind(MaterialKind::PRandInt);
@@ -145,23 +152,42 @@ where
         let mut prep = node.preprocessing_material.lock().await;
 
         if let Some(blob) = triples {
-            let decoded = preproc::deserialize_beaver_triples::<F>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            let decoded = preproc::deserialize_beaver_triples::<F>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
             prep.add(Some(decoded), None, None, None);
         }
         if let Some(blob) = randoms {
-            let decoded = preproc::deserialize_robust_shares::<F>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            let decoded = preproc::deserialize_robust_shares::<F>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
             prep.add(None, Some(decoded), None, None);
         }
         if let Some(blob) = prandbits {
-            let decoded = preproc::deserialize_prandbit_shares::<F>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            let decoded = preproc::deserialize_prandbit_shares::<F>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
             prep.add(None, None, Some(decoded), None);
         }
         if let Some(blob) = prandints {
-            let decoded = preproc::deserialize_robust_shares::<F>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            let decoded = preproc::deserialize_robust_shares::<F>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
             prep.add(None, None, None, Some(decoded));
         }
 
-        tracing::info!("Loaded preprocessing material from store for program {}", hex::encode(hash));
+        tracing::info!(
+            "Loaded preprocessing material from store for program {}",
+            hex::encode(hash)
+        );
         Ok(true)
     }
 
@@ -181,7 +207,14 @@ where
             _ => return Ok(()),
         };
 
-        let base = PreprocKey::new(hash, F::field_kind(), self.n, self.t, self.party_id, MaterialKind::BeaverTriple);
+        let base = PreprocKey::new(
+            hash,
+            F::field_kind(),
+            self.n,
+            self.t,
+            self.party_id,
+            MaterialKind::BeaverTriple,
+        );
 
         // Drain and serialize inside the lock, collect (key, blob, items) tuples
         let mut to_store: Vec<(PreprocKey, PreprocBlob)> = Vec::new();
@@ -196,27 +229,47 @@ where
             let (n_bt, n_rs, n_pb, n_pi) = prep.len();
 
             if n_bt > 0 {
-                let items = prep.take_beaver_triples(n_bt).map_err(|e| format!("{e:?}"))?;
+                let items = prep
+                    .take_beaver_triples(n_bt)
+                    .map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_beaver_triples::<F>(&items)?;
-                to_store.push((base.clone(), PreprocBlob::new(data, item_size, items.len() as u32)));
+                to_store.push((
+                    base.clone(),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
                 restore_bt = Some(items);
             }
             if n_rs > 0 {
-                let items = prep.take_random_shares(n_rs).map_err(|e| format!("{e:?}"))?;
+                let items = prep
+                    .take_random_shares(n_rs)
+                    .map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
-                to_store.push((base.with_kind(MaterialKind::RandomShare), PreprocBlob::new(data, item_size, items.len() as u32)));
+                to_store.push((
+                    base.with_kind(MaterialKind::RandomShare),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
                 restore_rs = Some(items);
             }
             if n_pb > 0 {
-                let items = prep.take_prandbit_shares(n_pb).map_err(|e| format!("{e:?}"))?;
+                let items = prep
+                    .take_prandbit_shares(n_pb)
+                    .map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_prandbit_shares::<F>(&items)?;
-                to_store.push((base.with_kind(MaterialKind::PRandBit), PreprocBlob::new(data, item_size, items.len() as u32)));
+                to_store.push((
+                    base.with_kind(MaterialKind::PRandBit),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
                 restore_pb = Some(items);
             }
             if n_pi > 0 {
-                let items = prep.take_prandint_shares(n_pi).map_err(|e| format!("{e:?}"))?;
+                let items = prep
+                    .take_prandint_shares(n_pi)
+                    .map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
-                to_store.push((base.with_kind(MaterialKind::PRandInt), PreprocBlob::new(data, item_size, items.len() as u32)));
+                to_store.push((
+                    base.with_kind(MaterialKind::PRandInt),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
                 restore_pi = Some(items);
             }
 
@@ -228,7 +281,10 @@ where
             store.store(key, blob).await?;
         }
 
-        tracing::info!("Persisted preprocessing material to store for program {}", hex::encode(hash));
+        tracing::info!(
+            "Persisted preprocessing material to store for program {}",
+            hex::encode(hash)
+        );
         Ok(())
     }
 
@@ -629,12 +685,10 @@ where
             if peer_id == self.party_id {
                 continue;
             }
-            self.net.send(peer_id, &payload).await.map_err(|e| {
-                format!(
-                    "Failed to send open payload to party {}: {}",
-                    peer_id, e
-                )
-            })?;
+            self.net
+                .send(peer_id, &payload)
+                .await
+                .map_err(|e| format!("Failed to send open payload to party {}: {}", peer_id, e))?;
         }
         Ok(())
     }
@@ -948,7 +1002,12 @@ where
         }
     }
 
-    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<ShareData, String> {
+    fn multiply_share(
+        &self,
+        ty: ShareType,
+        left: &[u8],
+        right: &[u8],
+    ) -> Result<ShareData, String> {
         crate::net::block_on_current(self.multiply_share_async(ty, left, right))
     }
 
@@ -973,8 +1032,12 @@ where
         let n = self.n;
         let t = self.t;
 
-        self.open_registry
-            .open_share_wait(self.party_id, &type_key, share_bytes, required, |collected| {
+        self.open_registry.open_share_wait(
+            self.party_id,
+            &type_key,
+            share_bytes,
+            required,
+            |collected| {
                 let mut shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
                 for bytes in collected {
                     shares.push(Self::decode_share(bytes)?);
@@ -990,7 +1053,8 @@ where
                 let (_deg, secret) = RobustShare::recover_secret(&shares, n, t)
                     .map_err(|e| format!("recover_secret: {:?}", e))?;
                 Ok(Self::field_to_value(ty, secret))
-            })
+            },
+        )
     }
 
     fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
@@ -1014,8 +1078,12 @@ where
         let n = self.n;
         let t = self.t;
 
-        self.open_registry
-            .batch_open_wait(self.party_id, &type_key, shares, required, |collected, pos| {
+        self.open_registry.batch_open_wait(
+            self.party_id,
+            &type_key,
+            shares,
+            required,
+            |collected, pos| {
                 let mut decoded_shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
                 for bytes in collected {
                     decoded_shares.push(Self::decode_share(bytes)?);
@@ -1024,7 +1092,8 @@ where
                 let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, n, t)
                     .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
                 Ok(Self::field_to_value(ty, secret))
-            })
+            },
+        )
     }
 
     fn shutdown(&self) {
@@ -1222,7 +1291,6 @@ where
 // For multi-process deployments, these protocols would need to use the
 // actual network-based Avid/ABA implementations from mpc-protocols.
 
-
 impl<F, G> MpcEngineConsensus for HoneyBadgerMpcEngine<F, G>
 where
     F: SupportedMpcField,
@@ -1233,10 +1301,7 @@ where
 
         // Assign the earliest session index this party has not used yet for this instance.
         let mut session_id = 0u64;
-        while registry
-            .messages
-            .contains_key(&(session_id, self.party_id))
-        {
+        while registry.messages.contains_key(&(session_id, self.party_id)) {
             session_id = session_id
                 .checked_add(1)
                 .ok_or_else(|| "RBC session id overflow".to_string())?;
@@ -1362,9 +1427,7 @@ where
                 }
             }
             if let Some((session_id, party, message)) = next {
-                registry
-                    .delivered
-                    .insert((party_id, party, session_id));
+                registry.delivered.insert((party_id, party, session_id));
                 tracing::info!(
                     instance_id = instance_id,
                     session_id = session_id,
@@ -1589,11 +1652,7 @@ where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
-    async fn init_reservations(
-        &self,
-        program_hash: [u8; 32],
-        capacity: u64,
-    ) -> Result<(), String> {
+    async fn init_reservations(&self, program_hash: [u8; 32], capacity: u64) -> Result<(), String> {
         let store = self.preproc_store.read().await.clone();
         if let Some(store) = store {
             if let Some(restored) =
@@ -1605,16 +1664,15 @@ where
                 return Ok(());
             }
         }
-        *self.reservation.write().await =
-            Some(ReservationRegistry::new(program_hash, self.party_id, capacity));
+        *self.reservation.write().await = Some(ReservationRegistry::new(
+            program_hash,
+            self.party_id,
+            capacity,
+        ));
         Ok(())
     }
 
-    async fn reserve_masks(
-        &self,
-        client_id: ClientId,
-        n: u64,
-    ) -> Result<ReservationGrant, String> {
+    async fn reserve_masks(&self, client_id: ClientId, n: u64) -> Result<ReservationGrant, String> {
         let guard = self.reservation.read().await;
         let reg = guard.as_ref().ok_or("reservations not initialized")?;
         reg.reserve(client_id, n).await.map_err(|e| e.to_string())
@@ -1629,11 +1687,18 @@ where
         };
 
         let key = PreprocKey::new(
-            hash, F::field_kind(), self.n, self.t, self.party_id, MaterialKind::RandomShare,
+            hash,
+            F::field_kind(),
+            self.n,
+            self.t,
+            self.party_id,
+            MaterialKind::RandomShare,
         );
         let blob = store.load(&key).await?.ok_or("no random shares stored")?;
         let share = preproc::deserialize_one_robust_share::<F>(
-            &blob.data, blob.meta.item_size, index as u32,
+            &blob.data,
+            blob.meta.item_size,
+            index as u32,
         )?;
         Self::encode_share(&share)
     }
@@ -1651,17 +1716,16 @@ where
             .map_err(|e| e.to_string())
     }
 
-    async fn consume_masked_inputs(
-        &self,
-        indices: &[u64],
-    ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    async fn consume_masked_inputs(&self, indices: &[u64]) -> Result<Vec<(u64, Vec<u8>)>, String> {
         // Collect masked inputs from the registry first, then drop the lock
         let masked_inputs: Vec<(u64, Vec<u8>)> = {
             let reg_guard = self.reservation.read().await;
             let reg = reg_guard.as_ref().ok_or("reservations not initialized")?;
             let mut inputs = Vec::with_capacity(indices.len());
             for &idx in indices {
-                let mi = reg.get_masked_input(idx).await
+                let mi = reg
+                    .get_masked_input(idx)
+                    .await
                     .ok_or_else(|| format!("no masked input for index {idx}"))?;
                 inputs.push((idx, mi));
             }
@@ -1676,14 +1740,21 @@ where
             _ => return Err("preproc store not configured".into()),
         };
         let key = PreprocKey::new(
-            hash, F::field_kind(), self.n, self.t, self.party_id, MaterialKind::RandomShare,
+            hash,
+            F::field_kind(),
+            self.n,
+            self.t,
+            self.party_id,
+            MaterialKind::RandomShare,
         );
         let blob = store.load(&key).await?.ok_or("no random shares stored")?;
 
         let mut result = Vec::with_capacity(indices.len());
         for (idx, masked_input_bytes) in &masked_inputs {
             let mask_share = preproc::deserialize_one_robust_share::<F>(
-                &blob.data, blob.meta.item_size, *idx as u32,
+                &blob.data,
+                blob.meta.item_size,
+                *idx as u32,
             )?;
             let masked_input = Self::decode_share(masked_input_bytes)?;
 
@@ -1717,7 +1788,9 @@ where
         };
         let store = self.preproc_store.read().await.clone();
         if let Some(store) = store {
-            reg.persist(store.as_ref()).await.map_err(|e| e.to_string())?;
+            reg.persist(store.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }

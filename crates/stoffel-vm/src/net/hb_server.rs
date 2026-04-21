@@ -302,10 +302,9 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                             loop {
                                 match connection.receive().await {
                                     Ok(data) => {
-                                        match open_message_router.try_handle_wire_message(
-                                            pid_for_task,
-                                            &data,
-                                        ) {
+                                        match open_message_router
+                                            .try_handle_wire_message(pid_for_task, &data)
+                                        {
                                             Ok(true) => continue,
                                             Err(e) => {
                                                 warn!(
@@ -316,10 +315,11 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                             }
                                             Ok(false) => {}
                                         }
-                                        match open_message_router.try_handle_hb_open_exp_wire_message(
-                                            pid_for_task,
-                                            &data,
-                                        ) {
+                                        match open_message_router
+                                            .try_handle_hb_open_exp_wire_message(
+                                                pid_for_task,
+                                                &data,
+                                            ) {
                                             Ok(true) => continue,
                                             Err(e) => {
                                                 warn!(
@@ -446,9 +446,8 @@ pub async fn spawn_receive_loops(
                     loop {
                         match connection.receive().await {
                             Ok(data) => {
-                                match open_message_router.try_handle_wire_message(
-                                    sender_id, &data,
-                                ) {
+                                match open_message_router.try_handle_wire_message(sender_id, &data)
+                                {
                                     Ok(true) => continue,
                                     Err(e) => {
                                         tracing::warn!(
@@ -462,9 +461,9 @@ pub async fn spawn_receive_loops(
                                     Ok(false) => {}
                                 }
 
-                                match open_message_router.try_handle_hb_open_exp_wire_message(
-                                    sender_id, &data,
-                                ) {
+                                match open_message_router
+                                    .try_handle_hb_open_exp_wire_message(sender_id, &data)
+                                {
                                     Ok(true) => continue,
                                     Err(e) => {
                                         tracing::warn!(
@@ -594,16 +593,15 @@ pub async fn spawn_receive_loops_split(
                     loop {
                         match connection.receive().await {
                             Ok(data) => {
-                                match open_message_router.try_handle_wire_message(
-                                    sender_id, &data,
-                                ) {
+                                match open_message_router.try_handle_wire_message(sender_id, &data)
+                                {
                                     Ok(true) => continue,
                                     Err(_) => continue,
                                     Ok(false) => {}
                                 }
-                                match open_message_router.try_handle_hb_open_exp_wire_message(
-                                    sender_id, &data,
-                                ) {
+                                match open_message_router
+                                    .try_handle_hb_open_exp_wire_message(sender_id, &data)
+                                {
                                     Ok(true) => continue,
                                     Err(_) => continue,
                                     Ok(false) => {}

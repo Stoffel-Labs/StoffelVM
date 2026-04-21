@@ -196,7 +196,13 @@ impl InstanceRegistry {
                 });
             }
         }
-        self.open_share_poll(party_id, type_key.to_owned(), share_bytes, required, reconstruct)
+        self.open_share_poll(
+            party_id,
+            type_key.to_owned(),
+            share_bytes,
+            required,
+            reconstruct,
+        )
     }
 
     async fn open_share_async<R>(
@@ -428,7 +434,13 @@ impl InstanceRegistry {
                 });
             }
         }
-        self.batch_open_poll(party_id, type_key.to_owned(), shares, required, reconstruct_one)
+        self.batch_open_poll(
+            party_id,
+            type_key.to_owned(),
+            shares,
+            required,
+            reconstruct_one,
+        )
     }
 
     async fn batch_open_async<R>(
@@ -765,7 +777,11 @@ impl OpenMessageRouter {
             Some(registry) => registry,
             None => return Ok(false),
         };
-        registry.insert_exp(message.sender_party_id, message.share_id, message.partial_point);
+        registry.insert_exp(
+            message.sender_party_id,
+            message.share_id,
+            message.partial_point,
+        );
         Ok(true)
     }
 
@@ -806,8 +822,8 @@ impl OpenMessageRouter {
             return Ok(false);
         }
 
-        let message: ExpOpenWireMessage = bincode::deserialize(&payload[prefix.len()..])
-            .map_err(|e| {
+        let message: ExpOpenWireMessage =
+            bincode::deserialize(&payload[prefix.len()..]).map_err(|e| {
                 if use_g2_registry {
                     format!("deserialize avss g2 open-exp payload: {}", e)
                 } else {
@@ -858,9 +874,17 @@ impl OpenMessageRouter {
             None => return Ok(false),
         };
         if use_g2_registry {
-            registry.insert_exp_g2(message.sender_party_id, message.share_id, message.partial_point);
+            registry.insert_exp_g2(
+                message.sender_party_id,
+                message.share_id,
+                message.partial_point,
+            );
         } else {
-            registry.insert_exp(message.sender_party_id, message.share_id, message.partial_point);
+            registry.insert_exp(
+                message.sender_party_id,
+                message.share_id,
+                message.partial_point,
+            );
         }
         Ok(true)
     }
@@ -1038,9 +1062,13 @@ mod tests {
 
         let reg2 = reg.clone();
         let waiter = tokio::spawn(async move {
-            reg2.open_share_async(0, "single-notify".to_string(), b"s0".to_vec(), 2, |shares| {
-                Ok(Value::I64(shares.len() as i64))
-            })
+            reg2.open_share_async(
+                0,
+                "single-notify".to_string(),
+                b"s0".to_vec(),
+                2,
+                |shares| Ok(Value::I64(shares.len() as i64)),
+            )
             .await
         });
 
@@ -1052,7 +1080,9 @@ mod tests {
                     r.get(&(0usize, "single-notify".to_string()))
                         .is_some_and(|entry| entry.party_ids == vec![0])
                 };
-                if ready { break; }
+                if ready {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         })
@@ -1061,9 +1091,13 @@ mod tests {
 
         let reg3 = reg.clone();
         let finalizer = tokio::spawn(async move {
-            reg3.open_share_async(1, "single-notify".to_string(), b"s1".to_vec(), 2, |shares| {
-                Ok(Value::I64(shares.len() as i64))
-            })
+            reg3.open_share_async(
+                1,
+                "single-notify".to_string(),
+                b"s1".to_vec(),
+                2,
+                |shares| Ok(Value::I64(shares.len() as i64)),
+            )
             .await
         });
 
@@ -1102,7 +1136,9 @@ mod tests {
                     r.get(&(0usize, "batch-notify".to_string(), 2usize))
                         .is_some_and(|entry| entry.party_ids == vec![0])
                 };
-                if ready { break; }
+                if ready {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         })
@@ -1129,7 +1165,10 @@ mod tests {
             .expect("batch open waiters should be notified by local insertion");
 
         assert_eq!(waiter.unwrap().unwrap(), vec![Value::I64(2), Value::I64(2)]);
-        assert_eq!(finalizer.unwrap().unwrap(), vec![Value::I64(2), Value::I64(2)]);
+        assert_eq!(
+            finalizer.unwrap().unwrap(),
+            vec![Value::I64(2), Value::I64(2)]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1144,8 +1183,20 @@ mod tests {
         reg_b.insert_single("key", 0, b"share_b".to_vec());
 
         // Verify isolation
-        let a_count = reg_a.single.lock().get(&(0, "key".to_string())).unwrap().shares.len();
-        let b_count = reg_b.single.lock().get(&(0, "key".to_string())).unwrap().shares.len();
+        let a_count = reg_a
+            .single
+            .lock()
+            .get(&(0, "key".to_string()))
+            .unwrap()
+            .shares
+            .len();
+        let b_count = reg_b
+            .single
+            .lock()
+            .get(&(0, "key".to_string()))
+            .unwrap()
+            .shares
+            .len();
         assert_eq!(a_count, 1);
         assert_eq!(b_count, 1);
     }

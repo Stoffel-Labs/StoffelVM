@@ -1141,7 +1141,9 @@ impl VMState {
         match value {
             Value::Share(ty, sd) => {
                 // Queue the reveal instead of executing immediately
-                let index = self.reveal_batcher.queue(*ty, sd.as_bytes().to_vec(), dest_reg);
+                let index = self
+                    .reveal_batcher
+                    .queue(*ty, sd.as_bytes().to_vec(), dest_reg);
 
                 // Check if we should auto-flush (hit max pending)
                 if self.reveal_batcher.should_auto_flush() {
@@ -2513,7 +2515,10 @@ impl VMState {
             .ok_or_else(|| format!("No share found for client {} at index {}", client_id, index))?;
 
         // TODO: The client store doesn't carry type metadata, so we assume 64-bit secret int.
-        Ok(Value::Share(ShareType::secret_int(64), ShareData::Opaque(share_bytes)))
+        Ok(Value::Share(
+            ShareType::secret_int(64),
+            ShareData::Opaque(share_bytes),
+        ))
     }
 
     /// Load a client's input share as a fixed-point share from the global client store
@@ -2543,7 +2548,9 @@ impl VMState {
         Ok(shares
             .into_iter()
             // TODO: The client store doesn't carry type metadata, so we assume 64-bit secret int.
-            .map(|share_bytes| Value::Share(ShareType::secret_int(64), ShareData::Opaque(share_bytes)))
+            .map(|share_bytes| {
+                Value::Share(ShareType::secret_int(64), ShareData::Opaque(share_bytes))
+            })
             .collect())
     }
 
@@ -2859,8 +2866,7 @@ impl VMState {
             .map_err(|e| format!("Failed to deserialize field element: {}", e))?;
         match share {
             DecodedShare::Robust(share) => {
-                let new_share =
-                    RobustShare::new(share.share[0] * scalar_f, share.id, share.degree);
+                let new_share = RobustShare::new(share.share[0] * scalar_f, share.id, share.degree);
                 Self::encode_share_bytes_typed(&new_share)
             }
             DecodedShare::Feldman(share) => {
@@ -2968,10 +2974,7 @@ impl VMState {
             .mpc_engine()
             .map(|e| e.n_parties())
             .unwrap_or(shares.len());
-        let threshold = self
-            .mpc_engine()
-            .map(|e| e.threshold())
-            .unwrap_or(1);
+        let threshold = self.mpc_engine().map(|e| e.threshold()).unwrap_or(1);
         let secret = match format {
             Some(LocalShareFormat::Robust) => {
                 let (_degree, secret) =

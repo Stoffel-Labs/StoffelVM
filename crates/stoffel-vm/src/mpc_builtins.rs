@@ -408,9 +408,7 @@ fn register_share_builtins(vm: &mut VirtualMachine) {
     // Returns a byte array.
     vm.register_foreign_function("Share.get_commitment", |ctx| {
         if ctx.args.len() < 2 {
-            return Err(
-                "Share.get_commitment expects 2 arguments: share, index".to_string(),
-            );
+            return Err("Share.get_commitment expects 2 arguments: share, index".to_string());
         }
         let (_, share_data) =
             share_object::extract_share_data(&ctx.vm_state.object_store, &ctx.args[0])?;
@@ -421,9 +419,13 @@ fn register_share_builtins(vm: &mut VirtualMachine) {
         let commitments = share_data
             .commitments()
             .ok_or("Share does not have Feldman commitments (requires AVSS backend)")?;
-        let commitment = commitments
-            .get(index)
-            .ok_or_else(|| format!("Commitment index {} out of bounds (have {})", index, commitments.len()))?;
+        let commitment = commitments.get(index).ok_or_else(|| {
+            format!(
+                "Commitment index {} out of bounds (have {})",
+                index,
+                commitments.len()
+            )
+        })?;
         let arr_id = ctx
             .vm_state
             .object_store
@@ -467,24 +469,18 @@ fn register_share_builtins(vm: &mut VirtualMachine) {
     // Share.mul_field - Multiply share by a field element (given as byte array)
     vm.register_foreign_function("Share.mul_field", |ctx| {
         if ctx.args.len() < 2 {
-            return Err(
-                "Share.mul_field expects 2 arguments: share, field_bytes".to_string(),
-            );
+            return Err("Share.mul_field expects 2 arguments: share, field_bytes".to_string());
         }
 
         let (ty, data) =
             share_object::extract_share_data(&ctx.vm_state.object_store, &ctx.args[0])?;
         let field_bytes = extract_byte_array(&ctx.vm_state.object_store, &ctx.args[1])?;
 
-        let result_data =
-            ctx.vm_state
-                .secret_share_mul_field(ty, data.as_bytes(), &field_bytes)?;
-
-        let party_id = ctx
+        let result_data = ctx
             .vm_state
-            .mpc_engine()
-            .map(|e| e.party_id())
-            .unwrap_or(0);
+            .secret_share_mul_field(ty, data.as_bytes(), &field_bytes)?;
+
+        let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
 
         let obj_id = share_object::create_share_object(
             &mut ctx.vm_state.object_store,
@@ -1109,7 +1105,9 @@ fn share_add(ctx: ForeignFunctionContext) -> Result<Value, String> {
     }
 
     // Perform addition using VM's share arithmetic
-    let result_data = ctx.vm_state.secret_share_add(ty1, data1.as_bytes(), data2.as_bytes())?;
+    let result_data = ctx
+        .vm_state
+        .secret_share_add(ty1, data1.as_bytes(), data2.as_bytes())?;
 
     let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
 
@@ -1136,7 +1134,9 @@ fn share_sub(ctx: ForeignFunctionContext) -> Result<Value, String> {
         return Err(format!("Share type mismatch: {:?} vs {:?}", ty1, ty2));
     }
 
-    let result_data = ctx.vm_state.secret_share_sub(ty1, data1.as_bytes(), data2.as_bytes())?;
+    let result_data = ctx
+        .vm_state
+        .secret_share_sub(ty1, data1.as_bytes(), data2.as_bytes())?;
 
     let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
 
@@ -1187,7 +1187,9 @@ fn share_add_scalar(ctx: ForeignFunctionContext) -> Result<Value, String> {
         _ => return Err("Scalar must be an integer".to_string()),
     };
 
-    let result_data = ctx.vm_state.secret_share_add_scalar(ty, data.as_bytes(), scalar)?;
+    let result_data = ctx
+        .vm_state
+        .secret_share_add_scalar(ty, data.as_bytes(), scalar)?;
 
     let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
 
@@ -1216,7 +1218,9 @@ fn share_mul_scalar(ctx: ForeignFunctionContext) -> Result<Value, String> {
         _ => return Err("Scalar must be an integer".to_string()),
     };
 
-    let result_data = ctx.vm_state.secret_share_mul_scalar(ty, data.as_bytes(), scalar)?;
+    let result_data = ctx
+        .vm_state
+        .secret_share_mul_scalar(ty, data.as_bytes(), scalar)?;
 
     let party_id = ctx.vm_state.mpc_engine().map(|e| e.party_id()).unwrap_or(0);
 
@@ -1354,7 +1358,10 @@ fn share_batch_open(ctx: ForeignFunctionContext) -> Result<Value, String> {
     }
 
     // Collect share bytes for batch reveal
-    let shares: Vec<Vec<u8>> = share_data.iter().map(|(_, d)| d.as_bytes().to_vec()).collect();
+    let shares: Vec<Vec<u8>> = share_data
+        .iter()
+        .map(|(_, d)| d.as_bytes().to_vec())
+        .collect();
 
     // Perform batch reveal
     let revealed = engine.batch_open_shares(first_ty, &shares)?;
@@ -2027,7 +2034,12 @@ mod tests {
         let data = vec![1, 2, 3, 4];
         let party_id = 0;
 
-        let id = share_object::create_share_object(&mut store, share_type, ShareData::Opaque(data.clone()), party_id);
+        let id = share_object::create_share_object(
+            &mut store,
+            share_type,
+            ShareData::Opaque(data.clone()),
+            party_id,
+        );
 
         // Verify we can extract the share data
         let result = share_object::extract_share_data(&store, &Value::Object(id));
@@ -2045,7 +2057,8 @@ mod tests {
         let share_type = ShareType::default_secret_int();
         let data = vec![1, 2, 3, 4];
 
-        let share_id = share_object::create_share_object(&mut store, share_type, ShareData::Opaque(data), 0);
+        let share_id =
+            share_object::create_share_object(&mut store, share_type, ShareData::Opaque(data), 0);
         let non_share_id = store.create_object();
 
         assert!(share_object::is_share_object(

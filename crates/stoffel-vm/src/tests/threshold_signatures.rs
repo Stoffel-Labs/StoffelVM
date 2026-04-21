@@ -235,10 +235,7 @@ where
 // Network setup (mirrors avss_e2e_integration)
 // ---------------------------------------------------------------------------
 
-async fn setup_test_network<F, G>(
-    n: usize,
-    base_port: u16,
-) -> Result<Vec<TestNode<F, G>>, String>
+async fn setup_test_network<F, G>(n: usize, base_port: u16) -> Result<Vec<TestNode<F, G>>, String>
 where
     F: ark_ff::Field + UniformRand + PrimeField,
     G: CurveGroup<ScalarField = F> + CanonicalSerialize + CanonicalDeserialize,
@@ -399,9 +396,9 @@ where
             if did == net.local_derived_id() {
                 continue;
             }
-            let pid = conn.remote_party_id().unwrap_or_else(|| {
-                *derived_to_logical.get(&did).unwrap_or(&did)
-            });
+            let pid = conn
+                .remote_party_id()
+                .unwrap_or_else(|| *derived_to_logical.get(&did).unwrap_or(&did));
             if pid == local_pid {
                 continue;
             }
@@ -440,9 +437,7 @@ where
 }
 
 /// Exchange ECDH public keys between all nodes.
-async fn exchange_ecdh_keys<F, G>(
-    nodes: &mut [TestNode<F, G>],
-) -> Result<Vec<Arc<Vec<G>>>, String>
+async fn exchange_ecdh_keys<F, G>(nodes: &mut [TestNode<F, G>]) -> Result<Vec<Arc<Vec<G>>>, String>
 where
     F: ark_ff::Field + UniformRand + PrimeField,
     G: CurveGroup<ScalarField = F> + CanonicalSerialize + CanonicalDeserialize,
@@ -570,9 +565,7 @@ fn spawn_message_processors<F, G>(
                 }
 
                 // 2. Check AVSS open-in-exp (G1) wire messages
-                match open_message_router
-                    .try_handle_avss_open_exp_wire_message(sender_id, &data)
-                {
+                match open_message_router.try_handle_avss_open_exp_wire_message(sender_id, &data) {
                     Ok(true) => continue,
                     Err(_) => {} // Not an open-exp message, continue
                     Ok(false) => {}
@@ -767,7 +760,7 @@ async fn test_threshold_schnorr_ed25519() {
         Instruction::PUSHARG(0),
         Instruction::PUSHARG(8),
         Instruction::CALL("Crypto.hash_to_field".to_string()), // e
-        Instruction::MOV(9, 0), // r9 = e bytes
+        Instruction::MOV(9, 0),                                // r9 = e bytes
         // s = k + e*sk
         Instruction::PUSHARG(1),
         Instruction::PUSHARG(9),
@@ -778,7 +771,7 @@ async fn test_threshold_schnorr_ed25519() {
         Instruction::CALL("Share.add".to_string()), // k + e*sk
         Instruction::PUSHARG(0),
         Instruction::CALL("Share.open_field".to_string()), // s bytes
-        Instruction::MOV(11, 0), // r11 = s bytes (32)
+        Instruction::MOV(11, 0),                           // r11 = s bytes (32)
         // Result: R(32) + s(32) + pk(32) = 96 bytes
         Instruction::PUSHARG(5),
         Instruction::PUSHARG(11),
@@ -798,19 +791,29 @@ async fn test_threshold_schnorr_ed25519() {
     }
 
     for i in 1..n {
-        assert_eq!(byte_results[0], byte_results[i],
-            "Party 0 and party {} produced different results", i);
+        assert_eq!(
+            byte_results[0], byte_results[i],
+            "Party 0 and party {} produced different results",
+            i
+        );
     }
 
     let result = &byte_results[0];
-    assert_eq!(result.len(), 96, "Expected 96 bytes (R:32 + s:32 + pk:32), got {}", result.len());
+    assert_eq!(
+        result.len(),
+        96,
+        "Expected 96 bytes (R:32 + s:32 + pk:32), got {}",
+        result.len()
+    );
 
     // Parse
     let r_point: EdwardsProjective = EdwardsAffine::deserialize_compressed(&result[..32])
-        .expect("deserialize R").into();
+        .expect("deserialize R")
+        .into();
     let s_scalar = Fr::deserialize_compressed(&result[32..64]).expect("deserialize s");
     let pk_point: EdwardsProjective = EdwardsAffine::deserialize_compressed(&result[64..96])
-        .expect("deserialize pk").into();
+        .expect("deserialize pk")
+        .into();
 
     // Recompute challenge: e = hash_to_field(SHA-256(R || msg), "ed25519")
     let msg = b"test message for schnorr";
@@ -825,9 +828,15 @@ async fn test_threshold_schnorr_ed25519() {
     println!("  Parties:   {}", n);
     println!("  Threshold: {}", t);
     println!("  Message:   \"test message for schnorr\"");
-    println!("  Public Key (32 bytes): 0x{}", hex::encode(&result[64..96]));
+    println!(
+        "  Public Key (32 bytes): 0x{}",
+        hex::encode(&result[64..96])
+    );
     println!("  R (32 bytes):          0x{}", hex::encode(&result[..32]));
-    println!("  s (32 bytes):          0x{}", hex::encode(&result[32..64]));
+    println!(
+        "  s (32 bytes):          0x{}",
+        hex::encode(&result[32..64])
+    );
     println!("  Challenge:             e = SHA-256(R || msg) mod l");
     println!("  All {} parties produced identical signatures: YES", n);
 
@@ -844,12 +853,16 @@ async fn test_threshold_schnorr_ed25519() {
     // 2) Verify R and pk are valid points in curve25519-dalek (third-party)
     {
         use curve25519_dalek::edwards::CompressedEdwardsY;
-        let r_d = CompressedEdwardsY(result[..32].try_into().unwrap())
-            .decompress();
-        assert!(r_d.is_some(), "R must decompress as valid Ed25519 point in curve25519-dalek");
-        let pk_d = CompressedEdwardsY(result[64..96].try_into().unwrap())
-            .decompress();
-        assert!(pk_d.is_some(), "pk must decompress as valid Ed25519 point in curve25519-dalek");
+        let r_d = CompressedEdwardsY(result[..32].try_into().unwrap()).decompress();
+        assert!(
+            r_d.is_some(),
+            "R must decompress as valid Ed25519 point in curve25519-dalek"
+        );
+        let pk_d = CompressedEdwardsY(result[64..96].try_into().unwrap()).decompress();
+        assert!(
+            pk_d.is_some(),
+            "pk must decompress as valid Ed25519 point in curve25519-dalek"
+        );
         println!("  R and pk validated by curve25519-dalek: YES");
     }
     println!("================================================\n");
@@ -924,18 +937,15 @@ async fn test_threshold_eddsa_ed25519() {
         // r0 = Share.random() -- sk share (DKG)
         Instruction::CALL("Share.random".to_string()),
         Instruction::MOV(1, 0), // r1 = sk share
-
         // r0 = Share.get_commitment(sk, 0) -- pk from Feldman commitment
         Instruction::LDI(2, Value::I64(0)),
         Instruction::PUSHARG(1),
         Instruction::PUSHARG(2),
         Instruction::CALL("Share.get_commitment".to_string()),
         Instruction::MOV(3, 0), // r3 = pk (byte array, 32 bytes compressed)
-
         // r0 = Share.random() -- nonce share (DKG)
         Instruction::CALL("Share.random".to_string()),
         Instruction::MOV(4, 0), // r4 = k share
-
         // r0 = Share.get_commitment(k, 0) -- R = g^k from Feldman commitment
         // Using commitment rather than open_exp ensures byte-level compatibility
         // with ed25519-dalek's expected point encoding.
@@ -944,49 +954,40 @@ async fn test_threshold_eddsa_ed25519() {
         Instruction::PUSHARG(2),
         Instruction::CALL("Share.get_commitment".to_string()),
         Instruction::MOV(5, 0), // r5 = R (byte array, 32 bytes compressed)
-
         // Build challenge: e = hash_to_field(sha512(R || pk || msg))
         Instruction::PUSHARG(5),
         Instruction::PUSHARG(3),
         Instruction::CALL("Bytes.concat".to_string()),
         Instruction::MOV(6, 0), // r6 = R||pk
-
         Instruction::LDI(7, Value::String("test message for eddsa".to_string())),
         Instruction::PUSHARG(7),
         Instruction::CALL("Bytes.from_string".to_string()),
         Instruction::MOV(8, 0), // r8 = msg bytes
-
         Instruction::PUSHARG(6),
         Instruction::PUSHARG(8),
         Instruction::CALL("Bytes.concat".to_string()),
         // r0 = R||pk||msg
-
         Instruction::PUSHARG(0),
         Instruction::CALL("Crypto.sha512".to_string()),
         // r0 = SHA-512(R||pk||msg)
-
         Instruction::LDI(9, Value::String("ed25519".to_string())),
         Instruction::PUSHARG(0),
         Instruction::PUSHARG(9),
         Instruction::CALL("Crypto.hash_to_field".to_string()),
         Instruction::MOV(10, 0), // r10 = e (field element bytes)
-
         // r0 = Share.mul_field(sk, e) -- e*sk share
         Instruction::PUSHARG(1),
         Instruction::PUSHARG(10),
         Instruction::CALL("Share.mul_field".to_string()),
         Instruction::MOV(11, 0), // r11 = e*sk share
-
         // r0 = Share.add(k, e*sk) -- s = k + e*sk
         Instruction::PUSHARG(4),
         Instruction::PUSHARG(11),
         Instruction::CALL("Share.add".to_string()),
-
         // r0 = Share.open_field(s) -- reconstruct s as field bytes
         Instruction::PUSHARG(0),
         Instruction::CALL("Share.open_field".to_string()),
         Instruction::MOV(12, 0), // r12 = s bytes
-
         // Build result: R(32) + s(32) + pk(32) = 96 bytes
         Instruction::PUSHARG(5),
         Instruction::PUSHARG(12),
@@ -994,7 +995,6 @@ async fn test_threshold_eddsa_ed25519() {
         Instruction::PUSHARG(0),
         Instruction::PUSHARG(3),
         Instruction::CALL("Bytes.concat".to_string()), // R || s || pk
-
         Instruction::RET(0),
     ];
 
@@ -1025,16 +1025,13 @@ async fn test_threshold_eddsa_ed25519() {
     );
 
     // Parse components
-    let r_point: EdwardsProjective =
-        EdwardsAffine::deserialize_compressed(&result[..32])
-            .expect("Failed to deserialize R")
-            .into();
-    let s_scalar =
-        Fr::deserialize_compressed(&result[32..64]).expect("Failed to deserialize s");
-    let pk_point: EdwardsProjective =
-        EdwardsAffine::deserialize_compressed(&result[64..96])
-            .expect("Failed to deserialize pk")
-            .into();
+    let r_point: EdwardsProjective = EdwardsAffine::deserialize_compressed(&result[..32])
+        .expect("Failed to deserialize R")
+        .into();
+    let s_scalar = Fr::deserialize_compressed(&result[32..64]).expect("Failed to deserialize s");
+    let pk_point: EdwardsProjective = EdwardsAffine::deserialize_compressed(&result[64..96])
+        .expect("Failed to deserialize pk")
+        .into();
 
     // Recompute challenge: e = hash_to_field_le(sha512(R || pk || msg))
     // Ed25519 uses LITTLE-ENDIAN byte order per RFC 8032
@@ -1048,19 +1045,40 @@ async fn test_threshold_eddsa_ed25519() {
 
     // Display signature components
     let r_hex: String = result[..32].iter().map(|b| format!("{:02x}", b)).collect();
-    let s_hex: String = result[32..64].iter().map(|b| format!("{:02x}", b)).collect();
-    let pk_hex: String = result[64..96].iter().map(|b| format!("{:02x}", b)).collect();
+    let s_hex: String = result[32..64]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let pk_hex: String = result[64..96]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
     println!("\n=== Threshold EdDSA Signature (Ed25519) ===");
     println!("  Parties:   {}", n);
     println!("  Threshold: {}", t);
     println!("  Message:   \"test message for eddsa\"");
-    println!("  Public Key (Ed25519, {} bytes): 0x{}", result[64..96].len(), pk_hex);
-    println!("  R (Ed25519, {} bytes):          0x{}", result[..32].len(), r_hex);
-    println!("  S (Fr, {} bytes):               0x{}", result[32..64].len(), s_hex);
+    println!(
+        "  Public Key (Ed25519, {} bytes): 0x{}",
+        result[64..96].len(),
+        pk_hex
+    );
+    println!(
+        "  R (Ed25519, {} bytes):          0x{}",
+        result[..32].len(),
+        r_hex
+    );
+    println!(
+        "  S (Fr, {} bytes):               0x{}",
+        result[32..64].len(),
+        s_hex
+    );
     println!("  All {} parties produced identical signatures: YES", n);
 
     // Validate public key loads into arkworks as a valid curve point
-    assert!(!pk_point.is_zero(), "Public key must not be the identity point");
+    assert!(
+        !pk_point.is_zero(),
+        "Public key must not be the identity point"
+    );
     assert!(
         pk_point.into_affine().is_on_curve(),
         "Public key is valid Ed25519 point on the curve"
@@ -1076,8 +1094,8 @@ async fn test_threshold_eddsa_ed25519() {
     // 2) ed25519-dalek third-party verification
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let pk_bytes: [u8; 32] = result[64..96].try_into().expect("pk must be 32 bytes");
-    let vk = VerifyingKey::from_bytes(&pk_bytes)
-        .expect("Failed to load public key into ed25519-dalek");
+    let vk =
+        VerifyingKey::from_bytes(&pk_bytes).expect("Failed to load public key into ed25519-dalek");
     println!("  Public key loaded into ed25519-dalek: YES");
 
     // Ed25519 signature = R (32 bytes) || S (32 bytes)
@@ -1090,9 +1108,9 @@ async fn test_threshold_eddsa_ed25519() {
     // Arkworks Fr::serialize_compressed produces Montgomery form bytes, not standard
     // integer bytes. Convert S, R, pk through BigInt to get standard representation.
     use ark_ff::BigInteger;
+    use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
     use curve25519_dalek::edwards::CompressedEdwardsY;
     use curve25519_dalek::scalar::Scalar;
-    use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 
     // Convert S: arkworks Fr → BigInt → LE bytes → dalek Scalar
     let s_bigint = s_scalar.into_bigint();
@@ -1130,7 +1148,7 @@ async fn test_threshold_eddsa_ed25519() {
 
     // Recompute challenge with re-serialized bytes
     {
-        use sha2::{Sha512, Digest};
+        use sha2::{Digest, Sha512};
         let mut h = Sha512::new();
         h.update(&r_ark_bytes);
         h.update(&pk_ark_bytes);
@@ -1145,7 +1163,9 @@ async fn test_threshold_eddsa_ed25519() {
         Err(e) => {
             println!("  ed25519-dalek verification: FAILED ({})", e);
             // Manual dalek check
-            let r_d = CompressedEdwardsY(r_ark_bytes.try_into().unwrap()).decompress().unwrap();
+            let r_d = CompressedEdwardsY(r_ark_bytes.try_into().unwrap())
+                .decompress()
+                .unwrap();
             let check_lhs = &s_dalek * ED25519_BASEPOINT_TABLE;
             let mut dh = sha2::Sha512::new();
             sha2::Digest::update(&mut dh, &sig2_bytes[..32]);
@@ -1229,14 +1249,12 @@ async fn test_threshold_bls_signature() {
         // r0 = Share.random() -- sk share (DKG)
         Instruction::CALL("Share.random".to_string()),
         Instruction::MOV(1, 0), // r1 = sk share
-
         // r0 = Share.open_exp(sk, "bls12-381-g2") -- pk in G2
         Instruction::LDI(2, Value::String("bls12-381-g2".to_string())),
         Instruction::PUSHARG(1),
         Instruction::PUSHARG(2),
         Instruction::CALL("Share.open_exp".to_string()),
         Instruction::MOV(3, 0), // r3 = pk_g2 (96-byte compressed G2)
-
         // r0 = Bytes.from_string("test message for bls")
         Instruction::LDI(4, Value::String("test message for bls".to_string())),
         Instruction::PUSHARG(4),
@@ -1247,13 +1265,11 @@ async fn test_threshold_bls_signature() {
         Instruction::PUSHARG(0),
         Instruction::CALL("Crypto.hash_to_g1".to_string()),
         Instruction::MOV(5, 0), // r5 = H_msg (48-byte compressed G1)
-
         // r0 = Share.open_exp_custom(sk, H_msg) -- sig = sk * H(msg)
         Instruction::PUSHARG(1),
         Instruction::PUSHARG(5),
         Instruction::CALL("Share.open_exp_custom".to_string()),
         Instruction::MOV(6, 0), // r6 = sig (48-byte compressed G1)
-
         // Build result: sig(48) + pk_g2(96) + H_msg(48) = 192 bytes
         Instruction::PUSHARG(6),
         Instruction::PUSHARG(3),
@@ -1261,7 +1277,6 @@ async fn test_threshold_bls_signature() {
         Instruction::PUSHARG(0),
         Instruction::PUSHARG(5),
         Instruction::CALL("Bytes.concat".to_string()), // sig || pk_g2 || H_msg
-
         Instruction::RET(0),
     ];
 
@@ -1292,31 +1307,54 @@ async fn test_threshold_bls_signature() {
     );
 
     // Parse components
-    let sig = G1Affine::deserialize_compressed(&result[..48])
-        .expect("Failed to deserialize sig");
-    let pk_g2 = G2Affine::deserialize_compressed(&result[48..144])
-        .expect("Failed to deserialize pk_g2");
-    let h_msg = G1Affine::deserialize_compressed(&result[144..192])
-        .expect("Failed to deserialize H_msg");
+    let sig = G1Affine::deserialize_compressed(&result[..48]).expect("Failed to deserialize sig");
+    let pk_g2 =
+        G2Affine::deserialize_compressed(&result[48..144]).expect("Failed to deserialize pk_g2");
+    let h_msg =
+        G1Affine::deserialize_compressed(&result[144..192]).expect("Failed to deserialize H_msg");
 
     // Display signature components
     let sig_hex: String = result[..48].iter().map(|b| format!("{:02x}", b)).collect();
-    let pk_g2_hex: String = result[48..144].iter().map(|b| format!("{:02x}", b)).collect();
-    let h_msg_hex: String = result[144..192].iter().map(|b| format!("{:02x}", b)).collect();
+    let pk_g2_hex: String = result[48..144]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let h_msg_hex: String = result[144..192]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
     println!("\n=== Threshold BLS Signature (BLS12-381) ===");
     println!("  Parties:   {}", n);
     println!("  Threshold: {}", t);
     println!("  Message:   \"test message for bls\"");
-    println!("  Public Key (G2, {} bytes): 0x{}", result[48..144].len(), pk_g2_hex);
-    println!("  Signature (G1, {} bytes):  0x{}", result[..48].len(), sig_hex);
-    println!("  H(msg) (G1, {} bytes):     0x{}", result[144..192].len(), h_msg_hex);
+    println!(
+        "  Public Key (G2, {} bytes): 0x{}",
+        result[48..144].len(),
+        pk_g2_hex
+    );
+    println!(
+        "  Signature (G1, {} bytes):  0x{}",
+        result[..48].len(),
+        sig_hex
+    );
+    println!(
+        "  H(msg) (G1, {} bytes):     0x{}",
+        result[144..192].len(),
+        h_msg_hex
+    );
     println!("  All {} parties produced identical signatures: YES", n);
 
     // Validate public key loads into arkworks as valid curve points
     assert!(!sig.is_zero(), "Signature must not be the identity point");
     assert!(sig.is_on_curve(), "Signature must be on BLS12-381 G1 curve");
-    assert!(!pk_g2.is_zero(), "Public key must not be the identity point");
-    assert!(pk_g2.is_on_curve(), "Public key must be on BLS12-381 G2 curve");
+    assert!(
+        !pk_g2.is_zero(),
+        "Public key must not be the identity point"
+    );
+    assert!(
+        pk_g2.is_on_curve(),
+        "Public key must be on BLS12-381 G2 curve"
+    );
     println!("  Public key is valid BLS12-381 G2 point: YES");
     println!("  Signature is valid BLS12-381 G1 point: YES");
 

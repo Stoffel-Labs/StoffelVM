@@ -10,8 +10,7 @@ use ark_serialize::{Compress, Validate};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use stoffelmpc_mpc::honeybadger::{
-    fpmul::f256::Gf2568,
-    robust_interpolate::robust_interpolate::RobustShare,
+    fpmul::f256::Gf2568, robust_interpolate::robust_interpolate::RobustShare,
     triple_gen::ShamirBeaverTriple,
 };
 
@@ -97,12 +96,22 @@ impl PreprocKey {
         party_id: usize,
         kind: MaterialKind,
     ) -> Self {
-        Self { program_hash, field_kind, n, t, party_id, kind }
+        Self {
+            program_hash,
+            field_kind,
+            n,
+            t,
+            party_id,
+            kind,
+        }
     }
 
     /// Build a key with a different material kind, sharing all other fields.
     pub fn with_kind(&self, kind: MaterialKind) -> Self {
-        Self { kind, ..self.clone() }
+        Self {
+            kind,
+            ..self.clone()
+        }
     }
 
     /// Encode as a compact byte key for LMDB lookups.
@@ -159,7 +168,11 @@ pub struct PreprocBlob {
 impl PreprocBlob {
     pub fn new(data: Vec<u8>, item_size: u32, count: u32) -> Self {
         Self {
-            meta: PreprocMeta { count, consumed: 0, item_size },
+            meta: PreprocMeta {
+                count,
+                consumed: 0,
+                item_size,
+            },
             data,
         }
     }
@@ -175,7 +188,11 @@ impl PreprocBlob {
         let is = self.meta.item_size as usize;
         let start = index as usize * is;
         let end = start + is;
-        if end <= self.data.len() { Some(&self.data[start..end]) } else { None }
+        if end <= self.data.len() {
+            Some(&self.data[start..end])
+        } else {
+            None
+        }
     }
 }
 
@@ -198,7 +215,8 @@ pub trait PreprocStore: Send + Sync + 'static {
     async fn delete(&self, key: &PreprocKey) -> Result<(), PreprocStoreError>;
 
     /// Store an opaque byte blob under a namespaced key (for reservations etc.).
-    async fn store_blob(&self, ns: &[u8], key: &[u8], data: &[u8]) -> Result<(), PreprocStoreError>;
+    async fn store_blob(&self, ns: &[u8], key: &[u8], data: &[u8])
+        -> Result<(), PreprocStoreError>;
     /// Load an opaque byte blob by namespaced key.
     async fn load_blob(&self, ns: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, PreprocStoreError>;
 }
@@ -211,10 +229,23 @@ type RmwFn = Box<dyn FnOnce(Option<&[u8]>) -> Result<Option<Vec<u8>>, PreprocSto
 
 /// Request sent to the LMDB actor thread.
 enum DbRequest {
-    PutMulti { pairs: Vec<(Vec<u8>, Vec<u8>)>, reply: tokio::sync::oneshot::Sender<Result<(), PreprocStoreError>> },
-    Get { key: Vec<u8>, reply: tokio::sync::oneshot::Sender<Result<Option<Vec<u8>>, PreprocStoreError>> },
-    Delete { keys: Vec<Vec<u8>>, reply: tokio::sync::oneshot::Sender<Result<(), PreprocStoreError>> },
-    Rmw { key: Vec<u8>, f: RmwFn, reply: tokio::sync::oneshot::Sender<Result<Option<Vec<u8>>, PreprocStoreError>> },
+    PutMulti {
+        pairs: Vec<(Vec<u8>, Vec<u8>)>,
+        reply: tokio::sync::oneshot::Sender<Result<(), PreprocStoreError>>,
+    },
+    Get {
+        key: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<Option<Vec<u8>>, PreprocStoreError>>,
+    },
+    Delete {
+        keys: Vec<Vec<u8>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), PreprocStoreError>>,
+    },
+    Rmw {
+        key: Vec<u8>,
+        f: RmwFn,
+        reply: tokio::sync::oneshot::Sender<Result<Option<Vec<u8>>, PreprocStoreError>>,
+    },
 }
 
 /// LMDB-backed preprocessing store using the actor pattern.
@@ -251,7 +282,10 @@ impl LmdbPreprocStore {
             .spawn(move || Self::actor_loop(env, db, rx))
             .map_err(PreprocStoreError::Io)?;
 
-        Ok(Self { tx, _thread: thread })
+        Ok(Self {
+            tx,
+            _thread: thread,
+        })
     }
 
     pub fn default_path() -> PathBuf {
@@ -315,25 +349,45 @@ impl LmdbPreprocStore {
     }
 
     async fn send(&self, req: DbRequest) -> Result<(), PreprocStoreError> {
-        self.tx.send(req).map_err(|_| PreprocStoreError::Lmdb("actor thread gone".into()))
+        self.tx
+            .send(req)
+            .map_err(|_| PreprocStoreError::Lmdb("actor thread gone".into()))
     }
 
     async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, PreprocStoreError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::Get { key, reply: reply_tx }).await?;
-        reply_rx.await.map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
+        self.send(DbRequest::Get {
+            key,
+            reply: reply_tx,
+        })
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
     }
 
     async fn put_multi(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), PreprocStoreError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::PutMulti { pairs, reply: reply_tx }).await?;
-        reply_rx.await.map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
+        self.send(DbRequest::PutMulti {
+            pairs,
+            reply: reply_tx,
+        })
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
     }
 
     async fn delete_keys(&self, keys: Vec<Vec<u8>>) -> Result<(), PreprocStoreError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::Delete { keys, reply: reply_tx }).await?;
-        reply_rx.await.map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
+        self.send(DbRequest::Delete {
+            keys,
+            reply: reply_tx,
+        })
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
     }
 
     async fn rmw(
@@ -342,8 +396,15 @@ impl LmdbPreprocStore {
         f: impl FnOnce(Option<&[u8]>) -> Result<Option<Vec<u8>>, PreprocStoreError> + Send + 'static,
     ) -> Result<Option<Vec<u8>>, PreprocStoreError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::Rmw { key, f: Box::new(f), reply: reply_tx }).await?;
-        reply_rx.await.map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
+        self.send(DbRequest::Rmw {
+            key,
+            f: Box::new(f),
+            reply: reply_tx,
+        })
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
     }
 }
 
@@ -354,7 +415,8 @@ impl PreprocStore for LmdbPreprocStore {
         self.put_multi(vec![
             (key.meta_key(), meta_v),
             (key.encode(), blob.data.clone()),
-        ]).await
+        ])
+        .await
     }
 
     async fn load(&self, key: &PreprocKey) -> Result<Option<PreprocBlob>, PreprocStoreError> {
@@ -363,24 +425,29 @@ impl PreprocStore for LmdbPreprocStore {
             None => return Ok(None),
         };
         let meta: PreprocMeta = bincode::deserialize(&meta_bytes)?;
-        let data = self.get(key.encode()).await?.ok_or(PreprocStoreError::NotFound)?;
+        let data = self
+            .get(key.encode())
+            .await?
+            .ok_or(PreprocStoreError::NotFound)?;
         Ok(Some(PreprocBlob { meta, data }))
     }
 
     async fn reserve(&self, key: &PreprocKey, n: u32) -> Result<u32, PreprocStoreError> {
-        let result = self.rmw(key.meta_key(), move |raw| {
-            let raw = raw.ok_or(PreprocStoreError::NotFound)?;
-            let mut meta: PreprocMeta = bincode::deserialize(raw)?;
-            if meta.consumed + n > meta.count {
-                return Err(PreprocStoreError::Insufficient {
-                    need: n,
-                    available: meta.available(),
-                });
-            }
-            meta.consumed += n;
-            let v = bincode::serialize(&meta)?;
-            Ok(Some(v))
-        }).await?;
+        let result = self
+            .rmw(key.meta_key(), move |raw| {
+                let raw = raw.ok_or(PreprocStoreError::NotFound)?;
+                let mut meta: PreprocMeta = bincode::deserialize(raw)?;
+                if meta.consumed + n > meta.count {
+                    return Err(PreprocStoreError::Insufficient {
+                        need: n,
+                        available: meta.available(),
+                    });
+                }
+                meta.consumed += n;
+                let v = bincode::serialize(&meta)?;
+                Ok(Some(v))
+            })
+            .await?;
         // Decode the written-back metadata to return consumed count
         if let Some(v) = result {
             let meta: PreprocMeta = bincode::deserialize(&v)?;
@@ -408,7 +475,12 @@ impl PreprocStore for LmdbPreprocStore {
         self.delete_keys(vec![key.meta_key(), key.encode()]).await
     }
 
-    async fn store_blob(&self, ns: &[u8], key: &[u8], data: &[u8]) -> Result<(), PreprocStoreError> {
+    async fn store_blob(
+        &self,
+        ns: &[u8],
+        key: &[u8],
+        data: &[u8],
+    ) -> Result<(), PreprocStoreError> {
         let mut k = ns.to_vec();
         k.extend_from_slice(key);
         self.put_multi(vec![(k, data.to_vec())]).await
@@ -425,7 +497,10 @@ impl PreprocStore for LmdbPreprocStore {
 // Serialization helpers (HoneyBadger)
 // ---------------------------------------------------------------------------
 
-fn write_robust_share<F: FftField>(share: &RobustShare<F>, buf: &mut Vec<u8>) -> Result<(), PreprocStoreError> {
+fn write_robust_share<F: FftField>(
+    share: &RobustShare<F>,
+    buf: &mut Vec<u8>,
+) -> Result<(), PreprocStoreError> {
     share.share[0]
         .serialize_with_mode(&mut *buf, Compress::Yes)
         .map_err(|e| PreprocStoreError::Serialization(e.to_string()))?;
@@ -438,17 +513,22 @@ fn robust_share_size<F: FftField>() -> usize {
     F::default().serialized_size(Compress::Yes) + 16
 }
 
-fn read_robust_share<F: FftField>(data: &[u8], item_size: usize) -> Result<RobustShare<F>, PreprocStoreError> {
+fn read_robust_share<F: FftField>(
+    data: &[u8],
+    item_size: usize,
+) -> Result<RobustShare<F>, PreprocStoreError> {
     let field_size = item_size - 16;
     // Data originates from our own serialization so subgroup checks are not required.
     let elem = F::deserialize_with_mode(&data[..field_size], Compress::Yes, Validate::No)
         .map_err(|e| PreprocStoreError::Deserialization(e.to_string()))?;
     let id = u64::from_le_bytes(
-        data[field_size..field_size + 8].try_into()
+        data[field_size..field_size + 8]
+            .try_into()
             .map_err(|_| PreprocStoreError::Deserialization("bad id bytes".into()))?,
     ) as usize;
     let degree = u64::from_le_bytes(
-        data[field_size + 8..field_size + 16].try_into()
+        data[field_size + 8..field_size + 16]
+            .try_into()
             .map_err(|_| PreprocStoreError::Deserialization("bad degree bytes".into()))?,
     ) as usize;
     Ok(RobustShare::new(elem, id, degree))
@@ -491,7 +571,8 @@ pub fn deserialize_one_robust_share<F: FftField>(
     let start = index as usize * is;
     if start + is > data.len() {
         return Err(PreprocStoreError::Deserialization(format!(
-            "index {index} out of range (data len {})", data.len()
+            "index {index} out of range (data len {})",
+            data.len()
         )));
     }
     read_robust_share::<F>(&data[start..], is)
@@ -752,7 +833,14 @@ mod tests {
 
     #[test]
     fn preproc_key_with_kind() {
-        let base = PreprocKey::new([0xAB; 32], MpcFieldKind::Bn254Fr, 5, 2, 1, MaterialKind::BeaverTriple);
+        let base = PreprocKey::new(
+            [0xAB; 32],
+            MpcFieldKind::Bn254Fr,
+            5,
+            2,
+            1,
+            MaterialKind::BeaverTriple,
+        );
         let rs = base.with_kind(MaterialKind::RandomShare);
         assert_eq!(rs.program_hash, base.program_hash);
         assert_eq!(rs.kind, MaterialKind::RandomShare);
@@ -764,7 +852,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LmdbPreprocStore::open(dir.path()).unwrap();
 
-        let key = PreprocKey::new([0x01; 32], MpcFieldKind::Bn254Fr, 5, 2, 0, MaterialKind::RandomShare);
+        let key = PreprocKey::new(
+            [0x01; 32],
+            MpcFieldKind::Bn254Fr,
+            5,
+            2,
+            0,
+            MaterialKind::RandomShare,
+        );
         let blob = PreprocBlob::new(vec![0xAA; 480], 48, 10);
 
         store.store(&key, &blob).await.unwrap();
@@ -780,7 +875,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LmdbPreprocStore::open(dir.path()).unwrap();
 
-        let key = PreprocKey::new([0x02; 32], MpcFieldKind::Bls12_381Fr, 3, 1, 0, MaterialKind::BeaverTriple);
+        let key = PreprocKey::new(
+            [0x02; 32],
+            MpcFieldKind::Bls12_381Fr,
+            3,
+            1,
+            0,
+            MaterialKind::BeaverTriple,
+        );
         let blob = PreprocBlob::new(vec![0; 480], 48, 10);
 
         store.store(&key, &blob).await.unwrap();

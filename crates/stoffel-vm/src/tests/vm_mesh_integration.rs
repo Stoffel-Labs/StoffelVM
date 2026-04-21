@@ -136,7 +136,10 @@ async fn test_vm_mesh_full_integration() {
             .finalize_network()
             .expect("Failed to finalize network");
         server.spawn_server_receive_loops();
-        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
     }
 
     // Step 3b: Spawn receive-loop tasks for the message dispatch channel.
@@ -159,8 +162,7 @@ async fn test_vm_mesh_full_integration() {
                     }
                     Ok(false) => {}
                 }
-                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
-                {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -303,7 +305,9 @@ async fn test_vm_mesh_full_integration() {
     let mut vms: Vec<Arc<parking_lot::Mutex<VirtualMachine>>> = Vec::new();
 
     for (idx, server) in servers.iter().enumerate() {
-        let sorted_pid = server.party_id.expect("party_id should be set after finalize");
+        let sorted_pid = server
+            .party_id
+            .expect("party_id should be set after finalize");
         let mut vm = VirtualMachine::new();
 
         // Attach MPC engine to VM, wrapping the already-running HB node for this party
@@ -398,7 +402,10 @@ async fn test_vm_mesh_full_integration() {
     let joined = tokio::time::timeout(Duration::from_secs(120), join_all_fut)
         .await
         .expect("Timed out waiting for VMs to execute; possible deadlock if parties didn't run concurrently");
-    let joined: Vec<_> = joined.into_iter().map(|r| r.expect("VM task panicked")).collect();
+    let joined: Vec<_> = joined
+        .into_iter()
+        .map(|r| r.expect("VM task panicked"))
+        .collect();
 
     let mut party_results: Vec<(usize, Value)> = Vec::new();
     for res in joined {
@@ -527,7 +534,10 @@ async fn test_vm_mesh_average_salary_integration() {
             .finalize_network()
             .expect("Failed to finalize network");
         server.spawn_server_receive_loops();
-        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
     }
 
     // Spawn receive-loop tasks
@@ -549,8 +559,7 @@ async fn test_vm_mesh_average_salary_integration() {
                     }
                     Ok(false) => {}
                 }
-                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
-                {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1026,7 +1035,10 @@ async fn test_vm_mesh_large_preprocessing() {
             .finalize_network()
             .expect("Failed to finalize network");
         server.spawn_server_receive_loops();
-        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
     }
 
     // Spawn receive-loop tasks
@@ -1048,8 +1060,7 @@ async fn test_vm_mesh_large_preprocessing() {
                     }
                     Ok(false) => {}
                 }
-                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
-                {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1343,7 +1354,10 @@ async fn test_vm_mesh_output_client_integration() {
             .finalize_network()
             .expect("Failed to finalize network");
         server.spawn_server_receive_loops();
-        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
     }
 
     // Spawn receive-loop tasks
@@ -1365,8 +1379,7 @@ async fn test_vm_mesh_output_client_integration() {
                     }
                     Ok(false) => {}
                 }
-                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
-                {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1855,7 +1868,10 @@ async fn test_vm_mesh_matrix_average_integration() {
             .finalize_network()
             .expect("Failed to finalize network");
         server.spawn_server_receive_loops();
-        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
     }
 
     // Spawn receive-loop tasks
@@ -1877,8 +1893,7 @@ async fn test_vm_mesh_matrix_average_integration() {
                     }
                     Ok(false) => {}
                 }
-                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
-                {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -2477,7 +2492,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             .finalize_network()
             .expect("Failed to finalize network");
         server.spawn_server_receive_loops();
-        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
     }
 
     // Spawn receive-loop tasks
@@ -2499,8 +2517,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                     }
                     Ok(false) => {}
                 }
-                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
-                {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -3723,7 +3740,10 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
             .finalize_network()
             .expect("Failed to finalize network");
         server.spawn_server_receive_loops();
-        info!("  Server {} finalized with party_id={}", server.node_id, pid);
+        info!(
+            "  Server {} finalized with party_id={}",
+            server.node_id, pid
+        );
     }
 
     // Spawn receive-loop tasks
@@ -3745,8 +3765,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                     }
                     Ok(false) => {}
                 }
-                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
-                {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");

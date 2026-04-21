@@ -18,9 +18,7 @@
 use crate::net::client_store::ClientInputStore;
 use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
 use crate::net::mpc_engine::{MpcCapabilities, MpcEngine, MpcEngineClientOps};
-use crate::storage::preproc::{
-    self, MaterialKind, PreprocBlob, PreprocKey, PreprocStore,
-};
+use crate::storage::preproc::{self, MaterialKind, PreprocBlob, PreprocKey, PreprocStore};
 use ark_ec::CurveGroup;
 use ark_ff::{FftField, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -40,7 +38,9 @@ use stoffelmpc_mpc::avss_mpc::{
 };
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
-use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, ProtocolSessionId, SecretSharingScheme};
+use stoffelmpc_mpc::common::{
+    MPCProtocol, PreprocessingMPCProtocol, ProtocolSessionId, SecretSharingScheme,
+};
 use stoffelnet::network_utils::{ClientId, Network};
 use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
@@ -629,12 +629,16 @@ where
             _ => return Ok(false),
         };
 
-        let base = PreprocKey::new(hash, field_kind, self.n, self.t, self.party_id, MaterialKind::BeaverTriple);
+        let base = PreprocKey::new(
+            hash,
+            field_kind,
+            self.n,
+            self.t,
+            self.party_id,
+            MaterialKind::BeaverTriple,
+        );
         let k_rs = base.with_kind(MaterialKind::RandomShare);
-        let (triples, randoms) = tokio::try_join!(
-            store.load(&base),
-            store.load(&k_rs),
-        )?;
+        let (triples, randoms) = tokio::try_join!(store.load(&base), store.load(&k_rs),)?;
 
         if triples.is_none() && randoms.is_none() {
             return Ok(false);
@@ -644,15 +648,26 @@ where
         let mut prep = node.preprocessing_material.lock().await;
 
         if let Some(blob) = triples {
-            let decoded = preproc::deserialize_avss_triples::<F, G>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            let decoded = preproc::deserialize_avss_triples::<F, G>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
             prep.add(Some(decoded), None);
         }
         if let Some(blob) = randoms {
-            let decoded = preproc::deserialize_feldman_shares::<F, G>(blob.unconsumed_data(), blob.meta.item_size, 0)?;
+            let decoded = preproc::deserialize_feldman_shares::<F, G>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
             prep.add(None, Some(decoded));
         }
 
-        info!("Loaded AVSS preprocessing material from store for program {}", hex::encode(hash));
+        info!(
+            "Loaded AVSS preprocessing material from store for program {}",
+            hex::encode(hash)
+        );
         Ok(true)
     }
 
@@ -667,7 +682,14 @@ where
             _ => return Ok(()),
         };
 
-        let base = PreprocKey::new(hash, field_kind, self.n, self.t, self.party_id, MaterialKind::BeaverTriple);
+        let base = PreprocKey::new(
+            hash,
+            field_kind,
+            self.n,
+            self.t,
+            self.party_id,
+            MaterialKind::BeaverTriple,
+        );
         let mut to_store: Vec<(PreprocKey, PreprocBlob)> = Vec::new();
 
         {
@@ -678,13 +700,21 @@ where
             if n_bt > 0 {
                 let items = prep.take_triples(n_bt).map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_avss_triples::<F, G>(&items)?;
-                to_store.push((base.clone(), PreprocBlob::new(data, item_size, items.len() as u32)));
+                to_store.push((
+                    base.clone(),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
                 prep.add(Some(items), None);
             }
             if n_rs > 0 {
-                let items = prep.take_v_random_shares(n_rs).map_err(|e| format!("{e:?}"))?;
+                let items = prep
+                    .take_v_random_shares(n_rs)
+                    .map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_feldman_shares::<F, G>(&items)?;
-                to_store.push((base.with_kind(MaterialKind::RandomShare), PreprocBlob::new(data, item_size, items.len() as u32)));
+                to_store.push((
+                    base.with_kind(MaterialKind::RandomShare),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
                 prep.add(None, Some(items));
             }
         }
@@ -693,7 +723,10 @@ where
             store.store(key, blob).await?;
         }
 
-        info!("Persisted AVSS preprocessing material to store for program {}", hex::encode(hash));
+        info!(
+            "Persisted AVSS preprocessing material to store for program {}",
+            hex::encode(hash)
+        );
         Ok(())
     }
 
@@ -728,10 +761,7 @@ where
     }
 
     /// Copy all client input shares into the global ClientInputStore.
-    pub async fn hydrate_client_inputs(
-        &self,
-        store: &ClientInputStore,
-    ) -> Result<usize, String> {
+    pub async fn hydrate_client_inputs(&self, store: &ClientInputStore) -> Result<usize, String> {
         let all_inputs = self.get_all_client_inputs().await?;
         let count = all_inputs.len();
         for (client_id, shares) in all_inputs {
@@ -1210,7 +1240,12 @@ where
         Self::share_to_share_data(&share)
     }
 
-    fn multiply_share(&self, _ty: ShareType, left: &[u8], right: &[u8]) -> Result<ShareData, String> {
+    fn multiply_share(
+        &self,
+        _ty: ShareType,
+        left: &[u8],
+        right: &[u8],
+    ) -> Result<ShareData, String> {
         let avss_node = self.avss_node.clone();
         let net = self.net.clone();
         let left_bytes = left.to_vec();
@@ -1284,11 +1319,7 @@ where
         )
     }
 
-    fn open_share_as_field(
-        &self,
-        ty: ShareType,
-        share_bytes: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    fn open_share_as_field(&self, ty: ShareType, share_bytes: &[u8]) -> Result<Vec<u8>, String> {
         let type_key = match ty {
             ShareType::SecretInt { bit_length } => format!("avss-field-int-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
@@ -1485,7 +1516,8 @@ where
 {
     fn get_client_ids_sync(&self) -> Vec<ClientId> {
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
+            Ok(handle) =>
+            {
                 #[allow(deprecated)]
                 match handle.runtime_flavor() {
                     tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -1587,9 +1619,7 @@ pub trait ThresholdExpG2: Send + Sync {
     ) -> Result<Vec<u8>, String>;
 }
 
-impl ThresholdExpG2
-    for AvssMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>
-{
+impl ThresholdExpG2 for AvssMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective> {
     fn open_share_in_exp_g2(
         &self,
         share_bytes: &[u8],
@@ -1602,8 +1632,7 @@ impl ThresholdExpG2
 
         type G1 = ark_bls12_381::G1Projective;
 
-        let share =
-            AvssMpcEngine::<Fr, G1>::decode_feldman_share(share_bytes)?;
+        let share = AvssMpcEngine::<Fr, G1>::decode_feldman_share(share_bytes)?;
         let generator_g2 = G2Projective::deserialize_compressed(&generator_g2_bytes[..])
             .map_err(|e| format!("deserialize G2 generator: {}", e))?;
 
@@ -1643,9 +1672,7 @@ impl ThresholdExpG2
                 self.net
                     .send(peer_id, &wire_payload)
                     .await
-                    .map_err(|e| {
-                        format!("broadcast avss g2 open-exp to {}: {}", peer_id, e)
-                    })?;
+                    .map_err(|e| format!("broadcast avss g2 open-exp to {}: {}", peer_id, e))?;
             }
             Ok::<(), String>(())
         })?;
@@ -1718,11 +1745,9 @@ impl ThresholdExpG2
                         let num = -x_j;
                         let den = x_i - x_j;
                         lambda *= num
-                            * den
-                                .inverse()
-                                .ok_or_else(|| {
-                                    "zero denominator in AVSS G2 Lagrange".to_string()
-                                })?;
+                            * den.inverse().ok_or_else(|| {
+                                "zero denominator in AVSS G2 Lagrange".to_string()
+                            })?;
                     }
                     result += *pt_i * lambda;
                 }
@@ -1791,7 +1816,6 @@ impl ThresholdExpG2
         }
     }
 }
-
 
 // ============================================================================
 // Unit Tests
@@ -2218,9 +2242,18 @@ mod tests {
         )
         .await
         .expect("engine0");
-        let e1 = AvssMpcEngine::<Fr, G1>::new(instance_id, 1, n, t, net, Fr::from(13u64), pk_map, vec![])
-            .await
-            .expect("engine1");
+        let e1 = AvssMpcEngine::<Fr, G1>::new(
+            instance_id,
+            1,
+            n,
+            t,
+            net,
+            Fr::from(13u64),
+            pk_map,
+            vec![],
+        )
+        .await
+        .expect("engine1");
 
         let (dealer0, sid0) = e0.allocate_input_share_session().expect("session0");
         let (dealer1, sid1) = e1.allocate_input_share_session().expect("session1");

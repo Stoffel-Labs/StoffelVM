@@ -94,7 +94,9 @@ impl ReservationRegistry {
     }
 
     pub fn from_state(state: RegistryState) -> Self {
-        Self { state: RwLock::new(state) }
+        Self {
+            state: RwLock::new(state),
+        }
     }
 
     /// Reserve `n` consecutive indices for `client_id`. O(1) allocation.
@@ -106,7 +108,10 @@ impl ReservationRegistry {
         let mut s = self.state.write().await;
         let avail = s.capacity - s.next_index;
         if n > avail {
-            return Err(ReservationError::InsufficientMaterial { need: n, have: avail });
+            return Err(ReservationError::InsufficientMaterial {
+                need: n,
+                have: avail,
+            });
         }
         let start = s.next_index;
         for i in start..start + n {
@@ -228,7 +233,10 @@ mod tests {
     async fn reserve_insufficient() {
         let reg = ReservationRegistry::new([0; 32], 0, 5);
         let err = reg.reserve(1, 6).await.unwrap_err();
-        assert!(matches!(err, ReservationError::InsufficientMaterial { need: 6, have: 5 }));
+        assert!(matches!(
+            err,
+            ReservationError::InsufficientMaterial { need: 6, have: 5 }
+        ));
     }
 
     #[tokio::test]
@@ -236,10 +244,15 @@ mod tests {
         let reg = ReservationRegistry::new([0; 32], 0, 10);
         let grant = reg.reserve(1, 3).await.unwrap();
 
-        reg.submit_masked_input(1, grant.start, vec![0xAA]).await.unwrap();
+        reg.submit_masked_input(1, grant.start, vec![0xAA])
+            .await
+            .unwrap();
         assert_eq!(reg.get_masked_input(grant.start).await, Some(vec![0xAA]));
 
-        let err = reg.submit_masked_input(99, grant.start + 1, vec![0xBB]).await.unwrap_err();
+        let err = reg
+            .submit_masked_input(99, grant.start + 1, vec![0xBB])
+            .await
+            .unwrap_err();
         assert!(matches!(err, ReservationError::NotReservedByClient(_)));
 
         let indices: Vec<u64> = grant.indices().collect();
@@ -271,7 +284,9 @@ mod tests {
         reg.persist(&store).await.unwrap();
 
         let restored = ReservationRegistry::load(&store, &[0x42; 32], 1)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(restored.available().await, 16);
         assert_eq!(restored.get_masked_input(0).await, Some(vec![0xFF]));
     }
@@ -280,7 +295,9 @@ mod tests {
     async fn load_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
         let store = LmdbPreprocStore::open(dir.path()).unwrap();
-        let result = ReservationRegistry::load(&store, &[0x99; 32], 0).await.unwrap();
+        let result = ReservationRegistry::load(&store, &[0x99; 32], 0)
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 }

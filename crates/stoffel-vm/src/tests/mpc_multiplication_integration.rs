@@ -317,7 +317,10 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             node_id, bind_address
         );
         let mut mgr = QuicNetworkManager::new();
-        info!("[HB-QUIC] Node {} calling listen({})", node_id, bind_address);
+        info!(
+            "[HB-QUIC] Node {} calling listen({})",
+            node_id, bind_address
+        );
         mgr.listen(bind_address).await.map_err(|e| {
             error!(
                 "[HB-QUIC] Node {} failed to bind to {}: {}",
@@ -375,7 +378,10 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
     pub async fn add_peer(&mut self, peer_id: PartyId, address: SocketAddr) {
         if let Some(ref mut builder) = self.network_builder {
             builder.add_node_with_party_id(peer_id, address);
-            info!("Added peer {} at {} to node {}", peer_id, address, self.node_id);
+            info!(
+                "Added peer {} at {} to node {}",
+                peer_id, address, self.node_id
+            );
         } else {
             panic!("Cannot add peer after start() on node {}", self.node_id);
         }
@@ -467,14 +473,9 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             .expect("connect_to_peers() called before start()")
             .clone();
 
-        let peers: Vec<SocketAddr> = network
-            .parties()
-            .iter()
-            .map(|p| p.address())
-            .collect();
+        let peers: Vec<SocketAddr> = network.parties().iter().map(|p| p.address()).collect();
 
         let mut dialer = (*network).clone();
-
         let local_did = network.local_derived_id();
 
         for peer_addr in &peers {
@@ -493,10 +494,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             loop {
                 match dialer.connect_as_server(*peer_addr).await {
                     Ok(conn) => {
-                        info!(
-                            "Node {} connected to peer at {}",
-                            self.node_id, peer_addr
-                        );
+                        info!("Node {} connected to peer at {}", self.node_id, peer_addr);
                         drop(conn);
                         break;
                     }
@@ -778,9 +776,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
                                 match connection.receive().await {
                                     Ok(data) => {
                                         // Use remote_party_id at receive time
-                                        let sid = connection
-                                            .remote_party_id()
-                                            .unwrap_or(i);
+                                        let sid = connection.remote_party_id().unwrap_or(i);
                                         if let Err(e) = actor_tx
                                             .send(ClientActorMessage::ProcessData(sid, data))
                                             .await
@@ -1134,9 +1130,14 @@ mod tests {
 
         // Finalize network: assign party IDs and recreate HB nodes
         for server in servers.iter_mut() {
-            let pid = server.finalize_network().expect("Failed to finalize network");
+            let pid = server
+                .finalize_network()
+                .expect("Failed to finalize network");
             server.spawn_server_receive_loops();
-            info!("✓ Server {} finalized with party_id={}", server.node_id, pid);
+            info!(
+                "✓ Server {} finalized with party_id={}",
+                server.node_id, pid
+            );
         }
 
         // Register client connections under logical IDs in each server's RoutedNetwork
@@ -1319,7 +1320,10 @@ mod tests {
                     input_client_id,
                     local_shares,
                     2,
-                    server.routed_network.clone().expect("routed_network should be set"),
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
                 )
                 .await
             {
@@ -1336,7 +1340,10 @@ mod tests {
         let mut handles = Vec::new();
         for pid in 0..n_parties {
             let mut node = servers[pid].node.clone();
-            let net: Arc<RoutedNetwork> = servers[pid].routed_network.clone().expect("routed_network should be set");
+            let net: Arc<RoutedNetwork> = servers[pid]
+                .routed_network
+                .clone()
+                .expect("routed_network should be set");
 
             let (x_shares, y_shares) = {
                 let input_store = node
@@ -1375,7 +1382,10 @@ mod tests {
         // Use the output client ID we defined earlier
         // Each server sends its output shares using the results from mul()
         for (i, server) in servers.iter().enumerate() {
-            let net: Arc<RoutedNetwork> = server.routed_network.clone().expect("routed_network should be set");
+            let net: Arc<RoutedNetwork> = server
+                .routed_network
+                .clone()
+                .expect("routed_network should be set");
 
             // Find the result for this party from the collected mul results
             let shares_mult_for_node = mul_results
@@ -1501,9 +1511,14 @@ mod tests {
 
         // Finalize network: assign party IDs and recreate HB nodes
         for server in servers.iter_mut() {
-            let pid = server.finalize_network().expect("Failed to finalize network");
+            let pid = server
+                .finalize_network()
+                .expect("Failed to finalize network");
             server.spawn_server_receive_loops();
-            info!("✓ Server {} finalized with party_id={}", server.node_id, pid);
+            info!(
+                "✓ Server {} finalized with party_id={}",
+                server.node_id, pid
+            );
         }
 
         // Register client connections under logical IDs in each server's RoutedNetwork
@@ -1688,7 +1703,10 @@ mod tests {
                     clientid[0],
                     local_shares,
                     2,
-                    server.routed_network.clone().expect("routed_network should be set"),
+                    server
+                        .routed_network
+                        .clone()
+                        .expect("routed_network should be set"),
                 )
                 .await
             {
@@ -1757,9 +1775,14 @@ mod tests {
 
         // Finalize network: assign party IDs and recreate HB nodes
         for server in servers.iter_mut() {
-            let pid = server.finalize_network().expect("Failed to finalize network");
+            let pid = server
+                .finalize_network()
+                .expect("Failed to finalize network");
             server.spawn_server_receive_loops();
-            info!("✓ Server {} finalized with party_id={}", server.node_id, pid);
+            info!(
+                "✓ Server {} finalized with party_id={}",
+                server.node_id, pid
+            );
         }
 
         // Spawn receive-loop tasks with updated nodes and routed networks

@@ -1,32 +1,33 @@
 # StoffelVM
 ![Discord](https://img.shields.io/discord/1300834528042160150?label=discord)
-![Static Badge](https://img.shields.io/badge/telegram-24A1DE?link=https%3A%2F%2Ft.me%2F%2B7L0HPi1U8pU1MzQx)
-![GitHub License](https://img.shields.io/github/license/Stoffel-Labs/StoffelVM)
+[![GitHub License](https://img.shields.io/github/license/Stoffel-Labs/StoffelVM)](LICENSE)
 
-This repository contains the core crates of the Stoffel Virtual Machine, a virtual machine optimized for multiparty computation (MPC). 
-
-> 🚧👷‍♂️ This repository is currently under construction and as such, doesn't contain MPC functionality yet. But the VM is mostly functional with some quirks 
+This repository contains the core crates of the Stoffel Virtual Machine, a register-based VM built for both local execution and networked multiparty computation (MPC).
 
 ## Background on Stoffel VM!
 
-In its current form, Stoffel is designed to handle simple and complex programs. Our VM handle both basic types(integers, booleans, strings, and soon fixed point) and more complex types such as objects, arrays, closures, and foreign objects! The VM is designed as a register machine to enable easy optimization and mapping to physical hardware.
+In its current form, Stoffel is designed to handle both simple and complex programs. The VM supports basic values such as integers, booleans, strings, and floating point numbers, along with more complex runtime types such as objects, arrays, closures, foreign objects, and secret shares. The VM is designed as a register machine to make execution predictable and to map cleanly onto optimized runtimes and physical MPC backends.
 
-The VM contains instructions to handle memory operations, arithmetic, bitwise operations, and control flow. It has a closure system implemented that supports true lexical scoping, where functions can and will "capture" variables from their surrounding environment, preserving them even after the original scope has exited. This mechanism tracks these values as "upvalues" in order to maintain their state between function calls, allowing for users to adopt functional programming patterns.
+The instruction set covers memory operations, arithmetic, bitwise operations, control flow, and function calls. Stoffel also has a closure system with true lexical scoping, where functions can capture values from their surrounding environment as upvalues and continue using them after the original scope has exited.
 
-Stoffel supports FFI out of the box between Rust <> Stoffel's runtime. This bridge allows for developers to upgrade the runtime with high performance functionality. The runtime implements a configurable hook system that allows for the interception of instruction execution, register access, activation stack operations, and more to facilitate debugging!  
+Stoffel supports Rust <> Stoffel FFI out of the box. This lets you extend the runtime with native Rust functions and objects while keeping the VM execution model intact. The runtime also exposes a configurable hook system that can intercept instruction execution, register access, stack events, object and array access, closure creation, and more for debugging or instrumentation.
 
-> 🚧 Currently Stoffel's architecture supports recursion(soon with out-of-the-box forced/guaranteed tail calls), stateful closures, and allows for object-oriented patterns. Currently, the runtime lacks an automatic clear/secret memory management / garbage collection system, any concept of side effects, exception handling, being able to (un)load libraries, and most importantly handling MPC natively.
+The workspace currently includes:
+
+- `crates/stoffel-vm`: the runtime, networking layer, MPC integrations, CLI binaries, and C FFI
+- `crates/stoffel-vm-types`: shared VM types, instruction definitions, and the compiled bytecode format
+- `include/`: the public C header and FFI notes
 
 ## Features
 
-Stoffel VM supports the following instructions:
+Stoffel VM currently supports the following instructions:
 
 ### Memory Operations
 
-- `LD(dest_reg, stack_offset)`: Load value from stack to register
-- `LDI(dest_reg, value)`: Load immediate value to register
-- `MOV(dest_reg, src_reg)`: Move value from one register to another
-- `PUSHARG(reg)`: Push register value as function argument
+- `LD(dest_reg, stack_offset)`: Load a value from the current activation record into a register
+- `LDI(dest_reg, value)`: Load an immediate value into a register
+- `MOV(dest_reg, src_reg)`: Move a value from one register to another
+- `PUSHARG(reg)`: Push a register value as a function argument
 
 ### Arithmetic Operations
 
@@ -48,15 +49,17 @@ Stoffel VM supports the following instructions:
 ### Control Flow
 
 - `JMP(label)`: Unconditional jump
-- `JMPEQ(label)`: Jump if equal (compare_flag == 0)
-- `JMPNEQ(label)`: Jump if not equal (compare_flag != 0)
+- `JMPEQ(label)`: Jump if equal
+- `JMPNEQ(label)`: Jump if not equal
+- `JMPLT(label)`: Jump if less than
+- `JMPGT(label)`: Jump if greater than
 - `CMP(reg1, reg2)`: Compare two registers
 - `CALL(function_name)`: Call a function
-- `RET(reg)`: Return from function with value in register
+- `RET(reg)`: Return from the current function with the value in a register
 
 ### Values
 
-Stoffel VM supports the following value types:
+Stoffel VM currently exposes the following runtime value variants:
 
 - `Value::I64(i64)`: 64-bit signed integer
 - `Value::I32(i32)`: 32-bit signed integer
@@ -66,91 +69,139 @@ Stoffel VM supports the following value types:
 - `Value::U16(u16)`: 16-bit unsigned integer
 - `Value::U32(u32)`: 32-bit unsigned integer
 - `Value::U64(u64)`: 64-bit unsigned integer
-- `Value::Float(F64)`: 64-bit floating point (F64 wrapper for Eq/Hash)
+- `Value::Float(F64)`: 64-bit floating point
 - `Value::Bool(bool)`: Boolean value
 - `Value::String(String)`: String value
-- `Value::Object(usize)`: Object reference (key-value map)
+- `Value::Object(usize)`: Object reference
 - `Value::Array(usize)`: Array reference
-- `Value::Foreign(usize)`: Foreign object reference (Rust objects exposed to VM)
+- `Value::Foreign(usize)`: Foreign object reference
 - `Value::Closure(Arc<Closure>)`: Function closure with captured environment
 - `Value::Unit`: Unit/void/nil value
-- `Value::Share(ShareType, Vec<u8>)`: Secret shared value for MPC
+- `Value::Share(ShareType, ShareData)`: Secret-shared value for MPC
+- `Value::PendingReveal(usize)`: Internal marker used by batched reveal optimization
 
 ### Standard Library Builtins!
 
-Stoffel VM includes several built-in functions:
-- `print`: Print values to the console 
-- `create_object`: Create a new object 
-- `create_array`: Create a new array 
-- `get_field`: Get a field from an object or array 
-- `set_field`: Set a field in an object or array 
-- `array_length`: Get the length of an array 
-- `array_push`: Add an element to an array 
-- `create_closure`: Create a closure 
-- `call_closure`: Call a closure 
-- `get_upvalue`: Get an upvalue from a closure 
-- `set_upvalue`: Set an upvalue in a closure 
+Stoffel VM registers the following general runtime builtins by default:
+
+- `print`: Print values to the console
 - `type`: Get the type of a value as a string
+- `create_object`: Create a new object
+- `create_array`: Create a new array
+- `get_field`: Get a field from an object or array
+- `set_field`: Set a field in an object or array
+- `array_length`: Get the length of an array
+- `array_push`: Append one or more values to an array
+- `create_closure`: Create a closure
+- `call_closure`: Call a closure
+- `get_upvalue`: Read a captured upvalue from a closure
+- `set_upvalue`: Update a captured upvalue in a closure
+- `ClientStore.get_number_clients`: Get the number of connected clients
+- `ClientStore.take_share`: Load a client share into the VM
+- `ClientStore.take_share_fixed`: Load a client fixed-point share into the VM
+- `MpcOutput.send_to_client`: Send a share result to a client
+
+### MPC Builtins
+
+The VM also registers MPC-focused module-style builtins:
+
+- `Share.*`: clear-to-share conversion, arithmetic on shares, opening, random share generation, client output, local interpolation, and commitment inspection
+- `Mpc.*`: runtime MPC metadata such as party id, threshold, instance id, readiness, and randomness helpers
+- `Rbc.*`: reliable broadcast helpers
+- `Aba.*`: asynchronous binary agreement helpers
+- `Crypto.*`: hashing and curve/field conversion helpers
+- `Bytes.*`: byte-array helpers
+- `Avss.*`: AVSS-specific helpers when the `avss` feature is enabled
 
 ## How do I use it!?
 
-I'm glad you asked! At the moment, the runtime should be embedded in a program to use. For example:
+At the moment, the most direct way to use the runtime is to embed it in a Rust program and register `VMFunction` values. `VirtualMachine::new()` automatically registers the standard library and MPC builtins.
 
 ```rust
-// Stoffel related imports 
+use std::collections::HashMap;
+
+use stoffel_vm::core_types::Value;
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::functions::VMFunction;
 use stoffel_vm::instructions::Instruction;
-use stoffel_vm::core_types::Value;
-// stdlib for hashmap
-use std::collections::HashMap;
 
-// main method to run our program!
 fn main() -> Result<(), String> {
-    // Initialize the VM
-    let vm = VirtualMachine::new();
-    
-    // Create a simple hello world function
-    let hello_world = VMFunction {
-        name: "hello_world".to_string(), // The name that the method is identified by
-        parameters: vec![], // The string names 
-        upvalues: vec![], // Upvalues are the captured variables for true lexical scoping
-        parent: None, // If this function is owned by another function
-        register_count: 1, // Configurable amount of registers the function will use. In the future this is for optimization.
-        instructions: vec![ // Holds all the instructions associated with this method
-            // Load "Hello, World!" string into register 0
+    let mut vm = VirtualMachine::new();
+
+    let hello_world = VMFunction::new(
+        "hello_world".to_string(),
+        vec![],
+        vec![],
+        None,
+        2,
+        vec![
             Instruction::LDI(0, Value::String("Hello, World!".to_string())),
-            // Push register 0 as argument for print function
-            Instruction::PUSHARG(0), // Arguments go on a stack that is then accessed by activation records when creating the scope of the funcction.
-            // Call the built-in print function
+            Instruction::PUSHARG(0),
             Instruction::CALL("print".to_string()),
-            // Return Unit (void)
-            Instruction::RET(0),
+            Instruction::LDI(1, Value::Unit),
+            Instruction::RET(1),
         ],
-        labels: HashMap::new(), // Labels for GOTO jumps. (<"label name">, <instruction offset to jump to>)
-    };
-    
-    // Register the function with the VM
+        HashMap::new(),
+    );
+
     vm.register_function(hello_world);
-    
-    // Execute the function
+
     let result = vm.execute("hello_world")?;
-    
-    // Print the result of the program, in this case nothing!
     println!("Program returned: {:?}", result);
-    
+
     Ok(())
 }
 ```
 
-Now that you're familiar with the basics of Stoffel VM, you should:
-1. Explore the [examples directory](examples) for example programs!
-2. Create more complex programs with control flow and closures
+Now that you're familiar with the basics of Stoffel VM, good places to explore next are:
 
+1. `crates/stoffel-vm-types/examples/generate_client_mul_program.rs` for a bytecode-generation example
+2. `crates/stoffel-vm/src/tests/vm_mpc_integration.rs` for VM + MPC execution flows
+3. `tests/p2p_integration.rs` for QUIC networking coverage
+
+## Compiled Bytecode
+
+StoffelVM also ships a portable compiled binary format through `stoffel-vm-types::compiled_binary::CompiledBinary`. The format uses the magic bytes `STFL` and can round-trip between `VMFunction` definitions and serialized binaries.
+
+You can generate a compiled binary from Rust-defined functions like this:
+
+```rust
+use stoffel_vm_types::compiled_binary::{utils::save_to_file, CompiledBinary};
+
+// Assume `functions: Vec<VMFunction>` already exists.
+let binary = CompiledBinary::from_vm_functions(&functions);
+save_to_file(&binary, "program.stflb").unwrap();
+```
+
+This repository does not currently include a source-language compiler, so compiled binaries are usually produced either by Rust-side tooling or by an external compiler that targets the same format.
+
+## Build and Test
+
+Build everything:
+
+```bash
+cargo build
+```
+
+Run the test suite:
+
+```bash
+cargo test
+cargo test --all-features
+cargo test -- --ignored
+```
+
+Build the runtime and CLI in release mode:
+
+```bash
+cargo build --release -p stoffel-vm
+```
+
+`stoffel-vm` enables the `honeybadger` and `avss` features by default.
 
 ## CLI: Run a compiled Stoffel binary
 
-A minimal CLI is included to run a compiled Stoffel bytecode/binary file.
+A CLI is included to run a compiled Stoffel bytecode file locally or as part of a distributed MPC session.
 
 Build the CLI:
 
@@ -158,22 +209,69 @@ Build the CLI:
 cargo build --release -p stoffel-vm
 ```
 
-Run a compiled program (default entry function is `main`):
+Show the available flags:
 
 ```bash
-./target/release/stoffel-run path/to/program.stfbin [entry_function]
+cargo run -p stoffel-vm --bin stoffel-run -- --help
 ```
 
-What it does:
-- Loads the compiled binary from disk using `stoffel-vm-types::compiled_binary::utils::load_from_file`
-- Converts it to VM functions and registers them in the VM
-- Registers the standard library (so built-ins like `print` work)
-- Executes the specified entry function and prints the returned value
-
-Example:
+Run a compiled program locally (default entry function is `main`):
 
 ```bash
-./target/release/stoffel-run examples/hello_world.stfbin
+./target/release/stoffel-run path/to/program.stflb
+./target/release/stoffel-run path/to/program.stflb main --trace-instr
 ```
 
-Note: Ensure your compiled binary contains the entry function you intend to run (e.g., `main`).
+Run a leader node for a 5-party MPC session:
+
+```bash
+STOFFEL_AUTH_TOKEN=replace-with-random-secret \
+./target/release/stoffel-run path/to/program.stflb main \
+  --leader \
+  --bind 127.0.0.1:9000 \
+  --n-parties 5 \
+  --threshold 1
+```
+
+Join as another party:
+
+```bash
+STOFFEL_AUTH_TOKEN=replace-with-random-secret \
+./target/release/stoffel-run path/to/program.stflb main \
+  --party-id 1 \
+  --bootstrap 127.0.0.1:9000 \
+  --bind 127.0.0.1:9002 \
+  --n-parties 5 \
+  --threshold 1
+```
+
+Run in client mode to submit inputs to the party servers:
+
+```bash
+./target/release/stoffel-run --client \
+  --inputs 10,20 \
+  --servers 127.0.0.1:10000,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004,127.0.0.1:9005 \
+  --n-parties 5
+```
+
+Notes:
+
+- `STOFFEL_AUTH_TOKEN` is required for authenticated discovery in bootnode, leader, and party flows
+- The CLI accepts any file path; this repository conventionally stores compiled fixtures as `.stflb`
+- `--mpc-backend` supports `honeybadger` and `avss`
+- `--mpc-curve` supports `bls12-381`, `bn254`, `curve25519`, and `ed25519`
+
+## C Foreign Function Interface
+
+`stoffel-vm` builds as both an `rlib` and a `cdylib`, so the runtime can also be embedded from C-compatible environments.
+
+Relevant files:
+
+- `include/stoffel_vm.h`
+- `include/README.md`
+
+Platform-specific library names:
+
+- Linux: `libstoffel_vm.so`
+- macOS: `libstoffel_vm.dylib`
+- Windows: `stoffel_vm.dll`

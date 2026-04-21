@@ -47,7 +47,8 @@ pub trait MpcEngine: Send + Sync {
     fn input_share(&self, ty: ShareType, clear: &Value) -> Result<ShareData, String>;
 
     /// Perform secure multiplication of two shares (requires MPC interaction)
-    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8]) -> Result<ShareData, String>;
+    fn multiply_share(&self, ty: ShareType, left: &[u8], right: &[u8])
+        -> Result<ShareData, String>;
 
     /// Reconstruct a secret from shares (requires collecting shares from other parties)
     /// This broadcasts to all parties - all parties learn the secret.
@@ -96,11 +97,7 @@ pub trait MpcEngine: Send + Sync {
     ///
     /// This is used by `Share.open_field` to get the serialized field element
     /// for cryptographic operations (e.g. threshold signatures).
-    fn open_share_as_field(
-        &self,
-        _ty: ShareType,
-        _share_bytes: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    fn open_share_as_field(&self, _ty: ShareType, _share_bytes: &[u8]) -> Result<Vec<u8>, String> {
         Err("open_share_as_field not implemented for this engine".to_string())
     }
 
@@ -429,18 +426,10 @@ pub trait MpcEngineClientOps: MpcEngine {
 #[async_trait::async_trait]
 pub trait MpcEngineReservation: MpcEngine {
     /// Initialize or restore reservation state for a program.
-    async fn init_reservations(
-        &self,
-        program_hash: [u8; 32],
-        capacity: u64,
-    ) -> Result<(), String>;
+    async fn init_reservations(&self, program_hash: [u8; 32], capacity: u64) -> Result<(), String>;
 
     /// Reserve `n` consecutive mask indices for a client.
-    async fn reserve_masks(
-        &self,
-        client_id: ClientId,
-        n: u64,
-    ) -> Result<ReservationGrant, String>;
+    async fn reserve_masks(&self, client_id: ClientId, n: u64) -> Result<ReservationGrant, String>;
 
     /// Get this node's mask share at a given index (serialized bytes).
     async fn get_mask_share(&self, index: u64) -> Result<Vec<u8>, String>;
@@ -455,10 +444,7 @@ pub trait MpcEngineReservation: MpcEngine {
 
     /// Compute `input_share = masked_input − mask_share` for each index.
     /// Marks the indices as consumed.
-    async fn consume_masked_inputs(
-        &self,
-        indices: &[u64],
-    ) -> Result<Vec<(u64, Vec<u8>)>, String>;
+    async fn consume_masked_inputs(&self, indices: &[u64]) -> Result<Vec<(u64, Vec<u8>)>, String>;
 
     /// Number of unreserved mask slots.
     async fn available_masks(&self) -> u64;

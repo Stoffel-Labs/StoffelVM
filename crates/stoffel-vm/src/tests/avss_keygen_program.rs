@@ -54,8 +54,7 @@ fn generate_avss_keygen_bytecode() {
     // Verify we can load it back
     let loaded =
         stoffel_vm_types::compiled_binary::utils::load_from_file(&path).expect("failed to reload");
-    let functions =
-        stoffel_vm_types::compiled_binary::utils::to_vm_functions(&loaded);
+    let functions = stoffel_vm_types::compiled_binary::utils::to_vm_functions(&loaded);
     assert_eq!(functions.len(), 1);
     assert_eq!(functions[0].name, "main");
     assert_eq!(functions[0].instructions.len(), 7);

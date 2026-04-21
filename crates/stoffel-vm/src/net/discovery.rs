@@ -1205,14 +1205,8 @@ pub async fn register_and_wait_for_session_with_program(
 
                         for (pid, addr) in &higher_peers {
                             if use_nat {
-                                add_node_and_connect_nat(
-                                    net,
-                                    my_party_id,
-                                    *pid,
-                                    *addr,
-                                    &*bn_conn,
-                                )
-                                .await;
+                                add_node_and_connect_nat(net, my_party_id, *pid, *addr, &*bn_conn)
+                                    .await;
                             } else {
                                 add_node_and_connect(net, *pid, *addr).await;
                             }

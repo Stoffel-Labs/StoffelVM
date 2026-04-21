@@ -316,7 +316,8 @@ mod tests {
         let mut rng = ark_std::test_rng();
         let ids: Vec<usize> = (1..=5).collect();
         let shares =
-            FeldmanShamirShare::<Fr, G1>::compute_shares(secret, 5, 1, Some(&ids), &mut rng).unwrap();
+            FeldmanShamirShare::<Fr, G1>::compute_shares(secret, 5, 1, Some(&ids), &mut rng)
+                .unwrap();
 
         store.store_client_input_feldman(client_id, shares.clone());
 

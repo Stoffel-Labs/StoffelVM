@@ -216,7 +216,6 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
 
     instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
     instructions.push(Instruction::JMP(phase3_loop.clone()));
-
     labels.insert(phase3_done.clone(), instructions.len());
 
     // Return the result array
@@ -284,7 +283,6 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         connection_retry_delay: Duration::from_millis(100),
         ..Default::default()
     };
-
     // Create the program binary (for reference/future use)
     info!("Creating federated average program binary...");
     let program_bytes = create_federated_average_binary();
@@ -408,6 +406,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             .expect("routed_network should be set after finalize_network()");
         let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
+        let open_message_router = open_message_router.clone();
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
                 match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
@@ -418,8 +417,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                     }
                     Ok(false) => {}
                 }
-                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
-                {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -592,7 +590,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                 .map(|(client, shares)| (*client, shares.clone()))
                 .collect()
         };
-        let mut vm = vm_arc.lock();
+        let vm = vm_arc.lock();
         let store = vm.state.client_store();
         store.clear();
         for (client_id, shares) in shares_for_party {

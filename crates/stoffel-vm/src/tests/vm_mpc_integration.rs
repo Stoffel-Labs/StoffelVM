@@ -123,8 +123,7 @@ async fn test_vm_mpc_multiplication_integration() {
                     }
                     Ok(false) => {}
                 }
-                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
-                {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -361,7 +360,10 @@ async fn test_vm_mpc_multiplication_integration() {
             // Load the result share into r0
             Instruction::LDI(
                 0,
-                Value::Share(ShareType::secret_int(64), ShareData::Opaque(result_share_bytes.clone())),
+                Value::Share(
+                    ShareType::secret_int(64),
+                    ShareData::Opaque(result_share_bytes.clone()),
+                ),
             ),
             // Could perform additional operations here (e.g., add constants)
             // For now, just return the share
@@ -387,7 +389,10 @@ async fn test_vm_mpc_multiplication_integration() {
 
     match result {
         Value::Share(ShareType::SecretInt { .. }, result_bytes) => {
-            info!("Received result share: {} bytes", result_bytes.as_bytes().len());
+            info!(
+                "Received result share: {} bytes",
+                result_bytes.as_bytes().len()
+            );
 
             // Decode the result share
             let result_share = RobustShare::<Fr>::deserialize_compressed(result_bytes.as_bytes())
