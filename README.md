@@ -159,6 +159,11 @@ Now that you're familiar with the basics of Stoffel VM, good places to explore n
 2. `crates/stoffel-vm/src/tests/vm_mpc_integration.rs` for VM + MPC execution flows
 3. `tests/p2p_integration.rs` for QUIC networking coverage
 
+## Learn More
+
+To learn more about what you can build with Stoffel, visit 
+[stoffelmpc.com](https://stoffelmpc.com?utm_source=github&utm_medium=readme&utm_campaign=stoffelvm-repo&utm_term=mpc)
+
 ## Compiled Bytecode
 
 StoffelVM also ships a portable compiled binary format through `stoffel-vm-types::compiled_binary::CompiledBinary`. The format uses the magic bytes `STFL` and can round-trip between `VMFunction` definitions and serialized binaries.
