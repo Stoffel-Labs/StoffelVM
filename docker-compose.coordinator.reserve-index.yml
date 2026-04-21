@@ -1,0 +1,274 @@
+# Reserve-index off-chain coordinator stack.
+#
+# Default run:
+#   STOFFEL_AUTH_TOKEN=replace-with-random-secret \
+#   docker compose -f docker-compose.coordinator.reserve-index.yml up --build
+#
+# Swap client order by swapping the reserved indices:
+#   STOFFEL_AUTH_TOKEN=replace-with-random-secret \
+#   STOFFEL_CLIENT0_INDEX=1 \
+#   STOFFEL_CLIENT1_INDEX=0 \
+#   docker compose -f docker-compose.coordinator.reserve-index.yml up --build
+#
+# The program computes client[0] - client[1], so changing which client claims
+# index 0 vs 1 changes the result deterministically without depending on race timing.
+
+x-stoffel-build: &stoffel-build
+  context: .
+  dockerfile: Dockerfile
+  additional_contexts:
+    coordsrc: ../stoffel-mpc-coordinator
+
+x-party-common: &party-common
+  build: *stoffel-build
+  environment: &party-env
+    STOFFEL_AUTH_TOKEN: ${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
+    STOFFEL_N_PARTIES: "5"
+    STOFFEL_THRESHOLD: "1"
+    STOFFEL_PROGRAM: /app/programs/client_sub_order.stflb
+    STOFFEL_ENTRY: main
+    STOFFEL_COORD_ADDR: 172.29.0.5:31415
+    STOFFEL_TIMESTAMP: "0"
+    STOFFEL_EXPECTED_CLIENTS: /app/ids/clients/cert0.crt,/app/ids/clients/cert1.crt
+    RUST_LOG: info
+    RUST_BACKTRACE: "1"
+  networks:
+    stoffel-coord-net: {}
+
+x-client-common: &client-common
+  build: *stoffel-build
+  environment: &client-env
+    STOFFEL_ROLE: client
+    STOFFEL_SERVERS: 172.29.0.10:16180,172.29.0.11:16181,172.29.0.12:16182,172.29.0.13:16183,172.29.0.14:16184
+    STOFFEL_N_PARTIES: "5"
+    STOFFEL_THRESHOLD: "1"
+    STOFFEL_COORD_ADDR: 172.29.0.5:31415
+    STOFFEL_TIMESTAMP: "0"
+    STOFFEL_CLIENT_DELAY: "20"
+    RUST_LOG: info
+    RUST_BACKTRACE: "1"
+  networks:
+    stoffel-coord-net: {}
+
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: docker/coordinator.Dockerfile
+      additional_contexts:
+        coordsrc: ../stoffel-mpc-coordinator
+    container_name: stoffel-coordinator-reserve-index
+    hostname: coordinator
+    command:
+      - --bind-addr
+      - 0.0.0.0
+      - --port
+      - "31415"
+      - --hash
+      - "0000000000000000000000000000000000000000000000000000000000000000"
+      - --server-cert
+      - /app/ids/server_cert.crt
+      - --server-key
+      - /app/ids/server_key.der
+      - --n
+      - "5"
+      - --t
+      - "1"
+      - --n-inputs
+      - "2"
+      - --initial-mpc-nodes
+      - /app/ids/nodes/cert0.crt,/app/ids/nodes/cert1.crt,/app/ids/nodes/cert2.crt,/app/ids/nodes/cert3.crt,/app/ids/nodes/cert4.crt
+    volumes:
+      - ./ids:/app/ids:ro
+    networks:
+      stoffel-coord-net:
+        ipv4_address: 172.29.0.5
+    ports:
+      - "31415:31415"
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -tuln | grep -q ':31415' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  party0:
+    <<: *party-common
+    container_name: stoffel-coord-party0
+    hostname: party0
+    environment:
+      <<: *party-env
+      STOFFEL_ROLE: leader
+      STOFFEL_PARTY_ID: "0"
+      STOFFEL_BIND_ADDR: 172.29.0.10:9000
+      STOFFEL_RPC_ADDR: 172.29.0.10:16180
+      STOFFEL_CERT: /app/ids/nodes/cert0.crt
+      STOFFEL_KEY: /app/ids/nodes/key0.der
+    networks:
+      stoffel-coord-net:
+        ipv4_address: 172.29.0.10
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    ports:
+      - "9000:9000/tcp"
+      - "9000:9000/udp"
+      - "10000:10000/tcp"
+      - "10000:10000/udp"
+      - "16180:16180/tcp"
+      - "16180:16180/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -tuln | grep -q ':9000' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  party1:
+    <<: *party-common
+    container_name: stoffel-coord-party1
+    hostname: party1
+    environment:
+      <<: *party-env
+      STOFFEL_ROLE: party
+      STOFFEL_PARTY_ID: "1"
+      STOFFEL_BIND_ADDR: 172.29.0.11:9001
+      STOFFEL_BOOTSTRAP_ADDR: 172.29.0.10:9000
+      STOFFEL_RPC_ADDR: 172.29.0.11:16181
+      STOFFEL_CERT: /app/ids/nodes/cert1.crt
+      STOFFEL_KEY: /app/ids/nodes/key1.der
+    networks:
+      stoffel-coord-net:
+        ipv4_address: 172.29.0.11
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      party0:
+        condition: service_healthy
+
+  party2:
+    <<: *party-common
+    container_name: stoffel-coord-party2
+    hostname: party2
+    environment:
+      <<: *party-env
+      STOFFEL_ROLE: party
+      STOFFEL_PARTY_ID: "2"
+      STOFFEL_BIND_ADDR: 172.29.0.12:9002
+      STOFFEL_BOOTSTRAP_ADDR: 172.29.0.10:9000
+      STOFFEL_RPC_ADDR: 172.29.0.12:16182
+      STOFFEL_CERT: /app/ids/nodes/cert2.crt
+      STOFFEL_KEY: /app/ids/nodes/key2.der
+    networks:
+      stoffel-coord-net:
+        ipv4_address: 172.29.0.12
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      party0:
+        condition: service_healthy
+
+  party3:
+    <<: *party-common
+    container_name: stoffel-coord-party3
+    hostname: party3
+    environment:
+      <<: *party-env
+      STOFFEL_ROLE: party
+      STOFFEL_PARTY_ID: "3"
+      STOFFEL_BIND_ADDR: 172.29.0.13:9003
+      STOFFEL_BOOTSTRAP_ADDR: 172.29.0.10:9000
+      STOFFEL_RPC_ADDR: 172.29.0.13:16183
+      STOFFEL_CERT: /app/ids/nodes/cert3.crt
+      STOFFEL_KEY: /app/ids/nodes/key3.der
+    networks:
+      stoffel-coord-net:
+        ipv4_address: 172.29.0.13
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      party0:
+        condition: service_healthy
+
+  party4:
+    <<: *party-common
+    container_name: stoffel-coord-party4
+    hostname: party4
+    environment:
+      <<: *party-env
+      STOFFEL_ROLE: party
+      STOFFEL_PARTY_ID: "4"
+      STOFFEL_BIND_ADDR: 172.29.0.14:9004
+      STOFFEL_BOOTSTRAP_ADDR: 172.29.0.10:9000
+      STOFFEL_RPC_ADDR: 172.29.0.14:16184
+      STOFFEL_CERT: /app/ids/nodes/cert4.crt
+      STOFFEL_KEY: /app/ids/nodes/key4.der
+    networks:
+      stoffel-coord-net:
+        ipv4_address: 172.29.0.14
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      party0:
+        condition: service_healthy
+
+  client0:
+    <<: *client-common
+    container_name: stoffel-coord-client0
+    hostname: client0
+    environment:
+      <<: *client-env
+      STOFFEL_INPUTS: ${STOFFEL_CLIENT0_INPUT:-15}
+      STOFFEL_CLIENT_INDEX: ${STOFFEL_CLIENT0_INDEX:-0}
+      STOFFEL_CERT: /app/ids/clients/cert0.crt
+      STOFFEL_KEY: /app/ids/clients/key0.der
+    networks:
+      stoffel-coord-net:
+        ipv4_address: 172.29.0.100
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      party0:
+        condition: service_healthy
+      party1:
+        condition: service_started
+      party2:
+        condition: service_started
+      party3:
+        condition: service_started
+      party4:
+        condition: service_started
+
+  client1:
+    <<: *client-common
+    container_name: stoffel-coord-client1
+    hostname: client1
+    environment:
+      <<: *client-env
+      STOFFEL_INPUTS: ${STOFFEL_CLIENT1_INPUT:-25}
+      STOFFEL_CLIENT_INDEX: ${STOFFEL_CLIENT1_INDEX:-1}
+      STOFFEL_CERT: /app/ids/clients/cert1.crt
+      STOFFEL_KEY: /app/ids/clients/key1.der
+    networks:
+      stoffel-coord-net:
+        ipv4_address: 172.29.0.101
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      party0:
+        condition: service_healthy
+      party1:
+        condition: service_started
+      party2:
+        condition: service_started
+      party3:
+        condition: service_started
+      party4:
+        condition: service_started
+
+networks:
+  stoffel-coord-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24

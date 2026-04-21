@@ -1,0 +1,42 @@
+# Persistent preprocessing override for the reserve-index coordinator stack.
+#
+# Use with docker-compose.coordinator.reserve-index.yml to keep each party's
+# HoneyBadger preprocessing material in a named LMDB volume across runs.
+
+services:
+  party0:
+    environment:
+      STOFFEL_PREPROC_STORE: /var/lib/stoffel-preproc
+    volumes:
+      - coordri-preproc-party0:/var/lib/stoffel-preproc
+
+  party1:
+    environment:
+      STOFFEL_PREPROC_STORE: /var/lib/stoffel-preproc
+    volumes:
+      - coordri-preproc-party1:/var/lib/stoffel-preproc
+
+  party2:
+    environment:
+      STOFFEL_PREPROC_STORE: /var/lib/stoffel-preproc
+    volumes:
+      - coordri-preproc-party2:/var/lib/stoffel-preproc
+
+  party3:
+    environment:
+      STOFFEL_PREPROC_STORE: /var/lib/stoffel-preproc
+    volumes:
+      - coordri-preproc-party3:/var/lib/stoffel-preproc
+
+  party4:
+    environment:
+      STOFFEL_PREPROC_STORE: /var/lib/stoffel-preproc
+    volumes:
+      - coordri-preproc-party4:/var/lib/stoffel-preproc
+
+volumes:
+  coordri-preproc-party0:
+  coordri-preproc-party1:
+  coordri-preproc-party2:
+  coordri-preproc-party3:
+  coordri-preproc-party4:

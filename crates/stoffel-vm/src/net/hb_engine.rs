@@ -67,6 +67,8 @@ where
     preproc_store: tokio::sync::RwLock<Option<Arc<dyn PreprocStore>>>,
     /// Program hash for keying stored material.
     program_hash: tokio::sync::RwLock<Option<[u8; 32]>>,
+    /// Stable operator-assigned party slot used for persistent store keys.
+    persistent_party_id: tokio::sync::RwLock<usize>,
     /// Reservation registry for masked-input protocol.
     reservation: tokio::sync::RwLock<Option<ReservationRegistry>>,
     /// Session-local router for open-share/open-exp payloads.
@@ -125,13 +127,14 @@ where
             (Some(s), Some(h)) => (s, h),
             _ => return Ok(false),
         };
+        let persistent_party_id = *self.persistent_party_id.read().await;
 
         let base = PreprocKey::new(
             hash,
             F::field_kind(),
             self.n,
             self.t,
-            self.party_id,
+            persistent_party_id,
             MaterialKind::BeaverTriple,
         );
         let k_rs = base.with_kind(MaterialKind::RandomShare);
@@ -145,13 +148,39 @@ where
         )?;
 
         if triples.is_none() && randoms.is_none() && prandbits.is_none() && prandints.is_none() {
+            let msg = format!(
+                "No preprocessing material found in store for program {} (party_id={}, n={}, t={})",
+                hex::encode(hash),
+                persistent_party_id,
+                self.n,
+                self.t
+            );
+            eprintln!("{msg}");
+            tracing::info!("{msg}");
             return Ok(false);
         }
 
         let mut node = self.node.lock().await;
         let mut prep = node.preprocessing_material.lock().await;
 
-        if let Some(blob) = triples {
+        let loaded_triples = triples
+            .as_ref()
+            .map(|blob| blob.meta.available())
+            .unwrap_or(0);
+        let loaded_randoms = randoms
+            .as_ref()
+            .map(|blob| blob.meta.available())
+            .unwrap_or(0);
+        let loaded_prandbits = prandbits
+            .as_ref()
+            .map(|blob| blob.meta.available())
+            .unwrap_or(0);
+        let loaded_prandints = prandints
+            .as_ref()
+            .map(|blob| blob.meta.available())
+            .unwrap_or(0);
+
+        if let Some(ref blob) = triples {
             let decoded = preproc::deserialize_beaver_triples::<F>(
                 blob.unconsumed_data(),
                 blob.meta.item_size,
@@ -159,7 +188,7 @@ where
             )?;
             prep.add(Some(decoded), None, None, None);
         }
-        if let Some(blob) = randoms {
+        if let Some(ref blob) = randoms {
             let decoded = preproc::deserialize_robust_shares::<F>(
                 blob.unconsumed_data(),
                 blob.meta.item_size,
@@ -167,7 +196,7 @@ where
             )?;
             prep.add(None, Some(decoded), None, None);
         }
-        if let Some(blob) = prandbits {
+        if let Some(ref blob) = prandbits {
             let decoded = preproc::deserialize_prandbit_shares::<F>(
                 blob.unconsumed_data(),
                 blob.meta.item_size,
@@ -175,7 +204,7 @@ where
             )?;
             prep.add(None, None, Some(decoded), None);
         }
-        if let Some(blob) = prandints {
+        if let Some(ref blob) = prandints {
             let decoded = preproc::deserialize_robust_shares::<F>(
                 blob.unconsumed_data(),
                 blob.meta.item_size,
@@ -184,15 +213,33 @@ where
             prep.add(None, None, None, Some(decoded));
         }
 
-        tracing::info!(
-            "Loaded preprocessing material from store for program {}",
-            hex::encode(hash)
+        let msg = format!(
+            "Loaded preprocessing material from store for program {} (party_id={}, n={}, t={}, triples={}, randoms={}, prandbits={}, prandints={})",
+            hex::encode(hash),
+            persistent_party_id,
+            self.n,
+            self.t,
+            loaded_triples,
+            loaded_randoms,
+            loaded_prandbits,
+            loaded_prandints
         );
+        eprintln!("{msg}");
+        tracing::info!("{msg}");
         Ok(true)
     }
 
     pub fn open_message_router(&self) -> Arc<crate::net::open_registry::OpenMessageRouter> {
         self.open_message_router.clone()
+    }
+
+    pub fn set_preproc_store_party_id(&self, persistent_party_id: usize) {
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                *self.persistent_party_id.write().await = persistent_party_id;
+            });
+        });
     }
 
     /// Persist current preprocessing material to the store.
@@ -206,13 +253,14 @@ where
             (Some(s), Some(h)) => (s, h),
             _ => return Ok(()),
         };
+        let persistent_party_id = *self.persistent_party_id.read().await;
 
         let base = PreprocKey::new(
             hash,
             F::field_kind(),
             self.n,
             self.t,
-            self.party_id,
+            persistent_party_id,
             MaterialKind::BeaverTriple,
         );
 
@@ -281,10 +329,16 @@ where
             store.store(key, blob).await?;
         }
 
-        tracing::info!(
-            "Persisted preprocessing material to store for program {}",
-            hex::encode(hash)
+        let msg = format!(
+            "Persisted preprocessing material to store for program {} (party_id={}, n={}, t={}, blobs={})",
+            hex::encode(hash),
+            persistent_party_id,
+            self.n,
+            self.t,
+            to_store.len()
         );
+        eprintln!("{msg}");
+        tracing::info!("{msg}");
         Ok(())
     }
 
@@ -573,6 +627,7 @@ where
             group_marker: PhantomData,
             preproc_store: tokio::sync::RwLock::new(None),
             program_hash: tokio::sync::RwLock::new(None),
+            persistent_party_id: tokio::sync::RwLock::new(party_id),
             reservation: tokio::sync::RwLock::new(None),
             open_registry: open_message_router.register_instance(instance_id),
             open_message_router,
@@ -622,6 +677,7 @@ where
             group_marker: PhantomData,
             preproc_store: tokio::sync::RwLock::new(None),
             program_hash: tokio::sync::RwLock::new(None),
+            persistent_party_id: tokio::sync::RwLock::new(party_id),
             reservation: tokio::sync::RwLock::new(None),
             open_registry: open_message_router.register_instance(instance_id),
             open_message_router,
@@ -1654,9 +1710,10 @@ where
 {
     async fn init_reservations(&self, program_hash: [u8; 32], capacity: u64) -> Result<(), String> {
         let store = self.preproc_store.read().await.clone();
+        let persistent_party_id = *self.persistent_party_id.read().await;
         if let Some(store) = store {
             if let Some(restored) =
-                ReservationRegistry::load(store.as_ref(), &program_hash, self.party_id)
+                ReservationRegistry::load(store.as_ref(), &program_hash, persistent_party_id)
                     .await
                     .map_err(|e| e.to_string())?
             {
@@ -1666,7 +1723,7 @@ where
         }
         *self.reservation.write().await = Some(ReservationRegistry::new(
             program_hash,
-            self.party_id,
+            persistent_party_id,
             capacity,
         ));
         Ok(())
@@ -1681,6 +1738,7 @@ where
     async fn get_mask_share(&self, index: u64) -> Result<Vec<u8>, String> {
         let store = self.preproc_store.read().await.clone();
         let hash = *self.program_hash.read().await;
+        let persistent_party_id = *self.persistent_party_id.read().await;
         let (store, hash) = match (store, hash) {
             (Some(s), Some(h)) => (s, h),
             _ => return Err("preproc store not configured".into()),
@@ -1691,7 +1749,7 @@ where
             F::field_kind(),
             self.n,
             self.t,
-            self.party_id,
+            persistent_party_id,
             MaterialKind::RandomShare,
         );
         let blob = store.load(&key).await?.ok_or("no random shares stored")?;
@@ -1735,6 +1793,7 @@ where
         // Load the random-share blob once for all indices
         let store = self.preproc_store.read().await.clone();
         let hash = *self.program_hash.read().await;
+        let persistent_party_id = *self.persistent_party_id.read().await;
         let (store, hash) = match (store, hash) {
             (Some(s), Some(h)) => (s, h),
             _ => return Err("preproc store not configured".into()),
@@ -1744,7 +1803,7 @@ where
             F::field_kind(),
             self.n,
             self.t,
-            self.party_id,
+            persistent_party_id,
             MaterialKind::RandomShare,
         );
         let blob = store.load(&key).await?.ok_or("no random shares stored")?;

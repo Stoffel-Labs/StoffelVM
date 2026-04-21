@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # Multi-stage Dockerfile for StoffelVM
 # Builds the stoffel-run binary and packages it for distributed MPC execution
 #
@@ -14,7 +15,6 @@ FROM rustlang/rust:nightly-bookworm AS builder
 
 # Build argument to enable NAT traversal feature
 ARG ENABLE_NAT=false
-
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -26,6 +26,10 @@ WORKDIR /build
 
 # Copy the entire project (we need all crates for workspace build)
 COPY . .
+
+# The VM depends on a sibling coordinator checkout at /stoffel-mpc-coordinator.
+# Pull that source from the compose-provided additional build context.
+COPY --from=coordsrc . /stoffel-mpc-coordinator
 
 # Configure git for private repos if using SSH
 # For private GitHub repos, mount SSH keys during build:
@@ -67,6 +71,7 @@ COPY --from=builder /build/target/release/stoffel-run /app/stoffel-run
 # Copy the test bytecode files
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/matrix_average_fixed_point.stflb /app/programs/matrix_average_fixed_point.stflb
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/client_mul.stflb /app/programs/client_mul.stflb
+COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/client_sub_order.stflb /app/programs/client_sub_order.stflb
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/avss_keygen.stflb /app/programs/avss_keygen.stflb
 
 # Copy pre-generated certificates for coordinator identity
@@ -90,6 +95,7 @@ ENV STOFFEL_RPC_ADDR=""
 ENV STOFFEL_CERT=""
 ENV STOFFEL_KEY=""
 ENV STOFFEL_TIMESTAMP="0"
+ENV STOFFEL_CLIENT_INDEX=""
 ENV STOFFEL_EXPECTED_CLIENTS=""
 # NAT traversal settings (only effective if built with --features nat)
 ENV STOFFEL_ENABLE_NAT="false"

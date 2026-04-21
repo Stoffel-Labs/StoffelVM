@@ -20,6 +20,7 @@ echo "=========================================="
 echo "Role: ${STOFFEL_ROLE}"
 if [ "${STOFFEL_ROLE}" = "client" ]; then
     echo "Inputs: ${STOFFEL_INPUTS}"
+    echo "Client Index: ${STOFFEL_CLIENT_INDEX:-unset}"
     echo "Servers: ${STOFFEL_SERVERS}"
 else
     echo "Party ID: ${STOFFEL_PARTY_ID}"
@@ -32,6 +33,7 @@ echo "Threshold: ${STOFFEL_THRESHOLD}"
 echo "Program: ${STOFFEL_PROGRAM}"
 echo "Entry: ${STOFFEL_ENTRY}"
 echo "Coordinator: ${STOFFEL_COORD_ADDR:-N/A}"
+echo "Preproc Store: ${STOFFEL_PREPROC_STORE:-none}"
 echo "Auth Token: $( [ -n "${STOFFEL_AUTH_TOKEN:-}" ] && echo "configured" || echo "not set" )"
 echo "=========================================="
 
@@ -85,6 +87,9 @@ build_command() {
         cmd="${cmd} --cert ${STOFFEL_CERT}"
         cmd="${cmd} --key ${STOFFEL_KEY}"
         cmd="${cmd} --timestamp ${STOFFEL_TIMESTAMP:-0}"
+        if [ -n "${STOFFEL_CLIENT_INDEX:-}" ]; then
+            cmd="${cmd} --client-index ${STOFFEL_CLIENT_INDEX}"
+        fi
         echo "$cmd"
         return
     fi
@@ -126,6 +131,10 @@ build_command() {
 
     if [ -n "${STOFFEL_EXPECTED_CLIENTS:-}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
         cmd="${cmd} --expected-clients ${STOFFEL_EXPECTED_CLIENTS}"
+    fi
+
+    if [ -n "${STOFFEL_PREPROC_STORE:-}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
+        cmd="${cmd} --preproc-store ${STOFFEL_PREPROC_STORE}"
     fi
 
     # Add MPC backend if specified

@@ -23,9 +23,11 @@ use stoffel_mpc_coordinator::on_chain;
 use stoffel_mpc_coordinator::Coordinator;
 use stoffel_vm::core_vm::VirtualMachine;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
-use stoffel_vm::net::curve::SupportedMpcField;
+use stoffel_vm::net::curve::{field_from_i64, field_to_i64, SupportedMpcField};
 #[cfg(feature = "honeybadger")]
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
+#[cfg(feature = "honeybadger")]
+use stoffel_vm::net::mpc_engine::MpcEngine;
 #[cfg(feature = "honeybadger")]
 use stoffel_vm::net::{honeybadger_node_opts, spawn_receive_loops_split};
 use stoffel_vm::net::{
@@ -33,6 +35,8 @@ use stoffel_vm::net::{
 };
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
+#[cfg(feature = "honeybadger")]
+use stoffel_vm::storage::preproc::LmdbPreprocStore;
 use stoffel_vm_types::compiled_binary::CompiledBinary;
 use stoffel_vm_types::core_types::Value;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
@@ -60,6 +64,153 @@ fn extract_pubkey_from_cert(cert_der: &[u8]) -> Vec<u8> {
         .data
         .as_ref()
         .to_vec()
+}
+
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
+fn format_coordinator_outputs<F>(outputs: &[F]) -> String
+where
+    F: PrimeField + Copy + PartialEq + std::fmt::Debug,
+{
+    let rendered = outputs
+        .iter()
+        .copied()
+        .map(|output| {
+            let signed = field_to_i64(output);
+            if field_from_i64::<F>(signed) == output {
+                signed.to_string()
+            } else {
+                format!("{output:?}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("[{}]", rendered)
+}
+
+#[cfg(feature = "honeybadger")]
+fn store_reserved_client_inputs<F, I>(
+    vm: &mut VirtualMachine,
+    client_to_index: &std::collections::HashMap<I, u64>,
+    client_inputs: std::collections::HashMap<I, Vec<RobustShare<F>>>,
+) where
+    F: ark_ff::FftField,
+    I: Eq + std::hash::Hash + std::fmt::Debug,
+{
+    let mut seen_reserved_indices = std::collections::HashSet::new();
+
+    for (client_id, shares) in client_inputs {
+        let reserved_index = match client_to_index.get(&client_id).copied() {
+            Some(index) => index,
+            None => {
+                eprintln!(
+                    "Coordinator returned input for client {:?} without a reserved index",
+                    client_id
+                );
+                exit(13);
+            }
+        };
+
+        let reserved_index = if reserved_index > usize::MAX as u64 {
+            eprintln!(
+                "Coordinator reserved index {} exceeds local usize range",
+                reserved_index
+            );
+            exit(13);
+        } else {
+            reserved_index as usize
+        };
+
+        if !seen_reserved_indices.insert(reserved_index) {
+            eprintln!(
+                "Coordinator assigned duplicate reserved index {} while collecting inputs",
+                reserved_index
+            );
+            exit(13);
+        }
+
+        vm.state
+            .client_store()
+            .store_client_input(reserved_index, shares);
+    }
+}
+
+#[cfg(feature = "honeybadger")]
+fn configure_hb_preproc_store<F, G>(
+    engine: &Arc<HoneyBadgerMpcEngine<F, G>>,
+    program_hash: [u8; 32],
+    persistent_party_id: usize,
+    preproc_store_path: Option<&str>,
+) -> Result<(), String>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
+    let Some(path) = preproc_store_path else {
+        return Ok(());
+    };
+
+    let store = Arc::new(LmdbPreprocStore::open(path)?);
+    engine.set_preproc_store(store, program_hash);
+    engine.set_preproc_store_party_id(persistent_party_id);
+    Ok(())
+}
+
+#[cfg(feature = "honeybadger")]
+async fn load_reserved_mask_share<F, G>(
+    engine: &Arc<HoneyBadgerMpcEngine<F, G>>,
+    reserved_index: u64,
+) -> Result<RobustShare<F>, String>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
+    let reservation = engine
+        .as_reservation()
+        .ok_or("HoneyBadger engine does not support reserved mask retrieval")?;
+    let share_bytes = reservation.get_mask_share(reserved_index).await?;
+    ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.as_slice())
+        .map_err(|e| format!("deserialize reserved mask share {reserved_index}: {:?}", e))
+}
+
+#[cfg(feature = "honeybadger")]
+async fn load_reserved_mask_shares<F, G>(
+    engine: &Arc<HoneyBadgerMpcEngine<F, G>>,
+    capacity: usize,
+    reserved_indices: impl IntoIterator<Item = u64>,
+) -> Result<Vec<RobustShare<F>>, String>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
+    if capacity == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut slots: Vec<Option<RobustShare<F>>> = vec![None; capacity];
+    for reserved_index in reserved_indices {
+        let slot = usize::try_from(reserved_index)
+            .map_err(|_| format!("reserved index {reserved_index} exceeds usize range"))?;
+        if slot >= capacity {
+            return Err(format!(
+                "reserved index {reserved_index} exceeds expected input capacity {capacity}"
+            ));
+        }
+        if slots[slot].is_some() {
+            return Err(format!(
+                "duplicate reserved mask share request for slot {reserved_index}"
+            ));
+        }
+        slots[slot] = Some(load_reserved_mask_share(engine, reserved_index).await?);
+    }
+
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(slot, share)| {
+            share.ok_or_else(|| format!("missing reserved mask share for slot {slot}"))
+        })
+        .collect()
 }
 
 /// Network adapter for MPC clients that remaps party IDs from 5-space (0..n-1)
@@ -903,10 +1054,13 @@ async fn setup_hb_party_for_curve<F, G>(
     vm: &mut VirtualMachine,
     net: Arc<QuicNetworkManager>,
     my_id: usize,
+    persistent_party_id: usize,
     n: usize,
     t: usize,
     instance_id: u64,
     expected_client_count: Option<usize>,
+    program_hash: [u8; 32],
+    preproc_store_path: Option<&str>,
 ) -> Result<Arc<HoneyBadgerMpcEngine<F, G>>, String>
 where
     F: SupportedMpcField,
@@ -1037,6 +1191,16 @@ where
         net.clone(),
         mpc_node, // moved, not cloned
     );
+
+    configure_hb_preproc_store(
+        &engine,
+        program_hash,
+        persistent_party_id,
+        preproc_store_path,
+    )?;
+    if let Some(path) = preproc_store_path {
+        eprintln!("[party {}] Using preprocessing store at {}", my_id, path);
+    }
 
     eprintln!(
         "[party {}] Spawning receive loops (split channels)...",
@@ -1696,6 +1860,8 @@ async fn main() {
     let mut wallet_sk_str: Option<String> = None;
     let mut contract_addr: Option<Address> = None;
     let mut node_ids: Vec<Address> = Vec::new();
+    let mut coordinator_client_index: Option<u64> = None;
+    let mut preproc_store_path: Option<String> = None;
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -1737,6 +1903,8 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--timestamp") {
         } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
         } else if let Some(_rest) = arg.strip_prefix("--node-ids") {
+        } else if let Some(_rest) = arg.strip_prefix("--client-index") {
+        } else if let Some(_rest) = arg.strip_prefix("--preproc-store") {
         }
     }
 
@@ -1901,6 +2069,16 @@ async fn main() {
                     timestamp = Some(v.parse().expect("Invalid --timestamp"));
                 }
             }
+            "--client-index" => {
+                if let Some(v) = args_iter.next() {
+                    coordinator_client_index = Some(v.parse().expect("Invalid --client-index"));
+                }
+            }
+            "--preproc-store" => {
+                if let Some(v) = args_iter.next() {
+                    preproc_store_path = Some(v);
+                }
+            }
             "--expected-clients" => {
                 if let Some(v) = args_iter.next() {
                     expected_clients = v.split(',').map(|s| s.trim().to_string()).collect();
@@ -1940,6 +2118,19 @@ async fn main() {
                 .split(',')
                 .map(|s| s.trim().parse().expect("invalid input value"))
                 .collect();
+            if input_values.len() != 1 {
+                eprintln!(
+                    "Error: coordinator client mode currently supports exactly one input value; got {}",
+                    input_values.len()
+                );
+                exit(2);
+            }
+            let reserved_index = coordinator_client_index.unwrap_or_else(|| {
+                eprintln!(
+                    "Error: coordinator client mode requires --client-index to claim a reserved input slot"
+                );
+                exit(2);
+            });
 
             if let Some(contract) = contract_addr {
                 // On-chain client mode
@@ -1957,15 +2148,14 @@ async fn main() {
 
                 coord.wait_for_pp().await.unwrap();
                 coord.wait_for_input_mask_init().await.unwrap();
-                let mut indices = Vec::new();
-                for i in 0..input_values.len() as u64 {
-                    coord.reserve_mask_index(i).await.unwrap();
-                    indices.push(i);
-                }
-                eprintln!("[on-chain client] obtained index {}", indices[0]);
+                coord.reserve_mask_index(reserved_index).await.unwrap();
+                eprintln!(
+                    "[on-chain client] obtained reserved index {}",
+                    reserved_index
+                );
 
                 let base_nonce = coord.base_nonce().await;
-                let sig = on_chain::generate_client_sig(base_nonce, indices[0], signer).await;
+                let sig = on_chain::generate_client_sig(base_nonce, reserved_index, signer).await;
 
                 let rpc_addrs: Vec<(String, u16)> = server_addrs
                     .iter()
@@ -1985,12 +2175,15 @@ async fn main() {
 
                 coord.wait_for_input().await.unwrap();
                 let masked = mask + ark_bls12_381::Fr::from(input_values[0] as u64);
-                coord.send_masked_input(masked, indices[0]).await.unwrap();
+                coord
+                    .send_masked_input(masked, reserved_index)
+                    .await
+                    .unwrap();
 
                 coord.wait_for_mpc().await.unwrap();
                 coord.wait_for_outputs().await.unwrap();
                 let outputs = coord.obtain_outputs().await.unwrap();
-                println!("outputs: {:?}", outputs);
+                println!("outputs: {}", format_coordinator_outputs(&outputs));
                 return;
             } else {
                 // Off-chain client mode
@@ -2012,11 +2205,7 @@ async fn main() {
 
                 coord.wait_for_pp().await.unwrap();
                 coord.wait_for_input_mask_init().await.unwrap();
-                let mut indices = Vec::new();
-                for i in 0..input_values.len() as u64 {
-                    coord.reserve_mask_index(i).await.unwrap();
-                    indices.push(i);
-                }
+                coord.reserve_mask_index(reserved_index).await.unwrap();
 
                 let rpc_addrs: Vec<(String, u16)> = server_addrs
                     .iter()
@@ -2034,12 +2223,15 @@ async fn main() {
 
                 coord.wait_for_input().await.unwrap();
                 let masked = mask + ark_bls12_381::Fr::from(input_values[0] as u64);
-                coord.send_masked_input(masked, indices[0]).await.unwrap();
+                coord
+                    .send_masked_input(masked, reserved_index)
+                    .await
+                    .unwrap();
 
                 coord.wait_for_mpc().await.unwrap();
                 coord.wait_for_outputs().await.unwrap();
                 let outputs = coord.obtain_outputs().await.unwrap();
-                println!("outputs: {:?}", outputs);
+                println!("outputs: {}", format_coordinator_outputs(&outputs));
                 return;
             }
         }
@@ -2553,10 +2745,13 @@ async fn main() {
                     &mut vm,
                     net.clone(),
                     my_id,
+                    party_id.unwrap_or(0usize),
                     n,
                     t,
                     instance_id,
                     None, // coordinator handles clients
+                    program_id,
+                    preproc_store_path.as_deref(),
                 )
                 .await
                 {
@@ -2569,27 +2764,35 @@ async fn main() {
 
             // Mask distribution
             if !input_addrs.is_empty() {
-                let mask_shares = engine
-                    .node_handle()
-                    .lock()
-                    .await
-                    .preprocessing_material
-                    .lock()
-                    .await
-                    .take_random_shares(input_addrs.len())
-                    .unwrap_or_else(|e| {
-                        eprintln!("take_random_shares: {}", e);
-                        exit(13);
-                    });
+                let precomputed_mask_shares = if preproc_store_path.is_some() {
+                    None
+                } else {
+                    Some(
+                        engine
+                            .node_handle()
+                            .lock()
+                            .await
+                            .preprocessing_material
+                            .lock()
+                            .await
+                            .take_random_shares(input_addrs.len())
+                            .unwrap_or_else(|e| {
+                                eprintln!("take_random_shares: {}", e);
+                                exit(13);
+                            }),
+                    )
+                };
 
-                for (i, share) in mask_shares.iter().enumerate() {
-                    node_rpc
-                        .add_mask_share(i as u64, share.clone())
-                        .await
-                        .unwrap_or_else(|e| {
-                            eprintln!("add_mask_share: {:?}", e);
-                            exit(13);
-                        });
+                if let Some(ref mask_shares) = precomputed_mask_shares {
+                    for (i, share) in mask_shares.iter().enumerate() {
+                        node_rpc
+                            .add_mask_share(i as u64, share.clone())
+                            .await
+                            .unwrap_or_else(|e| {
+                                eprintln!("add_mask_share: {:?}", e);
+                                exit(13);
+                            });
+                    }
                 }
 
                 if as_leader {
@@ -2601,6 +2804,34 @@ async fn main() {
                     .wait_for_indices(input_addrs.len() as u64)
                     .await
                     .unwrap();
+
+                let mask_shares = if let Some(mask_shares) = precomputed_mask_shares {
+                    mask_shares
+                } else {
+                    let mask_shares = load_reserved_mask_shares(
+                        &engine,
+                        input_addrs.len(),
+                        client_to_index.values().copied(),
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("load_reserved_mask_shares: {}", e);
+                        exit(13);
+                    });
+
+                    for idx in client_to_index.values().copied() {
+                        node_rpc
+                            .add_mask_share(idx, mask_shares[idx as usize].clone())
+                            .await
+                            .unwrap_or_else(|e| {
+                                eprintln!("add_mask_share: {:?}", e);
+                                exit(13);
+                            });
+                    }
+
+                    mask_shares
+                };
+
                 for (addr, idx) in &client_to_index {
                     node_rpc
                         .add_reserved_index(*addr, *idx)
@@ -2634,11 +2865,7 @@ async fn main() {
                     .wait_for_inputs(input_addrs.len() as u64, mask_shares)
                     .await
                     .unwrap();
-                for (client_idx, (_addr, shares)) in client_inputs.iter().enumerate() {
-                    vm.state
-                        .client_store()
-                        .store_client_input(client_idx, shares.clone());
-                }
+                store_reserved_client_inputs(&mut vm, &client_to_index, client_inputs);
             }
 
             vm.state.set_mpc_engine(engine);
@@ -2790,10 +3017,13 @@ async fn main() {
                             &mut vm,
                             net.clone(),
                             my_id,
+                            party_id.unwrap_or(0usize),
                             n,
                             t,
                             instance_id,
                             expected_client_count,
+                            program_id,
+                            preproc_store_path.as_deref(),
                         )
                         .await
                         {
@@ -2816,10 +3046,13 @@ async fn main() {
                         &mut vm,
                         net.clone(),
                         my_id,
+                        party_id.unwrap_or(0usize),
                         n,
                         t,
                         instance_id,
                         None, // coordinator handles clients
+                        program_id,
+                        preproc_store_path.as_deref(),
                     )
                     .await
                     {
@@ -2837,27 +3070,35 @@ async fn main() {
                             .expect("--rpc-bind required with coordinator");
 
                         if !input_ids.is_empty() {
-                            let mask_shares = engine
-                                .node_handle()
-                                .lock()
-                                .await
-                                .preprocessing_material
-                                .lock()
-                                .await
-                                .take_random_shares(input_ids.len())
-                                .unwrap_or_else(|e| {
-                                    eprintln!("take_random_shares: {}", e);
-                                    exit(13);
-                                });
+                            let precomputed_mask_shares = if preproc_store_path.is_some() {
+                                None
+                            } else {
+                                Some(
+                                    engine
+                                        .node_handle()
+                                        .lock()
+                                        .await
+                                        .preprocessing_material
+                                        .lock()
+                                        .await
+                                        .take_random_shares(input_ids.len())
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("take_random_shares: {}", e);
+                                            exit(13);
+                                        }),
+                                )
+                            };
 
-                            for (i, share) in mask_shares.iter().enumerate() {
-                                node_rpc
-                                    .add_mask_share(i as u64, share)
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        eprintln!("add_mask_share: {:?}", e);
-                                        exit(13);
-                                    });
+                            if let Some(ref mask_shares) = precomputed_mask_shares {
+                                for (i, share) in mask_shares.iter().enumerate() {
+                                    node_rpc
+                                        .add_mask_share(i as u64, share)
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("add_mask_share: {:?}", e);
+                                            exit(13);
+                                        });
+                                }
                             }
 
                             if as_leader {
@@ -2869,6 +3110,34 @@ async fn main() {
                                 .wait_for_indices(input_ids.len() as u64)
                                 .await
                                 .unwrap();
+
+                            let mask_shares = if let Some(mask_shares) = precomputed_mask_shares {
+                                mask_shares
+                            } else {
+                                let mask_shares = load_reserved_mask_shares(
+                                    &engine,
+                                    input_ids.len(),
+                                    client_to_index.values().copied(),
+                                )
+                                .await
+                                .unwrap_or_else(|e| {
+                                    eprintln!("load_reserved_mask_shares: {}", e);
+                                    exit(13);
+                                });
+
+                                for idx in client_to_index.values().copied() {
+                                    node_rpc
+                                        .add_mask_share(idx, &mask_shares[idx as usize])
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("add_mask_share: {:?}", e);
+                                            exit(13);
+                                        });
+                                }
+
+                                mask_shares
+                            };
+
                             for (cid, idx) in &client_to_index {
                                 node_rpc
                                     .add_reserved_index(cid.clone(), *idx)
@@ -2888,11 +3157,7 @@ async fn main() {
                                 .wait_for_inputs(input_ids.len() as u64, mask_shares)
                                 .await
                                 .unwrap();
-                            for (client_idx, (_cid, shares)) in client_inputs.iter().enumerate() {
-                                vm.state
-                                    .client_store()
-                                    .store_client_input(client_idx, shares.clone());
-                            }
+                            store_reserved_client_inputs(&mut vm, &client_to_index, client_inputs);
                         }
                     }
 
@@ -3107,6 +3372,8 @@ Flags:
   --cert <path>           Path to DER-encoded X.509 certificate
   --key <path>            Path to DER-encoded private key
   --timestamp <u64>       Coordinator session timestamp (off-chain)
+  --client-index <u64>    Reserved coordinator input index (coordinator client mode)
+  --preproc-store <path>  Persistent HoneyBadger preprocessing store directory
   --expected-clients <cert-paths-or-addrs>
                           Comma-separated client cert paths (off-chain) or Ethereum addresses (on-chain)
   -h, --help              Show this help
@@ -3177,4 +3444,21 @@ Examples:
 "#
     );
     exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_coordinator_outputs;
+
+    #[test]
+    fn formats_negative_field_outputs_as_signed_i64s() {
+        let outputs = vec![-ark_bls12_381::Fr::from(10u64)];
+        assert_eq!(format_coordinator_outputs(&outputs), "[-10]");
+    }
+
+    #[test]
+    fn formats_positive_field_outputs_as_signed_i64s() {
+        let outputs = vec![ark_bls12_381::Fr::from(10u64)];
+        assert_eq!(format_coordinator_outputs(&outputs), "[10]");
+    }
 }
