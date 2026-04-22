@@ -3270,13 +3270,23 @@ async fn main() {
                                 output_share.as_slice(),
                             )
                             .expect("deserialize output share");
-                        coord
+                        if let Err(e) = coord
                             .send_output_shares(cid.clone(), cid.clone(), vec![share])
                             .await
-                            .unwrap();
+                        {
+                            eprintln!(
+                                "Warning: failed to submit output shares for client {:?}: {}",
+                                cid, e
+                            );
+                        }
                     }
                     if as_leader {
-                        coord.finalize().await.unwrap();
+                        if let Err(e) = coord.finalize().await {
+                            eprintln!(
+                                "Warning: failed to finalize off-chain coordinator round: {}",
+                                e
+                            );
+                        }
                     }
                 }
             } else {

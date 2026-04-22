@@ -1,0 +1,76 @@
+diff --git a/src/off_chain.rs b/src/off_chain.rs
+index eeb8d53..14c2a49 100644
+--- a/src/off_chain.rs
++++ b/src/off_chain.rs
+@@ -582,7 +582,7 @@ impl<F: FftField> CoordinatorRPCServerImplInternal<F> {
+             if index != events.len() {
+                 let event = *events[index].1.clone().downcast::<E>().map_err(|_| "BUG: Downcasting failed").unwrap();
+                 let json = to_json_raw_value(&event).expect("failed convert to JSON");
+-                sink.send(json).await.unwrap();
++                let _ = sink.send(json).await;
+ 
+                 return Ok(());
+             }
+@@ -605,7 +605,7 @@ impl<F: FftField> CoordinatorRPCServerImplInternal<F> {
+             for i in index..events.len() {
+                 let event = events[i].1.clone();
+                 let json = to_json_raw_value(&event).expect("failed convert to JSON");
+-                sink.send(json).await.unwrap();
++                let _ = sink.send(json).await;
+             }
+ 
+             return Ok(());
+@@ -627,7 +627,7 @@ impl<F: FftField> CoordinatorRPCServerImplInternal<F> {
+             for i in index..events.len() {
+                 let event = events[i].1.clone();
+                 let json = to_json_raw_value(&event).expect("failed convert to JSON");
+-                sink.send(json).await.unwrap();
++                let _ = sink.send(json).await;
+             }
+ 
+             return Ok(());
+@@ -647,7 +647,7 @@ impl<F: FftField> CoordinatorRPCServerImplInternal<F> {
+         // broadcast event to all subscribed RPC clients
+         for sink in sinks.iter() {
+             let json = to_json_raw_value(&event).expect("failed convert to JSON");
+-            sink.send(json).await.unwrap();
++            let _ = sink.send(json).await;
+         }
+ 
+         // clear all subscribed RPC clients
+@@ -801,7 +801,7 @@ impl<F: FftField> CoordinatorRPCServerImpl<F> {
+                 let event = MaskedInputEvent { client: self.id.clone(), masked_input, reserved_index: raw_reserved_index };
+                 for sink in &d.masked_input_sinks {
+                     let json = to_json_raw_value(&event).expect("failed convert to JSON");
+-                    sink.send(json).await.unwrap();
++                    let _ = sink.send(json).await;
+                 }
+                 d.masked_input_events.push((SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), event));
+             }
+@@ -855,7 +855,7 @@ impl<F: FftField> CoordinatorRPCServerImpl<F> {
+         // broadcast reserved index to all subscribed RPC clients
+         for sink in &d.reserved_index_sinks {
+             let json = to_json_raw_value(&event).expect("failed convert to JSON");
+-            sink.send(json).await.unwrap();
++            let _ = sink.send(json).await;
+         }
+ 
+         d.reserved_index_events.push((SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), event));
+@@ -916,7 +916,7 @@ impl<F: FftField> CoordinatorRPCServerImpl<F> {
+         if output_shares.len() as u64 >= 2 * d.t + 1 {
+             if let Some(sink) = d.output_sinks.get(&client_id) {
+                 let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
+-                sink.send(json.clone()).await.unwrap();
++                let _ = sink.send(json).await;
+             }
+         }
+         Ok(())
+@@ -943,7 +943,7 @@ impl<F: FftField> CoordinatorRPCServerImpl<F> {
+             let json = to_json_raw_value(&output_shares).expect("failed convert to JSON");
+             let sink = d.output_sinks.get(&self.id).unwrap();
+ 
+-            sink.send(json.clone()).await.unwrap();
++            let _ = sink.send(json).await;
+         }
+ 
+         Ok(())
