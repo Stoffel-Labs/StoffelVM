@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 
 COPY .cargo /build/.cargo
+COPY --from=coordsrc . /build/stoffel-mpc-coordinator
+COPY docker/cargo-coordinator-source-patch.toml /tmp/cargo-coordinator-source-patch.toml
+RUN cat /tmp/cargo-coordinator-source-patch.toml >> /build/.cargo/config.toml
 COPY docker/coordinator-wrapper /build/coordinator-wrapper
 
 WORKDIR /build/coordinator-wrapper

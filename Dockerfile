@@ -26,6 +26,9 @@ WORKDIR /build
 
 # Copy the entire project (we need all crates for workspace build)
 COPY . .
+COPY --from=coordsrc . /build/stoffel-mpc-coordinator
+COPY docker/cargo-coordinator-source-patch.toml /tmp/cargo-coordinator-source-patch.toml
+RUN cat /tmp/cargo-coordinator-source-patch.toml >> /build/.cargo/config.toml
 
 # Configure git for private repos if using SSH
 # For private GitHub repos, mount SSH keys during build:

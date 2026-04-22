@@ -10,6 +10,6 @@ ark-bls12-381 = "0.5.0"
 clap = { version = "4.5.56", features = ["derive"] }
 hex = "0.4.3"
 rustls = "0.23.36"
-stoffel-mpc-coordinator = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git", branch = "reserve-index" }
+stoffel-mpc-coordinator = { version = "0.1.0", git = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git", rev = "6cb3e7e9f6c2f603153e3f2e1d0177507ad4dbad" }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "time"] }
 x509-parser = "0.18.1"
