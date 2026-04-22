@@ -1,0 +1,2 @@
+[patch."https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git"]
+stoffel-mpc-coordinator = { path = "/build/stoffel-mpc-coordinator" }
