@@ -5,6 +5,8 @@
 pub mod avss_engine;
 #[cfg(feature = "avss")]
 pub mod avss_server;
+#[cfg(feature = "avss")]
+pub mod local_cluster;
 pub mod backend;
 pub mod client_store;
 pub mod curve;
