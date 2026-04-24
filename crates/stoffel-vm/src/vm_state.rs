@@ -2647,6 +2647,9 @@ macro_rules! dispatch_share_curve {
             crate::net::curve::MpcFieldKind::Curve25519Fr => {
                 $self.$method::<ark_curve25519::Fr, ark_curve25519::EdwardsProjective>($($arg),*)
             }
+            crate::net::curve::MpcFieldKind::Secp256k1Fr => {
+                $self.$method::<ark_secp256k1::Fr, ark_secp256k1::Projective>($($arg),*)
+            }
         }
     };
 }

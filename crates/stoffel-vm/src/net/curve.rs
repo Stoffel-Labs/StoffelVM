@@ -20,6 +20,9 @@ pub enum MpcCurveConfig {
     /// Ed25519 uses the same scalar field as Curve25519.
     /// See enum-level docs for details.
     Ed25519,
+    /// secp256k1 — the curve underpinning the eventual cggmp24 ECDSA
+    /// threshold signing flow built on top of ADKG.
+    Secp256k1,
 }
 
 impl std::str::FromStr for MpcCurveConfig {
@@ -32,8 +35,9 @@ impl std::str::FromStr for MpcCurveConfig {
             "bn254" => Ok(Self::Bn254),
             "curve25519" | "curve-25519" => Ok(Self::Curve25519),
             "ed25519" | "ed-25519" => Ok(Self::Ed25519),
+            "secp256k1" | "secp256-k1" | "secp-256k1" => Ok(Self::Secp256k1),
             other => Err(format!(
-                "Unknown MPC curve '{other}'. Supported curves: bls12-381, bn254, curve25519, ed25519"
+                "Unknown MPC curve '{other}'. Supported curves: bls12-381, bn254, curve25519, ed25519, secp256k1"
             )),
         }
     }
@@ -46,6 +50,7 @@ impl MpcCurveConfig {
             Self::Bn254 => "bn254",
             Self::Curve25519 => "curve25519",
             Self::Ed25519 => "ed25519",
+            Self::Secp256k1 => "secp256k1",
         }
     }
 
@@ -56,6 +61,7 @@ impl MpcCurveConfig {
             Self::Curve25519 => MpcFieldKind::Curve25519Fr,
             // Ed25519 uses the same scalar field as curve25519.
             Self::Ed25519 => MpcFieldKind::Curve25519Fr,
+            Self::Secp256k1 => MpcFieldKind::Secp256k1Fr,
         }
     }
 
@@ -80,6 +86,7 @@ pub enum MpcFieldKind {
     Bls12_381Fr,
     Bn254Fr,
     Curve25519Fr,
+    Secp256k1Fr,
 }
 
 impl MpcFieldKind {
@@ -88,6 +95,7 @@ impl MpcFieldKind {
             Self::Bls12_381Fr => "bls12-381-fr",
             Self::Bn254Fr => "bn254-fr",
             Self::Curve25519Fr => "curve25519-fr",
+            Self::Secp256k1Fr => "secp256k1-fr",
         }
     }
 }
@@ -112,6 +120,10 @@ impl SupportedMpcField for ark_bn254::Fr {
 
 impl SupportedMpcField for ark_curve25519::Fr {
     const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Curve25519;
+}
+
+impl SupportedMpcField for ark_secp256k1::Fr {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Secp256k1;
 }
 
 /// Convert an `i64` to a field element.
@@ -208,10 +220,34 @@ mod tests {
             MpcCurveConfig::from_str("ed25519").unwrap(),
             MpcCurveConfig::Ed25519
         );
+        assert_eq!(
+            MpcCurveConfig::from_str("secp256k1").unwrap(),
+            MpcCurveConfig::Secp256k1
+        );
         // Also works via str::parse()
         assert_eq!(
             "bn254".parse::<MpcCurveConfig>().unwrap(),
             MpcCurveConfig::Bn254
+        );
+    }
+
+    #[test]
+    fn secp256k1_round_trip_metadata() {
+        let c = MpcCurveConfig::Secp256k1;
+        assert_eq!(c.name(), "secp256k1");
+        assert_eq!(c.field_kind(), MpcFieldKind::Secp256k1Fr);
+        assert_eq!(c.field_kind().name(), "secp256k1-fr");
+    }
+
+    #[test]
+    fn secp256k1_supported_mpc_field_impl_links() {
+        assert_eq!(
+            <ark_secp256k1::Fr as SupportedMpcField>::CURVE_CONFIG,
+            MpcCurveConfig::Secp256k1
+        );
+        assert_eq!(
+            <ark_secp256k1::Fr as SupportedMpcField>::field_kind(),
+            MpcFieldKind::Secp256k1Fr
         );
     }
 

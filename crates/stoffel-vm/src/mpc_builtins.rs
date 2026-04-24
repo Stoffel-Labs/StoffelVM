@@ -673,6 +673,14 @@ fn register_crypto_builtins(vm: &mut VirtualMachine) {
                     .map_err(|e| format!("serialize field element: {}", e))?;
                 out
             }
+            MpcCurveConfig::Secp256k1 => {
+                let field_elem = ark_secp256k1::Fr::from_be_bytes_mod_order(&hash_bytes);
+                let mut out = Vec::new();
+                field_elem
+                    .serialize_compressed(&mut out)
+                    .map_err(|e| format!("serialize field element: {}", e))?;
+                out
+            }
         };
 
         let arr_id = create_byte_array(&mut ctx.vm_state.object_store, &out_bytes);
