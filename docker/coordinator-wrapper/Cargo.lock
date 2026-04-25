@@ -5051,7 +5051,7 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?rev=6cb3e7e9f6c2f603153e3f2e1d0177507ad4dbad#6cb3e7e9f6c2f603153e3f2e1d0177507ad4dbad"
+source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?rev=dfb4f795ba701369229915eff2cf3dc70d371380#dfb4f795ba701369229915eff2cf3dc70d371380"
 dependencies = [
  "alloy",
  "alloy-primitives",
@@ -5075,7 +5075,7 @@ dependencies = [
  "ring",
  "rustls",
  "serde",
- "stoffel-solidity-bindings",
+ "stoffel-solidity-bindings-test",
  "stoffelmpc-mpc",
  "stoffelnet",
  "thiserror 2.0.18",
@@ -5087,9 +5087,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "stoffel-solidity-bindings"
+name = "stoffel-solidity-bindings-test"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git?branch=test-coord#e8f3dad12ff448045617ab484a23c8e1e408d103"
+source = "git+https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git?branch=test-coord#0322199fb2d4c7260d53b6d3b21c7a6f3c6acd58"
 dependencies = [
  "alloy",
  "serde",

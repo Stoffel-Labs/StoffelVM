@@ -1,12 +1,10 @@
 # Reserve-index off-chain coordinator stack.
 #
 # Default run:
-#   ./docker/prepare-coordinator-source.sh && \
 #   STOFFEL_AUTH_TOKEN=replace-with-random-secret \
 #   docker compose -f docker-compose.coordinator.reserve-index.yml up --build
 #
 # Swap client order by swapping the reserved indices:
-#   ./docker/prepare-coordinator-source.sh && \
 #   STOFFEL_AUTH_TOKEN=replace-with-random-secret \
 #   STOFFEL_CLIENT0_INDEX=1 \
 #   STOFFEL_CLIENT1_INDEX=0 \
@@ -18,8 +16,6 @@
 x-stoffel-build: &stoffel-build
   context: .
   dockerfile: Dockerfile
-  additional_contexts:
-    coordsrc: .docker-cache/stoffel-mpc-coordinator
 
 x-party-common: &party-common
   build: *stoffel-build
@@ -57,8 +53,6 @@ services:
     build:
       context: .
       dockerfile: docker/coordinator.Dockerfile
-      additional_contexts:
-        coordsrc: .docker-cache/stoffel-mpc-coordinator
     container_name: stoffel-coordinator-reserve-index
     hostname: coordinator
     command:

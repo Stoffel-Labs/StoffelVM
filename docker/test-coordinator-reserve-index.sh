@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PREPARE_COORDINATOR_SOURCE="${ROOT_DIR}/docker/prepare-coordinator-source.sh"
 BASE_COMPOSE="${ROOT_DIR}/docker-compose.coordinator.reserve-index.yml"
 AUTH_TOKEN="${STOFFEL_AUTH_TOKEN:-coord-test-token}"
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-240}"
@@ -85,8 +84,6 @@ require_log() {
 }
 
 trap cleanup EXIT
-
-"${PREPARE_COORDINATOR_SOURCE}"
 
 compose down --remove-orphans -v >/dev/null 2>&1 || true
 compose up "${COMPOSE_BUILD_FLAG}" -d

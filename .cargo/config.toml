@@ -1,11 +1,2 @@
-[source."https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git"]
-git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git"
-branch = "test-coord"
-replace-with = "stoffel-solidity-sdk-pinned"
-
-[source.stoffel-solidity-sdk-pinned]
-git = "https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git"
-rev = "e8f3dad12ff448045617ab484a23c8e1e408d103"
-
 [net]
 git-fetch-with-cli = true
