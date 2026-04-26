@@ -49,11 +49,10 @@ const PROGRAM_REGISTERS: usize = 24;
 
 /// Build a federated averaging program that computes element-wise averages.
 ///
-/// The current VM batches `MOV(secret -> clear)` reveals, so this test has to
-/// stage its work across three passes:
-/// 1. compute and store all secret sums,
-/// 2. queue reveals for every element,
-/// 3. read the revealed values, divide by `num_clients`, and store the result.
+/// The VM's current reveal path batches `MOV(secret -> clear)` operations. This
+/// builder mirrors the phased reveal pattern used by the passing mesh test:
+/// compute all secret sums first, queue all reveals second, then read the
+/// revealed values and divide in a final pass.
 fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usize>) {
     let matrix_size = MATRIX_SIZE;
     let mut instructions = Vec::new();
@@ -70,7 +69,6 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     // reg7 = scratch / revealed value
     // reg8 = secret_sums array reference
     // reg9 = revealed_sums array reference
-    // reg10 = 1-based array index scratch
     // reg16 = current element sum accumulator (secret share)
     // reg17 = scratch for shares
 
@@ -99,7 +97,7 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     instructions.push(Instruction::CALL("create_array".to_string()));
     instructions.push(Instruction::MOV(6, 0)); // reg6 = result array
 
-    // Phase 1: compute all secret sums.
+    // Phase 1: compute all secret sums without revealing them yet.
     instructions.push(Instruction::LDI(5, Value::I64(0))); // reg5 = 0 (element index)
 
     let phase1_loop = "phase1_loop".to_string();
@@ -140,7 +138,6 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
     instructions.push(Instruction::JMP(client_sum_done.clone()));
 
     labels.insert(client_sum_process.clone(), instructions.len());
-    // Get share for current client, current element
     instructions.push(Instruction::PUSHARG(2)); // client_index
     instructions.push(Instruction::PUSHARG(5)); // element_index
     instructions.push(Instruction::CALL(
@@ -157,20 +154,18 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
 
     labels.insert(client_sum_done.clone(), instructions.len());
 
-    // Store the secret sum for the later reveal pass.
-    instructions.push(Instruction::ADD(10, 5, 3)); // reg10 = element_index + 1 (1-indexed)
+    // Store the secret sum. This stays secret until phase 2.
     instructions.push(Instruction::PUSHARG(8)); // secret_sums array ref
-    instructions.push(Instruction::PUSHARG(10)); // index (1-based)
+    instructions.push(Instruction::PUSHARG(5)); // index
     instructions.push(Instruction::PUSHARG(16)); // secret sum
     instructions.push(Instruction::CALL("set_field".to_string()));
 
-    // Increment element counter
     instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
     instructions.push(Instruction::JMP(phase1_loop.clone()));
 
     labels.insert(phase1_done.clone(), instructions.len());
 
-    // Phase 2: queue all reveals before reading any of them back.
+    // Phase 2: queue all reveals.
     instructions.push(Instruction::LDI(5, Value::I64(0))); // reset element index
 
     labels.insert(phase2_loop.clone(), instructions.len());
@@ -180,15 +175,15 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
 
     labels.insert(phase2_process.clone(), instructions.len());
 
-    instructions.push(Instruction::ADD(10, 5, 3)); // reg10 = element_index + 1
     instructions.push(Instruction::PUSHARG(8)); // secret_sums array
-    instructions.push(Instruction::PUSHARG(10)); // index
+    instructions.push(Instruction::PUSHARG(5)); // index
     instructions.push(Instruction::CALL("get_field".to_string()));
     instructions.push(Instruction::MOV(16, 0)); // reg16 = secret sum
 
-    instructions.push(Instruction::MOV(7, 16)); // queue reveal
+    // MOV(secret -> clear) queues the reveal in the current MPC runtime.
+    instructions.push(Instruction::MOV(7, 16));
     instructions.push(Instruction::PUSHARG(9)); // revealed_sums array
-    instructions.push(Instruction::PUSHARG(10)); // index
+    instructions.push(Instruction::PUSHARG(5)); // index
     instructions.push(Instruction::PUSHARG(7)); // pending reveal marker
     instructions.push(Instruction::CALL("set_field".to_string()));
 
@@ -197,7 +192,7 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
 
     labels.insert(phase2_done.clone(), instructions.len());
 
-    // Phase 3: reading the first reveal flushes the full batch.
+    // Phase 3: reading the first queued reveal flushes the whole batch.
     instructions.push(Instruction::LDI(5, Value::I64(0))); // reset element index
 
     labels.insert(phase3_loop.clone(), instructions.len());
@@ -207,22 +202,20 @@ fn build_federated_average_program_6() -> (Vec<Instruction>, HashMap<String, usi
 
     labels.insert(phase3_process.clone(), instructions.len());
 
-    instructions.push(Instruction::ADD(10, 5, 3)); // reg10 = element_index + 1
     instructions.push(Instruction::PUSHARG(9)); // revealed_sums array
-    instructions.push(Instruction::PUSHARG(10)); // index
+    instructions.push(Instruction::PUSHARG(5)); // index
     instructions.push(Instruction::CALL("get_field".to_string()));
     instructions.push(Instruction::MOV(7, 0)); // reg7 = revealed sum
 
     instructions.push(Instruction::DIV(7, 7, 1)); // reg7 = sum / num_clients
 
     instructions.push(Instruction::PUSHARG(6)); // result array ref
-    instructions.push(Instruction::PUSHARG(10)); // index (1-based)
+    instructions.push(Instruction::PUSHARG(5)); // index
     instructions.push(Instruction::PUSHARG(7)); // value (revealed average)
     instructions.push(Instruction::CALL("set_field".to_string()));
 
     instructions.push(Instruction::ADD(5, 5, 3)); // reg5++
     instructions.push(Instruction::JMP(phase3_loop.clone()));
-
     labels.insert(phase3_done.clone(), instructions.len());
 
     // Return the result array
@@ -263,7 +256,6 @@ fn create_federated_average_binary() -> Vec<u8> {
 /// 3. Executes fixed-point federated averaging
 /// 4. Verifies element-wise average results
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn test_leader_bootnode_matrix_average_fixed_point() {
     init_crypto_provider();
     setup_test_tracing();
@@ -291,8 +283,6 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         connection_retry_delay: Duration::from_millis(100),
         ..Default::default()
     };
-    let open_message_router = Arc::new(crate::net::open_registry::OpenMessageRouter::new());
-
     // Create the program binary (for reference/future use)
     info!("Creating federated average program binary...");
     let program_bytes = create_federated_average_binary();
@@ -414,6 +404,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             .routed_network
             .clone()
             .expect("routed_network should be set after finalize_network()");
+        let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         let open_message_router = open_message_router.clone();
         tokio::spawn(async move {
@@ -426,7 +417,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -569,7 +560,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
         let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
-            open_message_router.clone(),
+            server.open_message_router.clone(),
             instance_id,
             party_id,
             n_parties,
@@ -680,7 +671,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             if let Some(arr) = vm.state.object_store.get_array(*array_id) {
                 info!("Verifying {} averaged matrix elements:", arr.length());
                 for elem_idx in 0..MATRIX_SIZE {
-                    let idx_val = Value::I64((elem_idx + 1) as i64);
+                    let idx_val = Value::I64(elem_idx as i64);
                     if let Some(elem_val) = arr.get(&idx_val) {
                         let computed_avg: f64 = match elem_val {
                             Value::I64(v) => *v as f64,
@@ -735,7 +726,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             .expect("array exists");
         (0..MATRIX_SIZE)
             .map(|i| {
-                let idx = Value::I64((i + 1) as i64);
+                let idx = Value::I64(i as i64);
                 match arr.get(&idx).expect("element exists") {
                     Value::I64(v) => *v as f64,
                     Value::Float(v) => v.0,
@@ -757,7 +748,7 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
             .get_array(array_id)
             .expect("array exists");
         for (i, &ref_val) in reference_vals.iter().enumerate() {
-            let idx = Value::I64((i + 1) as i64);
+            let idx = Value::I64(i as i64);
             let party_val: f64 = match arr.get(&idx).expect("element exists") {
                 Value::I64(v) => *v as f64,
                 Value::Float(v) => v.0,

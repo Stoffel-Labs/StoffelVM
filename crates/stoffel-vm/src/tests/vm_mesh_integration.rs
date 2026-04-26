@@ -60,7 +60,7 @@ async fn test_vm_mesh_full_integration() {
     let n_triples = program_mul_count;
     let n_random_shares = 2 + 2 * n_triples;
     info!("Number of triples: {:?} {:?}", n_triples, n_random_shares);
-    let instance_id = 99999;
+    let instance_id = 99995;
     let base_port = 9400;
 
     let config = HoneyBadgerQuicConfig {
@@ -162,7 +162,7 @@ async fn test_vm_mesh_full_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -559,7 +559,7 @@ async fn test_vm_mesh_average_salary_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1060,7 +1060,7 @@ async fn test_vm_mesh_large_preprocessing() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1379,7 +1379,7 @@ async fn test_vm_mesh_output_client_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1710,9 +1710,11 @@ const MATRIX_SIZE: usize = MATRIX_ROWS * MATRIX_COLS;
 const MATRIX_AVG_PROGRAM_REGISTERS: usize = 32;
 
 /// Large matrix dimensions for the fixed-point integration test (128x128)
-const LARGE_MATRIX_ROWS: usize = 512;
-const LARGE_MATRIX_COLS: usize = 512;
+const LARGE_MATRIX_ROWS: usize = 128;
+const LARGE_MATRIX_COLS: usize = 128;
 const LARGE_MATRIX_SIZE: usize = LARGE_MATRIX_ROWS * LARGE_MATRIX_COLS;
+const LARGE_MATRIX_CLIENT_COUNT: usize = 4;
+const LARGE_MATRIX_TEST_SEED: u64 = 0x5A0FFE1_u64;
 
 /// Maximum elements that can be preprocessed in a single batch (due to protocol limitations)
 /// The preprocessing protocol freezes when attempting to generate >511 elements at once
@@ -1891,7 +1893,7 @@ async fn test_vm_mesh_matrix_average_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -2368,7 +2370,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     // We'll use batched preprocessing, so start with a small initial batch
     let initial_n_triples = 32;
     let initial_n_random_shares = MAX_PREPROCESSING_BATCH_SIZE;
-    let instance_id = 66666; // Different instance ID to avoid collision
+    let instance_id = 66665; // Different instance ID to avoid collision
     let base_port = 9800; // Different port range
 
     let config = HoneyBadgerQuicConfig {
@@ -2377,10 +2379,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         ..Default::default()
     };
 
-    // Generate test client data before network setup (client IDs must be registered at setup time)
-    // For federated averaging, we need to track per-element values to compute expected averages
-    let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-    let client_count = rng.gen_range(2..=4usize);
+    // Keep this ignored stress test reproducible so runtime and share counts are stable across runs.
+    // For federated averaging, we need to track per-element values to compute expected averages.
+    let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(LARGE_MATRIX_TEST_SEED);
+    let client_count = LARGE_MATRIX_CLIENT_COUNT;
     let mut client_ids = Vec::new();
     let mut client_inputs = Vec::new();
 
@@ -2515,7 +2517,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -3763,7 +3765,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");

@@ -1179,9 +1179,9 @@ mod tests {
                         }
                         Ok(false) => {}
                     }
-                    match crate::net::hb_engine::try_handle_open_exp_wire_message(
-                        sender_id, &raw_msg,
-                    ) {
+                    match open_message_router
+                        .try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                    {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1425,7 +1425,7 @@ mod tests {
         let threshold = 1;
         let n_triples = 2 * threshold + 1; // Minimal number of triples
         let n_random_shares = 2 + 2 * n_triples; // Minimal random shares
-        let instance_id = 99999;
+        let instance_id = 99997;
         let base_port = 9220; // Unique port range for test_client_input_only
                               // Define client IDs before network setup (client IDs must be registered at setup time)
         let clientid: Vec<ClientId> = vec![100, 200];
@@ -1563,9 +1563,9 @@ mod tests {
                         }
                         Ok(false) => {}
                     }
-                    match crate::net::hb_engine::try_handle_open_exp_wire_message(
-                        sender_id, &raw_msg,
-                    ) {
+                    match open_message_router
+                        .try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                    {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -1731,7 +1731,7 @@ mod tests {
         let threshold = 1;
         let n_triples = 3; // Minimal number of triples
         let n_random_shares = 6; // Minimal random shares
-        let instance_id = 99999;
+        let instance_id = 99996;
         let base_port = 9230; // Unique port range for test_preprocessing_only
 
         let mut config = HoneyBadgerQuicConfig::default();
@@ -1804,9 +1804,9 @@ mod tests {
                         }
                         Ok(false) => {}
                     }
-                    match crate::net::hb_engine::try_handle_open_exp_wire_message(
-                        sender_id, &raw_msg,
-                    ) {
+                    match open_message_router
+                        .try_handle_hb_open_exp_wire_message(sender_id, &raw_msg)
+                    {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");

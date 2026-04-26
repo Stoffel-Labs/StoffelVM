@@ -573,13 +573,14 @@ fn spawn_avss_message_processors(
     for (i, node) in nodes.iter_mut().enumerate() {
         let rx = node.rx.take().unwrap();
         let engine = engines[i].clone();
+        let open_message_router = engine.open_message_router();
         let simple_net = node.simple_net.clone().unwrap();
         let node_id = node.node_id;
 
         tokio::spawn(async move {
             let mut rx = rx;
             while let Some((sender_id, data)) = rx.recv().await {
-                match crate::net::open_registry::try_handle_wire_message(sender_id, &data) {
+                match open_message_router.try_handle_wire_message(sender_id, &data) {
                     Ok(true) => continue,
                     Err(e) => {
                         error!(

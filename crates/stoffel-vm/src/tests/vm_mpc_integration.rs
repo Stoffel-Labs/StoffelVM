@@ -123,7 +123,7 @@ async fn test_vm_mpc_multiplication_integration() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");

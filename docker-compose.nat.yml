@@ -1,0 +1,71 @@
+# StoffelVM NAT-Enabled Cross-Internet MPC Deployment
+# This docker-compose file is for cross-internet MPC execution with NAT traversal.
+#
+# Prerequisites:
+#   1. Build the image with NAT support:
+#      docker-compose -f docker-compose.nat.yml build --build-arg ENABLE_NAT=true
+#
+#   2. The leader node needs to be publicly accessible (port forwarding required)
+#
+# Usage:
+#   Person A (Leader - with public IP or port forwarding):
+#     docker-compose -f docker-compose.nat.yml up leader
+#
+#   Person B (Remote party - behind NAT):
+#     LEADER_PUBLIC_IP=<person_a_ip> docker-compose -f docker-compose.nat.yml up party
+#
+# Google STUN servers (pre-resolved IPs for DNS-free operation):
+#   74.125.250.129:19302 (stun.l.google.com)
+#   74.125.250.127:19302 (stun1.l.google.com)
+
+services:
+  # Leader node - runs bootnode + party 0
+  # Must be publicly accessible (port forward 9000 and 10000)
+  leader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENABLE_NAT: "true"
+    container_name: stoffel-leader
+    hostname: leader
+    environment:
+      - STOFFEL_ROLE=leader
+      - STOFFEL_PARTY_ID=0
+      - STOFFEL_BIND_ADDR=0.0.0.0:9000
+      - STOFFEL_N_PARTIES=${N_PARTIES:-2}
+      - STOFFEL_THRESHOLD=${THRESHOLD:-1}
+      - STOFFEL_PROGRAM=/app/programs/matrix_average_fixed_point.stflb
+      - STOFFEL_ENTRY=main
+      - STOFFEL_ENABLE_NAT=true
+      - STOFFEL_STUN_SERVERS=74.125.250.129:19302,74.125.250.127:19302
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    network_mode: host
+    # Host network mode for proper NAT traversal
+
+  # Remote party - connects to leader via public IP
+  # Set LEADER_PUBLIC_IP environment variable before running
+  party:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENABLE_NAT: "true"
+    container_name: stoffel-party
+    hostname: party
+    environment:
+      - STOFFEL_ROLE=party
+      - STOFFEL_PARTY_ID=${PARTY_ID:-1}
+      - STOFFEL_BIND_ADDR=0.0.0.0:9001
+      - STOFFEL_BOOTSTRAP_ADDR=${LEADER_PUBLIC_IP:?Set LEADER_PUBLIC_IP environment variable}:9000
+      - STOFFEL_N_PARTIES=${N_PARTIES:-2}
+      - STOFFEL_THRESHOLD=${THRESHOLD:-1}
+      - STOFFEL_PROGRAM=/app/programs/matrix_average_fixed_point.stflb
+      - STOFFEL_ENTRY=main
+      - STOFFEL_ENABLE_NAT=true
+      - STOFFEL_STUN_SERVERS=74.125.250.129:19302,74.125.250.127:19302
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    network_mode: host
+    # Host network mode for proper NAT traversal

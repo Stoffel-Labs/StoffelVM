@@ -18,6 +18,7 @@
 use crate::net::client_store::ClientInputStore;
 use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
 use crate::net::mpc_engine::{MpcCapabilities, MpcEngine, MpcEngineClientOps};
+use crate::storage::preproc::{self, MaterialKind, PreprocBlob, PreprocKey, PreprocStore};
 use ark_ec::CurveGroup;
 use ark_ff::{FftField, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -60,187 +61,12 @@ struct AvssExpOpenWireMessage {
     partial_point: Vec<u8>,
 }
 
-#[derive(Default, Clone)]
-struct AvssExpOpenAccumulator {
-    /// (share_id, serialized compressed affine point)
-    partial_points: Vec<(usize, Vec<u8>)>,
-    party_ids: Vec<usize>,
-    result: Option<Vec<u8>>,
-    result_cached_at: Option<std::time::Instant>,
-}
-
-const AVSS_EXP_EVICTION_AGE: Duration = Duration::from_secs(60);
-
-static AVSS_EXP_REGISTRY: once_cell::sync::Lazy<
-    parking_lot::Mutex<HashMap<(u64, usize), AvssExpOpenAccumulator>>,
-> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
-
-static AVSS_EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
-
 // ============================================================================
 // Open-in-exp registry for AVSS G2 (BLS12-381 threshold BLS signatures)
 // ============================================================================
 
 /// Wire prefix that identifies an AVSS open-in-exp G2 contribution message.
 const AVSS_G2_EXP_WIRE_PREFIX: &[u8; 4] = b"AXG2";
-
-static AVSS_G2_EXP_REGISTRY: once_cell::sync::Lazy<
-    parking_lot::Mutex<HashMap<(u64, usize), AvssExpOpenAccumulator>>,
-> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
-
-static AVSS_G2_EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
-
-fn insert_remote_avss_exp_partial(
-    instance_id: u64,
-    sender_party_id: usize,
-    share_id: usize,
-    partial_point: Vec<u8>,
-) {
-    let mut reg = AVSS_EXP_REGISTRY.lock();
-    let now = std::time::Instant::now();
-    reg.retain(|_, acc| {
-        acc.result_cached_at
-            .is_none_or(|t| now.duration_since(t) < AVSS_EXP_EVICTION_AGE)
-    });
-    let mut seq = 0usize;
-    loop {
-        let key = (instance_id, seq);
-        let entry = reg.entry(key).or_default();
-        if !entry.party_ids.contains(&sender_party_id) {
-            entry.partial_points.push((share_id, partial_point));
-            entry.party_ids.push(sender_party_id);
-            break;
-        }
-        seq += 1;
-    }
-    drop(reg);
-    AVSS_EXP_NOTIFY.notify_waiters();
-}
-
-/// Inspect an incoming message and, if it carries an AVSS open-in-exp contribution
-/// (`AXOP` prefix), insert it into the accumulator registry and return `Ok(true)`.
-/// Returns `Ok(false)` for unrelated messages.
-pub fn try_handle_avss_open_exp_wire_message(
-    authenticated_sender_id: usize,
-    payload: &[u8],
-) -> Result<bool, String> {
-    if payload.len() < AVSS_EXP_WIRE_PREFIX.len()
-        || &payload[..AVSS_EXP_WIRE_PREFIX.len()] != AVSS_EXP_WIRE_PREFIX
-    {
-        return Ok(false);
-    }
-
-    let message: AvssExpOpenWireMessage =
-        bincode::deserialize(&payload[AVSS_EXP_WIRE_PREFIX.len()..])
-            .map_err(|e| format!("deserialize avss open-exp payload: {}", e))?;
-
-    if authenticated_sender_id == crate::net::open_registry::UNKNOWN_SENDER_ID {
-        tracing::warn!(
-            sender_party_id = message.sender_party_id,
-            "Rejecting AVSS open-exp wire message from unauthenticated connection"
-        );
-        return Err("avss open-exp wire rejected: sender identity not authenticated".to_string());
-    }
-    if message.sender_party_id != authenticated_sender_id {
-        return Err(format!(
-            "avss open-exp sender mismatch: transport={} payload={}",
-            authenticated_sender_id, message.sender_party_id
-        ));
-    }
-    // In AVSS the share_id equals party_id + 1 (evaluation points are 1-indexed).
-    if message.share_id != message.sender_party_id + 1 {
-        return Err(format!(
-            "avss open-exp share_id mismatch: sender_party_id={} share_id={}",
-            message.sender_party_id, message.share_id
-        ));
-    }
-
-    insert_remote_avss_exp_partial(
-        message.instance_id,
-        message.sender_party_id,
-        message.share_id,
-        message.partial_point,
-    );
-    Ok(true)
-}
-
-fn insert_remote_avss_g2_exp_partial(
-    instance_id: u64,
-    sender_party_id: usize,
-    share_id: usize,
-    partial_point: Vec<u8>,
-) {
-    let mut reg = AVSS_G2_EXP_REGISTRY.lock();
-    let now = std::time::Instant::now();
-    reg.retain(|_, acc| {
-        acc.result_cached_at
-            .is_none_or(|t| now.duration_since(t) < AVSS_EXP_EVICTION_AGE)
-    });
-    let mut seq = 0usize;
-    loop {
-        let key = (instance_id, seq);
-        let entry = reg.entry(key).or_default();
-        if !entry.party_ids.contains(&sender_party_id) {
-            entry.partial_points.push((share_id, partial_point));
-            entry.party_ids.push(sender_party_id);
-            break;
-        }
-        seq += 1;
-    }
-    drop(reg);
-    AVSS_G2_EXP_NOTIFY.notify_waiters();
-}
-
-/// Inspect an incoming message and, if it carries an AVSS G2 open-in-exp contribution
-/// (`AXG2` prefix), insert it into the G2 accumulator registry and return `Ok(true)`.
-/// Returns `Ok(false)` for unrelated messages.
-pub fn try_handle_avss_g2_exp_wire_message(
-    authenticated_sender_id: usize,
-    payload: &[u8],
-) -> Result<bool, String> {
-    if payload.len() < AVSS_G2_EXP_WIRE_PREFIX.len()
-        || &payload[..AVSS_G2_EXP_WIRE_PREFIX.len()] != AVSS_G2_EXP_WIRE_PREFIX
-    {
-        return Ok(false);
-    }
-
-    let message: AvssExpOpenWireMessage =
-        bincode::deserialize(&payload[AVSS_G2_EXP_WIRE_PREFIX.len()..])
-            .map_err(|e| format!("deserialize avss g2 open-exp payload: {}", e))?;
-
-    if authenticated_sender_id == crate::net::open_registry::UNKNOWN_SENDER_ID {
-        tracing::warn!(
-            sender_party_id = message.sender_party_id,
-            "Rejecting AVSS G2 open-exp wire message from unauthenticated connection"
-        );
-        return Err(
-            "avss g2 open-exp wire rejected: sender identity not authenticated".to_string(),
-        );
-    }
-    if message.sender_party_id != authenticated_sender_id {
-        return Err(format!(
-            "avss g2 open-exp sender mismatch: transport={} payload={}",
-            authenticated_sender_id, message.sender_party_id
-        ));
-    }
-    // In AVSS the share_id equals party_id + 1 (evaluation points are 1-indexed).
-    if message.share_id != message.sender_party_id + 1 {
-        return Err(format!(
-            "avss g2 open-exp share_id mismatch: sender_party_id={} share_id={}",
-            message.sender_party_id, message.share_id
-        ));
-    }
-
-    insert_remote_avss_g2_exp_partial(
-        message.instance_id,
-        message.sender_party_id,
-        message.share_id,
-        message.partial_point,
-    );
-    Ok(true)
-}
 
 // ============================================================================
 
@@ -323,6 +149,14 @@ where
     #[allow(dead_code)]
     sk_i: F,
     _marker: PhantomData<G>,
+    /// Persistent preprocessing store.
+    preproc_store: tokio::sync::RwLock<Option<Arc<dyn crate::storage::preproc::PreprocStore>>>,
+    /// Program hash and field kind for keying stored material.
+    preproc_config: tokio::sync::RwLock<Option<([u8; 32], crate::net::curve::MpcFieldKind)>>,
+    /// Router that owns open-message accumulation for this AVSS runtime.
+    open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
+    /// Per-instance open share accumulation registry.
+    open_registry: Arc<crate::net::open_registry::InstanceRegistry>,
 }
 
 impl<F, G> AvssMpcEngine<F, G>
@@ -342,6 +176,31 @@ where
     /// * `pk_map` - AVSS ECDH public keys from all parties
     /// * `input_ids` - Client IDs that will provide inputs (empty if no clients)
     pub async fn new(
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        net: Arc<QuicNetworkManager>,
+        sk_i: F,
+        pk_map: Arc<Vec<G>>,
+        input_ids: Vec<ClientId>,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_with_router(
+            Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
+            instance_id,
+            party_id,
+            n,
+            t,
+            net,
+            sk_i,
+            pk_map,
+            input_ids,
+        )
+        .await
+    }
+
+    pub async fn new_with_router(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
         instance_id: u64,
         party_id: usize,
         n: usize,
@@ -386,7 +245,15 @@ where
             share_notify: Arc::new(tokio::sync::Notify::new()),
             sk_i,
             _marker: PhantomData,
+            preproc_store: tokio::sync::RwLock::new(None),
+            preproc_config: tokio::sync::RwLock::new(None),
+            open_message_router: open_message_router.clone(),
+            open_registry: open_message_router.register_instance(instance_id),
         }))
+    }
+
+    pub fn open_message_router(&self) -> Arc<crate::net::open_registry::OpenMessageRouter> {
+        self.open_message_router.clone()
     }
 
     #[inline]
@@ -567,22 +434,19 @@ where
         self.broadcast_open_avss_exp_payload_sync(wire_message)?;
 
         let required = self.t + 1;
-        let instance_id = self.instance_id;
         let party_id = self.party_id;
+        let open_registry = self.open_registry.clone();
 
         let try_check = |my_sequence: &mut Option<usize>,
                          partial_bytes: &[u8],
                          share_id: usize|
          -> Result<Option<Vec<u8>>, String> {
-            let mut reg = AVSS_EXP_REGISTRY.lock();
+            let mut reg = open_registry.exp.lock();
 
             if my_sequence.is_none() {
                 let mut seq = 0;
                 loop {
-                    let key = (instance_id, seq);
-                    let entry = reg
-                        .entry(key)
-                        .or_insert_with(AvssExpOpenAccumulator::default);
+                    let entry = reg.entry(seq).or_default();
                     if !entry.party_ids.contains(&party_id) {
                         entry
                             .partial_points
@@ -596,9 +460,8 @@ where
             }
 
             let seq = my_sequence.expect("sequence must be set after insertion");
-            let key = (instance_id, seq);
             let entry = reg
-                .get_mut(&key)
+                .get_mut(&seq)
                 .expect("avss exp registry entry must exist after insertion");
 
             if let Some(result) = entry.result.clone() {
@@ -652,7 +515,6 @@ where
                     .map_err(|e| format!("serialize result: {}", e))?;
 
                 entry.result = Some(result_bytes.clone());
-                entry.result_cached_at = Some(std::time::Instant::now());
                 return Ok(Some(result_bytes));
             }
 
@@ -669,7 +531,7 @@ where
                         let mut my_sequence: Option<usize> = None;
 
                         loop {
-                            let notified = AVSS_EXP_NOTIFY.notified();
+                            let notified = open_registry.exp_notify.notified();
 
                             if let Some(result) =
                                 try_check(&mut my_sequence, &partial_bytes, share_id)?
@@ -724,25 +586,148 @@ where
     }
 
     /// Run cooperative preprocessing to generate random shares and Beaver triples.
-    /// Run cooperative preprocessing to generate random shares and Beaver triples.
+    ///
+    /// If a persistent store is configured, attempts to load from it first.
+    /// After generation, persists the result for future runs.
     ///
     /// This clones the inner node so that preprocessing can run concurrently
     /// with the message processing loop (which also needs the node lock for
     /// `process()`). Both clones share `Arc<Mutex<>>` internal state
     /// (preprocessing_material, shares) so results are visible to either.
     pub async fn preprocess(&self) -> Result<(), String> {
-        let mut node_clone = {
-            let node = self.avss_node.lock().await;
-            node.clone()
+        // Try loading from persistent store first
+        if self.try_load_preproc().await? {
+            return Ok(());
+        }
+
+        {
+            let mut node_clone = {
+                let node = self.avss_node.lock().await;
+                node.clone()
+            };
+            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+            PreprocessingMPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::run_preprocessing(
+                &mut node_clone,
+                self.net.clone(),
+                &mut rng,
+            )
+            .await
+            .map_err(|e| format!("AVSS preprocessing failed: {:?}", e))?;
+        }
+
+        // Persist for future runs
+        self.persist_preproc().await?;
+        Ok(())
+    }
+
+    /// Try to load AVSS preprocessing material from the persistent store.
+    async fn try_load_preproc(&self) -> Result<bool, String> {
+        let store = self.preproc_store.read().await.clone();
+        let config = *self.preproc_config.read().await;
+        let (store, (hash, field_kind)) = match (store, config) {
+            (Some(s), Some(c)) => (s, c),
+            _ => return Ok(false),
         };
-        let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        PreprocessingMPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::run_preprocessing(
-            &mut node_clone,
-            self.net.clone(),
-            &mut rng,
-        )
-        .await
-        .map_err(|e| format!("AVSS preprocessing failed: {:?}", e))
+
+        let base = PreprocKey::new(
+            hash,
+            field_kind,
+            self.n,
+            self.t,
+            self.party_id,
+            MaterialKind::BeaverTriple,
+        );
+        let k_rs = base.with_kind(MaterialKind::RandomShare);
+        let (triples, randoms) = tokio::try_join!(store.load(&base), store.load(&k_rs),)?;
+
+        if triples.is_none() && randoms.is_none() {
+            return Ok(false);
+        }
+
+        let node = self.avss_node.lock().await;
+        let mut prep = node.preprocessing_material.lock().await;
+
+        if let Some(blob) = triples {
+            let decoded = preproc::deserialize_avss_triples::<F, G>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
+            prep.add(Some(decoded), None);
+        }
+        if let Some(blob) = randoms {
+            let decoded = preproc::deserialize_feldman_shares::<F, G>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
+            prep.add(None, Some(decoded));
+        }
+
+        info!(
+            "Loaded AVSS preprocessing material from store for program {}",
+            hex::encode(hash)
+        );
+        Ok(true)
+    }
+
+    /// Persist current AVSS preprocessing material to the store.
+    ///
+    /// Drains and serializes inside the lock, then stores after releasing.
+    async fn persist_preproc(&self) -> Result<(), String> {
+        let store = self.preproc_store.read().await.clone();
+        let config = *self.preproc_config.read().await;
+        let (store, (hash, field_kind)) = match (store, config) {
+            (Some(s), Some(c)) => (s, c),
+            _ => return Ok(()),
+        };
+
+        let base = PreprocKey::new(
+            hash,
+            field_kind,
+            self.n,
+            self.t,
+            self.party_id,
+            MaterialKind::BeaverTriple,
+        );
+        let mut to_store: Vec<(PreprocKey, PreprocBlob)> = Vec::new();
+
+        {
+            let node = self.avss_node.lock().await;
+            let mut prep = node.preprocessing_material.lock().await;
+            let (n_bt, n_rs) = prep.len();
+
+            if n_bt > 0 {
+                let items = prep.take_triples(n_bt).map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_avss_triples::<F, G>(&items)?;
+                to_store.push((
+                    base.clone(),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
+                prep.add(Some(items), None);
+            }
+            if n_rs > 0 {
+                let items = prep
+                    .take_v_random_shares(n_rs)
+                    .map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_feldman_shares::<F, G>(&items)?;
+                to_store.push((
+                    base.with_kind(MaterialKind::RandomShare),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
+                prep.add(None, Some(items));
+            }
+        }
+
+        for (key, blob) in &to_store {
+            store.store(key, blob).await?;
+        }
+
+        info!(
+            "Persisted AVSS preprocessing material to store for program {}",
+            hex::encode(hash)
+        );
+        Ok(())
     }
 
     // ========================================================================
@@ -1318,8 +1303,7 @@ where
         let n = self.n;
         let t = self.t;
 
-        crate::net::open_registry::open_share_via_registry(
-            self.instance_id,
+        self.open_registry.open_share_wait(
             self.party_id,
             &type_key,
             share_bytes,
@@ -1358,8 +1342,7 @@ where
         // Use open_share_via_registry with a closure that serializes the secret
         // as a field element, then carries the bytes through Value::String
         // (using unsafe-from-utf8-lossy is fine since we immediately extract).
-        let result = crate::net::open_registry::open_share_via_registry(
-            self.instance_id,
+        let result = self.open_registry.open_share_wait(
             self.party_id,
             &type_key,
             share_bytes,
@@ -1391,7 +1374,7 @@ where
                 }
                 Ok(bytes)
             }
-            _ => Err("unexpected result from open_share_via_registry".to_string()),
+            _ => Err("unexpected result from open_share_wait".to_string()),
         }
     }
 
@@ -1415,8 +1398,7 @@ where
         let n = self.n;
         let t = self.t;
 
-        crate::net::open_registry::batch_open_via_registry(
-            self.instance_id,
+        self.open_registry.batch_open_wait(
             self.party_id,
             &type_key,
             shares,
@@ -1505,6 +1487,17 @@ where
 
     fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> {
         Some(self)
+    }
+
+    fn set_preproc_store(&self, store: Arc<dyn PreprocStore>, program_hash: [u8; 32]) {
+        let field_kind = self.curve_config().field_kind();
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                *self.preproc_store.write().await = Some(store);
+                *self.preproc_config.write().await = Some((program_hash, field_kind));
+            });
+        });
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -1685,22 +1678,19 @@ impl ThresholdExpG2 for AvssMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projec
         })?;
 
         let required = self.t + 1;
-        let instance_id = self.instance_id;
         let party_id = self.party_id;
+        let open_registry = self.open_registry.clone();
 
         let try_check = |my_sequence: &mut Option<usize>,
                          partial_bytes: &[u8],
                          share_id: usize|
          -> Result<Option<Vec<u8>>, String> {
-            let mut reg = AVSS_G2_EXP_REGISTRY.lock();
+            let mut reg = open_registry.exp_g2.lock();
 
             if my_sequence.is_none() {
                 let mut seq = 0;
                 loop {
-                    let key = (instance_id, seq);
-                    let entry = reg
-                        .entry(key)
-                        .or_insert_with(AvssExpOpenAccumulator::default);
+                    let entry = reg.entry(seq).or_default();
                     if !entry.party_ids.contains(&party_id) {
                         entry
                             .partial_points
@@ -1714,9 +1704,8 @@ impl ThresholdExpG2 for AvssMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projec
             }
 
             let seq = my_sequence.expect("sequence must be set after insertion");
-            let key = (instance_id, seq);
             let entry = reg
-                .get_mut(&key)
+                .get_mut(&seq)
                 .expect("avss g2 exp registry entry must exist after insertion");
 
             if let Some(result) = entry.result.clone() {
@@ -1770,7 +1759,6 @@ impl ThresholdExpG2 for AvssMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projec
                     .map_err(|e| format!("serialize G2 result: {}", e))?;
 
                 entry.result = Some(result_bytes.clone());
-                entry.result_cached_at = Some(std::time::Instant::now());
                 return Ok(Some(result_bytes));
             }
 
@@ -1787,7 +1775,7 @@ impl ThresholdExpG2 for AvssMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projec
                         let mut my_sequence: Option<usize> = None;
 
                         loop {
-                            let notified = AVSS_G2_EXP_NOTIFY.notified();
+                            let notified = open_registry.exp_g2_notify.notified();
 
                             if let Some(result) =
                                 try_check(&mut my_sequence, &partial_bytes, share_id)?
@@ -1827,76 +1815,6 @@ impl ThresholdExpG2 for AvssMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projec
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-}
-
-// ============================================================================
-// Registry for coordinating AVSS sessions across parties
-// ============================================================================
-
-/// Global registry for AVSS share coordination (for in-process multi-party testing).
-///
-/// Only compiled for tests and integration test feature gates; not used in production.
-#[cfg(any(test, feature = "avss_itest"))]
-#[derive(Default)]
-struct AvssRegistry {
-    /// Maps (instance_id, session_id, party_id) to serialized share
-    shares: std::collections::HashMap<(u64, u64, usize), Vec<u8>>,
-    /// Maps (instance_id, session_id) to aggregated public key once agreed
-    public_keys: std::collections::HashMap<(u64, u64), Vec<u8>>,
-}
-
-#[cfg(any(test, feature = "avss_itest"))]
-static AVSS_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<AvssRegistry>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(AvssRegistry::default()));
-
-/// Store a share in the global registry (for testing)
-#[cfg(any(test, feature = "avss_itest"))]
-pub fn registry_store_share(
-    instance_id: u64,
-    session_id: u64,
-    party_id: usize,
-    share_bytes: Vec<u8>,
-) {
-    let mut registry = AVSS_REGISTRY.lock();
-    registry
-        .shares
-        .insert((instance_id, session_id, party_id), share_bytes);
-}
-
-/// Get all shares for a session from the registry (for testing)
-#[cfg(any(test, feature = "avss_itest"))]
-pub fn registry_get_shares(instance_id: u64, session_id: u64) -> Vec<(usize, Vec<u8>)> {
-    let registry = AVSS_REGISTRY.lock();
-    registry
-        .shares
-        .iter()
-        .filter_map(|((inst, sess, party), bytes)| {
-            if *inst == instance_id && *sess == session_id {
-                Some((*party, bytes.clone()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Store agreed public key in registry
-#[cfg(any(test, feature = "avss_itest"))]
-pub fn registry_store_public_key(instance_id: u64, session_id: u64, pk_bytes: Vec<u8>) {
-    let mut registry = AVSS_REGISTRY.lock();
-    registry
-        .public_keys
-        .insert((instance_id, session_id), pk_bytes);
-}
-
-/// Get public key from registry
-#[cfg(any(test, feature = "avss_itest"))]
-pub fn registry_get_public_key(instance_id: u64, session_id: u64) -> Option<Vec<u8>> {
-    let registry = AVSS_REGISTRY.lock();
-    registry
-        .public_keys
-        .get(&(instance_id, session_id))
-        .cloned()
 }
 
 // ============================================================================
@@ -2017,23 +1935,6 @@ mod tests {
         }
 
         assert_eq!(commitments[0], G1::generator() * secret);
-    }
-
-    #[test]
-    fn test_registry_operations() {
-        let instance_id = 100;
-        let session_id = 1;
-
-        registry_store_share(instance_id, session_id, 0, vec![1, 2, 3]);
-        registry_store_share(instance_id, session_id, 1, vec![4, 5, 6]);
-        registry_store_share(instance_id, session_id, 2, vec![7, 8, 9]);
-
-        let shares = registry_get_shares(instance_id, session_id);
-        assert_eq!(shares.len(), 3);
-
-        let pk = vec![10, 11, 12];
-        registry_store_public_key(instance_id, session_id, pk.clone());
-        assert_eq!(registry_get_public_key(instance_id, session_id), Some(pk));
     }
 
     #[test]

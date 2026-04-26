@@ -3,14 +3,16 @@ use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
 use crate::net::mpc::honeybadger_node_opts;
 use crate::net::mpc_engine::{
     AsyncMpcEngineConsensus, MpcEngine, MpcEngineClientOps, MpcEngineConsensus,
+    MpcEngineReservation,
 };
+use crate::net::reservation::{ReservationGrant, ReservationRegistry};
+use crate::storage::preproc::{self, MaterialKind, PreprocBlob, PreprocKey, PreprocStore};
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::any::TypeId;
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -40,102 +42,7 @@ struct ExpOpenWireMessage {
     partial_point: Vec<u8>,
 }
 
-#[derive(Default, Clone)]
-struct ExpOpenAccumulator {
-    partial_points: Vec<(usize, Vec<u8>)>, // (share_id, serialized affine point)
-    party_ids: Vec<usize>,
-    result: Option<Vec<u8>>,
-    /// Set when `result` is first cached; used for eviction.
-    result_cached_at: Option<std::time::Instant>,
-}
-
-/// Completed entries older than this are evicted on the next insertion.
-const EXP_EVICTION_AGE: Duration = Duration::from_secs(60);
-
-static EXP_REGISTRY: once_cell::sync::Lazy<
-    parking_lot::Mutex<HashMap<(u64, usize), ExpOpenAccumulator>>,
-> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
-
-/// Notified after every insertion into [`EXP_REGISTRY`].
-static EXP_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
-
-/// Clear the exponentiation-domain open registry. Useful between test cases.
-#[allow(dead_code)]
-pub(crate) fn clear_exp_registry() {
-    EXP_REGISTRY.lock().clear();
-}
-
-fn insert_remote_exp_partial(
-    instance_id: u64,
-    sender_party_id: usize,
-    share_id: usize,
-    partial_point: Vec<u8>,
-) {
-    let mut reg = EXP_REGISTRY.lock();
-    // Evict completed entries older than EXP_EVICTION_AGE.
-    let now = std::time::Instant::now();
-    reg.retain(|_, acc| {
-        acc.result_cached_at
-            .is_none_or(|t| now.duration_since(t) < EXP_EVICTION_AGE)
-    });
-    let mut seq = 0usize;
-    loop {
-        let key = (instance_id, seq);
-        let entry = reg.entry(key).or_default();
-        if !entry.party_ids.contains(&sender_party_id) {
-            entry.partial_points.push((share_id, partial_point));
-            entry.party_ids.push(sender_party_id);
-            break;
-        }
-        seq += 1;
-    }
-    drop(reg);
-    EXP_NOTIFY.notify_waiters();
-}
-
-pub(crate) fn try_handle_open_exp_wire_message(
-    authenticated_sender_id: usize,
-    payload: &[u8],
-) -> Result<bool, String> {
-    if payload.len() < EXP_OPEN_WIRE_PREFIX.len()
-        || &payload[..EXP_OPEN_WIRE_PREFIX.len()] != EXP_OPEN_WIRE_PREFIX
-    {
-        return Ok(false);
-    }
-
-    let message: ExpOpenWireMessage = bincode::deserialize(&payload[EXP_OPEN_WIRE_PREFIX.len()..])
-        .map_err(|e| format!("deserialize open-exp payload: {}", e))?;
-
-    if authenticated_sender_id == crate::net::open_registry::UNKNOWN_SENDER_ID {
-        tracing::warn!(
-            sender_party_id = message.sender_party_id,
-            "Rejecting open-exp wire message from unauthenticated connection"
-        );
-        return Err("open-exp wire rejected: sender identity not authenticated".to_string());
-    }
-    if message.sender_party_id != authenticated_sender_id {
-        return Err(format!(
-            "open-exp sender mismatch: transport={} payload={}",
-            authenticated_sender_id, message.sender_party_id
-        ));
-    }
-
-    if message.share_id != message.sender_party_id {
-        return Err(format!(
-            "open-exp share_id mismatch: sender_party_id={} share_id={}",
-            message.sender_party_id, message.share_id
-        ));
-    }
-
-    insert_remote_exp_partial(
-        message.instance_id,
-        message.sender_party_id,
-        message.share_id,
-        message.partial_point,
-    );
-    Ok(true)
-}
+use crate::net::open_registry::ExpOpenAccumulator;
 
 /// HoneyBadger-backed MPC engine that integrates with the VM.
 /// This wraps a real HoneyBadgerMPCNode and provides MPC operations
@@ -155,8 +62,19 @@ where
     /// Session counter for multiplication operations
     #[allow(dead_code)]
     mul_session_counter: Arc<Mutex<usize>>,
-    open_registry: Option<Arc<crate::net::open_registry::InstanceRegistry>>,
     group_marker: PhantomData<G>,
+    /// Persistent preprocessing store.
+    preproc_store: tokio::sync::RwLock<Option<Arc<dyn PreprocStore>>>,
+    /// Program hash for keying stored material.
+    program_hash: tokio::sync::RwLock<Option<[u8; 32]>>,
+    /// Stable operator-assigned party slot used for persistent store keys.
+    persistent_party_id: tokio::sync::RwLock<usize>,
+    /// Reservation registry for masked-input protocol.
+    reservation: tokio::sync::RwLock<Option<ReservationRegistry>>,
+    /// Session-local router for open-share/open-exp payloads.
+    open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
+    /// Per-instance open share accumulation registry.
+    open_registry: Arc<crate::net::open_registry::InstanceRegistry>,
 }
 
 pub type Bls12381HoneyBadgerMpcEngine =
@@ -178,14 +96,249 @@ where
     }
 
     pub async fn preprocess(&self) -> Result<(), String> {
+        // Try loading from persistent store first
+        if self.try_load_preproc().await? {
+            self.ready.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+
         // Run the actual preprocessing protocol to generate triples and random shares
-        let mut node = self.node.lock().await;
-        let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        node.run_preprocessing(self.net.clone(), &mut rng)
-            .await
-            .map_err(|e| format!("Preprocessing failed: {:?}", e))?;
+        {
+            let mut node = self.node.lock().await;
+            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+            node.run_preprocessing(self.net.clone(), &mut rng)
+                .await
+                .map_err(|e| format!("Preprocessing failed: {:?}", e))?;
+        }
+
+        // Persist to store for future runs
+        self.persist_preproc().await?;
 
         self.ready.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Try to load preprocessing material from the persistent store.
+    /// Returns `true` if material was loaded, `false` if nothing available.
+    async fn try_load_preproc(&self) -> Result<bool, String> {
+        let store = self.preproc_store.read().await.clone();
+        let hash = *self.program_hash.read().await;
+        let (store, hash) = match (store, hash) {
+            (Some(s), Some(h)) => (s, h),
+            _ => return Ok(false),
+        };
+        let persistent_party_id = *self.persistent_party_id.read().await;
+
+        let base = PreprocKey::new(
+            hash,
+            F::field_kind(),
+            self.n,
+            self.t,
+            persistent_party_id,
+            MaterialKind::BeaverTriple,
+        );
+        let k_rs = base.with_kind(MaterialKind::RandomShare);
+        let k_pb = base.with_kind(MaterialKind::PRandBit);
+        let k_pi = base.with_kind(MaterialKind::PRandInt);
+        let (triples, randoms, prandbits, prandints) = tokio::try_join!(
+            store.load(&base),
+            store.load(&k_rs),
+            store.load(&k_pb),
+            store.load(&k_pi),
+        )?;
+
+        if triples.is_none() && randoms.is_none() && prandbits.is_none() && prandints.is_none() {
+            let msg = format!(
+                "No preprocessing material found in store for program {} (party_id={}, n={}, t={})",
+                hex::encode(hash),
+                persistent_party_id,
+                self.n,
+                self.t
+            );
+            eprintln!("{msg}");
+            tracing::info!("{msg}");
+            return Ok(false);
+        }
+
+        let mut node = self.node.lock().await;
+        let mut prep = node.preprocessing_material.lock().await;
+
+        let loaded_triples = triples
+            .as_ref()
+            .map(|blob| blob.meta.available())
+            .unwrap_or(0);
+        let loaded_randoms = randoms
+            .as_ref()
+            .map(|blob| blob.meta.available())
+            .unwrap_or(0);
+        let loaded_prandbits = prandbits
+            .as_ref()
+            .map(|blob| blob.meta.available())
+            .unwrap_or(0);
+        let loaded_prandints = prandints
+            .as_ref()
+            .map(|blob| blob.meta.available())
+            .unwrap_or(0);
+
+        if let Some(ref blob) = triples {
+            let decoded = preproc::deserialize_beaver_triples::<F>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
+            prep.add(Some(decoded), None, None, None);
+        }
+        if let Some(ref blob) = randoms {
+            let decoded = preproc::deserialize_robust_shares::<F>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
+            prep.add(None, Some(decoded), None, None);
+        }
+        if let Some(ref blob) = prandbits {
+            let decoded = preproc::deserialize_prandbit_shares::<F>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
+            prep.add(None, None, Some(decoded), None);
+        }
+        if let Some(ref blob) = prandints {
+            let decoded = preproc::deserialize_robust_shares::<F>(
+                blob.unconsumed_data(),
+                blob.meta.item_size,
+                0,
+            )?;
+            prep.add(None, None, None, Some(decoded));
+        }
+
+        let msg = format!(
+            "Loaded preprocessing material from store for program {} (party_id={}, n={}, t={}, triples={}, randoms={}, prandbits={}, prandints={})",
+            hex::encode(hash),
+            persistent_party_id,
+            self.n,
+            self.t,
+            loaded_triples,
+            loaded_randoms,
+            loaded_prandbits,
+            loaded_prandints
+        );
+        eprintln!("{msg}");
+        tracing::info!("{msg}");
+        Ok(true)
+    }
+
+    pub fn open_message_router(&self) -> Arc<crate::net::open_registry::OpenMessageRouter> {
+        self.open_message_router.clone()
+    }
+
+    pub fn set_preproc_store_party_id(&self, persistent_party_id: usize) {
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                *self.persistent_party_id.write().await = persistent_party_id;
+            });
+        });
+    }
+
+    /// Persist current preprocessing material to the store.
+    ///
+    /// Drains and serializes material inside the lock, then releases the lock
+    /// before the async store writes to minimise lock hold time.
+    async fn persist_preproc(&self) -> Result<(), String> {
+        let store = self.preproc_store.read().await.clone();
+        let hash = *self.program_hash.read().await;
+        let (store, hash) = match (store, hash) {
+            (Some(s), Some(h)) => (s, h),
+            _ => return Ok(()),
+        };
+        let persistent_party_id = *self.persistent_party_id.read().await;
+
+        let base = PreprocKey::new(
+            hash,
+            F::field_kind(),
+            self.n,
+            self.t,
+            persistent_party_id,
+            MaterialKind::BeaverTriple,
+        );
+
+        // Drain and serialize inside the lock, collect (key, blob, items) tuples
+        let mut to_store: Vec<(PreprocKey, PreprocBlob)> = Vec::new();
+        let mut restore_bt = None;
+        let mut restore_rs = None;
+        let mut restore_pb = None;
+        let mut restore_pi = None;
+
+        {
+            let mut node = self.node.lock().await;
+            let mut prep = node.preprocessing_material.lock().await;
+            let (n_bt, n_rs, n_pb, n_pi) = prep.len();
+
+            if n_bt > 0 {
+                let items = prep
+                    .take_beaver_triples(n_bt)
+                    .map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_beaver_triples::<F>(&items)?;
+                to_store.push((
+                    base.clone(),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
+                restore_bt = Some(items);
+            }
+            if n_rs > 0 {
+                let items = prep
+                    .take_random_shares(n_rs)
+                    .map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
+                to_store.push((
+                    base.with_kind(MaterialKind::RandomShare),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
+                restore_rs = Some(items);
+            }
+            if n_pb > 0 {
+                let items = prep
+                    .take_prandbit_shares(n_pb)
+                    .map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_prandbit_shares::<F>(&items)?;
+                to_store.push((
+                    base.with_kind(MaterialKind::PRandBit),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
+                restore_pb = Some(items);
+            }
+            if n_pi > 0 {
+                let items = prep
+                    .take_prandint_shares(n_pi)
+                    .map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
+                to_store.push((
+                    base.with_kind(MaterialKind::PRandInt),
+                    PreprocBlob::new(data, item_size, items.len() as u32),
+                ));
+                restore_pi = Some(items);
+            }
+
+            // Restore immediately so the pool is available even if store.store fails
+            prep.add(restore_bt, restore_rs, restore_pb, restore_pi);
+        }
+        // Lock released — store blobs without holding the node mutex
+        for (key, blob) in &to_store {
+            store.store(key, blob).await?;
+        }
+
+        let msg = format!(
+            "Persisted preprocessing material to store for program {} (party_id={}, n={}, t={}, blobs={})",
+            hex::encode(hash),
+            persistent_party_id,
+            self.n,
+            self.t,
+            to_store.len()
+        );
+        eprintln!("{msg}");
+        tracing::info!("{msg}");
         Ok(())
     }
 
@@ -427,6 +580,30 @@ where
         net: Arc<QuicNetworkManager>,
         input_ids: Vec<ClientId>,
     ) -> Result<Arc<Self>, String> {
+        Self::new_with_router(
+            Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
+            instance_id,
+            party_id,
+            n,
+            t,
+            n_triples,
+            n_random,
+            net,
+            input_ids,
+        )
+    }
+
+    pub fn new_with_router(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
+        instance_id: u64,
+        party_id: usize,
+        n: usize,
+        t: usize,
+        n_triples: usize,
+        n_random: usize,
+        net: Arc<QuicNetworkManager>,
+        input_ids: Vec<ClientId>,
+    ) -> Result<Arc<Self>, String> {
         // Create the MPC node options
         let mpc_opts = honeybadger_node_opts(n, t, n_triples, n_random, instance_id)?;
 
@@ -447,8 +624,13 @@ where
             node: Arc::new(Mutex::new(node)),
             ready: AtomicBool::new(false),
             mul_session_counter: Arc::new(Mutex::new(0)),
-            open_registry: None,
             group_marker: PhantomData,
+            preproc_store: tokio::sync::RwLock::new(None),
+            program_hash: tokio::sync::RwLock::new(None),
+            persistent_party_id: tokio::sync::RwLock::new(party_id),
+            reservation: tokio::sync::RwLock::new(None),
+            open_registry: open_message_router.register_instance(instance_id),
+            open_message_router,
         }))
     }
 
@@ -462,29 +644,17 @@ where
         net: Arc<QuicNetworkManager>,
         node: HoneyBadgerMPCNode<F, RBCImpl>,
     ) -> Arc<Self> {
-        // Wrap the provided node so this engine can access it via async locks.
-        // Note: This currently clones/moves a node instance rather than sharing the
-        // exact same node that the server loop owns. Concurrency semantics depend on
-        // the underlying type's Clone implementation. For tests focused on compile
-        // viability, we prioritize type compatibility here.
-        let node = Arc::new(Mutex::new(node));
-        Arc::new(Self {
+        Self::from_existing_node_with_router(
+            Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
             instance_id,
             party_id,
             n,
             t,
             net,
             node,
-            // Assume the provided node has been preprocessed already in tests; callers can override via start()/preprocess().
-            ready: AtomicBool::new(true),
-            mul_session_counter: Arc::new(Mutex::new(0)),
-            open_registry: None,
-            group_marker: PhantomData,
-        })
+        )
     }
 
-    /// Construct an engine from an existing node while scoping open-share
-    /// traffic to a shared session-local router.
     pub fn from_existing_node_with_router(
         open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
         instance_id: u64,
@@ -504,8 +674,13 @@ where
             node,
             ready: AtomicBool::new(true),
             mul_session_counter: Arc::new(Mutex::new(0)),
-            open_registry: Some(open_message_router.register_instance(instance_id)),
             group_marker: PhantomData,
+            preproc_store: tokio::sync::RwLock::new(None),
+            program_hash: tokio::sync::RwLock::new(None),
+            persistent_party_id: tokio::sync::RwLock::new(party_id),
+            reservation: tokio::sync::RwLock::new(None),
+            open_registry: open_message_router.register_instance(instance_id),
+            open_message_router,
         })
     }
 
@@ -614,9 +789,9 @@ where
         self.broadcast_open_exp_payload_sync(wire_message)?;
 
         let required = 2 * self.t + 1;
-        let instance_id = self.instance_id;
         let party_id = self.party_id;
         let n = self.n;
+        let registry = self.open_registry.clone();
 
         // Closure that checks the registry and returns the result or reconstructs.
         // Returns Ok(Some(bytes)) when done, Ok(None) when more contributions needed.
@@ -624,13 +799,12 @@ where
                          partial_bytes: &[u8],
                          share_id: usize|
          -> Result<Option<Vec<u8>>, String> {
-            let mut reg = EXP_REGISTRY.lock();
+            let mut reg = registry.exp.lock();
 
             if my_sequence.is_none() {
                 let mut seq = 0;
                 loop {
-                    let key = (instance_id, seq);
-                    let entry = reg.entry(key).or_insert_with(ExpOpenAccumulator::default);
+                    let entry = reg.entry(seq).or_insert_with(ExpOpenAccumulator::default);
 
                     if !entry.party_ids.contains(&party_id) {
                         entry
@@ -645,9 +819,8 @@ where
             }
 
             let seq = my_sequence.expect("sequence must be set after insertion");
-            let key = (instance_id, seq);
             let entry = reg
-                .get_mut(&key)
+                .get_mut(&seq)
                 .expect("exp registry entry must exist after insertion");
 
             if let Some(result) = entry.result.clone() {
@@ -702,7 +875,6 @@ where
                     .map_err(|e| format!("serialize result: {}", e))?;
 
                 entry.result = Some(result_bytes.clone());
-                entry.result_cached_at = Some(std::time::Instant::now());
                 return Ok(Some(result_bytes));
             }
 
@@ -719,7 +891,7 @@ where
                         let mut my_sequence: Option<usize> = None;
 
                         loop {
-                            let notified = EXP_NOTIFY.notified();
+                            let notified = registry.exp_notify.notified();
 
                             if let Some(result) =
                                 try_check(&mut my_sequence, &partial_bytes, share.id)?
@@ -916,42 +1088,29 @@ where
         let n = self.n;
         let t = self.t;
 
-        let reconstruct = |collected: &[Vec<u8>]| {
-            let mut shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
-            for bytes in collected {
-                shares.push(Self::decode_share(bytes)?);
-            }
+        self.open_registry.open_share_wait(
+            self.party_id,
+            &type_key,
+            share_bytes,
+            required,
+            |collected| {
+                let mut shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
+                for bytes in collected {
+                    shares.push(Self::decode_share(bytes)?);
+                }
 
-            tracing::debug!(
-                "open_share reconstruction: n={}, required={}, shares.len()={}",
-                n,
-                required,
-                shares.len()
-            );
+                tracing::debug!(
+                    "open_share reconstruction: n={}, required={}, shares.len()={}",
+                    n,
+                    required,
+                    shares.len()
+                );
 
-            let (_deg, secret) = RobustShare::recover_secret(&shares, n, t)
-                .map_err(|e| format!("recover_secret: {:?}", e))?;
-            Ok(Self::field_to_value(ty, secret))
-        };
-
-        if let Some(open_registry) = &self.open_registry {
-            open_registry.open_share_wait(
-                self.party_id,
-                &type_key,
-                share_bytes,
-                required,
-                reconstruct,
-            )
-        } else {
-            crate::net::open_registry::open_share_via_registry(
-                self.instance_id,
-                self.party_id,
-                &type_key,
-                share_bytes,
-                required,
-                reconstruct,
-            )
-        }
+                let (_deg, secret) = RobustShare::recover_secret(&shares, n, t)
+                    .map_err(|e| format!("recover_secret: {:?}", e))?;
+                Ok(Self::field_to_value(ty, secret))
+            },
+        )
     }
 
     fn batch_open_shares(&self, ty: ShareType, shares: &[Vec<u8>]) -> Result<Vec<Value>, String> {
@@ -975,29 +1134,22 @@ where
         let n = self.n;
         let t = self.t;
 
-        let reconstruct = |collected: &[Vec<u8>], pos: usize| {
-            let mut decoded_shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
-            for bytes in collected {
-                decoded_shares.push(Self::decode_share(bytes)?);
-            }
+        self.open_registry.batch_open_wait(
+            self.party_id,
+            &type_key,
+            shares,
+            required,
+            |collected, pos| {
+                let mut decoded_shares: Vec<RobustShare<F>> = Vec::with_capacity(collected.len());
+                for bytes in collected {
+                    decoded_shares.push(Self::decode_share(bytes)?);
+                }
 
-            let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, n, t)
-                .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
-            Ok(Self::field_to_value(ty, secret))
-        };
-
-        if let Some(open_registry) = &self.open_registry {
-            open_registry.batch_open_wait(self.party_id, &type_key, shares, required, reconstruct)
-        } else {
-            crate::net::open_registry::batch_open_via_registry(
-                self.instance_id,
-                self.party_id,
-                &type_key,
-                shares,
-                required,
-                reconstruct,
-            )
-        }
+                let (_deg, secret) = RobustShare::recover_secret(&decoded_shares, n, t)
+                    .map_err(|e| format!("batch recover_secret pos {}: {:?}", pos, e))?;
+                Ok(Self::field_to_value(ty, secret))
+            },
+        )
     }
 
     fn shutdown(&self) {
@@ -1036,6 +1188,7 @@ where
             | MpcCapabilities::OPEN_IN_EXP
             | MpcCapabilities::CLIENT_INPUT
             | MpcCapabilities::CONSENSUS
+            | MpcCapabilities::RESERVATION
     }
 
     fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> {
@@ -1043,6 +1196,20 @@ where
     }
     fn as_client_ops(&self) -> Option<&dyn MpcEngineClientOps> {
         Some(self)
+    }
+    fn as_reservation(&self) -> Option<&dyn MpcEngineReservation> {
+        Some(self)
+    }
+
+    fn set_preproc_store(&self, store: Arc<dyn PreprocStore>, program_hash: [u8; 32]) {
+        // Use block_in_place since this is called from sync context before start()
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                *self.preproc_store.write().await = Some(store);
+                *self.program_hash.write().await = Some(program_hash);
+            });
+        });
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -1180,63 +1347,28 @@ where
 // For multi-process deployments, these protocols would need to use the
 // actual network-based Avid/ABA implementations from mpc-protocols.
 
-/// Registry for RBC broadcasts - maps (instance_id, session_id) to broadcast data
-#[derive(Default)]
-struct RbcRegistry {
-    /// Maps (instance_id, session_id, from_party) to message bytes
-    messages: std::collections::HashMap<(u64, u64, usize), Vec<u8>>,
-    /// Tracks deliveries to receivers: (instance_id, receiver_party, from_party, session_id).
-    delivered: std::collections::HashSet<(u64, usize, usize, u64)>,
-}
-
-/// Registry for ABA sessions - maps (instance_id, session_id) to agreement state
-#[derive(Default)]
-struct AbaRegistry {
-    /// Maps (instance_id, session_id, party_id) to proposed value
-    proposals: std::collections::HashMap<(u64, u64, usize), bool>,
-    /// Maps (instance_id, session_id) to agreed result once consensus is reached
-    results: std::collections::HashMap<(u64, u64), bool>,
-}
-
-static RBC_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<RbcRegistry>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(RbcRegistry::default()));
-
-/// Notified after every insertion into [`RBC_REGISTRY`].
-static RBC_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
-
-static ABA_REGISTRY: once_cell::sync::Lazy<parking_lot::Mutex<AbaRegistry>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(AbaRegistry::default()));
-
-/// Notified after every insertion into [`ABA_REGISTRY`].
-static ABA_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
-
 impl<F, G> MpcEngineConsensus for HoneyBadgerMpcEngine<F, G>
 where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
     fn rbc_broadcast(&self, message: &[u8]) -> Result<u64, String> {
-        let mut registry = RBC_REGISTRY.lock();
+        let mut registry = self.open_registry.rbc.lock();
 
         // Assign the earliest session index this party has not used yet for this instance.
         let mut session_id = 0u64;
-        while registry
-            .messages
-            .contains_key(&(self.instance_id, session_id, self.party_id))
-        {
+        while registry.messages.contains_key(&(session_id, self.party_id)) {
             session_id = session_id
                 .checked_add(1)
                 .ok_or_else(|| "RBC session id overflow".to_string())?;
         }
 
         // Store the message for this party's broadcast
-        let key = (self.instance_id, session_id, self.party_id);
+        let key = (session_id, self.party_id);
         registry.messages.insert(key, message.to_vec());
         drop(registry);
 
-        RBC_NOTIFY.notify_waiters();
+        self.open_registry.rbc_notify.notify_waiters();
 
         tracing::info!(
             instance_id = self.instance_id,
@@ -1252,15 +1384,16 @@ where
     fn rbc_receive(&self, from_party: usize, timeout_ms: u64) -> Result<Vec<u8>, String> {
         let instance_id = self.instance_id;
         let party_id = self.party_id;
+        let or = self.open_registry.clone();
 
         let try_deliver = || -> Option<Vec<u8>> {
-            let mut registry = RBC_REGISTRY.lock();
+            let mut registry = or.rbc.lock();
             let mut next: Option<(u64, Vec<u8>)> = None;
-            for ((inst_id, session_id, party), message) in registry.messages.iter() {
-                if *inst_id != instance_id || *party != from_party {
+            for ((session_id, party), message) in registry.messages.iter() {
+                if *party != from_party {
                     continue;
                 }
-                let delivery_key = (instance_id, party_id, from_party, *session_id);
+                let delivery_key = (party_id, from_party, *session_id);
                 if registry.delivered.contains(&delivery_key) {
                     continue;
                 }
@@ -1272,7 +1405,7 @@ where
             if let Some((session_id, message)) = next {
                 registry
                     .delivered
-                    .insert((instance_id, party_id, from_party, session_id));
+                    .insert((party_id, from_party, session_id));
                 tracing::info!(
                     instance_id = instance_id,
                     session_id = session_id,
@@ -1292,7 +1425,7 @@ where
                         let deadline = tokio::time::Instant::now()
                             + tokio::time::Duration::from_millis(timeout_ms);
                         loop {
-                            let notified = RBC_NOTIFY.notified();
+                            let notified = or.rbc_notify.notified();
                             if let Some(msg) = try_deliver() {
                                 return Ok(msg);
                             }
@@ -1330,15 +1463,16 @@ where
     fn rbc_receive_any(&self, timeout_ms: u64) -> Result<(usize, Vec<u8>), String> {
         let instance_id = self.instance_id;
         let party_id = self.party_id;
+        let or = self.open_registry.clone();
 
         let try_deliver = || -> Option<(usize, Vec<u8>)> {
-            let mut registry = RBC_REGISTRY.lock();
+            let mut registry = or.rbc.lock();
             let mut next: Option<(u64, usize, Vec<u8>)> = None;
-            for ((inst_id, session_id, party), message) in registry.messages.iter() {
-                if *inst_id != instance_id || *party == party_id {
+            for ((session_id, party), message) in registry.messages.iter() {
+                if *party == party_id {
                     continue;
                 }
-                let delivery_key = (instance_id, party_id, *party, *session_id);
+                let delivery_key = (party_id, *party, *session_id);
                 if registry.delivered.contains(&delivery_key) {
                     continue;
                 }
@@ -1349,9 +1483,7 @@ where
                 }
             }
             if let Some((session_id, party, message)) = next {
-                registry
-                    .delivered
-                    .insert((instance_id, party_id, party, session_id));
+                registry.delivered.insert((party_id, party, session_id));
                 tracing::info!(
                     instance_id = instance_id,
                     session_id = session_id,
@@ -1371,7 +1503,7 @@ where
                         let deadline = tokio::time::Instant::now()
                             + tokio::time::Duration::from_millis(timeout_ms);
                         loop {
-                            let notified = RBC_NOTIFY.notified();
+                            let notified = or.rbc_notify.notified();
                             if let Some(result) = try_deliver() {
                                 return Ok(result);
                             }
@@ -1406,14 +1538,14 @@ where
     }
 
     fn aba_propose(&self, value: bool) -> Result<u64, String> {
-        let mut registry = ABA_REGISTRY.lock();
+        let mut registry = self.open_registry.aba.lock();
 
         // Assign the earliest session index this party has not proposed in yet.
         // This keeps round indices aligned across parties despite asynchronous ordering.
         let mut session_id = 0u64;
         while registry
             .proposals
-            .contains_key(&(self.instance_id, session_id, self.party_id))
+            .contains_key(&(session_id, self.party_id))
         {
             session_id = session_id
                 .checked_add(1)
@@ -1421,11 +1553,11 @@ where
         }
 
         // Store this party's proposal
-        let key = (self.instance_id, session_id, self.party_id);
+        let key = (session_id, self.party_id);
         registry.proposals.insert(key, value);
         drop(registry);
 
-        ABA_NOTIFY.notify_waiters();
+        self.open_registry.aba_notify.notify_waiters();
 
         tracing::info!(
             instance_id = self.instance_id,
@@ -1441,19 +1573,20 @@ where
     fn aba_result(&self, session_id: u64, timeout_ms: u64) -> Result<bool, String> {
         let instance_id = self.instance_id;
         let required = 2 * self.t + 1;
+        let or = self.open_registry.clone();
 
         let try_check = || -> Option<bool> {
-            let mut registry = ABA_REGISTRY.lock();
+            let mut registry = or.aba.lock();
 
-            if let Some(&result) = registry.results.get(&(instance_id, session_id)) {
+            if let Some(&result) = registry.results.get(&session_id) {
                 return Some(result);
             }
 
             let mut true_count = 0usize;
             let mut false_count = 0usize;
 
-            for ((inst_id, sess_id, _party), &proposal) in registry.proposals.iter() {
-                if *inst_id == instance_id && *sess_id == session_id {
+            for ((sess_id, _party), &proposal) in registry.proposals.iter() {
+                if *sess_id == session_id {
                     if proposal {
                         true_count += 1;
                     } else {
@@ -1463,7 +1596,7 @@ where
             }
 
             if true_count >= required {
-                registry.results.insert((instance_id, session_id), true);
+                registry.results.insert(session_id, true);
                 tracing::info!(
                     instance_id = instance_id,
                     session_id = session_id,
@@ -1475,7 +1608,7 @@ where
             }
 
             if false_count >= required {
-                registry.results.insert((instance_id, session_id), false);
+                registry.results.insert(session_id, false);
                 tracing::info!(
                     instance_id = instance_id,
                     session_id = session_id,
@@ -1496,7 +1629,7 @@ where
                         let deadline = tokio::time::Instant::now()
                             + tokio::time::Duration::from_millis(timeout_ms);
                         loop {
-                            let notified = ABA_NOTIFY.notified();
+                            let notified = or.aba_notify.notified();
                             if let Some(result) = try_check() {
                                 return Ok(result);
                             }
@@ -1565,6 +1698,163 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// MpcEngineReservation
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl<F, G> MpcEngineReservation for HoneyBadgerMpcEngine<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
+    async fn init_reservations(&self, program_hash: [u8; 32], capacity: u64) -> Result<(), String> {
+        let store = self.preproc_store.read().await.clone();
+        let persistent_party_id = *self.persistent_party_id.read().await;
+        if let Some(store) = store {
+            if let Some(restored) =
+                ReservationRegistry::load(store.as_ref(), &program_hash, persistent_party_id)
+                    .await
+                    .map_err(|e| e.to_string())?
+            {
+                *self.reservation.write().await = Some(restored);
+                return Ok(());
+            }
+        }
+        *self.reservation.write().await = Some(ReservationRegistry::new(
+            program_hash,
+            persistent_party_id,
+            capacity,
+        ));
+        Ok(())
+    }
+
+    async fn reserve_masks(&self, client_id: ClientId, n: u64) -> Result<ReservationGrant, String> {
+        let guard = self.reservation.read().await;
+        let reg = guard.as_ref().ok_or("reservations not initialized")?;
+        reg.reserve(client_id, n).await.map_err(|e| e.to_string())
+    }
+
+    async fn get_mask_share(&self, index: u64) -> Result<Vec<u8>, String> {
+        let store = self.preproc_store.read().await.clone();
+        let hash = *self.program_hash.read().await;
+        let persistent_party_id = *self.persistent_party_id.read().await;
+        let (store, hash) = match (store, hash) {
+            (Some(s), Some(h)) => (s, h),
+            _ => return Err("preproc store not configured".into()),
+        };
+
+        let key = PreprocKey::new(
+            hash,
+            F::field_kind(),
+            self.n,
+            self.t,
+            persistent_party_id,
+            MaterialKind::RandomShare,
+        );
+        let blob = store.load(&key).await?.ok_or("no random shares stored")?;
+        let share = preproc::deserialize_one_robust_share::<F>(
+            &blob.data,
+            blob.meta.item_size,
+            index as u32,
+        )?;
+        Self::encode_share(&share)
+    }
+
+    async fn submit_masked_input(
+        &self,
+        client_id: ClientId,
+        index: u64,
+        value: Vec<u8>,
+    ) -> Result<(), String> {
+        let guard = self.reservation.read().await;
+        let reg = guard.as_ref().ok_or("reservations not initialized")?;
+        reg.submit_masked_input(client_id, index, value)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn consume_masked_inputs(&self, indices: &[u64]) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        // Collect masked inputs from the registry first, then drop the lock
+        let masked_inputs: Vec<(u64, Vec<u8>)> = {
+            let reg_guard = self.reservation.read().await;
+            let reg = reg_guard.as_ref().ok_or("reservations not initialized")?;
+            let mut inputs = Vec::with_capacity(indices.len());
+            for &idx in indices {
+                let mi = reg
+                    .get_masked_input(idx)
+                    .await
+                    .ok_or_else(|| format!("no masked input for index {idx}"))?;
+                inputs.push((idx, mi));
+            }
+            inputs
+        };
+
+        // Load the random-share blob once for all indices
+        let store = self.preproc_store.read().await.clone();
+        let hash = *self.program_hash.read().await;
+        let persistent_party_id = *self.persistent_party_id.read().await;
+        let (store, hash) = match (store, hash) {
+            (Some(s), Some(h)) => (s, h),
+            _ => return Err("preproc store not configured".into()),
+        };
+        let key = PreprocKey::new(
+            hash,
+            F::field_kind(),
+            self.n,
+            self.t,
+            persistent_party_id,
+            MaterialKind::RandomShare,
+        );
+        let blob = store.load(&key).await?.ok_or("no random shares stored")?;
+
+        let mut result = Vec::with_capacity(indices.len());
+        for (idx, masked_input_bytes) in &masked_inputs {
+            let mask_share = preproc::deserialize_one_robust_share::<F>(
+                &blob.data,
+                blob.meta.item_size,
+                *idx as u32,
+            )?;
+            let masked_input = Self::decode_share(masked_input_bytes)?;
+
+            let input_elem = masked_input.share[0] - mask_share.share[0];
+            let input_share = RobustShare::new(input_elem, mask_share.id, mask_share.degree);
+            result.push((*idx, Self::encode_share(&input_share)?));
+        }
+
+        // Mark as consumed
+        {
+            let reg_guard = self.reservation.read().await;
+            let reg = reg_guard.as_ref().ok_or("reservations not initialized")?;
+            reg.consume(indices).await.map_err(|e| e.to_string())?;
+        }
+        Ok(result)
+    }
+
+    async fn available_masks(&self) -> u64 {
+        let guard = self.reservation.read().await;
+        match guard.as_ref() {
+            Some(reg) => reg.available().await,
+            None => 0,
+        }
+    }
+
+    async fn persist_reservations(&self) -> Result<(), String> {
+        let reg_guard = self.reservation.read().await;
+        let reg = match reg_guard.as_ref() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let store = self.preproc_store.read().await.clone();
+        if let Some(store) = store {
+            reg.persist(store.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1576,12 +1866,14 @@ mod tests {
     }
 
     fn test_engine(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
         instance_id: u64,
         party_id: usize,
         n: usize,
         t: usize,
     ) -> Arc<HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>> {
-        HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::new(
+        HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::new_with_router(
+            open_message_router,
             instance_id,
             party_id,
             n,
@@ -1618,10 +1910,11 @@ mod tests {
         let instance_id = next_instance_id();
         let n = 4;
         let t = 1;
-        let e0 = test_engine(instance_id, 0, n, t);
-        let e1 = test_engine(instance_id, 1, n, t);
-        let e2 = test_engine(instance_id, 2, n, t);
-        let e3 = test_engine(instance_id, 3, n, t);
+        let router = Arc::new(crate::net::open_registry::OpenMessageRouter::new());
+        let e0 = test_engine(router.clone(), instance_id, 0, n, t);
+        let e1 = test_engine(router.clone(), instance_id, 1, n, t);
+        let e2 = test_engine(router.clone(), instance_id, 2, n, t);
+        let e3 = test_engine(router, instance_id, 3, n, t);
 
         let s0 = e0.aba_propose(true).expect("party 0 propose");
         let s1 = e1.aba_propose(true).expect("party 1 propose");
@@ -1645,8 +1938,9 @@ mod tests {
         let instance_id = next_instance_id();
         let n = 4;
         let t = 1;
-        let sender = test_engine(instance_id, 0, n, t);
-        let receiver = test_engine(instance_id, 1, n, t);
+        let router = Arc::new(crate::net::open_registry::OpenMessageRouter::new());
+        let sender = test_engine(router.clone(), instance_id, 0, n, t);
+        let receiver = test_engine(router, instance_id, 1, n, t);
 
         sender.rbc_broadcast(b"first").expect("broadcast first");
         sender.rbc_broadcast(b"second").expect("broadcast second");
@@ -1666,11 +1960,13 @@ mod tests {
 
     #[test]
     fn open_exp_wire_rejects_mismatched_share_id() {
-        clear_exp_registry();
         let instance_id = next_instance_id();
+        let router = crate::net::open_registry::OpenMessageRouter::new();
+        let registry = router.register_instance(instance_id);
         let payload = open_exp_test_payload(instance_id, 1, 0, vec![1, 2, 3, 4]);
 
-        let err = try_handle_open_exp_wire_message(1, &payload)
+        let err = router
+            .try_handle_hb_open_exp_wire_message(1, &payload)
             .expect_err("mismatched share_id must be rejected");
         assert!(
             err.contains("open-exp share_id mismatch"),
@@ -1678,24 +1974,26 @@ mod tests {
             err
         );
         assert!(
-            !EXP_REGISTRY.lock().contains_key(&(instance_id, 0)),
+            !registry.exp.lock().contains_key(&0),
             "rejected payload must not be inserted into the registry"
         );
     }
 
     #[test]
     fn open_exp_wire_accepts_matching_share_id() {
-        clear_exp_registry();
         let instance_id = next_instance_id();
+        let router = crate::net::open_registry::OpenMessageRouter::new();
+        let registry = router.register_instance(instance_id);
         let payload = open_exp_test_payload(instance_id, 1, 1, vec![9, 8, 7, 6]);
 
-        let handled =
-            try_handle_open_exp_wire_message(1, &payload).expect("matching sender/share is valid");
+        let handled = router
+            .try_handle_hb_open_exp_wire_message(1, &payload)
+            .expect("matching sender/share is valid");
         assert!(handled, "open-exp prefix payload must be handled");
 
-        let reg = EXP_REGISTRY.lock();
+        let reg = registry.exp.lock();
         let entry = reg
-            .get(&(instance_id, 0))
+            .get(&0)
             .expect("entry should be inserted for valid payload");
         assert_eq!(entry.party_ids, vec![1]);
         assert_eq!(entry.partial_points, vec![(1, vec![9, 8, 7, 6])]);

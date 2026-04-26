@@ -20,19 +20,20 @@ echo "=========================================="
 echo "Role: ${STOFFEL_ROLE}"
 if [ "${STOFFEL_ROLE}" = "client" ]; then
     echo "Inputs: ${STOFFEL_INPUTS}"
+    echo "Client Index: ${STOFFEL_CLIENT_INDEX:-unset}"
     echo "Servers: ${STOFFEL_SERVERS}"
 else
     echo "Party ID: ${STOFFEL_PARTY_ID}"
     echo "Bind Address: ${STOFFEL_BIND_ADDR}"
     echo "Bootstrap: ${STOFFEL_BOOTSTRAP_ADDR:-N/A}"
-    echo "Expected Client Count: ${STOFFEL_EXPECTED_CLIENT_COUNT:-none}"
+    echo "Expected Clients: ${STOFFEL_EXPECTED_CLIENTS:-none}"
 fi
 echo "N Parties: ${STOFFEL_N_PARTIES}"
 echo "Threshold: ${STOFFEL_THRESHOLD}"
 echo "Program: ${STOFFEL_PROGRAM}"
 echo "Entry: ${STOFFEL_ENTRY}"
-echo "NAT Enabled: ${STOFFEL_ENABLE_NAT:-false}"
-echo "STUN Servers: ${STOFFEL_STUN_SERVERS:-N/A}"
+echo "Coordinator: ${STOFFEL_COORD_ADDR:-N/A}"
+echo "Preproc Store: ${STOFFEL_PREPROC_STORE:-none}"
 echo "Auth Token: $( [ -n "${STOFFEL_AUTH_TOKEN:-}" ] && echo "configured" || echo "not set" )"
 echo "=========================================="
 
@@ -76,12 +77,19 @@ build_command() {
     local cmd="/app/stoffel-run"
 
     if [ "${STOFFEL_ROLE}" = "client" ]; then
-        # Client mode: connect to servers and submit inputs
+        # Client mode: connect to coordinator and submit inputs
         cmd="${cmd} --client"
         cmd="${cmd} --inputs ${STOFFEL_INPUTS}"
         cmd="${cmd} --servers ${STOFFEL_SERVERS}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD:-1}"
+        cmd="${cmd} --off-chain-coord ${STOFFEL_COORD_ADDR}"
+        cmd="${cmd} --cert ${STOFFEL_CERT}"
+        cmd="${cmd} --key ${STOFFEL_KEY}"
+        cmd="${cmd} --timestamp ${STOFFEL_TIMESTAMP:-0}"
+        if [ -n "${STOFFEL_CLIENT_INDEX:-}" ]; then
+            cmd="${cmd} --client-index ${STOFFEL_CLIENT_INDEX}"
+        fi
         echo "$cmd"
         return
     fi
@@ -109,9 +117,24 @@ build_command() {
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD}"
     fi
 
-    # Wait for N clients before starting execution (for leader and party modes)
-    if [ -n "${STOFFEL_EXPECTED_CLIENT_COUNT}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
-        cmd="${cmd} --wait-for-clients ${STOFFEL_EXPECTED_CLIENT_COUNT}"
+    # Coordinator flags (for leader, party, and bootnode modes)
+    if [ -n "${STOFFEL_COORD_ADDR:-}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
+        cmd="${cmd} --off-chain-coord ${STOFFEL_COORD_ADDR}"
+        cmd="${cmd} --cert ${STOFFEL_CERT}"
+        cmd="${cmd} --key ${STOFFEL_KEY}"
+        cmd="${cmd} --timestamp ${STOFFEL_TIMESTAMP:-0}"
+    fi
+
+    if [ -n "${STOFFEL_RPC_ADDR:-}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
+        cmd="${cmd} --rpc-bind ${STOFFEL_RPC_ADDR}"
+    fi
+
+    if [ -n "${STOFFEL_EXPECTED_CLIENTS:-}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
+        cmd="${cmd} --expected-clients ${STOFFEL_EXPECTED_CLIENTS}"
+    fi
+
+    if [ -n "${STOFFEL_PREPROC_STORE:-}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
+        cmd="${cmd} --preproc-store ${STOFFEL_PREPROC_STORE}"
     fi
 
     # Add MPC backend if specified

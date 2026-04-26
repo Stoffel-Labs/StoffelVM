@@ -25,6 +25,7 @@ target/
 .env
 .env.*
 !.env.example
+.docker-cache/
 
 # OS files
 .DS_Store

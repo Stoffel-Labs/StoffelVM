@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # Multi-stage Dockerfile for StoffelVM
 # Builds the stoffel-run binary and packages it for distributed MPC execution
 #
@@ -14,7 +15,6 @@ FROM rustlang/rust:nightly-bookworm AS builder
 
 # Build argument to enable NAT traversal feature
 ARG ENABLE_NAT=false
-
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -67,7 +67,11 @@ COPY --from=builder /build/target/release/stoffel-run /app/stoffel-run
 # Copy the test bytecode files
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/matrix_average_fixed_point.stflb /app/programs/matrix_average_fixed_point.stflb
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/client_mul.stflb /app/programs/client_mul.stflb
+COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/client_sub_order.stflb /app/programs/client_sub_order.stflb
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/avss_keygen.stflb /app/programs/avss_keygen.stflb
+
+# Copy pre-generated certificates for coordinator identity
+COPY ids /app/ids
 
 # Copy the entrypoint script
 COPY docker/entrypoint.sh /app/entrypoint.sh
@@ -82,13 +86,21 @@ ENV STOFFEL_ENTRY="main"
 ENV STOFFEL_ROLE="party"
 ENV STOFFEL_PARTY_ID="0"
 ENV STOFFEL_BOOTSTRAP_ADDR=""
+ENV STOFFEL_COORD_ADDR=""
+ENV STOFFEL_RPC_ADDR=""
+ENV STOFFEL_CERT=""
+ENV STOFFEL_KEY=""
+ENV STOFFEL_TIMESTAMP="0"
+ENV STOFFEL_CLIENT_INDEX=""
+ENV STOFFEL_EXPECTED_CLIENTS=""
 # NAT traversal settings (only effective if built with --features nat)
 ENV STOFFEL_ENABLE_NAT="false"
 ENV STOFFEL_STUN_SERVERS=""
 
-# Expose ports for bootnode and party communication
+# Expose ports for bootnode, party communication, and RPC
 # Port 9000: bootnode coordination
 # Port 10000: party-to-party communication (leader uses bind_port + 1000)
-EXPOSE 9000 10000
+# Port 16180: node RPC server (mask distribution to clients)
+EXPOSE 9000 10000 16180
 
 ENTRYPOINT ["/app/entrypoint.sh"]
