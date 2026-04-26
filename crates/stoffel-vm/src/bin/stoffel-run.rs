@@ -255,8 +255,13 @@ impl Network for ClientNetworkAdapter {
         // iterate over 6 positions (including self) with wrong party mapping.
         let n = self.party_count();
         let mut total = 0usize;
-        for party_id in 0..n {
-            match self.send(party_id, message).await {
+        let results = futures::future::join_all(
+            (0..n).map(|party_id| async move { (party_id, self.send(party_id, message).await) }),
+        )
+        .await;
+
+        for (party_id, result) in results {
+            match result {
                 Ok(bytes) => total += bytes,
                 Err(e) => {
                     tracing::debug!("client broadcast to party {} failed: {:?}", party_id, e);
