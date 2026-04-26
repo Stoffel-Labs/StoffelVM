@@ -75,7 +75,7 @@ impl Default for MpcCurveConfig {
 }
 
 /// Field-dispatch metadata for VM-local share math.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MpcFieldKind {
     Bls12_381Fr,
     Bn254Fr,

@@ -21,6 +21,7 @@
 use crate::core_vm::VirtualMachine;
 use crate::net::hb_engine::HoneyBadgerMpcEngine;
 use crate::net::mpc_engine::{MpcEngine, MpcEngineClientOps};
+use crate::storage::preproc::{LmdbPreprocStore, PreprocStore};
 use ark_bls12_381::Fr;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -280,6 +281,23 @@ impl MpcRunner {
     /// Get the party ID
     pub fn party_id(&self) -> usize {
         self.mpc_engine.party_id()
+    }
+
+    /// Attach a persistent preprocessing store to the MPC engine.
+    ///
+    /// Must be called before `preprocess()` / `start()`. The engine will
+    /// attempt to load existing material from the store before running the
+    /// MPC preprocessing protocol, and persist newly generated material for
+    /// future runs.
+    pub fn set_preproc_store(&self, store: Arc<dyn PreprocStore>, program_hash: [u8; 32]) {
+        self.mpc_engine.set_preproc_store(store, program_hash);
+    }
+
+    /// Convenience: open the default LMDB store and attach it.
+    pub fn enable_preproc_persistence(&self, program_hash: [u8; 32]) -> Result<(), String> {
+        let store = Arc::new(LmdbPreprocStore::open(LmdbPreprocStore::default_path())?);
+        self.set_preproc_store(store, program_hash);
+        Ok(())
     }
 }
 

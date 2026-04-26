@@ -57,14 +57,33 @@ async fn test_open_share_in_exp_known_value() {
     .await
     .expect("Failed to create servers");
 
-    // Start servers and spawn message processors
-    for (i, server) in servers.iter_mut().enumerate() {
+    // Start servers.
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
+
+    // Connect servers
+    for server in &mut servers {
+        server
+            .connect_to_peers()
+            .await
+            .expect("Failed to connect to peers");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    for server in servers.iter_mut() {
+        server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+    }
+
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
         let network = server
-            .network
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
         let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
@@ -77,7 +96,7 @@ async fn test_open_share_in_exp_known_value() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -92,22 +111,16 @@ async fn test_open_share_in_exp_known_value() {
         });
     }
 
-    // Connect servers
-    for server in &mut servers {
-        server
-            .connect_to_peers()
-            .await
-            .expect("Failed to connect to peers");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     // Create engines from existing nodes
     let engines: Vec<Arc<HoneyBadgerMpcEngine>> = (0..n)
         .map(|i| {
+            let party_id = servers[i]
+                .party_id
+                .expect("party_id should be set after finalize_network()");
             HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
                 servers[i].open_message_router.clone(),
                 instance_id,
-                i,
+                party_id,
                 n,
                 t,
                 servers[i]
@@ -156,7 +169,10 @@ async fn test_open_share_in_exp_known_value() {
     let handles: Vec<_> = (0..n)
         .map(|i| {
             let engine = engines[i].clone();
-            let share = share_bytes_vec[i].clone();
+            let share = share_bytes_vec[servers[i]
+                .party_id
+                .expect("party_id should be set after finalize_network()")]
+            .clone();
             let gen = gen_bytes.clone();
             tokio::spawn(async move { engine.open_share_in_exp(ty, &share, &gen) })
         })
@@ -229,14 +245,33 @@ async fn test_simulated_dkg_flow() {
     .await
     .expect("Failed to create servers");
 
-    // Start servers and spawn message processors
-    for (i, server) in servers.iter_mut().enumerate() {
+    // Start servers.
+    for server in servers.iter_mut() {
         server.start().await.expect("Failed to start server");
+    }
+
+    // Connect servers
+    for server in &mut servers {
+        server
+            .connect_to_peers()
+            .await
+            .expect("Failed to connect to peers");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    for server in servers.iter_mut() {
+        server
+            .finalize_network()
+            .expect("Failed to finalize network");
+        server.spawn_server_receive_loops();
+    }
+
+    for (i, server) in servers.iter().enumerate() {
         let mut node = server.node.clone();
         let network = server
-            .network
+            .routed_network
             .clone()
-            .expect("network should be set after start()");
+            .expect("routed_network should be set after finalize_network()");
         let open_message_router = server.open_message_router.clone();
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
@@ -249,7 +284,7 @@ async fn test_simulated_dkg_flow() {
                     }
                     Ok(false) => {}
                 }
-                match crate::net::hb_engine::try_handle_open_exp_wire_message(sender_id, &raw_msg) {
+                match open_message_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open_exp wire message: {e}");
@@ -264,22 +299,16 @@ async fn test_simulated_dkg_flow() {
         });
     }
 
-    // Connect servers
-    for server in &mut servers {
-        server
-            .connect_to_peers()
-            .await
-            .expect("Failed to connect to peers");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     // Create engines from existing nodes
     let engines: Vec<Arc<HoneyBadgerMpcEngine>> = (0..n)
         .map(|i| {
+            let party_id = servers[i]
+                .party_id
+                .expect("party_id should be set after finalize_network()");
             HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
                 servers[i].open_message_router.clone(),
                 instance_id,
-                i,
+                party_id,
                 n,
                 t,
                 servers[i]
@@ -335,7 +364,10 @@ async fn test_simulated_dkg_flow() {
     let exp_handles: Vec<_> = (0..n)
         .map(|i| {
             let engine = engines[i].clone();
-            let share = share_bytes_vec[i].clone();
+            let share = share_bytes_vec[servers[i]
+                .party_id
+                .expect("party_id should be set after finalize_network()")]
+            .clone();
             let gen = gen_bytes.clone();
             tokio::spawn(async move { engine.open_share_in_exp(ty, &share, &gen) })
         })

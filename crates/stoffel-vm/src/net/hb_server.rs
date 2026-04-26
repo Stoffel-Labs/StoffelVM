@@ -60,6 +60,8 @@ pub struct HoneyBadgerQuicServer<F: FftField + PrimeField> {
     pub node_id: PartyId,
     /// Channel for routing received messages
     pub channels: Sender<Vec<u8>>,
+    /// Router shared by this server's receive loops and HB engine.
+    pub open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
 }
 
 impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
@@ -122,6 +124,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
             shutdown_tx: None,
             node_id,
             channels,
+            open_message_router: Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
         })
     }
 
@@ -168,6 +171,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         let mut acceptor = (*network).clone();
         let node_id = self.node_id;
         let tx = self.channels.clone();
+        let open_message_router = self.open_message_router.clone();
 
         let connection_task = tokio::spawn(async move {
             loop {
@@ -187,6 +191,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                 // Spawn a task to handle this connection's messages
                                 let txx = tx.clone();
                                 let conn_node_id = node_id;
+                                let open_message_router = open_message_router.clone();
 
                                 info!("[HB-QUIC] Node {} spawning message handler for connection {}", conn_node_id, connection.remote_address());
                                 tokio::spawn(async move {
@@ -195,7 +200,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                             Ok(data) => {
                                                 let sender_id =
                                                     connection.remote_party_id().unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
-                                                match crate::net::open_registry::try_handle_wire_message(
+                                                match open_message_router.try_handle_wire_message(
                                                     sender_id, &data,
                                                 ) {
                                                     Ok(true) => continue,
@@ -208,7 +213,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                                     }
                                                     Ok(false) => {}
                                                 }
-                                                match crate::net::hb_engine::try_handle_open_exp_wire_message(
+                                                match open_message_router.try_handle_hb_open_exp_wire_message(
                                                     sender_id, &data,
                                                 ) {
                                                     Ok(true) => continue,
@@ -292,14 +297,14 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                         // Spawn message handler for this connection
                         let pid_for_task = peer_id;
                         let txx = self.channels.clone();
+                        let open_message_router = self.open_message_router.clone();
                         tokio::spawn(async move {
                             loop {
                                 match connection.receive().await {
                                     Ok(data) => {
-                                        match crate::net::open_registry::try_handle_wire_message(
-                                            pid_for_task,
-                                            &data,
-                                        ) {
+                                        match open_message_router
+                                            .try_handle_wire_message(pid_for_task, &data)
+                                        {
                                             Ok(true) => continue,
                                             Err(e) => {
                                                 warn!(
@@ -310,10 +315,11 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                             }
                                             Ok(false) => {}
                                         }
-                                        match crate::net::hb_engine::try_handle_open_exp_wire_message(
-                                            pid_for_task,
-                                            &data,
-                                        ) {
+                                        match open_message_router
+                                            .try_handle_hb_open_exp_wire_message(
+                                                pid_for_task,
+                                                &data,
+                                            ) {
                                             Ok(true) => continue,
                                             Err(e) => {
                                                 warn!(
@@ -396,6 +402,7 @@ pub async fn spawn_receive_loops(
     net: Arc<QuicNetworkManager>,
     node_id: PartyId,
     n_parties: usize,
+    open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
 ) -> mpsc::Receiver<(PartyId, Vec<u8>)> {
     let (tx, rx) = mpsc::channel::<(PartyId, Vec<u8>)>(65536);
     let scan_tx = tx.clone();
@@ -427,6 +434,7 @@ pub async fn spawn_receive_loops(
 
                 let txx = scan_tx.clone();
                 let local_party_id = node_id;
+                let open_message_router = open_message_router.clone();
                 tracing::info!(
                     party_id = local_party_id,
                     derived_id,
@@ -438,9 +446,8 @@ pub async fn spawn_receive_loops(
                     loop {
                         match connection.receive().await {
                             Ok(data) => {
-                                match crate::net::open_registry::try_handle_wire_message(
-                                    sender_id, &data,
-                                ) {
+                                match open_message_router.try_handle_wire_message(sender_id, &data)
+                                {
                                     Ok(true) => continue,
                                     Err(e) => {
                                         tracing::warn!(
@@ -454,9 +461,9 @@ pub async fn spawn_receive_loops(
                                     Ok(false) => {}
                                 }
 
-                                match crate::net::hb_engine::try_handle_open_exp_wire_message(
-                                    sender_id, &data,
-                                ) {
+                                match open_message_router
+                                    .try_handle_hb_open_exp_wire_message(sender_id, &data)
+                                {
                                     Ok(true) => continue,
                                     Err(e) => {
                                         tracing::warn!(
@@ -550,6 +557,7 @@ pub async fn spawn_receive_loops_split(
     net: Arc<QuicNetworkManager>,
     node_id: PartyId,
     n_parties: usize,
+    open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
 ) -> (
     mpsc::Receiver<(PartyId, Vec<u8>)>,
     mpsc::Receiver<(PartyId, Vec<u8>)>,
@@ -574,6 +582,7 @@ pub async fn spawn_receive_loops_split(
 
                 let txx = server_tx.clone();
                 let local_party_id = node_id;
+                let open_message_router = open_message_router.clone();
                 tracing::info!(
                     party_id = local_party_id,
                     sender_id,
@@ -584,16 +593,15 @@ pub async fn spawn_receive_loops_split(
                     loop {
                         match connection.receive().await {
                             Ok(data) => {
-                                match crate::net::open_registry::try_handle_wire_message(
-                                    sender_id, &data,
-                                ) {
+                                match open_message_router.try_handle_wire_message(sender_id, &data)
+                                {
                                     Ok(true) => continue,
                                     Err(_) => continue,
                                     Ok(false) => {}
                                 }
-                                match crate::net::hb_engine::try_handle_open_exp_wire_message(
-                                    sender_id, &data,
-                                ) {
+                                match open_message_router
+                                    .try_handle_hb_open_exp_wire_message(sender_id, &data)
+                                {
                                     Ok(true) => continue,
                                     Err(_) => continue,
                                     Ok(false) => {}
