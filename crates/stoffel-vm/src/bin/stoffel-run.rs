@@ -2712,7 +2712,7 @@ async fn main() {
                 .as_ref()
                 .expect("--wallet-sk required for on-chain coordinator");
             let provider = on_chain::ws_connect(eth_addr, wallet).await;
-            let mut coord_instance =
+            let coord_instance =
                 on_chain::setup_coord(provider, contract, t as u64, 1, None).await;
             let coord_for_rpc = coord_instance.coord();
 
@@ -2737,6 +2737,7 @@ async fn main() {
 
             // Coordinator preprocessing trigger
             if as_leader {
+                coord_instance.reset_coord().await.unwrap();
                 coord_instance.start_preprocessing().await.unwrap();
             }
             coord_instance.wait_for_round(Round::Preprocessing).await.unwrap();
@@ -2993,6 +2994,7 @@ async fn main() {
                 // Phase 1: Coordinator preprocessing trigger
                 if let Some(ref mut coord) = coord_opt {
                     if as_leader {
+                        coord.reset_coord().await.unwrap();
                         coord.start_preprocessing().await.unwrap();
                     }
                     coord.wait_for_round(Round::Preprocessing).await.unwrap();
