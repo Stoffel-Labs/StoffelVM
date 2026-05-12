@@ -33,6 +33,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::core_vm::VirtualMachine;
+use crate::net::avss_server::{AvssQuicConfig, AvssQuicServer};
 use crate::mpc_builtins::avss_object;
 use crate::net::avss_engine::AvssMpcEngine;
 use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
@@ -557,6 +558,147 @@ async fn exchange_ecdh_keys(nodes: &mut [AvssTestNode]) -> Result<Vec<Arc<Vec<G1
     }
 
     Ok(all_pk_maps)
+}
+
+// ---------------------------------------------------------------------------
+// Repro: AvssQuicServer full-mesh startup must be self-contained
+// ---------------------------------------------------------------------------
+
+/// Reproduction for the ADKG SDK workaround: `AvssQuicServer` should be able to
+/// run a concurrent full-mesh startup, assign transport party IDs, and exchange
+/// public keys without the downstream SDK owning topology or identity repair.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_avss_full_mesh_concurrent_startup_survives_duplicate_dials() {
+    init_crypto_provider();
+    setup_test_tracing();
+
+    let n = 4usize;
+    let t = 1usize;
+    let instance_id = 900_481;
+    let base_port = 12800u16;
+    let config = AvssQuicConfig {
+        pk_exchange_timeout: Duration::from_secs(5),
+        max_connection_retries: 3,
+        connection_retry_delay: Duration::from_millis(50),
+    };
+
+    let addresses: Vec<SocketAddr> = (0..n)
+        .map(|i| {
+            format!("127.0.0.1:{}", base_port + i as u16)
+                .parse()
+                .unwrap()
+        })
+        .collect();
+
+    let mut managers = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut manager = QuicNetworkManager::with_node_id(i);
+        manager
+            .listen(addresses[i])
+            .await
+            .unwrap_or_else(|e| panic!("node {} listen failed: {}", i, e));
+        managers.push(manager);
+    }
+
+    let derived_ids: Vec<usize> = managers
+        .iter()
+        .map(QuicNetworkManager::local_derived_id)
+        .collect();
+
+    let mut sorted_derived_ids = derived_ids.clone();
+    sorted_derived_ids.sort_unstable();
+    let sorted_party_ids: Vec<usize> = derived_ids
+        .iter()
+        .map(|id| {
+            sorted_derived_ids
+                .iter()
+                .position(|sorted_id| sorted_id == id)
+                .expect("derived ID should be present")
+        })
+        .collect();
+
+    let logical_node_ids: Vec<usize> = sorted_party_ids
+        .iter()
+        .map(|party_id| (party_id + 1) % n)
+        .collect();
+
+    let mut servers = Vec::with_capacity(n);
+    for (i, manager) in managers.into_iter().enumerate() {
+        let mut server = AvssQuicServer::<Fr, G1>::new(
+            logical_node_ids[i],
+            n,
+            t,
+            instance_id,
+            manager,
+            config.clone(),
+        );
+
+        for j in 0..n {
+            if i != j {
+                server.add_peer(derived_ids[j], addresses[j]);
+            }
+        }
+
+        servers.push(server);
+    }
+
+    for server in &mut servers {
+        server.start().expect("AVSS server start failed");
+    }
+
+    let connect_results = futures::future::join_all(
+        servers
+            .iter()
+            .enumerate()
+            .map(|(i, server)| async move { (i, server.connect_to_peers().await) }),
+    )
+    .await;
+
+    for (idx, result) in connect_results {
+        result.unwrap_or_else(|e| panic!("server {} connect_to_peers failed: {}", idx, e));
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    for (idx, server) in servers.iter().enumerate() {
+        let net = server.network.as_ref().expect("network should be started");
+        let assigned = net.assign_party_ids();
+        assert!(
+            assigned >= n,
+            "server {} assigned only {}/{} party IDs after full-mesh startup",
+            idx,
+            assigned,
+            n
+        );
+    }
+
+    let exchange_results = futures::future::join_all(
+        servers
+            .iter_mut()
+            .enumerate()
+            .map(|(i, server)| async move { (i, server.exchange_public_keys().await) }),
+    )
+    .await;
+
+    let mut pk_maps = Vec::with_capacity(n);
+    for (idx, result) in exchange_results {
+        pk_maps.push(result.unwrap_or_else(|e| {
+            panic!(
+                "server {} public-key exchange failed after full-mesh startup: {}",
+                idx, e
+            )
+        }));
+    }
+
+    for party_id in 0..n {
+        for idx in 1..n {
+            assert_eq!(
+                pk_maps[0][party_id], pk_maps[idx][party_id],
+                "party {} public key differs between server 0 and server {}",
+                party_id, idx
+            );
+        }
+    }
 }
 
 /// Spawn AVSS message processors that read from each node's channel and
