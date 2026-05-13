@@ -17,10 +17,10 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
-use stoffel_mpc_coordinator::off_chain::node_rpc::{NodeRPCClient, NodeRPCServer};
-use stoffel_mpc_coordinator::off_chain::OffChainCoordinator;
 use stoffel_mpc_coordinator::on_chain;
 use stoffel_mpc_coordinator::Coordinator;
+use stoffel_mpc_coordinator::Round;
+use stoffel_mpc_coordinator::off_chain::{FakeOffChainCoordinatorClient, FakeNodeRPCClient, FakeNodeRPCServer};
 use stoffel_vm::core_vm::VirtualMachine;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffel_vm::net::curve::{field_from_i64, field_to_i64, SupportedMpcField};
@@ -1864,7 +1864,6 @@ async fn main() {
     let mut eth_node_addr: Option<String> = None;
     let mut wallet_sk_str: Option<String> = None;
     let mut contract_addr: Option<Address> = None;
-    let mut node_ids: Vec<Address> = Vec::new();
     let mut coordinator_client_index: Option<u64> = None;
     let mut preproc_store_path: Option<String> = None;
 
@@ -1907,7 +1906,6 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--cert") {
         } else if let Some(_rest) = arg.strip_prefix("--timestamp") {
         } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
-        } else if let Some(_rest) = arg.strip_prefix("--node-ids") {
         } else if let Some(_rest) = arg.strip_prefix("--client-index") {
         } else if let Some(_rest) = arg.strip_prefix("--preproc-store") {
         }
@@ -2041,14 +2039,6 @@ async fn main() {
                         Some(Address::from_str(&v).expect("invalid smart contract address"));
                 }
             }
-            "--node-ids" => {
-                if let Some(v) = args_iter.next() {
-                    node_ids = v
-                        .split(',')
-                        .map(|s| Address::from_str(s.trim()).expect("invalid node address"))
-                        .collect();
-                }
-            }
             "--eth-node" => {
                 if let Some(v) = args_iter.next() {
                     eth_node_addr = Some(v);
@@ -2146,13 +2136,13 @@ async fn main() {
                     .as_ref()
                     .expect("--wallet-sk required for on-chain client mode");
                 let provider = on_chain::ws_connect(eth_addr, wallet).await;
-                let mut coord =
+                let mut coord: on_chain::FakeOnChainCoordinator<_> =
                     on_chain::setup_coord(provider, contract, t as u64, 1, key_der.clone()).await;
                 let signer = PrivateKeySigner::from_str(wallet).unwrap();
                 let client_addr = signer.address();
 
-                coord.wait_for_pp().await.unwrap();
-                coord.wait_for_input_mask_init().await.unwrap();
+                coord.wait_for_round(Round::Preprocessing).await.unwrap();
+                coord.wait_for_round(Round::InputMaskReservation).await.unwrap();
                 coord.reserve_mask_index(reserved_index).await.unwrap();
                 eprintln!(
                     "[on-chain client] obtained reserved index {}",
@@ -2160,13 +2150,13 @@ async fn main() {
                 );
 
                 let base_nonce = coord.base_nonce().await;
-                let sig = on_chain::generate_client_sig(base_nonce, reserved_index, signer).await;
+                let sig = on_chain::generate_client_sig(base_nonce, reserved_index, signer).await.expect("signing failed");
 
                 let rpc_addrs: Vec<(String, u16)> = server_addrs
                     .iter()
                     .map(|a| (a.ip().to_string(), a.port()))
                     .collect();
-                let node_rpc_client = on_chain::node_rpc::NodeRPCClient::start_rpc_client(
+                let node_rpc_client = on_chain::FakeNodeRPCClient::start_rpc_client(
                     t,
                     rpc_addrs,
                     cert_der.unwrap(),
@@ -2178,17 +2168,18 @@ async fn main() {
                     .await
                     .unwrap();
 
-                coord.wait_for_input().await.unwrap();
+                coord.wait_for_round(Round::InputCollection).await.unwrap();
                 let masked = mask + ark_bls12_381::Fr::from(input_values[0] as u64);
                 coord
                     .send_masked_input(masked, reserved_index)
                     .await
                     .unwrap();
 
-                coord.wait_for_mpc().await.unwrap();
-                coord.wait_for_outputs().await.unwrap();
+                coord.wait_for_round(Round::MPCExecution).await.unwrap();
+                coord.wait_for_round(Round::OutputDistribution).await.unwrap();
                 let outputs = coord.obtain_outputs().await.unwrap();
                 println!("outputs: {}", format_coordinator_outputs(&outputs));
+                coord.wait_for_round(Round::ProgramFinished).await.unwrap();
                 return;
             } else {
                 // Off-chain client mode
@@ -2196,8 +2187,8 @@ async fn main() {
                 let key = key_der.clone().expect("--key required in client mode");
 
                 let ca = coord_addr.as_ref().unwrap();
-                let mut coord: OffChainCoordinator<ark_bls12_381::Fr> =
-                    OffChainCoordinator::start_rpc_client(
+                let mut coord =
+                    FakeOffChainCoordinatorClient::start_rpc_client(
                         &ca.0,
                         ca.1,
                         timestamp.expect("--timestamp required in client mode"),
@@ -2206,37 +2197,38 @@ async fn main() {
                         cert,
                         key,
                     )
-                    .await;
+                    .await.unwrap();
 
-                coord.wait_for_pp().await.unwrap();
-                coord.wait_for_input_mask_init().await.unwrap();
+                coord.wait_for_round(Round::Preprocessing).await.unwrap();
+                coord.wait_for_round(Round::InputMaskReservation).await.unwrap();
                 coord.reserve_mask_index(reserved_index).await.unwrap();
 
                 let rpc_addrs: Vec<(String, u16)> = server_addrs
                     .iter()
                     .map(|a| (a.ip().to_string(), a.port()))
                     .collect();
-                let node_rpc_client: NodeRPCClient<ark_bls12_381::Fr> =
-                    NodeRPCClient::start_rpc_client(
+                let node_rpc_client =
+                    FakeNodeRPCClient::start_rpc_client(
                         t,
                         rpc_addrs,
                         cert_der.unwrap(),
                         key_der.unwrap(),
                     )
-                    .await;
+                    .await.unwrap();
                 let mask = node_rpc_client.receive_mask().await.unwrap();
 
-                coord.wait_for_input().await.unwrap();
+                coord.wait_for_round(Round::InputCollection).await.unwrap();
                 let masked = mask + ark_bls12_381::Fr::from(input_values[0] as u64);
                 coord
                     .send_masked_input(masked, reserved_index)
                     .await
                     .unwrap();
 
-                coord.wait_for_mpc().await.unwrap();
-                coord.wait_for_outputs().await.unwrap();
+                coord.wait_for_round(Round::MPCExecution).await.unwrap();
+                coord.wait_for_round(Round::OutputDistribution).await.unwrap();
                 let outputs = coord.obtain_outputs().await.unwrap();
                 println!("outputs: {}", format_coordinator_outputs(&outputs));
+                coord.wait_for_round(Round::ProgramFinished).await.unwrap();
                 return;
             }
         }
@@ -2710,14 +2702,9 @@ async fn main() {
                 .as_ref()
                 .expect("--wallet-sk required for on-chain coordinator");
             let provider = on_chain::ws_connect(eth_addr, wallet).await;
-            let mut coord_instance =
+            let coord_instance =
                 on_chain::setup_coord(provider, contract, t as u64, 1, None).await;
             let coord_for_rpc = coord_instance.coord();
-
-            // Grant roles (leader only)
-            if as_leader {
-                coord_instance.grant_roles(node_ids.clone()).await.unwrap();
-            }
 
             // Parse expected client addresses (on-chain uses Ethereum addresses)
             let input_addrs: Vec<Address> = expected_clients
@@ -2740,9 +2727,10 @@ async fn main() {
 
             // Coordinator preprocessing trigger
             if as_leader {
-                coord_instance.trigger_pp().await.unwrap();
+                coord_instance.reset_coord().await.unwrap();
+                coord_instance.start_preprocessing().await.unwrap();
             }
-            coord_instance.wait_for_pp().await.unwrap();
+            coord_instance.wait_for_round(Round::Preprocessing).await.unwrap();
 
             // Setup HB engine (BLS12-381 only for on-chain coordinator)
             let engine =
@@ -2801,9 +2789,9 @@ async fn main() {
                 }
 
                 if as_leader {
-                    coord_instance.init_input_masks().await.unwrap();
+                    coord_instance.reserve_input_masks().await.unwrap();
                 }
-                coord_instance.wait_for_input_mask_init().await.unwrap();
+                coord_instance.wait_for_round(Round::InputMaskReservation).await.unwrap();
 
                 let client_to_index = coord_instance
                     .wait_for_indices(input_addrs.len() as u64)
@@ -2847,24 +2835,10 @@ async fn main() {
                         });
                 }
 
-                // On-chain client auth
-                for addr in &input_addrs {
-                    if coord_instance.wait_for_client_auth(*addr).await.unwrap() {
-                        node_rpc.add_auth_status(*addr).await.unwrap_or_else(|e| {
-                            eprintln!("add_auth_status: {:?}", e);
-                            exit(13);
-                        });
-                        eprintln!("[party {}] client {:?} authenticated", my_id, addr);
-                    } else {
-                        eprintln!("[party {}] client {:?} auth failed", my_id, addr);
-                        exit(13);
-                    }
-                }
-
                 if as_leader {
-                    coord_instance.trigger_input().await.unwrap();
+                    coord_instance.collect_inputs().await.unwrap();
                 }
-                coord_instance.wait_for_input().await.unwrap();
+                coord_instance.wait_for_round(Round::InputCollection).await.unwrap();
 
                 let client_inputs = coord_instance
                     .wait_for_inputs(input_addrs.len() as u64, mask_shares)
@@ -2877,9 +2851,9 @@ async fn main() {
 
             // MPC execution phase
             if as_leader {
-                coord_instance.trigger_mpc().await.unwrap();
+                coord_instance.start_mpc().await.unwrap();
             }
-            coord_instance.wait_for_mpc().await.unwrap();
+            coord_instance.wait_for_round(Round::MPCExecution).await.unwrap();
 
             eprintln!("Starting VM execution of '{}'...", agreed_entry);
 
@@ -2896,9 +2870,9 @@ async fn main() {
 
                     if !output_share.is_empty() {
                         if as_leader {
-                            coord_instance.trigger_outputs().await.unwrap();
+                            coord_instance.send_output().await.unwrap();
                         }
-                        coord_instance.wait_for_outputs().await.unwrap();
+                        coord_instance.wait_for_round(Round::OutputDistribution).await.unwrap();
 
                         let ids_and_addrs = node_rpc.ids_and_addrs().await;
                         for client_addr in input_addrs.iter() {
@@ -2939,12 +2913,12 @@ async fn main() {
     // =====================================================================
 
     // Off-chain coordinator initialization (both leader and party modes)
-    let mut coord_opt: Option<OffChainCoordinator<ark_bls12_381::Fr>> = None;
-    let mut node_rpc_opt: Option<NodeRPCServer<ark_bls12_381::Fr>> = None;
+    let mut coord_opt: Option<FakeOffChainCoordinatorClient> = None;
+    let mut node_rpc_opt: Option<FakeNodeRPCServer> = None;
     let mut input_ids: Vec<Vec<u8>> = Vec::new();
 
     if let Some(ref ca) = coord_addr {
-        let coord = OffChainCoordinator::start_rpc_client(
+        let coord = FakeOffChainCoordinatorClient::start_rpc_client(
             &ca.0,
             ca.1,
             timestamp.expect("--timestamp required"),
@@ -2953,7 +2927,7 @@ async fn main() {
             cert_der.clone().expect("--cert required"),
             key_der.clone().expect("--key required"),
         )
-        .await;
+        .await.unwrap();
         coord_opt = Some(coord);
 
         input_ids = expected_clients
@@ -2962,13 +2936,13 @@ async fn main() {
             .collect();
 
         if let Some(ref rpc) = rpc_addr {
-            let node_rpc = NodeRPCServer::start(
+            let node_rpc = FakeNodeRPCServer::start(
                 &rpc.0,
                 rpc.1,
                 cert_der.clone().unwrap(),
                 key_der.clone().unwrap(),
             )
-            .await;
+            .await.unwrap();
             node_rpc_opt = Some(node_rpc);
         }
     }
@@ -3010,9 +2984,10 @@ async fn main() {
                 // Phase 1: Coordinator preprocessing trigger
                 if let Some(ref mut coord) = coord_opt {
                     if as_leader {
-                        coord.trigger_pp().await.unwrap();
+                        coord.reset_coord().await.unwrap();
+                        coord.start_preprocessing().await.unwrap();
                     }
-                    coord.wait_for_pp().await.unwrap();
+                    coord.wait_for_round(Round::Preprocessing).await.unwrap();
                 }
 
                 // Phase 2: Create MPC engine + preprocessing + coordinator input phases
@@ -3107,9 +3082,9 @@ async fn main() {
                             }
 
                             if as_leader {
-                                coord.init_input_masks().await.unwrap();
+                                coord.reserve_input_masks().await.unwrap();
                             }
-                            coord.wait_for_input_mask_init().await.unwrap();
+                            coord.wait_for_round(Round::InputMaskReservation).await.unwrap();
 
                             let client_to_index = coord
                                 .wait_for_indices(input_ids.len() as u64)
@@ -3154,9 +3129,9 @@ async fn main() {
                             }
 
                             if as_leader {
-                                coord.trigger_input().await.unwrap();
+                                coord.collect_inputs().await.unwrap();
                             }
-                            coord.wait_for_input().await.unwrap();
+                            coord.wait_for_round(Round::InputCollection).await.unwrap();
 
                             let client_inputs = coord
                                 .wait_for_inputs(input_ids.len() as u64, mask_shares)
@@ -3244,9 +3219,9 @@ async fn main() {
     // Coordinator: signal MPC execution phase
     if let Some(ref mut coord) = coord_opt {
         if as_leader {
-            coord.trigger_mpc().await.unwrap();
+            coord.start_mpc().await.unwrap();
         }
-        coord.wait_for_mpc().await.unwrap();
+        coord.wait_for_round(Round::MPCExecution).await.unwrap();
     }
 
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
@@ -3266,9 +3241,9 @@ async fn main() {
 
                 if !output_share.is_empty() {
                     if as_leader {
-                        coord.trigger_outputs().await.unwrap();
+                        coord.send_output().await.unwrap();
                     }
-                    coord.wait_for_outputs().await.unwrap();
+                    coord.wait_for_round(Round::OutputDistribution).await.unwrap();
                     for cid in input_ids.iter() {
                         let share: RobustShare<ark_bls12_381::Fr> =
                             ark_serialize::CanonicalDeserialize::deserialize_compressed(
@@ -3294,6 +3269,8 @@ async fn main() {
                         }
                     }
                 }
+
+                coord.wait_for_round(Round::ProgramFinished).await.unwrap();
             } else {
                 // No coordinator — auto-reveal as before
                 let result = if let Value::Share(ty, ref sd) = result {
@@ -3380,7 +3357,6 @@ Flags:
                           Off-chain coordinator address
   --on-chain-coord <address>
                           On-chain coordinator smart contract address
-  --node-ids <addrs>      Comma-separated Ethereum addresses of MPC nodes (on-chain, leader only)
   --eth-node <url>        Ethereum node WebSocket URL (on-chain coordinator)
   --wallet-sk <hex>       Wallet secret key hex (on-chain coordinator)
   --rpc-bind <addr:port>  Node RPC server bind address (for mask distribution)
