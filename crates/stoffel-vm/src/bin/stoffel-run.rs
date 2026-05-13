@@ -1864,7 +1864,6 @@ async fn main() {
     let mut eth_node_addr: Option<String> = None;
     let mut wallet_sk_str: Option<String> = None;
     let mut contract_addr: Option<Address> = None;
-    let mut node_ids: Vec<Address> = Vec::new();
     let mut coordinator_client_index: Option<u64> = None;
     let mut preproc_store_path: Option<String> = None;
 
@@ -1907,7 +1906,6 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--cert") {
         } else if let Some(_rest) = arg.strip_prefix("--timestamp") {
         } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
-        } else if let Some(_rest) = arg.strip_prefix("--node-ids") {
         } else if let Some(_rest) = arg.strip_prefix("--client-index") {
         } else if let Some(_rest) = arg.strip_prefix("--preproc-store") {
         }
@@ -2039,14 +2037,6 @@ async fn main() {
                 if let Some(v) = args_iter.next() {
                     contract_addr =
                         Some(Address::from_str(&v).expect("invalid smart contract address"));
-                }
-            }
-            "--node-ids" => {
-                if let Some(v) = args_iter.next() {
-                    node_ids = v
-                        .split(',')
-                        .map(|s| Address::from_str(s.trim()).expect("invalid node address"))
-                        .collect();
                 }
             }
             "--eth-node" => {
@@ -3367,7 +3357,6 @@ Flags:
                           Off-chain coordinator address
   --on-chain-coord <address>
                           On-chain coordinator smart contract address
-  --node-ids <addrs>      Comma-separated Ethereum addresses of MPC nodes (on-chain, leader only)
   --eth-node <url>        Ethereum node WebSocket URL (on-chain coordinator)
   --wallet-sk <hex>       Wallet secret key hex (on-chain coordinator)
   --rpc-bind <addr:port>  Node RPC server bind address (for mask distribution)
