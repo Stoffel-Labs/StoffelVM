@@ -53,9 +53,9 @@ pub enum ReducedOpcode {
     JMPEQ = 0x0F,
     // JMPNEQ <jump_to>
     JMPNEQ = 0x10,
-    // JMPLT <jump_to> (Jump if Less Than, compare_flag == -1)
+    // JMPLT <jump_to> (Jump if last comparison was Less)
     JMPLT = 0x15,
-    // JMPGT <jump_to> (Jump if Greater Than, compare_flag == 1)
+    // JMPGT <jump_to> (Jump if last comparison was Greater)
     JMPGT = 0x16,
     // CALL <function>
     CALL = 0x11,

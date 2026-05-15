@@ -70,16 +70,20 @@ fn main() {
     }
 
     // Run the benchmark again with the benchmark-specific method
-    println!("Running with execute_for_benchmark (should be faster):");
+    println!("Running with execute_for_benchmark_with_args (should be faster):");
 
     // First execute once normally to ensure instructions are cached
     let args = vec![Value::I64(10)];
     vm.execute_with_args("benchmark", &args).unwrap();
 
     for &iter_count in &iterations {
+        let args = vec![Value::I64(iter_count)];
+
         // Run the benchmark and measure time
         let start = Instant::now();
-        let result = vm.execute_for_benchmark("benchmark").unwrap();
+        let result = vm
+            .execute_for_benchmark_with_args("benchmark", &args)
+            .unwrap();
         let duration = start.elapsed();
 
         // Print results

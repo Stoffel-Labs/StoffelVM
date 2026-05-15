@@ -1,12 +1,17 @@
 // tests/p2p_integration.rs
 //! Integration tests for QUIC-based peer-to-peer networking.
 
+#![allow(clippy::while_let_loop)]
+
 use crate::net::{NetworkManager, QuicNetworkManager};
 use crate::tests::test_utils::init_crypto_provider;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, timeout, Duration};
+
+const SERVER_COUNT: usize = 3;
+const PINGS_PER_SERVER: usize = 3;
 
 /// Message sent from client to server
 #[derive(Debug, Serialize, Deserialize)]
@@ -43,16 +48,22 @@ fn calculate_latency(ping_sent: u128, pong_received: u128, server_processing_tim
     rtt - server_processing_time
 }
 
+fn loopback_ephemeral_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 0))
+}
+
 #[tokio::test]
 async fn test_quic_connection_basic() {
     init_crypto_provider();
 
-    let test_addr: SocketAddr = "127.0.0.1:9090".parse().unwrap();
     let mut server = QuicNetworkManager::new();
     server
-        .listen(test_addr)
+        .listen(loopback_ephemeral_addr())
         .await
         .expect("Server should start listening");
+    let test_addr = server
+        .local_addr()
+        .expect("Server should expose local addr");
 
     // Spawn server task
     let server_handle = tokio::spawn(async move {
@@ -111,13 +122,14 @@ async fn test_multiple_streams() {
     // It verifies that a client can connect to a server
     // and that the ALPN protocol negotiation works correctly
 
-    let test_addr: SocketAddr = "127.0.0.1:9091".parse().unwrap();
-
     let mut server = QuicNetworkManager::new();
     server
-        .listen(test_addr)
+        .listen(loopback_ephemeral_addr())
         .await
         .expect("Server should start listening");
+    let test_addr = server
+        .local_addr()
+        .expect("Server should expose local addr");
 
     let server_handle = tokio::spawn(async move {
         // Just accept a connection
@@ -146,15 +158,8 @@ async fn test_multiple_streams() {
 async fn test_ping_pong_three_servers() {
     init_crypto_provider();
 
-    // Define server addresses
-    let server_addrs = [
-        "127.0.0.1:9092".parse::<SocketAddr>().unwrap(),
-        "127.0.0.1:9093".parse::<SocketAddr>().unwrap(),
-        "127.0.0.1:9094".parse::<SocketAddr>().unwrap(),
-    ];
-
     // Create and start servers
-    let server_handles = start_ping_pong_servers(&server_addrs).await;
+    let (server_handles, server_addrs) = start_ping_pong_servers().await;
 
     // Give servers time to start
     sleep(Duration::from_millis(200)).await;
@@ -170,8 +175,11 @@ async fn test_ping_pong_three_servers() {
                 client_id, server_id, latencies
             );
 
-            // Verify we have 3 latency measurements per server
-            assert_eq!(latencies.len(), 3, "Should have 3 latency measurements");
+            assert_eq!(
+                latencies.len(),
+                PINGS_PER_SERVER,
+                "Should have {PINGS_PER_SERVER} latency measurements"
+            );
         }
     }
 
@@ -182,17 +190,20 @@ async fn test_ping_pong_three_servers() {
 }
 
 /// Start three ping-pong servers
-async fn start_ping_pong_servers(
-    server_addrs: &[SocketAddr; 3],
-) -> Vec<tokio::task::JoinHandle<()>> {
+async fn start_ping_pong_servers() -> (Vec<tokio::task::JoinHandle<()>>, Vec<SocketAddr>) {
     let mut server_handles = Vec::new();
+    let mut server_addrs = Vec::new();
 
-    for (i, &addr) in server_addrs.iter().enumerate() {
+    for i in 0..SERVER_COUNT {
         let mut server = QuicNetworkManager::new();
         server
-            .listen(addr)
+            .listen(loopback_ephemeral_addr())
             .await
-            .expect(&format!("Server {} should start listening", i));
+            .unwrap_or_else(|err| panic!("Server {i} should start listening: {err}"));
+        let addr = server
+            .local_addr()
+            .expect("Server should expose local addr");
+        server_addrs.push(addr);
 
         // Spawn server task
         let server_handle = tokio::spawn(async move {
@@ -240,35 +251,35 @@ async fn start_ping_pong_servers(
         server_handles.push(server_handle);
     }
 
-    server_handles
+    (server_handles, server_addrs)
 }
 
 /// Perform ping-pong exchanges between clients and servers
-async fn perform_ping_pong_exchanges(server_addrs: &[SocketAddr; 3]) -> Vec<Vec<Vec<u128>>> {
+async fn perform_ping_pong_exchanges(server_addrs: &[SocketAddr]) -> Vec<Vec<Vec<u128>>> {
     // Create three clients
     let mut clients = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..SERVER_COUNT {
         clients.push(QuicNetworkManager::new());
     }
 
     // Track latency results: [client_id][server_id][ping_sequence]
-    let mut latency_results: Vec<Vec<Vec<u128>>> = vec![vec![Vec::new(); 3]; 3];
+    let mut latency_results: Vec<Vec<Vec<u128>>> =
+        vec![vec![Vec::new(); server_addrs.len()]; SERVER_COUNT];
 
     // For each client, connect to each server and perform ping-pong exchanges
     for (client_id, client) in clients.iter_mut().enumerate() {
         for (server_id, &server_addr) in server_addrs.iter().enumerate() {
             // Connect to server
-            let mut connection = client.connect(server_addr).await.expect(&format!(
-                "Client {} should connect to server {}",
-                client_id, server_id
-            ));
+            let mut connection = client.connect(server_addr).await.unwrap_or_else(|err| {
+                panic!("Client {client_id} should connect to server {server_id}: {err}")
+            });
 
-            // Perform 3 ping-pong exchanges
-            for seq in 0..3 {
+            // Perform ping-pong exchanges
+            for seq in 0..PINGS_PER_SERVER {
                 // Create ping message
                 let ping = PingMessage {
                     sent_at: current_time_ms(),
-                    seq_num: seq,
+                    seq_num: u32::try_from(seq).expect("ping sequence fits u32"),
                 };
 
                 // Serialize and send ping

@@ -18,7 +18,7 @@
 
 use ark_ff::Field;
 use async_trait::async_trait;
-use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,6 +33,38 @@ use tokio::sync::Mutex;
 use tracing::debug;
 use uuid::Uuid;
 
+type PeerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+type BoxedPeerConnection = Box<dyn PeerConnection>;
+type SharedPeerConnection = Arc<Mutex<BoxedPeerConnection>>;
+type PeerConnectionMap = Arc<Mutex<HashMap<PartyId, SharedPeerConnection>>>;
+
+const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn client_endpoint_bind_addr() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 0))
+}
+
+fn party_id_from_uuid(uuid: Uuid) -> PartyId {
+    let mut id = PartyId::default();
+    for (index, byte) in uuid.as_bytes().iter().enumerate() {
+        let shift = (index % std::mem::size_of::<PartyId>()) * 8;
+        id ^= PartyId::from(*byte) << shift;
+    }
+    id
+}
+
+fn random_party_id() -> PartyId {
+    party_id_from_uuid(Uuid::new_v4())
+}
+
+fn party_id_to_u128(id: PartyId) -> u128 {
+    let mut bytes = [0u8; 16];
+    let id_bytes = id.to_le_bytes();
+    bytes[..id_bytes.len()].copy_from_slice(&id_bytes);
+    u128::from_le_bytes(bytes)
+}
+
 /// Represents a connection to a peer (re-export of stoffelnet traits is not used directly here)
 pub trait PeerConnection: Send + Sync {
     /// Sends data to the peer on the default stream
@@ -46,10 +78,7 @@ pub trait PeerConnection: Send + Sync {
     /// # Returns
     /// * `Ok(())` - If the data was sent successfully
     /// * `Err(String)` - If there was an error sending the data
-    fn send<'a>(
-        &'a mut self,
-        data: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn send<'a>(&'a mut self, data: &'a [u8]) -> PeerFuture<'a, ()>;
 
     /// Receives data from the peer on the default stream
     ///
@@ -59,9 +88,7 @@ pub trait PeerConnection: Send + Sync {
     /// # Returns
     /// * `Ok(Vec<u8>)` - The received data
     /// * `Err(String)` - If there was an error receiving data
-    fn receive<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+    fn receive<'a>(&'a mut self) -> PeerFuture<'a, Vec<u8>>;
 
     /// Sends data on a specific stream
     ///
@@ -75,11 +102,7 @@ pub trait PeerConnection: Send + Sync {
     /// # Returns
     /// * `Ok(())` - If the data was sent successfully
     /// * `Err(String)` - If there was an error sending the data
-    fn send_on_stream<'a>(
-        &'a mut self,
-        stream_id: u64,
-        data: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn send_on_stream<'a>(&'a mut self, stream_id: u64, data: &'a [u8]) -> PeerFuture<'a, ()>;
 
     /// Receives data from a specific stream
     ///
@@ -92,10 +115,7 @@ pub trait PeerConnection: Send + Sync {
     /// # Returns
     /// * `Ok(Vec<u8>)` - The received data
     /// * `Err(String)` - If there was an error receiving data
-    fn receive_from_stream<'a>(
-        &'a mut self,
-        stream_id: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+    fn receive_from_stream<'a>(&'a mut self, stream_id: u64) -> PeerFuture<'a, Vec<u8>>;
 
     /// Returns the address of the remote peer
     ///
@@ -111,7 +131,7 @@ pub trait PeerConnection: Send + Sync {
     /// # Returns
     /// * `Ok(())` - If the connection was closed successfully
     /// * `Err(String)` - If there was an error closing the connection
-    fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn close<'a>(&'a mut self) -> PeerFuture<'a, ()>;
 }
 
 /// Manages network connections for the VM
@@ -128,10 +148,7 @@ pub trait NetworkManager: Send + Sync {
     /// # Returns
     /// * `Ok(Box<dyn PeerConnection>)` - A connection to the peer
     /// * `Err(String)` - If the connection could not be established
-    fn connect<'a>(
-        &'a mut self,
-        address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
+    fn connect<'a>(&'a mut self, address: SocketAddr) -> PeerFuture<'a, BoxedPeerConnection>;
 
     /// Accepts an incoming connection
     ///
@@ -144,9 +161,7 @@ pub trait NetworkManager: Send + Sync {
     /// # Returns
     /// * `Ok(Box<dyn PeerConnection>)` - A connection to the peer
     /// * `Err(String)` - If no connection could be accepted
-    fn accept<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>>;
+    fn accept<'a>(&'a mut self) -> PeerFuture<'a, BoxedPeerConnection>;
 
     /// Listens for incoming connections
     ///
@@ -160,10 +175,7 @@ pub trait NetworkManager: Send + Sync {
     /// # Returns
     /// * `Ok(())` - If the listening endpoint was set up successfully
     /// * `Err(String)` - If the listening endpoint could not be set up
-    fn listen<'a>(
-        &'a mut self,
-        bind_address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn listen<'a>(&'a mut self, bind_address: SocketAddr) -> PeerFuture<'a, ()>;
 }
 
 /// QUIC-based implementation of PeerConnection
@@ -254,24 +266,15 @@ impl QuicPeerConnection {
 }
 
 impl PeerConnection for QuicPeerConnection {
-    fn send<'a>(
-        &'a mut self,
-        data: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    fn send<'a>(&'a mut self, data: &'a [u8]) -> PeerFuture<'a, ()> {
         Box::pin(async move { self.send_on_stream(0, data).await })
     }
 
-    fn receive<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+    fn receive<'a>(&'a mut self) -> PeerFuture<'a, Vec<u8>> {
         Box::pin(async move { self.receive_from_stream(0).await })
     }
 
-    fn send_on_stream<'a>(
-        &'a mut self,
-        stream_id: u64,
-        data: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    fn send_on_stream<'a>(&'a mut self, stream_id: u64, data: &'a [u8]) -> PeerFuture<'a, ()> {
         Box::pin(async move {
             let (mut send, recv) = self.get_or_create_stream(stream_id).await?;
 
@@ -287,10 +290,7 @@ impl PeerConnection for QuicPeerConnection {
         })
     }
 
-    fn receive_from_stream<'a>(
-        &'a mut self,
-        stream_id: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>> {
+    fn receive_from_stream<'a>(&'a mut self, stream_id: u64) -> PeerFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let (send, mut recv) = self.get_or_create_stream(stream_id).await?;
 
@@ -316,7 +316,7 @@ impl PeerConnection for QuicPeerConnection {
         self.remote_addr
     }
 
-    fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    fn close<'a>(&'a mut self) -> PeerFuture<'a, ()> {
         Box::pin(async move {
             self.connection.close(0u32.into(), b"Connection closed");
             Ok(())
@@ -332,6 +332,8 @@ impl PeerConnection for QuicPeerConnection {
 pub struct QuicNode {
     /// The UUID of this node
     uuid: Uuid,
+    /// Explicit MPC/network party identifier.
+    party_id: PartyId,
     /// The network address of this node
     address: SocketAddr,
 }
@@ -342,8 +344,10 @@ impl QuicNode {
     /// # Arguments
     /// * `address` - The network address of the node
     pub fn new_with_random_id(address: SocketAddr) -> Self {
+        let uuid = Uuid::new_v4();
         Self {
-            uuid: Uuid::new_v4(),
+            uuid,
+            party_id: party_id_from_uuid(uuid),
             address,
         }
     }
@@ -354,18 +358,25 @@ impl QuicNode {
     /// * `uuid` - The UUID of the node
     /// * `address` - The network address of the node
     pub fn new(uuid: Uuid, address: SocketAddr) -> Self {
-        Self { uuid, address }
+        Self {
+            uuid,
+            party_id: party_id_from_uuid(uuid),
+            address,
+        }
     }
 
     /// Creates a new node with a specific ID
     ///
     /// # Arguments
-    /// * `id` - The ID of the node (will be converted to UUID)
+    /// * `id` - The explicit party ID of the node
     /// * `address` - The network address of the node
     pub fn from_party_id(id: PartyId, address: SocketAddr) -> Self {
-        // Convert PartyId to u128 and then to UUID
-        let uuid = Uuid::from_u128(id as u128);
-        Self { uuid, address }
+        let uuid = Uuid::from_u128(party_id_to_u128(id));
+        Self {
+            uuid,
+            party_id: id,
+            address,
+        }
     }
 
     /// Returns the network address of this node
@@ -381,14 +392,11 @@ impl QuicNode {
 
 impl Node for QuicNode {
     fn id(&self) -> PartyId {
-        // Convert UUID to u128 and then to PartyId
-        // This might lose precision if PartyId is smaller than u128
-        self.uuid.as_u128() as PartyId
+        self.party_id
     }
 
     fn scalar_id<F: Field>(&self) -> F {
-        // Convert UUID to u128 for use with Field
-        F::from(self.uuid.as_u128())
+        F::from(party_id_to_u128(self.party_id))
     }
 }
 
@@ -482,7 +490,7 @@ pub struct QuicNetworkManager {
     network_config: QuicNetworkConfig,
     /// Active connections to other server nodes and clients are handled in stoffelnet impl.
     /// Each connection has its own lock to avoid holding the HashMap lock across await points.
-    connections: Arc<Mutex<HashMap<PartyId, Arc<Mutex<Box<dyn PeerConnection>>>>>>,
+    connections: PeerConnectionMap,
 }
 
 impl Default for QuicNetworkManager {
@@ -498,15 +506,12 @@ impl QuicNetworkManager {
     /// Before using the manager, you must call either `connect()` or `listen()`
     /// to set up the appropriate endpoint.
     pub fn new() -> Self {
-        // Generate a random UUID for this node
-        let node_id = Uuid::new_v4().as_u128() as PartyId;
-
         Self {
             endpoint: None,
             server_config: None,
             client_config: None,
             nodes: Vec::new(),
-            node_id,
+            node_id: random_party_id(),
             network_config: QuicNetworkConfig::default(),
             connections: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -535,6 +540,27 @@ impl QuicNetworkManager {
         let mut manager = Self::new();
         manager.network_config = config;
         manager
+    }
+
+    fn default_transport_config() -> Result<TransportConfig, String> {
+        let idle_timeout = IdleTimeout::try_from(DEFAULT_IDLE_TIMEOUT)
+            .map_err(|e| format!("Invalid QUIC idle timeout: {e}"))?;
+        let mut transport = TransportConfig::default();
+        transport.max_concurrent_uni_streams(0u32.into());
+        transport.max_idle_timeout(Some(idle_timeout));
+        transport.keep_alive_interval(Some(DEFAULT_KEEP_ALIVE_INTERVAL));
+        Ok(transport)
+    }
+
+    /// Return the local address currently bound by this manager's endpoint.
+    pub fn local_addr(&self) -> Result<SocketAddr, String> {
+        self.endpoint
+            .as_ref()
+            .ok_or_else(|| {
+                "Endpoint not initialized. Call listen() or connect() first.".to_string()
+            })?
+            .local_addr()
+            .map_err(|e| format!("Failed to read endpoint local address: {e}"))
     }
 
     /// Adds a node to the network
@@ -605,19 +631,7 @@ impl QuicNetworkManager {
         ));
 
         // Set transport config with reasonable timeouts
-        config.transport_config(Arc::new({
-            let mut transport = quinn::TransportConfig::default();
-            transport.max_concurrent_uni_streams(0u32.into());
-            // Set connection timeout to prevent indefinite hangs
-            transport.max_idle_timeout(Some(
-                std::time::Duration::from_secs(30)
-                    .try_into()
-                    .expect("idle timeout"),
-            ));
-            // Set keep-alive to detect dead connections
-            transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-            transport
-        }));
+        config.transport_config(Arc::new(Self::default_transport_config()?));
 
         Ok(config)
     }
@@ -663,26 +677,14 @@ impl QuicNetworkManager {
         ));
 
         // Configure transport parameters with reasonable timeouts
-        let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-        transport_config.max_concurrent_uni_streams(0u32.into());
-        // Set connection timeout to prevent indefinite hangs
-        transport_config.max_idle_timeout(Some(
-            std::time::Duration::from_secs(30)
-                .try_into()
-                .expect("idle timeout"),
-        ));
-        // Set keep-alive to detect dead connections
-        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+        server_config.transport = Arc::new(Self::default_transport_config()?);
 
         Ok(server_config)
     }
 }
 
 impl NetworkManager for QuicNetworkManager {
-    fn connect<'a>(
-        &'a mut self,
-        address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
+    fn connect<'a>(&'a mut self, address: SocketAddr) -> PeerFuture<'a, BoxedPeerConnection> {
         Box::pin(async move {
             // Create client config for outgoing connections
             let client_config = Self::create_insecure_client_config()?;
@@ -706,7 +708,7 @@ impl NetworkManager for QuicNetworkManager {
                             "[quic] Server endpoint connect failed ({}), creating client endpoint for {}",
                             e, address
                         );
-                        let mut client_endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+                        let mut client_endpoint = Endpoint::client(client_endpoint_bind_addr())
                             .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
                         client_endpoint.set_default_client_config(client_config);
 
@@ -730,15 +732,12 @@ impl NetworkManager for QuicNetworkManager {
                     "[quic] Creating new client endpoint to connect to {}",
                     address
                 );
-                let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+                let mut endpoint = Endpoint::client(client_endpoint_bind_addr())
                     .map_err(|e| format!("Failed to create client endpoint: {}", e))?;
                 endpoint.set_default_client_config(client_config);
-                self.endpoint = Some(endpoint);
+                let endpoint = self.endpoint.insert(endpoint);
 
-                let connecting = self
-                    .endpoint
-                    .as_ref()
-                    .unwrap()
+                let connecting = endpoint
                     .connect(address, "localhost")
                     .map_err(|e| format!("Failed to initiate connection to {}: {}", address, e))?;
 
@@ -785,9 +784,7 @@ impl NetworkManager for QuicNetworkManager {
         })
     }
 
-    fn accept<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn PeerConnection>, String>> + Send + 'a>> {
+    fn accept<'a>(&'a mut self) -> PeerFuture<'a, BoxedPeerConnection> {
         Box::pin(async move {
             let endpoint = self
                 .endpoint
@@ -843,10 +840,7 @@ impl NetworkManager for QuicNetworkManager {
         })
     }
 
-    fn listen<'a>(
-        &'a mut self,
-        bind_address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    fn listen<'a>(&'a mut self, bind_address: SocketAddr) -> PeerFuture<'a, ()> {
         Box::pin(async move {
             let server_config = Self::create_self_signed_server_config()?;
             let endpoint = Endpoint::server(server_config, bind_address)
@@ -1036,6 +1030,64 @@ impl Network for QuicNetworkManager {
 
     fn verified_ordering(&self) -> Option<VerifiedOrdering> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loopback_addr() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 0))
+    }
+
+    #[test]
+    fn client_endpoint_bind_address_is_unspecified_ephemeral_ipv4() {
+        let addr = client_endpoint_bind_addr();
+        assert!(addr.ip().is_unspecified());
+        assert_eq!(addr.port(), 0);
+    }
+
+    #[test]
+    fn default_transport_config_is_constructible_without_panics() {
+        QuicNetworkManager::default_transport_config()
+            .expect("valid default QUIC transport config");
+    }
+
+    #[test]
+    fn quic_node_from_party_id_preserves_explicit_party_id() {
+        let node = QuicNode::from_party_id(PartyId::MAX, loopback_addr());
+
+        assert_eq!(node.id(), PartyId::MAX);
+    }
+
+    #[test]
+    fn quic_node_uuid_constructor_uses_explicit_uuid_fold() {
+        let uuid = Uuid::from_u128(party_id_to_u128(PartyId::MAX) + 1);
+        let node = QuicNode::new(uuid, loopback_addr());
+
+        assert_eq!(node.uuid(), uuid);
+        assert_eq!(node.id(), party_id_from_uuid(uuid));
+    }
+
+    #[test]
+    fn quic_node_scalar_id_uses_party_id() {
+        let node = QuicNode::from_party_id(42, loopback_addr());
+
+        assert_eq!(
+            node.scalar_id::<ark_bn254::Fr>(),
+            ark_bn254::Fr::from(42u128)
+        );
+    }
+
+    #[test]
+    fn local_addr_reports_uninitialized_endpoint() {
+        let manager = QuicNetworkManager::new();
+
+        let err = manager
+            .local_addr()
+            .expect_err("endpoint is not initialized");
+        assert!(err.contains("Endpoint not initialized"));
     }
 }
 

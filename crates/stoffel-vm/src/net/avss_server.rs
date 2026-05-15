@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use super::avss_engine::AvssMpcEngine;
+use super::avss_engine::{AvssEngineConfig, AvssMpcEngine};
 
 // ============================================================================
 // Type aliases for supported curve configurations
@@ -58,6 +58,41 @@ impl Default for AvssQuicConfig {
             connection_retry_delay: Duration::from_millis(100),
         }
     }
+}
+
+/// Errors for the AVSS public-key exchange envelope.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AvssPublicKeyEnvelopeError {
+    #[error("public-key envelope from peer {authenticated_peer_id:?} is too short: {len} bytes")]
+    TooShort {
+        authenticated_peer_id: Option<usize>,
+        len: usize,
+    },
+    #[error("declared sender {declared_sender} cannot be represented on this target")]
+    SenderIdTooLarge { declared_sender: u32 },
+    #[error("sender id {sender_id} cannot be represented in the public-key envelope")]
+    SenderIdNotEncodable { sender_id: usize },
+    #[error(
+        "PK sender mismatch: authenticated peer {authenticated_peer_id} declared {declared_sender}"
+    )]
+    SenderMismatch {
+        authenticated_peer_id: usize,
+        declared_sender: usize,
+    },
+    #[error("invalid declared sender {declared_sender} (n={n_parties})")]
+    SenderOutOfRange {
+        declared_sender: usize,
+        n_parties: usize,
+    },
+    #[error("failed to serialize public key: {0}")]
+    Serialize(String),
+    #[error(
+        "failed to deserialize PK from authenticated peer {authenticated_peer_id:?}: {details}"
+    )]
+    Deserialize {
+        authenticated_peer_id: Option<usize>,
+        details: String,
+    },
 }
 
 /// An AVSS server node using QUIC networking.
@@ -117,16 +152,17 @@ where
         authenticated_peer_id: Option<usize>,
         payload: &[u8],
         n_parties: usize,
-    ) -> Result<(usize, G), String> {
+    ) -> Result<(usize, G), AvssPublicKeyEnvelopeError> {
         if payload.len() < 4 {
-            return Err(format!(
-                "Invalid PK message from peer {:?}: too short",
-                authenticated_peer_id
-            ));
+            return Err(AvssPublicKeyEnvelopeError::TooShort {
+                authenticated_peer_id,
+                len: payload.len(),
+            });
         }
 
-        let declared_sender =
-            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        let declared_sender = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let declared_sender = usize::try_from(declared_sender)
+            .map_err(|_| AvssPublicKeyEnvelopeError::SenderIdTooLarge { declared_sender })?;
         if let Some(auth_id) = authenticated_peer_id {
             // Security model: TLS mutual authentication prevents unauthorized connections.
             // The `auth_id >= n_parties` bypass handles early setup before party-ID mapping
@@ -134,27 +170,46 @@ where
             // outside the protocol range). Once the mapping is set (`auth_id < n_parties`),
             // we enforce that the declared sender matches the authenticated transport identity.
             if auth_id < n_parties && declared_sender != auth_id {
-                return Err(format!(
-                    "PK sender mismatch: authenticated peer {} declared {}",
-                    auth_id, declared_sender
-                ));
+                return Err(AvssPublicKeyEnvelopeError::SenderMismatch {
+                    authenticated_peer_id: auth_id,
+                    declared_sender,
+                });
             }
         }
 
         if declared_sender >= n_parties {
-            return Err(format!(
-                "Invalid declared sender {} (n={})",
-                declared_sender, n_parties
-            ));
+            return Err(AvssPublicKeyEnvelopeError::SenderOutOfRange {
+                declared_sender,
+                n_parties,
+            });
         }
 
         let pk = G::deserialize_compressed(&payload[4..]).map_err(|e| {
-            format!(
-                "Failed to deserialize PK from authenticated peer {:?}: {:?}",
-                authenticated_peer_id, e
-            )
+            AvssPublicKeyEnvelopeError::Deserialize {
+                authenticated_peer_id,
+                details: format!("{e:?}"),
+            }
         })?;
         Ok((declared_sender, pk))
+    }
+
+    #[inline]
+    fn encode_public_key_envelope(
+        sender_id: usize,
+        public_key: &G,
+    ) -> Result<Vec<u8>, AvssPublicKeyEnvelopeError> {
+        let sender_id = u32::try_from(sender_id)
+            .map_err(|_| AvssPublicKeyEnvelopeError::SenderIdNotEncodable { sender_id })?;
+
+        let mut pk_bytes = Vec::new();
+        public_key
+            .serialize_compressed(&mut pk_bytes)
+            .map_err(|e| AvssPublicKeyEnvelopeError::Serialize(format!("{e:?}")))?;
+
+        let mut envelope = Vec::with_capacity(4 + pk_bytes.len());
+        envelope.extend_from_slice(&sender_id.to_le_bytes());
+        envelope.extend_from_slice(&pk_bytes);
+        Ok(envelope)
     }
 
     #[inline]
@@ -378,16 +433,9 @@ where
             self.node_id, self.n
         );
 
-        // Serialize our public key
-        let mut pk_bytes = Vec::new();
-        self.pk_i
-            .serialize_compressed(&mut pk_bytes)
-            .map_err(|e| format!("Failed to serialize public key: {:?}", e))?;
-
         // Create envelope: [party_id: u32][pk_bytes]
-        let mut envelope = Vec::with_capacity(4 + pk_bytes.len());
-        envelope.extend_from_slice(&(self.node_id as u32).to_le_bytes());
-        envelope.extend_from_slice(&pk_bytes);
+        let envelope = Self::encode_public_key_envelope(self.node_id, &self.pk_i)
+            .map_err(|e| e.to_string())?;
 
         // Send to all peers
         let connections = net.get_all_server_connections();
@@ -527,18 +575,18 @@ where
             .ok_or("Public keys not exchanged yet")?
             .clone();
 
-        AvssMpcEngine::new_with_router(
-            self.open_message_router.clone(),
+        let session = crate::net::MpcSessionConfig::try_new(
             self.instance_id,
             self.node_id,
             self.n,
             self.t,
             net,
-            self.sk_i,
-            pk_map,
-            input_ids,
         )
-        .await
+        .map_err(|error| format!("Invalid AVSS MPC topology: {error}"))?
+        .with_input_ids(input_ids)
+        .with_open_message_router(self.open_message_router.clone());
+
+        AvssMpcEngine::from_config(AvssEngineConfig::new(session, self.sk_i, pk_map)).await
     }
 
     /// Spawn AVSS message receive/process loops for all peer connections.
@@ -792,44 +840,63 @@ mod tests {
     use super::*;
     use ark_bls12_381::{Fr, G1Projective as G1};
     use ark_ec::PrimeGroup;
-    use ark_serialize::CanonicalSerialize;
 
     #[test]
     fn test_decode_public_key_envelope_rejects_sender_mismatch() {
         let pk = G1::generator();
-        let mut pk_bytes = Vec::new();
-        pk.serialize_compressed(&mut pk_bytes)
-            .expect("serialize pk");
-
-        let mut envelope = Vec::with_capacity(4 + pk_bytes.len());
-        envelope.extend_from_slice(&(1u32).to_le_bytes());
-        envelope.extend_from_slice(&pk_bytes);
+        let envelope =
+            AvssQuicServer::<Fr, G1>::encode_public_key_envelope(1, &pk).expect("serialize pk");
 
         let err = AvssQuicServer::<Fr, G1>::decode_public_key_envelope(Some(2), &envelope, 4)
             .expect_err("mismatched sender must be rejected");
-        assert!(
-            err.contains("sender mismatch"),
-            "expected sender mismatch error, got: {}",
-            err
+        assert_eq!(
+            err,
+            AvssPublicKeyEnvelopeError::SenderMismatch {
+                authenticated_peer_id: 2,
+                declared_sender: 1,
+            }
         );
     }
 
     #[test]
     fn test_decode_public_key_envelope_accepts_unassigned_transport_party_id() {
         let pk = G1::generator();
-        let mut pk_bytes = Vec::new();
-        pk.serialize_compressed(&mut pk_bytes)
-            .expect("serialize pk");
-
-        let mut envelope = Vec::with_capacity(4 + pk_bytes.len());
-        envelope.extend_from_slice(&(1u32).to_le_bytes());
-        envelope.extend_from_slice(&pk_bytes);
+        let envelope =
+            AvssQuicServer::<Fr, G1>::encode_public_key_envelope(1, &pk).expect("serialize pk");
 
         let (sender, decoded) =
             AvssQuicServer::<Fr, G1>::decode_public_key_envelope(None, &envelope, 4)
                 .expect("valid message should decode without remote_party_id assignment");
         assert_eq!(sender, 1);
         assert_eq!(decoded, pk);
+    }
+
+    #[test]
+    fn encode_public_key_envelope_rejects_unrepresentable_sender_id() {
+        if usize::BITS <= u32::BITS {
+            return;
+        }
+
+        let sender_id = usize::try_from(u32::MAX).expect("u32::MAX fits usize") + 1;
+        let err = AvssQuicServer::<Fr, G1>::encode_public_key_envelope(sender_id, &G1::generator())
+            .expect_err("unrepresentable sender id should be rejected");
+        assert_eq!(
+            err,
+            AvssPublicKeyEnvelopeError::SenderIdNotEncodable { sender_id }
+        );
+    }
+
+    #[test]
+    fn decode_public_key_envelope_rejects_short_payload() {
+        let err = AvssQuicServer::<Fr, G1>::decode_public_key_envelope(Some(1), &[0, 1, 2], 4)
+            .expect_err("short payload should be rejected");
+        assert_eq!(
+            err,
+            AvssPublicKeyEnvelopeError::TooShort {
+                authenticated_peer_id: Some(1),
+                len: 3,
+            }
+        );
     }
 
     #[test]

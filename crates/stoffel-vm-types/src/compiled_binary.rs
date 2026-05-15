@@ -14,7 +14,7 @@
 //! codebase without modification.
 
 use crate::core_types::{F64, Value};
-use crate::functions::VMFunction;
+use crate::functions::{FunctionError, VMFunction};
 use crate::instructions::{Instruction, ReducedOpcode};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -23,6 +23,9 @@ use std::io::{self, Read, Write};
 pub const MAGIC_BYTES: &[u8; 4] = b"STFL";
 // Current bytecode format version
 pub const FORMAT_VERSION: u16 = 1;
+
+const MAX_BINARY_COLLECTION_LEN: usize = 1_000_000;
+const MAX_BINARY_STRING_BYTES: usize = 16 * 1024 * 1024;
 
 /// Error types that can occur during serialization or deserialization
 #[derive(Debug)]
@@ -43,8 +46,128 @@ impl From<io::Error> for BinaryError {
     }
 }
 
+impl From<FunctionError> for BinaryError {
+    fn from(error: FunctionError) -> Self {
+        invalid_data(error.to_string())
+    }
+}
+
 /// Result type for binary operations
 pub type BinaryResult<T> = Result<T, BinaryError>;
+
+fn invalid_data(message: impl Into<String>) -> BinaryError {
+    BinaryError::InvalidData(message.into())
+}
+
+fn usize_to_u16(value: usize, field: &str) -> BinaryResult<u16> {
+    u16::try_from(value).map_err(|_| invalid_data(format!("{field} {value} exceeds u16::MAX")))
+}
+
+fn usize_to_u32(value: usize, field: &str) -> BinaryResult<u32> {
+    u32::try_from(value).map_err(|_| invalid_data(format!("{field} {value} exceeds u32::MAX")))
+}
+
+fn write_usize_as_u16<W: Write>(writer: &mut W, value: usize, field: &str) -> BinaryResult<()> {
+    writer.write_all(&usize_to_u16(value, field)?.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_usize_as_u32<W: Write>(writer: &mut W, value: usize, field: &str) -> BinaryResult<()> {
+    writer.write_all(&usize_to_u32(value, field)?.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_len_prefixed_str_u16<W: Write>(
+    writer: &mut W,
+    value: &str,
+    field: &str,
+) -> BinaryResult<()> {
+    let bytes = value.as_bytes();
+    write_usize_as_u16(writer, bytes.len(), field)?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
+fn write_len_prefixed_str_u32<W: Write>(
+    writer: &mut W,
+    value: &str,
+    field: &str,
+) -> BinaryResult<()> {
+    let bytes = value.as_bytes();
+    write_usize_as_u32(writer, bytes.len(), field)?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
+fn read_u16<R: Read>(reader: &mut R) -> BinaryResult<u16> {
+    let mut bytes = [0u8; 2];
+    reader.read_exact(&mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32<R: Read>(reader: &mut R) -> BinaryResult<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_usize_u32<R: Read>(reader: &mut R, field: &str) -> BinaryResult<usize> {
+    let value = read_u32(reader)?;
+    usize::try_from(value).map_err(|_| invalid_data(format!("{field} {value} exceeds usize::MAX")))
+}
+
+fn read_u32_len_bounded<R: Read>(reader: &mut R, field: &str, max: usize) -> BinaryResult<usize> {
+    let value = read_u32(reader)?;
+    let max_u32 = u32::try_from(max).unwrap_or(u32::MAX);
+    if value > max_u32 {
+        return Err(invalid_data(format!(
+            "{field} {value} exceeds maximum supported {max}"
+        )));
+    }
+    usize::try_from(value).map_err(|_| invalid_data(format!("{field} {value} exceeds usize::MAX")))
+}
+
+fn read_exact_vec<R: Read>(reader: &mut R, len: usize, field: &str) -> BinaryResult<Vec<u8>> {
+    if len > MAX_BINARY_STRING_BYTES {
+        return Err(invalid_data(format!(
+            "{field} {len} exceeds maximum supported {MAX_BINARY_STRING_BYTES}"
+        )));
+    }
+
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|err| {
+        invalid_data(format!("{field} {len} bytes could not be allocated: {err}"))
+    })?;
+    bytes.resize(len, 0);
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_len_prefixed_string_u16<R: Read>(
+    reader: &mut R,
+    field: &str,
+    invalid_utf8: &str,
+) -> BinaryResult<String> {
+    let len = usize::from(read_u16(reader)?);
+    let bytes = read_exact_vec(reader, len, field)?;
+    String::from_utf8(bytes).map_err(|_| invalid_data(invalid_utf8))
+}
+
+fn read_len_prefixed_string_u32<R: Read>(
+    reader: &mut R,
+    field: &str,
+    invalid_utf8: &str,
+) -> BinaryResult<String> {
+    let len = read_u32_len_bounded(reader, field, MAX_BINARY_STRING_BYTES)?;
+    let bytes = read_exact_vec(reader, len, field)?;
+    String::from_utf8(bytes).map_err(|_| invalid_data(invalid_utf8))
+}
+
+fn reserve_vec<T>(values: &mut Vec<T>, len: usize, field: &str) -> BinaryResult<()> {
+    values
+        .try_reserve(len)
+        .map_err(|err| invalid_data(format!("{field} {len} could not be allocated: {err}")))
+}
 
 /// Represents a compiled StoffelVM program
 ///
@@ -63,7 +186,7 @@ pub struct CompiledBinary {
 /// Represents a compiled function in the program
 ///
 /// This struct contains all the metadata and instructions for a single function.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledFunction {
     /// Function name
     pub name: String,
@@ -85,7 +208,7 @@ pub struct CompiledFunction {
 ///
 /// This enum mirrors the Instruction enum but uses indices into the constant pool
 /// instead of embedding values directly.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompiledInstruction {
     // Load value from stack to register
     LD(usize, i32), // LD r1, [sp+0]
@@ -120,6 +243,12 @@ pub enum CompiledInstruction {
     CMP(usize, usize), // CMP r1, r2
 }
 
+impl Default for CompiledBinary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CompiledBinary {
     /// Creates a new empty compiled binary
     pub fn new() -> Self {
@@ -146,18 +275,8 @@ impl CompiledBinary {
         let mut binary = CompiledBinary::new();
         let mut constant_map = HashMap::new();
 
-        // First pass: collect all constants
         for function in functions {
-            for instruction in &function.instructions {
-                if let Instruction::LDI(_, value) = instruction {
-                    binary.add_constant_if_new(value, &mut constant_map);
-                }
-            }
-        }
-
-        // Second pass: convert functions
-        for function in functions {
-            binary.add_function_from_vm(function, &constant_map);
+            binary.add_function_from_vm(function, &mut constant_map);
         }
 
         binary
@@ -197,17 +316,17 @@ impl CompiledBinary {
     fn add_function_from_vm(
         &mut self,
         vm_function: &VMFunction,
-        constant_map: &HashMap<Value, usize>,
+        constant_map: &mut HashMap<Value, usize>,
     ) {
         let mut compiled_instructions = Vec::new();
 
         // Convert instructions
-        for instruction in &vm_function.instructions {
+        for instruction in vm_function.instructions() {
             let compiled = match instruction {
                 Instruction::LD(reg, offset) => CompiledInstruction::LD(*reg, *offset),
                 Instruction::LDI(reg, value) => {
-                    let const_idx = constant_map.get(value).unwrap_or(&0);
-                    CompiledInstruction::LDI(*reg, *const_idx)
+                    let const_idx = self.add_constant_if_new(value, constant_map);
+                    CompiledInstruction::LDI(*reg, const_idx)
                 }
                 Instruction::MOV(target, source) => CompiledInstruction::MOV(*target, *source),
                 Instruction::ADD(target, src1, src2) => {
@@ -259,104 +378,146 @@ impl CompiledBinary {
 
         // Create the compiled function
         let compiled_function = CompiledFunction {
-            name: vm_function.name.clone(),
-            register_count: vm_function.register_count,
-            parameters: vm_function.parameters.clone(),
-            upvalues: vm_function.upvalues.clone(),
-            parent: vm_function.parent.clone(),
-            labels: vm_function.labels.clone(),
+            name: vm_function.name().to_string(),
+            register_count: vm_function.register_count(),
+            parameters: vm_function.parameters().to_vec(),
+            upvalues: vm_function.upvalues().to_vec(),
+            parent: vm_function.parent().map(str::to_owned),
+            labels: vm_function.labels().clone(),
             instructions: compiled_instructions,
         };
 
         self.functions.push(compiled_function);
     }
 
-    /// Converts the compiled binary back to VM functions
+    fn compiled_instruction_to_vm_instruction<F>(
+        instruction: &CompiledInstruction,
+        mut constant_lookup: F,
+    ) -> BinaryResult<Instruction>
+    where
+        F: FnMut(usize) -> BinaryResult<Value>,
+    {
+        Ok(match instruction {
+            CompiledInstruction::LD(reg, offset) => Instruction::LD(*reg, *offset),
+            CompiledInstruction::LDI(reg, const_idx) => {
+                Instruction::LDI(*reg, constant_lookup(*const_idx)?)
+            }
+            CompiledInstruction::MOV(target, source) => Instruction::MOV(*target, *source),
+            CompiledInstruction::ADD(target, src1, src2) => Instruction::ADD(*target, *src1, *src2),
+            CompiledInstruction::SUB(target, src1, src2) => Instruction::SUB(*target, *src1, *src2),
+            CompiledInstruction::MUL(target, src1, src2) => Instruction::MUL(*target, *src1, *src2),
+            CompiledInstruction::DIV(target, src1, src2) => Instruction::DIV(*target, *src1, *src2),
+            CompiledInstruction::MOD(target, src1, src2) => Instruction::MOD(*target, *src1, *src2),
+            CompiledInstruction::AND(target, src1, src2) => Instruction::AND(*target, *src1, *src2),
+            CompiledInstruction::OR(target, src1, src2) => Instruction::OR(*target, *src1, *src2),
+            CompiledInstruction::XOR(target, src1, src2) => Instruction::XOR(*target, *src1, *src2),
+            CompiledInstruction::NOT(target, source) => Instruction::NOT(*target, *source),
+            CompiledInstruction::SHL(target, src1, src2) => Instruction::SHL(*target, *src1, *src2),
+            CompiledInstruction::SHR(target, src1, src2) => Instruction::SHR(*target, *src1, *src2),
+            CompiledInstruction::JMP(label) => Instruction::JMP(label.clone()),
+            CompiledInstruction::JMPEQ(label) => Instruction::JMPEQ(label.clone()),
+            CompiledInstruction::JMPNEQ(label) => Instruction::JMPNEQ(label.clone()),
+            CompiledInstruction::JMPLT(label) => Instruction::JMPLT(label.clone()),
+            CompiledInstruction::JMPGT(label) => Instruction::JMPGT(label.clone()),
+            CompiledInstruction::CALL(function_name) => Instruction::CALL(function_name.clone()),
+            CompiledInstruction::RET(reg) => Instruction::RET(*reg),
+            CompiledInstruction::PUSHARG(reg) => Instruction::PUSHARG(*reg),
+            CompiledInstruction::CMP(reg1, reg2) => Instruction::CMP(*reg1, *reg2),
+        })
+    }
+
+    fn vm_function_from_instructions(
+        function: &CompiledFunction,
+        instructions: Vec<Instruction>,
+    ) -> VMFunction {
+        VMFunction::new(
+            function.name.clone(),
+            function.parameters.clone(),
+            function.upvalues.clone(),
+            function.parent.clone(),
+            function.register_count,
+            instructions,
+            function.labels.clone(),
+        )
+    }
+
+    fn try_compiled_function_to_vm_function(
+        &self,
+        function: &CompiledFunction,
+    ) -> BinaryResult<VMFunction> {
+        let mut instructions = Vec::with_capacity(function.instructions.len());
+        for (instruction_index, instruction) in function.instructions.iter().enumerate() {
+            instructions.push(Self::compiled_instruction_to_vm_instruction(
+                instruction,
+                |const_idx| {
+                    self.constants.get(const_idx).cloned().ok_or_else(|| {
+                        invalid_data(format!(
+                            "Function {} instruction {} references constant {} but constant pool has {} values",
+                            function.name,
+                            instruction_index,
+                            const_idx,
+                            self.constants.len()
+                        ))
+                    })
+                },
+            )?);
+        }
+
+        let mut vm_function = Self::vm_function_from_instructions(function, instructions);
+        vm_function.try_normalize_register_count()?;
+        Ok(vm_function)
+    }
+
+    fn try_to_raw_vm_functions(&self) -> BinaryResult<Vec<VMFunction>> {
+        let mut vm_functions = Vec::with_capacity(self.functions.len());
+        for function in &self.functions {
+            vm_functions.push(self.try_compiled_function_to_vm_function(function)?);
+        }
+        Ok(vm_functions)
+    }
+
+    /// Converts the compiled binary back to VM functions.
     ///
-    /// # Returns
+    /// This keeps the legacy behavior of returning every function entry as-is,
+    /// including duplicate names. Prefer `try_to_vm_functions` for executable
+    /// program loading when bytecode validity should be handled as data.
     ///
-    /// A vector of VMFunction objects
+    /// # Panics
+    ///
+    /// Panics when a function references invalid bytecode metadata such as a
+    /// missing constant or unrepresentable register frame. Use
+    /// `try_to_vm_functions` to receive those failures as `BinaryError` values.
     pub fn to_vm_functions(&self) -> Vec<VMFunction> {
+        self.try_to_raw_vm_functions()
+            .expect("compiled binary contains invalid function data; use try_to_vm_functions for recoverable errors")
+    }
+
+    /// Converts the compiled binary back to VM functions with executable program validation.
+    ///
+    /// Function names are VM program identifiers, so conflicting duplicates are
+    /// rejected. Identical duplicates are ignored to tolerate older bytecode
+    /// fixtures that accidentally emitted the same wrapper twice.
+    pub fn try_to_vm_functions(&self) -> BinaryResult<Vec<VMFunction>> {
+        let mut seen: HashMap<&str, &CompiledFunction> = HashMap::new();
         let mut vm_functions = Vec::new();
 
         for function in &self.functions {
-            let mut instructions = Vec::new();
+            if let Some(existing) = seen.get(function.name.as_str()) {
+                if *existing == function {
+                    continue;
+                }
 
-            // Convert instructions
-            for instruction in &function.instructions {
-                let vm_instruction = match instruction {
-                    CompiledInstruction::LD(reg, offset) => Instruction::LD(*reg, *offset),
-                    CompiledInstruction::LDI(reg, const_idx) => {
-                        let value = self
-                            .constants
-                            .get(*const_idx)
-                            .cloned()
-                            .unwrap_or(Value::Unit);
-                        Instruction::LDI(*reg, value)
-                    }
-                    CompiledInstruction::MOV(target, source) => Instruction::MOV(*target, *source),
-                    CompiledInstruction::ADD(target, src1, src2) => {
-                        Instruction::ADD(*target, *src1, *src2)
-                    }
-                    CompiledInstruction::SUB(target, src1, src2) => {
-                        Instruction::SUB(*target, *src1, *src2)
-                    }
-                    CompiledInstruction::MUL(target, src1, src2) => {
-                        Instruction::MUL(*target, *src1, *src2)
-                    }
-                    CompiledInstruction::DIV(target, src1, src2) => {
-                        Instruction::DIV(*target, *src1, *src2)
-                    }
-                    CompiledInstruction::MOD(target, src1, src2) => {
-                        Instruction::MOD(*target, *src1, *src2)
-                    }
-                    CompiledInstruction::AND(target, src1, src2) => {
-                        Instruction::AND(*target, *src1, *src2)
-                    }
-                    CompiledInstruction::OR(target, src1, src2) => {
-                        Instruction::OR(*target, *src1, *src2)
-                    }
-                    CompiledInstruction::XOR(target, src1, src2) => {
-                        Instruction::XOR(*target, *src1, *src2)
-                    }
-                    CompiledInstruction::NOT(target, source) => Instruction::NOT(*target, *source),
-                    CompiledInstruction::SHL(target, src1, src2) => {
-                        Instruction::SHL(*target, *src1, *src2)
-                    }
-                    CompiledInstruction::SHR(target, src1, src2) => {
-                        Instruction::SHR(*target, *src1, *src2)
-                    }
-                    CompiledInstruction::JMP(label) => Instruction::JMP(label.clone()),
-                    CompiledInstruction::JMPEQ(label) => Instruction::JMPEQ(label.clone()),
-                    CompiledInstruction::JMPNEQ(label) => Instruction::JMPNEQ(label.clone()),
-                    CompiledInstruction::JMPLT(label) => Instruction::JMPLT(label.clone()),
-                    CompiledInstruction::JMPGT(label) => Instruction::JMPGT(label.clone()),
-                    CompiledInstruction::CALL(function_name) => {
-                        Instruction::CALL(function_name.clone())
-                    }
-                    CompiledInstruction::RET(reg) => Instruction::RET(*reg),
-                    CompiledInstruction::PUSHARG(reg) => Instruction::PUSHARG(*reg),
-                    CompiledInstruction::CMP(reg1, reg2) => Instruction::CMP(*reg1, *reg2),
-                };
-
-                instructions.push(vm_instruction);
+                return Err(invalid_data(format!(
+                    "duplicate function '{}' has conflicting definitions",
+                    function.name
+                )));
             }
 
-            // Create the VM function
-            let vm_function = VMFunction::new(
-                function.name.clone(),
-                function.parameters.clone(),
-                function.upvalues.clone(),
-                function.parent.clone(),
-                function.register_count,
-                instructions,
-                function.labels.clone(),
-            );
-
-            vm_functions.push(vm_function);
+            seen.insert(function.name.as_str(), function);
+            vm_functions.push(self.try_compiled_function_to_vm_function(function)?);
         }
 
-        vm_functions
+        Ok(vm_functions)
     }
 
     /// Serializes the compiled binary to a writer
@@ -374,16 +535,14 @@ impl CompiledBinary {
         writer.write_all(&self.version.to_le_bytes())?;
 
         // Write constant pool
-        let constant_count = self.constants.len() as u32;
-        writer.write_all(&constant_count.to_le_bytes())?;
+        write_usize_as_u32(writer, self.constants.len(), "constant count")?;
 
         for constant in &self.constants {
             self.serialize_value(constant, writer)?;
         }
 
         // Write functions
-        let function_count = self.functions.len() as u32;
-        writer.write_all(&function_count.to_le_bytes())?;
+        write_usize_as_u32(writer, self.functions.len(), "function count")?;
 
         for function in &self.functions {
             self.serialize_function(function, writer)?;
@@ -421,7 +580,7 @@ impl CompiledBinary {
             }
             Value::I8(i) => {
                 writer.write_all(&[4u8])?; // Type tag for I8
-                writer.write_all(&[*i as u8])?;
+                writer.write_all(&i.to_le_bytes())?;
             }
             Value::U8(i) => {
                 writer.write_all(&[5u8])?; // Type tag for U8
@@ -449,10 +608,7 @@ impl CompiledBinary {
             }
             Value::String(s) => {
                 writer.write_all(&[11u8])?; // Type tag for String
-                let bytes = s.as_bytes();
-                let len = bytes.len() as u32;
-                writer.write_all(&len.to_le_bytes())?;
-                writer.write_all(bytes)?;
+                write_len_prefixed_str_u32(writer, s, "string length")?;
             }
             // Complex types like Object, Array, Foreign, Closure, and Share are not
             // directly serializable in this format. They would need special handling
@@ -484,59 +640,40 @@ impl CompiledBinary {
         writer: &mut W,
     ) -> BinaryResult<()> {
         // Write function name
-        let name_bytes = function.name.as_bytes();
-        let name_len = name_bytes.len() as u16;
-        writer.write_all(&name_len.to_le_bytes())?;
-        writer.write_all(name_bytes)?;
+        write_len_prefixed_str_u16(writer, &function.name, "function name length")?;
 
         // Write register count
-        writer.write_all(&(function.register_count as u16).to_le_bytes())?;
+        write_usize_as_u16(writer, function.register_count, "register count")?;
 
         // Write parameters
-        let param_count = function.parameters.len() as u16;
-        writer.write_all(&param_count.to_le_bytes())?;
+        write_usize_as_u16(writer, function.parameters.len(), "parameter count")?;
         for param in &function.parameters {
-            let param_bytes = param.as_bytes();
-            let param_len = param_bytes.len() as u16;
-            writer.write_all(&param_len.to_le_bytes())?;
-            writer.write_all(param_bytes)?;
+            write_len_prefixed_str_u16(writer, param, "parameter name length")?;
         }
 
         // Write upvalues
-        let upvalue_count = function.upvalues.len() as u16;
-        writer.write_all(&upvalue_count.to_le_bytes())?;
+        write_usize_as_u16(writer, function.upvalues.len(), "upvalue count")?;
         for upvalue in &function.upvalues {
-            let upvalue_bytes = upvalue.as_bytes();
-            let upvalue_len = upvalue_bytes.len() as u16;
-            writer.write_all(&upvalue_len.to_le_bytes())?;
-            writer.write_all(upvalue_bytes)?;
+            write_len_prefixed_str_u16(writer, upvalue, "upvalue name length")?;
         }
 
         // Write parent function name (if any)
         if let Some(ref parent) = function.parent {
             writer.write_all(&[1u8])?; // Has parent
-            let parent_bytes = parent.as_bytes();
-            let parent_len = parent_bytes.len() as u16;
-            writer.write_all(&parent_len.to_le_bytes())?;
-            writer.write_all(parent_bytes)?;
+            write_len_prefixed_str_u16(writer, parent, "parent function name length")?;
         } else {
             writer.write_all(&[0u8])?; // No parent
         }
 
         // Write labels
-        let label_count = function.labels.len() as u16;
-        writer.write_all(&label_count.to_le_bytes())?;
+        write_usize_as_u16(writer, function.labels.len(), "label count")?;
         for (label, &offset) in &function.labels {
-            let label_bytes = label.as_bytes();
-            let label_len = label_bytes.len() as u16;
-            writer.write_all(&label_len.to_le_bytes())?;
-            writer.write_all(label_bytes)?;
-            writer.write_all(&(offset as u32).to_le_bytes())?;
+            write_len_prefixed_str_u16(writer, label, "label name length")?;
+            write_usize_as_u32(writer, offset, "label offset")?;
         }
 
         // Write instructions
-        let instruction_count = function.instructions.len() as u32;
-        writer.write_all(&instruction_count.to_le_bytes())?;
+        write_usize_as_u32(writer, function.instructions.len(), "instruction count")?;
         for instruction in &function.instructions {
             self.serialize_instruction(instruction, writer)?;
         }
@@ -562,138 +699,120 @@ impl CompiledBinary {
         match instruction {
             CompiledInstruction::LD(reg, offset) => {
                 writer.write_all(&[ReducedOpcode::LD as u8])?;
-                writer.write_all(&(*reg as u32).to_le_bytes())?;
-                writer.write_all(&(*offset as i32).to_le_bytes())?;
+                write_usize_as_u32(writer, *reg, "LD register")?;
+                writer.write_all(&offset.to_le_bytes())?;
             }
             CompiledInstruction::LDI(reg, const_idx) => {
                 writer.write_all(&[ReducedOpcode::LDI as u8])?;
-                writer.write_all(&(*reg as u32).to_le_bytes())?;
-                writer.write_all(&(*const_idx as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *reg, "LDI register")?;
+                write_usize_as_u32(writer, *const_idx, "LDI constant index")?;
             }
             CompiledInstruction::MOV(target, source) => {
                 writer.write_all(&[ReducedOpcode::MOV as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*source as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "MOV target register")?;
+                write_usize_as_u32(writer, *source, "MOV source register")?;
             }
             CompiledInstruction::ADD(target, src1, src2) => {
                 writer.write_all(&[ReducedOpcode::ADD as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*src1 as u32).to_le_bytes())?;
-                writer.write_all(&(*src2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "ADD target register")?;
+                write_usize_as_u32(writer, *src1, "ADD left register")?;
+                write_usize_as_u32(writer, *src2, "ADD right register")?;
             }
             CompiledInstruction::SUB(target, src1, src2) => {
                 writer.write_all(&[ReducedOpcode::SUB as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*src1 as u32).to_le_bytes())?;
-                writer.write_all(&(*src2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "SUB target register")?;
+                write_usize_as_u32(writer, *src1, "SUB left register")?;
+                write_usize_as_u32(writer, *src2, "SUB right register")?;
             }
             CompiledInstruction::MUL(target, src1, src2) => {
                 writer.write_all(&[ReducedOpcode::MUL as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*src1 as u32).to_le_bytes())?;
-                writer.write_all(&(*src2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "MUL target register")?;
+                write_usize_as_u32(writer, *src1, "MUL left register")?;
+                write_usize_as_u32(writer, *src2, "MUL right register")?;
             }
             CompiledInstruction::DIV(target, src1, src2) => {
                 writer.write_all(&[ReducedOpcode::DIV as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*src1 as u32).to_le_bytes())?;
-                writer.write_all(&(*src2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "DIV target register")?;
+                write_usize_as_u32(writer, *src1, "DIV left register")?;
+                write_usize_as_u32(writer, *src2, "DIV right register")?;
             }
             CompiledInstruction::MOD(target, src1, src2) => {
                 writer.write_all(&[ReducedOpcode::MOD as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*src1 as u32).to_le_bytes())?;
-                writer.write_all(&(*src2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "MOD target register")?;
+                write_usize_as_u32(writer, *src1, "MOD left register")?;
+                write_usize_as_u32(writer, *src2, "MOD right register")?;
             }
             CompiledInstruction::AND(target, src1, src2) => {
                 writer.write_all(&[ReducedOpcode::AND as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*src1 as u32).to_le_bytes())?;
-                writer.write_all(&(*src2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "AND target register")?;
+                write_usize_as_u32(writer, *src1, "AND left register")?;
+                write_usize_as_u32(writer, *src2, "AND right register")?;
             }
             CompiledInstruction::OR(target, src1, src2) => {
                 writer.write_all(&[ReducedOpcode::OR as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*src1 as u32).to_le_bytes())?;
-                writer.write_all(&(*src2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "OR target register")?;
+                write_usize_as_u32(writer, *src1, "OR left register")?;
+                write_usize_as_u32(writer, *src2, "OR right register")?;
             }
             CompiledInstruction::XOR(target, src1, src2) => {
                 writer.write_all(&[ReducedOpcode::XOR as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*src1 as u32).to_le_bytes())?;
-                writer.write_all(&(*src2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "XOR target register")?;
+                write_usize_as_u32(writer, *src1, "XOR left register")?;
+                write_usize_as_u32(writer, *src2, "XOR right register")?;
             }
             CompiledInstruction::NOT(target, source) => {
                 writer.write_all(&[ReducedOpcode::NOT as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*source as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "NOT target register")?;
+                write_usize_as_u32(writer, *source, "NOT source register")?;
             }
             CompiledInstruction::SHL(target, src1, src2) => {
                 writer.write_all(&[ReducedOpcode::SHL as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*src1 as u32).to_le_bytes())?;
-                writer.write_all(&(*src2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "SHL target register")?;
+                write_usize_as_u32(writer, *src1, "SHL left register")?;
+                write_usize_as_u32(writer, *src2, "SHL right register")?;
             }
             CompiledInstruction::SHR(target, src1, src2) => {
                 writer.write_all(&[ReducedOpcode::SHR as u8])?;
-                writer.write_all(&(*target as u32).to_le_bytes())?;
-                writer.write_all(&(*src1 as u32).to_le_bytes())?;
-                writer.write_all(&(*src2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *target, "SHR target register")?;
+                write_usize_as_u32(writer, *src1, "SHR left register")?;
+                write_usize_as_u32(writer, *src2, "SHR right register")?;
             }
             CompiledInstruction::JMP(label) => {
                 writer.write_all(&[ReducedOpcode::JMP as u8])?;
-                let label_bytes = label.as_bytes();
-                let label_len = label_bytes.len() as u16;
-                writer.write_all(&label_len.to_le_bytes())?;
-                writer.write_all(label_bytes)?;
+                write_len_prefixed_str_u16(writer, label, "JMP label length")?;
             }
             CompiledInstruction::JMPEQ(label) => {
                 writer.write_all(&[ReducedOpcode::JMPEQ as u8])?;
-                let label_bytes = label.as_bytes();
-                let label_len = label_bytes.len() as u16;
-                writer.write_all(&label_len.to_le_bytes())?;
-                writer.write_all(label_bytes)?;
+                write_len_prefixed_str_u16(writer, label, "JMPEQ label length")?;
             }
             CompiledInstruction::JMPNEQ(label) => {
                 writer.write_all(&[ReducedOpcode::JMPNEQ as u8])?;
-                let label_bytes = label.as_bytes();
-                let label_len = label_bytes.len() as u16;
-                writer.write_all(&label_len.to_le_bytes())?;
-                writer.write_all(label_bytes)?;
+                write_len_prefixed_str_u16(writer, label, "JMPNEQ label length")?;
             }
             CompiledInstruction::JMPLT(label) => {
                 writer.write_all(&[ReducedOpcode::JMPLT as u8])?;
-                let label_bytes = label.as_bytes();
-                let label_len = label_bytes.len() as u16;
-                writer.write_all(&label_len.to_le_bytes())?;
-                writer.write_all(label_bytes)?;
+                write_len_prefixed_str_u16(writer, label, "JMPLT label length")?;
             }
             CompiledInstruction::JMPGT(label) => {
                 writer.write_all(&[ReducedOpcode::JMPGT as u8])?;
-                let label_bytes = label.as_bytes();
-                let label_len = label_bytes.len() as u16;
-                writer.write_all(&label_len.to_le_bytes())?;
-                writer.write_all(label_bytes)?;
+                write_len_prefixed_str_u16(writer, label, "JMPGT label length")?;
             }
             CompiledInstruction::CALL(function_name) => {
                 writer.write_all(&[ReducedOpcode::CALL as u8])?;
-                let name_bytes = function_name.as_bytes();
-                let name_len = name_bytes.len() as u16;
-                writer.write_all(&name_len.to_le_bytes())?;
-                writer.write_all(name_bytes)?;
+                write_len_prefixed_str_u16(writer, function_name, "CALL function name length")?;
             }
             CompiledInstruction::RET(reg) => {
                 writer.write_all(&[ReducedOpcode::RET as u8])?;
-                writer.write_all(&(*reg as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *reg, "RET register")?;
             }
             CompiledInstruction::PUSHARG(reg) => {
                 writer.write_all(&[ReducedOpcode::PUSHARG as u8])?;
-                writer.write_all(&(*reg as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *reg, "PUSHARG register")?;
             }
             CompiledInstruction::CMP(reg1, reg2) => {
                 writer.write_all(&[ReducedOpcode::CMP as u8])?;
-                writer.write_all(&(*reg1 as u32).to_le_bytes())?;
-                writer.write_all(&(*reg2 as u32).to_le_bytes())?;
+                write_usize_as_u32(writer, *reg1, "CMP left register")?;
+                write_usize_as_u32(writer, *reg2, "CMP right register")?;
             }
         }
 
@@ -717,29 +836,28 @@ impl CompiledBinary {
             return Err(BinaryError::InvalidMagicBytes);
         }
 
-        let mut version_bytes = [0u8; 2];
-        reader.read_exact(&mut version_bytes)?;
-        let version = u16::from_le_bytes(version_bytes);
+        let version = read_u16(reader)?;
         if version > FORMAT_VERSION {
             return Err(BinaryError::UnsupportedVersion(version));
         }
 
         // Read constant pool
-        let mut count_bytes = [0u8; 4];
-        reader.read_exact(&mut count_bytes)?;
-        let constant_count = u32::from_le_bytes(count_bytes) as usize;
+        let constant_count =
+            read_u32_len_bounded(reader, "constant count", MAX_BINARY_COLLECTION_LEN)?;
 
-        let mut constants = Vec::with_capacity(constant_count);
+        let mut constants = Vec::new();
+        reserve_vec(&mut constants, constant_count, "constant count")?;
         for _ in 0..constant_count {
             let value = Self::deserialize_value(reader)?;
             constants.push(value);
         }
 
         // Read functions
-        reader.read_exact(&mut count_bytes)?;
-        let function_count = u32::from_le_bytes(count_bytes) as usize;
+        let function_count =
+            read_u32_len_bounded(reader, "function count", MAX_BINARY_COLLECTION_LEN)?;
 
-        let mut functions = Vec::with_capacity(function_count);
+        let mut functions = Vec::new();
+        reserve_vec(&mut functions, function_count, "function count")?;
         for _ in 0..function_count {
             let function = Self::deserialize_function(reader)?;
             functions.push(function);
@@ -785,7 +903,7 @@ impl CompiledBinary {
             4 => {
                 let mut byte = [0u8; 1];
                 reader.read_exact(&mut byte)?;
-                Ok(Value::I8(byte[0] as i8))
+                Ok(Value::I8(i8::from_le_bytes(byte)))
             }
             5 => {
                 let mut byte = [0u8; 1];
@@ -818,16 +936,11 @@ impl CompiledBinary {
                 Ok(Value::Bool(byte[0] != 0))
             }
             11 => {
-                let mut len_bytes = [0u8; 4];
-                reader.read_exact(&mut len_bytes)?;
-                let len = u32::from_le_bytes(len_bytes) as usize;
-
-                let mut string_bytes = vec![0u8; len];
-                reader.read_exact(&mut string_bytes)?;
-
-                let string = String::from_utf8(string_bytes)
-                    .map_err(|_| BinaryError::InvalidData("Invalid UTF-8 in string".to_string()))?;
-
+                let string = read_len_prefixed_string_u32(
+                    reader,
+                    "string length",
+                    "Invalid UTF-8 in string",
+                )?;
                 Ok(Value::String(string))
             }
             _ => Err(BinaryError::InvalidData(format!(
@@ -848,108 +961,86 @@ impl CompiledBinary {
     /// A result containing the deserialized function or an error
     fn deserialize_function<R: Read>(reader: &mut R) -> BinaryResult<CompiledFunction> {
         // Read function name
-        let mut name_len_bytes = [0u8; 2];
-        reader.read_exact(&mut name_len_bytes)?;
-        let name_len = u16::from_le_bytes(name_len_bytes) as usize;
-
-        let mut name_bytes = vec![0u8; name_len];
-        reader.read_exact(&mut name_bytes)?;
-        let name = String::from_utf8(name_bytes)
-            .map_err(|_| BinaryError::InvalidData("Invalid UTF-8 in function name".to_string()))?;
+        let name = read_len_prefixed_string_u16(
+            reader,
+            "function name length",
+            "Invalid UTF-8 in function name",
+        )?;
 
         // Read register count
-        let mut reg_count_bytes = [0u8; 2];
-        reader.read_exact(&mut reg_count_bytes)?;
-        let register_count = u16::from_le_bytes(reg_count_bytes) as usize;
+        let register_count = usize::from(read_u16(reader)?);
 
         // Read parameters
-        let mut param_count_bytes = [0u8; 2];
-        reader.read_exact(&mut param_count_bytes)?;
-        let param_count = u16::from_le_bytes(param_count_bytes) as usize;
+        let param_count = usize::from(read_u16(reader)?);
 
-        let mut parameters = Vec::with_capacity(param_count);
+        let mut parameters = Vec::new();
+        reserve_vec(&mut parameters, param_count, "parameter count")?;
         for _ in 0..param_count {
-            let mut param_len_bytes = [0u8; 2];
-            reader.read_exact(&mut param_len_bytes)?;
-            let param_len = u16::from_le_bytes(param_len_bytes) as usize;
-
-            let mut param_bytes = vec![0u8; param_len];
-            reader.read_exact(&mut param_bytes)?;
-            let param = String::from_utf8(param_bytes).map_err(|_| {
-                BinaryError::InvalidData("Invalid UTF-8 in parameter name".to_string())
-            })?;
-
+            let param = read_len_prefixed_string_u16(
+                reader,
+                "parameter name length",
+                "Invalid UTF-8 in parameter name",
+            )?;
             parameters.push(param);
         }
 
         // Read upvalues
-        let mut upvalue_count_bytes = [0u8; 2];
-        reader.read_exact(&mut upvalue_count_bytes)?;
-        let upvalue_count = u16::from_le_bytes(upvalue_count_bytes) as usize;
+        let upvalue_count = usize::from(read_u16(reader)?);
 
-        let mut upvalues = Vec::with_capacity(upvalue_count);
+        let mut upvalues = Vec::new();
+        reserve_vec(&mut upvalues, upvalue_count, "upvalue count")?;
         for _ in 0..upvalue_count {
-            let mut upvalue_len_bytes = [0u8; 2];
-            reader.read_exact(&mut upvalue_len_bytes)?;
-            let upvalue_len = u16::from_le_bytes(upvalue_len_bytes) as usize;
-
-            let mut upvalue_bytes = vec![0u8; upvalue_len];
-            reader.read_exact(&mut upvalue_bytes)?;
-            let upvalue = String::from_utf8(upvalue_bytes).map_err(|_| {
-                BinaryError::InvalidData("Invalid UTF-8 in upvalue name".to_string())
-            })?;
-
+            let upvalue = read_len_prefixed_string_u16(
+                reader,
+                "upvalue name length",
+                "Invalid UTF-8 in upvalue name",
+            )?;
             upvalues.push(upvalue);
         }
 
         // Read parent function name (if any)
         let mut has_parent_byte = [0u8; 1];
         reader.read_exact(&mut has_parent_byte)?;
-        let parent = if has_parent_byte[0] == 1 {
-            let mut parent_len_bytes = [0u8; 2];
-            reader.read_exact(&mut parent_len_bytes)?;
-            let parent_len = u16::from_le_bytes(parent_len_bytes) as usize;
-
-            let mut parent_bytes = vec![0u8; parent_len];
-            reader.read_exact(&mut parent_bytes)?;
-            let parent = String::from_utf8(parent_bytes).map_err(|_| {
-                BinaryError::InvalidData("Invalid UTF-8 in parent function name".to_string())
-            })?;
-
-            Some(parent)
-        } else {
-            None
+        let parent = match has_parent_byte[0] {
+            0 => None,
+            1 => Some(read_len_prefixed_string_u16(
+                reader,
+                "parent function name length",
+                "Invalid UTF-8 in parent function name",
+            )?),
+            other => {
+                return Err(invalid_data(format!(
+                    "Invalid parent presence flag: {other}"
+                )));
+            }
         };
 
         // Read labels
-        let mut label_count_bytes = [0u8; 2];
-        reader.read_exact(&mut label_count_bytes)?;
-        let label_count = u16::from_le_bytes(label_count_bytes) as usize;
+        let label_count = usize::from(read_u16(reader)?);
 
-        let mut labels = HashMap::with_capacity(label_count);
+        let mut labels = HashMap::new();
+        labels.try_reserve(label_count).map_err(|err| {
+            invalid_data(format!(
+                "label count {label_count} could not be allocated: {err}"
+            ))
+        })?;
         for _ in 0..label_count {
-            let mut label_len_bytes = [0u8; 2];
-            reader.read_exact(&mut label_len_bytes)?;
-            let label_len = u16::from_le_bytes(label_len_bytes) as usize;
-
-            let mut label_bytes = vec![0u8; label_len];
-            reader.read_exact(&mut label_bytes)?;
-            let label = String::from_utf8(label_bytes)
-                .map_err(|_| BinaryError::InvalidData("Invalid UTF-8 in label name".to_string()))?;
-
-            let mut offset_bytes = [0u8; 4];
-            reader.read_exact(&mut offset_bytes)?;
-            let offset = u32::from_le_bytes(offset_bytes) as usize;
+            let label = read_len_prefixed_string_u16(
+                reader,
+                "label name length",
+                "Invalid UTF-8 in label name",
+            )?;
+            let offset = read_usize_u32(reader, "label offset")?;
 
             labels.insert(label, offset);
         }
 
         // Read instructions
-        let mut instruction_count_bytes = [0u8; 4];
-        reader.read_exact(&mut instruction_count_bytes)?;
-        let instruction_count = u32::from_le_bytes(instruction_count_bytes) as usize;
+        let instruction_count =
+            read_u32_len_bounded(reader, "instruction count", MAX_BINARY_COLLECTION_LEN)?;
 
-        let mut instructions = Vec::with_capacity(instruction_count);
+        let mut instructions = Vec::new();
+        reserve_vec(&mut instructions, instruction_count, "instruction count")?;
         for _ in 0..instruction_count {
             let instruction = Self::deserialize_instruction(reader)?;
             instructions.push(instruction);
@@ -982,9 +1073,7 @@ impl CompiledBinary {
 
         match opcode {
             x if x == ReducedOpcode::LD as u8 => {
-                let mut reg_bytes = [0u8; 4];
-                reader.read_exact(&mut reg_bytes)?;
-                let reg = u32::from_le_bytes(reg_bytes) as usize;
+                let reg = read_usize_u32(reader, "LD register")?;
 
                 let mut offset_bytes = [0u8; 4];
                 reader.read_exact(&mut offset_bytes)?;
@@ -993,283 +1082,160 @@ impl CompiledBinary {
                 Ok(CompiledInstruction::LD(reg, offset))
             }
             x if x == ReducedOpcode::LDI as u8 => {
-                let mut reg_bytes = [0u8; 4];
-                reader.read_exact(&mut reg_bytes)?;
-                let reg = u32::from_le_bytes(reg_bytes) as usize;
-
-                let mut const_idx_bytes = [0u8; 4];
-                reader.read_exact(&mut const_idx_bytes)?;
-                let const_idx = u32::from_le_bytes(const_idx_bytes) as usize;
+                let reg = read_usize_u32(reader, "LDI register")?;
+                let const_idx = read_usize_u32(reader, "LDI constant index")?;
 
                 Ok(CompiledInstruction::LDI(reg, const_idx))
             }
             x if x == ReducedOpcode::MOV as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut source_bytes = [0u8; 4];
-                reader.read_exact(&mut source_bytes)?;
-                let source = u32::from_le_bytes(source_bytes) as usize;
+                let target = read_usize_u32(reader, "MOV target register")?;
+                let source = read_usize_u32(reader, "MOV source register")?;
 
                 Ok(CompiledInstruction::MOV(target, source))
             }
             x if x == ReducedOpcode::ADD as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut src1_bytes = [0u8; 4];
-                reader.read_exact(&mut src1_bytes)?;
-                let src1 = u32::from_le_bytes(src1_bytes) as usize;
-
-                let mut src2_bytes = [0u8; 4];
-                reader.read_exact(&mut src2_bytes)?;
-                let src2 = u32::from_le_bytes(src2_bytes) as usize;
+                let target = read_usize_u32(reader, "ADD target register")?;
+                let src1 = read_usize_u32(reader, "ADD left register")?;
+                let src2 = read_usize_u32(reader, "ADD right register")?;
 
                 Ok(CompiledInstruction::ADD(target, src1, src2))
             }
             x if x == ReducedOpcode::SUB as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut src1_bytes = [0u8; 4];
-                reader.read_exact(&mut src1_bytes)?;
-                let src1 = u32::from_le_bytes(src1_bytes) as usize;
-
-                let mut src2_bytes = [0u8; 4];
-                reader.read_exact(&mut src2_bytes)?;
-                let src2 = u32::from_le_bytes(src2_bytes) as usize;
+                let target = read_usize_u32(reader, "SUB target register")?;
+                let src1 = read_usize_u32(reader, "SUB left register")?;
+                let src2 = read_usize_u32(reader, "SUB right register")?;
 
                 Ok(CompiledInstruction::SUB(target, src1, src2))
             }
             x if x == ReducedOpcode::MUL as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut src1_bytes = [0u8; 4];
-                reader.read_exact(&mut src1_bytes)?;
-                let src1 = u32::from_le_bytes(src1_bytes) as usize;
-
-                let mut src2_bytes = [0u8; 4];
-                reader.read_exact(&mut src2_bytes)?;
-                let src2 = u32::from_le_bytes(src2_bytes) as usize;
+                let target = read_usize_u32(reader, "MUL target register")?;
+                let src1 = read_usize_u32(reader, "MUL left register")?;
+                let src2 = read_usize_u32(reader, "MUL right register")?;
 
                 Ok(CompiledInstruction::MUL(target, src1, src2))
             }
             x if x == ReducedOpcode::DIV as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut src1_bytes = [0u8; 4];
-                reader.read_exact(&mut src1_bytes)?;
-                let src1 = u32::from_le_bytes(src1_bytes) as usize;
-
-                let mut src2_bytes = [0u8; 4];
-                reader.read_exact(&mut src2_bytes)?;
-                let src2 = u32::from_le_bytes(src2_bytes) as usize;
+                let target = read_usize_u32(reader, "DIV target register")?;
+                let src1 = read_usize_u32(reader, "DIV left register")?;
+                let src2 = read_usize_u32(reader, "DIV right register")?;
 
                 Ok(CompiledInstruction::DIV(target, src1, src2))
             }
             x if x == ReducedOpcode::MOD as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut src1_bytes = [0u8; 4];
-                reader.read_exact(&mut src1_bytes)?;
-                let src1 = u32::from_le_bytes(src1_bytes) as usize;
-
-                let mut src2_bytes = [0u8; 4];
-                reader.read_exact(&mut src2_bytes)?;
-                let src2 = u32::from_le_bytes(src2_bytes) as usize;
+                let target = read_usize_u32(reader, "MOD target register")?;
+                let src1 = read_usize_u32(reader, "MOD left register")?;
+                let src2 = read_usize_u32(reader, "MOD right register")?;
 
                 Ok(CompiledInstruction::MOD(target, src1, src2))
             }
             x if x == ReducedOpcode::AND as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut src1_bytes = [0u8; 4];
-                reader.read_exact(&mut src1_bytes)?;
-                let src1 = u32::from_le_bytes(src1_bytes) as usize;
-
-                let mut src2_bytes = [0u8; 4];
-                reader.read_exact(&mut src2_bytes)?;
-                let src2 = u32::from_le_bytes(src2_bytes) as usize;
+                let target = read_usize_u32(reader, "AND target register")?;
+                let src1 = read_usize_u32(reader, "AND left register")?;
+                let src2 = read_usize_u32(reader, "AND right register")?;
 
                 Ok(CompiledInstruction::AND(target, src1, src2))
             }
             x if x == ReducedOpcode::OR as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut src1_bytes = [0u8; 4];
-                reader.read_exact(&mut src1_bytes)?;
-                let src1 = u32::from_le_bytes(src1_bytes) as usize;
-
-                let mut src2_bytes = [0u8; 4];
-                reader.read_exact(&mut src2_bytes)?;
-                let src2 = u32::from_le_bytes(src2_bytes) as usize;
+                let target = read_usize_u32(reader, "OR target register")?;
+                let src1 = read_usize_u32(reader, "OR left register")?;
+                let src2 = read_usize_u32(reader, "OR right register")?;
 
                 Ok(CompiledInstruction::OR(target, src1, src2))
             }
             x if x == ReducedOpcode::XOR as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut src1_bytes = [0u8; 4];
-                reader.read_exact(&mut src1_bytes)?;
-                let src1 = u32::from_le_bytes(src1_bytes) as usize;
-
-                let mut src2_bytes = [0u8; 4];
-                reader.read_exact(&mut src2_bytes)?;
-                let src2 = u32::from_le_bytes(src2_bytes) as usize;
+                let target = read_usize_u32(reader, "XOR target register")?;
+                let src1 = read_usize_u32(reader, "XOR left register")?;
+                let src2 = read_usize_u32(reader, "XOR right register")?;
 
                 Ok(CompiledInstruction::XOR(target, src1, src2))
             }
             x if x == ReducedOpcode::NOT as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut source_bytes = [0u8; 4];
-                reader.read_exact(&mut source_bytes)?;
-                let source = u32::from_le_bytes(source_bytes) as usize;
+                let target = read_usize_u32(reader, "NOT target register")?;
+                let source = read_usize_u32(reader, "NOT source register")?;
 
                 Ok(CompiledInstruction::NOT(target, source))
             }
             x if x == ReducedOpcode::SHL as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut src1_bytes = [0u8; 4];
-                reader.read_exact(&mut src1_bytes)?;
-                let src1 = u32::from_le_bytes(src1_bytes) as usize;
-
-                let mut src2_bytes = [0u8; 4];
-                reader.read_exact(&mut src2_bytes)?;
-                let src2 = u32::from_le_bytes(src2_bytes) as usize;
+                let target = read_usize_u32(reader, "SHL target register")?;
+                let src1 = read_usize_u32(reader, "SHL left register")?;
+                let src2 = read_usize_u32(reader, "SHL right register")?;
 
                 Ok(CompiledInstruction::SHL(target, src1, src2))
             }
             x if x == ReducedOpcode::SHR as u8 => {
-                let mut target_bytes = [0u8; 4];
-                reader.read_exact(&mut target_bytes)?;
-                let target = u32::from_le_bytes(target_bytes) as usize;
-
-                let mut src1_bytes = [0u8; 4];
-                reader.read_exact(&mut src1_bytes)?;
-                let src1 = u32::from_le_bytes(src1_bytes) as usize;
-
-                let mut src2_bytes = [0u8; 4];
-                reader.read_exact(&mut src2_bytes)?;
-                let src2 = u32::from_le_bytes(src2_bytes) as usize;
+                let target = read_usize_u32(reader, "SHR target register")?;
+                let src1 = read_usize_u32(reader, "SHR left register")?;
+                let src2 = read_usize_u32(reader, "SHR right register")?;
 
                 Ok(CompiledInstruction::SHR(target, src1, src2))
             }
             x if x == ReducedOpcode::JMP as u8 => {
-                let mut label_len_bytes = [0u8; 2];
-                reader.read_exact(&mut label_len_bytes)?;
-                let label_len = u16::from_le_bytes(label_len_bytes) as usize;
-
-                let mut label_bytes = vec![0u8; label_len];
-                reader.read_exact(&mut label_bytes)?;
-                let label = String::from_utf8(label_bytes)
-                    .map_err(|_| BinaryError::InvalidData("Invalid UTF-8 in label".to_string()))?;
+                let label = read_len_prefixed_string_u16(
+                    reader,
+                    "JMP label length",
+                    "Invalid UTF-8 in label",
+                )?;
 
                 Ok(CompiledInstruction::JMP(label))
             }
             x if x == ReducedOpcode::JMPEQ as u8 => {
-                let mut label_len_bytes = [0u8; 2];
-                reader.read_exact(&mut label_len_bytes)?;
-                let label_len = u16::from_le_bytes(label_len_bytes) as usize;
-
-                let mut label_bytes = vec![0u8; label_len];
-                reader.read_exact(&mut label_bytes)?;
-                let label = String::from_utf8(label_bytes)
-                    .map_err(|_| BinaryError::InvalidData("Invalid UTF-8 in label".to_string()))?;
+                let label = read_len_prefixed_string_u16(
+                    reader,
+                    "JMPEQ label length",
+                    "Invalid UTF-8 in label",
+                )?;
 
                 Ok(CompiledInstruction::JMPEQ(label))
             }
             x if x == ReducedOpcode::JMPNEQ as u8 => {
-                let mut label_len_bytes = [0u8; 2];
-                reader.read_exact(&mut label_len_bytes)?;
-                let label_len = u16::from_le_bytes(label_len_bytes) as usize;
-
-                let mut label_bytes = vec![0u8; label_len];
-                reader.read_exact(&mut label_bytes)?;
-                let label = String::from_utf8(label_bytes)
-                    .map_err(|_| BinaryError::InvalidData("Invalid UTF-8 in label".to_string()))?;
+                let label = read_len_prefixed_string_u16(
+                    reader,
+                    "JMPNEQ label length",
+                    "Invalid UTF-8 in label",
+                )?;
 
                 Ok(CompiledInstruction::JMPNEQ(label))
             }
             x if x == ReducedOpcode::JMPLT as u8 => {
-                let mut label_len_bytes = [0u8; 2];
-                reader.read_exact(&mut label_len_bytes)?;
-                let label_len = u16::from_le_bytes(label_len_bytes) as usize;
-
-                let mut label_bytes = vec![0u8; label_len];
-                reader.read_exact(&mut label_bytes)?;
-                let label = String::from_utf8(label_bytes)
-                    .map_err(|_| BinaryError::InvalidData("Invalid UTF-8 in label".to_string()))?;
+                let label = read_len_prefixed_string_u16(
+                    reader,
+                    "JMPLT label length",
+                    "Invalid UTF-8 in label",
+                )?;
 
                 Ok(CompiledInstruction::JMPLT(label))
             }
             x if x == ReducedOpcode::JMPGT as u8 => {
-                let mut label_len_bytes = [0u8; 2];
-                reader.read_exact(&mut label_len_bytes)?;
-                let label_len = u16::from_le_bytes(label_len_bytes) as usize;
-
-                let mut label_bytes = vec![0u8; label_len];
-                reader.read_exact(&mut label_bytes)?;
-                let label = String::from_utf8(label_bytes)
-                    .map_err(|_| BinaryError::InvalidData("Invalid UTF-8 in label".to_string()))?;
+                let label = read_len_prefixed_string_u16(
+                    reader,
+                    "JMPGT label length",
+                    "Invalid UTF-8 in label",
+                )?;
 
                 Ok(CompiledInstruction::JMPGT(label))
             }
             x if x == ReducedOpcode::CALL as u8 => {
-                let mut name_len_bytes = [0u8; 2];
-                reader.read_exact(&mut name_len_bytes)?;
-                let name_len = u16::from_le_bytes(name_len_bytes) as usize;
-
-                let mut name_bytes = vec![0u8; name_len];
-                reader.read_exact(&mut name_bytes)?;
-                let function_name = String::from_utf8(name_bytes).map_err(|_| {
-                    BinaryError::InvalidData("Invalid UTF-8 in function name".to_string())
-                })?;
+                let function_name = read_len_prefixed_string_u16(
+                    reader,
+                    "CALL function name length",
+                    "Invalid UTF-8 in function name",
+                )?;
 
                 Ok(CompiledInstruction::CALL(function_name))
             }
             x if x == ReducedOpcode::RET as u8 => {
-                let mut reg_bytes = [0u8; 4];
-                reader.read_exact(&mut reg_bytes)?;
-                let reg = u32::from_le_bytes(reg_bytes) as usize;
+                let reg = read_usize_u32(reader, "RET register")?;
 
                 Ok(CompiledInstruction::RET(reg))
             }
             x if x == ReducedOpcode::PUSHARG as u8 => {
-                let mut reg_bytes = [0u8; 4];
-                reader.read_exact(&mut reg_bytes)?;
-                let reg = u32::from_le_bytes(reg_bytes) as usize;
+                let reg = read_usize_u32(reader, "PUSHARG register")?;
 
                 Ok(CompiledInstruction::PUSHARG(reg))
             }
             x if x == ReducedOpcode::CMP as u8 => {
-                let mut reg1_bytes = [0u8; 4];
-                reader.read_exact(&mut reg1_bytes)?;
-                let reg1 = u32::from_le_bytes(reg1_bytes) as usize;
-
-                let mut reg2_bytes = [0u8; 4];
-                reader.read_exact(&mut reg2_bytes)?;
-                let reg2 = u32::from_le_bytes(reg2_bytes) as usize;
+                let reg1 = read_usize_u32(reader, "CMP left register")?;
+                let reg2 = read_usize_u32(reader, "CMP right register")?;
 
                 Ok(CompiledInstruction::CMP(reg1, reg2))
             }
@@ -1329,6 +1295,14 @@ pub mod utils {
         binary.to_vm_functions()
     }
 
+    /// Converts a compiled binary to executable VM functions.
+    ///
+    /// Returns an error when a binary contains conflicting duplicate function
+    /// names. Identical duplicate function records are deduplicated.
+    pub fn try_to_vm_functions(binary: &CompiledBinary) -> BinaryResult<Vec<VMFunction>> {
+        binary.try_to_vm_functions()
+    }
+
     /// Creates a compiled binary from VM functions
     ///
     /// # Arguments
@@ -1347,6 +1321,36 @@ pub mod utils {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn assert_invalid_data<T>(result: BinaryResult<T>, expected: &str) {
+        match result {
+            Err(BinaryError::InvalidData(message)) => {
+                assert!(
+                    message.contains(expected),
+                    "expected error containing {expected:?}, got {message:?}"
+                );
+            }
+            Err(other) => panic!("expected InvalidData error, got {other:?}"),
+            Ok(_) => panic!("expected operation to fail"),
+        }
+    }
+
+    fn binary_header() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC_BYTES);
+        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes
+    }
+
+    fn append_empty_function_prefix(bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(b"main");
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // register count
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // parameters
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // upvalues
+        bytes.push(0); // no parent
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // labels
+    }
 
     #[test]
     fn test_create_and_convert() {
@@ -1377,12 +1381,12 @@ mod tests {
 
         // Check the VM functions
         assert_eq!(vm_functions.len(), 1);
-        assert_eq!(vm_functions[0].name, "test_function");
-        assert_eq!(vm_functions[0].register_count, 2);
-        assert_eq!(vm_functions[0].instructions.len(), 2);
+        assert_eq!(vm_functions[0].name(), "test_function");
+        assert_eq!(vm_functions[0].register_count(), 2);
+        assert_eq!(vm_functions[0].instructions().len(), 2);
 
         // Check that the instructions were converted correctly
-        match &vm_functions[0].instructions[0] {
+        match &vm_functions[0].instructions()[0] {
             Instruction::LDI(reg, value) => {
                 assert_eq!(*reg, 0);
                 assert_eq!(*value, Value::I64(42));
@@ -1390,12 +1394,186 @@ mod tests {
             _ => panic!("Expected LDI instruction"),
         }
 
-        match &vm_functions[0].instructions[1] {
+        match &vm_functions[0].instructions()[1] {
             Instruction::RET(reg) => {
                 assert_eq!(*reg, 0);
             }
             _ => panic!("Expected RET instruction"),
         }
+    }
+
+    #[test]
+    fn from_vm_functions_assigns_constant_indices_while_converting() {
+        let function = VMFunction::new(
+            "main".to_string(),
+            vec![],
+            vec![],
+            None,
+            2,
+            vec![
+                Instruction::LDI(0, Value::I64(7)),
+                Instruction::LDI(1, Value::I64(7)),
+                Instruction::LDI(0, Value::I64(9)),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        );
+
+        let binary = CompiledBinary::from_vm_functions(&[function]);
+
+        assert_eq!(binary.constants, vec![Value::I64(7), Value::I64(9)]);
+        assert_eq!(
+            binary.functions[0].instructions,
+            vec![
+                CompiledInstruction::LDI(0, 0),
+                CompiledInstruction::LDI(1, 0),
+                CompiledInstruction::LDI(0, 1),
+                CompiledInstruction::RET(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn try_to_vm_functions_deduplicates_identical_function_records() {
+        let function = VMFunction::new(
+            "main".to_string(),
+            vec![],
+            vec![],
+            None,
+            1,
+            vec![Instruction::LDI(0, Value::I64(42)), Instruction::RET(0)],
+            HashMap::new(),
+        );
+        let mut binary = CompiledBinary::from_vm_functions(&[function]);
+        binary.functions.push(binary.functions[0].clone());
+
+        assert_eq!(
+            binary.to_vm_functions().len(),
+            2,
+            "legacy conversion preserves raw function table entries"
+        );
+        let vm_functions = binary
+            .try_to_vm_functions()
+            .expect("identical duplicate functions should be accepted");
+
+        assert_eq!(vm_functions.len(), 1);
+        assert_eq!(vm_functions[0].name(), "main");
+    }
+
+    #[test]
+    fn try_to_vm_functions_rejects_conflicting_duplicate_names() {
+        let first = VMFunction::new(
+            "main".to_string(),
+            vec![],
+            vec![],
+            None,
+            1,
+            vec![Instruction::LDI(0, Value::I64(1)), Instruction::RET(0)],
+            HashMap::new(),
+        );
+        let second = VMFunction::new(
+            "main".to_string(),
+            vec![],
+            vec![],
+            None,
+            1,
+            vec![Instruction::LDI(0, Value::I64(2)), Instruction::RET(0)],
+            HashMap::new(),
+        );
+        let binary = CompiledBinary::from_vm_functions(&[first, second]);
+
+        assert_invalid_data(
+            binary.try_to_vm_functions(),
+            "duplicate function 'main' has conflicting definitions",
+        );
+    }
+
+    #[test]
+    fn try_to_vm_functions_rejects_invalid_constant_indices() {
+        let binary = CompiledBinary {
+            version: FORMAT_VERSION,
+            constants: vec![],
+            functions: vec![CompiledFunction {
+                name: "main".to_string(),
+                register_count: 1,
+                parameters: vec![],
+                upvalues: vec![],
+                parent: None,
+                labels: HashMap::new(),
+                instructions: vec![CompiledInstruction::LDI(0, 0)],
+            }],
+        };
+
+        assert_invalid_data(
+            binary.try_to_vm_functions(),
+            "Function main instruction 0 references constant 0 but constant pool has 0 values",
+        );
+    }
+
+    #[test]
+    fn try_to_vm_functions_rejects_unrepresentable_frame_register_count() {
+        let binary = CompiledBinary {
+            version: FORMAT_VERSION,
+            constants: vec![Value::I64(1)],
+            functions: vec![CompiledFunction {
+                name: "main".to_string(),
+                register_count: 1,
+                parameters: vec![],
+                upvalues: vec![],
+                parent: None,
+                labels: HashMap::new(),
+                instructions: vec![CompiledInstruction::LDI(usize::MAX, 0)],
+            }],
+        };
+
+        assert_invalid_data(
+            binary.try_to_vm_functions(),
+            "Function main references register",
+        );
+        assert_invalid_data(
+            binary.try_to_vm_functions(),
+            "cannot fit in a frame register count",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "compiled binary contains invalid function data")]
+    fn to_vm_functions_panics_on_invalid_constant_indices() {
+        let binary = CompiledBinary {
+            version: FORMAT_VERSION,
+            constants: vec![],
+            functions: vec![CompiledFunction {
+                name: "main".to_string(),
+                register_count: 1,
+                parameters: vec![],
+                upvalues: vec![],
+                parent: None,
+                labels: HashMap::new(),
+                instructions: vec![CompiledInstruction::LDI(0, 0)],
+            }],
+        };
+
+        let _ = binary.to_vm_functions();
+    }
+
+    #[test]
+    #[should_panic(expected = "compiled binary contains invalid function data")]
+    fn to_vm_functions_panics_on_invalid_frame_register_count() {
+        let binary = CompiledBinary {
+            version: FORMAT_VERSION,
+            constants: vec![Value::I64(1)],
+            functions: vec![CompiledFunction {
+                name: "main".to_string(),
+                register_count: 1,
+                parameters: vec![],
+                upvalues: vec![],
+                parent: None,
+                labels: HashMap::new(),
+                instructions: vec![CompiledInstruction::LDI(usize::MAX, 0)],
+            }],
+        };
+
+        let _ = binary.to_vm_functions();
     }
 
     #[test]
@@ -1434,9 +1612,204 @@ mod tests {
 
         // Check the VM functions
         assert_eq!(vm_functions.len(), 1);
-        assert_eq!(vm_functions[0].name, "test_function");
-        assert_eq!(vm_functions[0].register_count, 2);
-        assert_eq!(vm_functions[0].instructions.len(), 2);
+        assert_eq!(vm_functions[0].name(), "test_function");
+        assert_eq!(vm_functions[0].register_count(), 2);
+        assert_eq!(vm_functions[0].instructions().len(), 2);
+    }
+
+    #[test]
+    fn serialize_deserialize_preserves_negative_i8_constants() {
+        let function = VMFunction::new(
+            "signed_byte".to_string(),
+            vec![],
+            vec![],
+            None,
+            1,
+            vec![Instruction::LDI(0, Value::I8(-7)), Instruction::RET(0)],
+            HashMap::new(),
+        );
+        let binary = CompiledBinary::from_vm_functions(&[function]);
+
+        let mut buffer = Vec::new();
+        binary.serialize(&mut buffer).unwrap();
+
+        let deserialized = CompiledBinary::deserialize(&mut Cursor::new(&buffer)).unwrap();
+        let vm_functions = deserialized.to_vm_functions();
+
+        match &vm_functions[0].instructions()[0] {
+            Instruction::LDI(reg, value) => {
+                assert_eq!(*reg, 0);
+                assert_eq!(*value, Value::I8(-7));
+            }
+            other => panic!("Expected LDI instruction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serialize_rejects_function_metadata_that_exceeds_binary_format() {
+        let binary = CompiledBinary {
+            version: FORMAT_VERSION,
+            constants: vec![],
+            functions: vec![CompiledFunction {
+                name: "oversized_register_frame".to_string(),
+                register_count: usize::from(u16::MAX) + 1,
+                parameters: vec![],
+                upvalues: vec![],
+                parent: None,
+                labels: HashMap::new(),
+                instructions: vec![],
+            }],
+        };
+
+        let mut buffer = Vec::new();
+        assert_invalid_data(binary.serialize(&mut buffer), "register count");
+    }
+
+    #[test]
+    fn serialize_rejects_u16_string_lengths_that_exceed_binary_format() {
+        let binary = CompiledBinary {
+            version: FORMAT_VERSION,
+            constants: vec![],
+            functions: vec![CompiledFunction {
+                name: "x".repeat(usize::from(u16::MAX) + 1),
+                register_count: 0,
+                parameters: vec![],
+                upvalues: vec![],
+                parent: None,
+                labels: HashMap::new(),
+                instructions: vec![],
+            }],
+        };
+
+        let mut buffer = Vec::new();
+        assert_invalid_data(binary.serialize(&mut buffer), "function name length");
+    }
+
+    #[test]
+    fn serialize_rejects_instruction_operands_that_exceed_binary_format() {
+        let oversized_operand = match usize::try_from(u64::from(u32::MAX) + 1) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let binary = CompiledBinary {
+            version: FORMAT_VERSION,
+            constants: vec![],
+            functions: vec![CompiledFunction {
+                name: "oversized_operand".to_string(),
+                register_count: 1,
+                parameters: vec![],
+                upvalues: vec![],
+                parent: None,
+                labels: HashMap::new(),
+                instructions: vec![CompiledInstruction::RET(oversized_operand)],
+            }],
+        };
+
+        let mut buffer = Vec::new();
+        assert_invalid_data(binary.serialize(&mut buffer), "RET register");
+    }
+
+    #[test]
+    fn serialize_rejects_label_offsets_that_exceed_binary_format() {
+        let oversized_offset = match usize::try_from(u64::from(u32::MAX) + 1) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let mut labels = HashMap::new();
+        labels.insert("too_far".to_string(), oversized_offset);
+
+        let binary = CompiledBinary {
+            version: FORMAT_VERSION,
+            constants: vec![],
+            functions: vec![CompiledFunction {
+                name: "oversized_label_offset".to_string(),
+                register_count: 0,
+                parameters: vec![],
+                upvalues: vec![],
+                parent: None,
+                labels,
+                instructions: vec![],
+            }],
+        };
+
+        let mut buffer = Vec::new();
+        assert_invalid_data(binary.serialize(&mut buffer), "label offset");
+    }
+
+    #[test]
+    fn deserialize_rejects_constant_count_above_supported_limit_before_allocation() {
+        let mut bytes = binary_header();
+        bytes.extend_from_slice(
+            &(u32::try_from(MAX_BINARY_COLLECTION_LEN).unwrap() + 1).to_le_bytes(),
+        );
+
+        assert_invalid_data(
+            CompiledBinary::deserialize(&mut Cursor::new(bytes)),
+            "constant count",
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_function_count_above_supported_limit_before_allocation() {
+        let mut bytes = binary_header();
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // constants
+        bytes.extend_from_slice(
+            &(u32::try_from(MAX_BINARY_COLLECTION_LEN).unwrap() + 1).to_le_bytes(),
+        );
+
+        assert_invalid_data(
+            CompiledBinary::deserialize(&mut Cursor::new(bytes)),
+            "function count",
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_string_payload_above_supported_limit_before_allocation() {
+        let mut bytes = binary_header();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // one constant
+        bytes.push(11); // Value::String
+        bytes.extend_from_slice(
+            &(u32::try_from(MAX_BINARY_STRING_BYTES).unwrap() + 1).to_le_bytes(),
+        );
+
+        assert_invalid_data(
+            CompiledBinary::deserialize(&mut Cursor::new(bytes)),
+            "string length",
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_instruction_count_above_supported_limit_before_allocation() {
+        let mut bytes = binary_header();
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // constants
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // functions
+        append_empty_function_prefix(&mut bytes);
+        bytes.extend_from_slice(
+            &(u32::try_from(MAX_BINARY_COLLECTION_LEN).unwrap() + 1).to_le_bytes(),
+        );
+
+        assert_invalid_data(
+            CompiledBinary::deserialize(&mut Cursor::new(bytes)),
+            "instruction count",
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_parent_presence_flag() {
+        let mut bytes = binary_header();
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // constants
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // functions
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(b"main");
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // register count
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // parameters
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // upvalues
+        bytes.push(2); // invalid parent flag
+
+        assert_invalid_data(
+            CompiledBinary::deserialize(&mut Cursor::new(bytes)),
+            "Invalid parent presence flag",
+        );
     }
 
     #[test]
@@ -1491,14 +1864,38 @@ mod tests {
 
         // Check the VM functions
         assert_eq!(vm_functions.len(), 1);
-        assert_eq!(vm_functions[0].name, "factorial");
-        assert_eq!(vm_functions[0].parameters, vec!["n".to_string()]);
-        assert_eq!(vm_functions[0].register_count, 4);
-        assert_eq!(vm_functions[0].instructions.len(), 10);
+        assert_eq!(vm_functions[0].name(), "factorial");
+        assert_eq!(vm_functions[0].parameters(), &["n".to_string()]);
+        assert_eq!(vm_functions[0].register_count(), 4);
+        assert_eq!(vm_functions[0].instructions().len(), 10);
 
         // Check that the labels were deserialized correctly
-        assert_eq!(vm_functions[0].labels.len(), 2);
-        assert_eq!(vm_functions[0].labels.get("loop_start"), Some(&2));
-        assert_eq!(vm_functions[0].labels.get("loop_end"), Some(&7));
+        assert_eq!(vm_functions[0].labels().len(), 2);
+        assert_eq!(vm_functions[0].labels().get("loop_start"), Some(&2));
+        assert_eq!(vm_functions[0].labels().get("loop_end"), Some(&7));
+    }
+
+    #[test]
+    fn to_vm_functions_expands_compact_secret_register_counts() {
+        let binary = CompiledBinary {
+            version: FORMAT_VERSION,
+            constants: vec![Value::I64(42)],
+            functions: vec![CompiledFunction {
+                name: "uses_secret_bank".to_string(),
+                register_count: 2,
+                parameters: vec![],
+                upvalues: vec![],
+                parent: None,
+                labels: HashMap::new(),
+                instructions: vec![
+                    CompiledInstruction::LDI(16, 0),
+                    CompiledInstruction::RET(16),
+                ],
+            }],
+        };
+
+        let vm_functions = binary.to_vm_functions();
+
+        assert_eq!(vm_functions[0].register_count(), 17);
     }
 }

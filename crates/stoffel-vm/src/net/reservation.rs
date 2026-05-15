@@ -48,10 +48,50 @@ pub struct RegistryState {
     pub masked_inputs: BTreeMap<u64, Vec<u8>>,
 }
 
+impl RegistryState {
+    fn validate(&self) -> Result<(), ReservationError> {
+        if self.next_index > self.capacity {
+            return Err(ReservationError::InvalidState(format!(
+                "next_index {} exceeds capacity {}",
+                self.next_index, self.capacity
+            )));
+        }
+
+        for index in self.slots.keys() {
+            if *index >= self.capacity {
+                return Err(ReservationError::InvalidState(format!(
+                    "slot index {index} exceeds capacity {}",
+                    self.capacity
+                )));
+            }
+        }
+
+        for index in self.masked_inputs.keys() {
+            if *index >= self.capacity {
+                return Err(ReservationError::InvalidState(format!(
+                    "masked input index {index} exceeds capacity {}",
+                    self.capacity
+                )));
+            }
+            if !self.slots.contains_key(index) {
+                return Err(ReservationError::InvalidState(format!(
+                    "masked input index {index} has no reservation slot"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReservationError {
     #[error("insufficient material: need {need}, have {have}")]
     InsufficientMaterial { need: u64, have: u64 },
+    #[error("reservation index range overflows u64: start {start}, count {count}")]
+    IndexOverflow { start: u64, count: u64 },
+    #[error("invalid reservation state: {0}")]
+    InvalidState(String),
     #[error("index {0} not reserved by this client")]
     NotReservedByClient(u64),
     #[error("index {0} not reserved")]
@@ -79,6 +119,34 @@ pub struct ReservationRegistry {
 
 const RESERVATION_NS: &[u8] = b"rsv:";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ReservationPersistenceKey {
+    program_hash: [u8; 32],
+    party_id: usize,
+}
+
+impl ReservationPersistenceKey {
+    fn new(program_hash: [u8; 32], party_id: usize) -> Self {
+        Self {
+            program_hash,
+            party_id,
+        }
+    }
+
+    fn encode(self) -> Result<Vec<u8>, PreprocStoreError> {
+        let error_value = u64::try_from(self.party_id).unwrap_or(u64::MAX);
+        let party_id =
+            u32::try_from(self.party_id).map_err(|_| PreprocStoreError::U32Overflow {
+                field: "reservation key party_id",
+                value: error_value,
+            })?;
+        let mut key = Vec::with_capacity(36);
+        key.extend_from_slice(&self.program_hash);
+        key.extend_from_slice(&party_id.to_le_bytes());
+        Ok(key)
+    }
+}
+
 impl ReservationRegistry {
     pub fn new(program_hash: [u8; 32], party_id: usize, capacity: u64) -> Self {
         Self {
@@ -93,20 +161,32 @@ impl ReservationRegistry {
         }
     }
 
+    pub fn try_from_state(state: RegistryState) -> Result<Self, ReservationError> {
+        state.validate()?;
+        Ok(Self {
+            state: RwLock::new(state),
+        })
+    }
+
     pub fn from_state(state: RegistryState) -> Self {
         Self {
             state: RwLock::new(state),
         }
     }
 
-    /// Reserve `n` consecutive indices for `client_id`. O(1) allocation.
+    /// Reserve `n` consecutive preprocessing indices for `client_id`.
     pub async fn reserve(
         &self,
         client_id: ClientId,
         n: u64,
     ) -> Result<ReservationGrant, ReservationError> {
         let mut s = self.state.write().await;
-        let avail = s.capacity - s.next_index;
+        let avail = s.capacity.checked_sub(s.next_index).ok_or_else(|| {
+            ReservationError::InvalidState(format!(
+                "next_index {} exceeds capacity {}",
+                s.next_index, s.capacity
+            ))
+        })?;
         if n > avail {
             return Err(ReservationError::InsufficientMaterial {
                 need: n,
@@ -114,10 +194,13 @@ impl ReservationRegistry {
             });
         }
         let start = s.next_index;
-        for i in start..start + n {
+        let end = start
+            .checked_add(n)
+            .ok_or(ReservationError::IndexOverflow { start, count: n })?;
+        for i in start..end {
             s.slots.insert(i, SlotStatus::Reserved(client_id));
         }
-        s.next_index = start + n;
+        s.next_index = end;
         Ok(ReservationGrant { start, count: n })
     }
 
@@ -161,7 +244,7 @@ impl ReservationRegistry {
 
     pub async fn available(&self) -> u64 {
         let s = self.state.read().await;
-        s.capacity - s.next_index
+        s.capacity.saturating_sub(s.next_index)
     }
 
     pub async fn get_masked_input(&self, index: u64) -> Option<Vec<u8>> {
@@ -177,16 +260,10 @@ impl ReservationRegistry {
     // Persistence through PreprocStore
     // -----------------------------------------------------------------------
 
-    fn persistence_key(program_hash: &[u8; 32], party_id: usize) -> Vec<u8> {
-        let mut k = Vec::with_capacity(36);
-        k.extend_from_slice(program_hash);
-        k.extend_from_slice(&(party_id as u32).to_le_bytes());
-        k
-    }
-
     pub async fn persist(&self, store: &dyn PreprocStore) -> Result<(), ReservationError> {
         let state = self.snapshot().await;
-        let key = Self::persistence_key(&state.program_hash, state.party_id);
+        state.validate()?;
+        let key = ReservationPersistenceKey::new(state.program_hash, state.party_id).encode()?;
         let data = bincode::serialize(&state)
             .map_err(|e| PreprocStoreError::Serialization(e.to_string()))?;
         store.store_blob(RESERVATION_NS, &key, &data).await?;
@@ -198,13 +275,13 @@ impl ReservationRegistry {
         program_hash: &[u8; 32],
         party_id: usize,
     ) -> Result<Option<Self>, ReservationError> {
-        let key = Self::persistence_key(program_hash, party_id);
+        let key = ReservationPersistenceKey::new(*program_hash, party_id).encode()?;
         let data = store.load_blob(RESERVATION_NS, &key).await?;
         match data {
             Some(bytes) => {
                 let state: RegistryState = bincode::deserialize(&bytes)
                     .map_err(|e| PreprocStoreError::Deserialization(e.to_string()))?;
-                Ok(Some(Self::from_state(state)))
+                Ok(Some(Self::try_from_state(state)?))
             }
             None => Ok(None),
         }
@@ -299,5 +376,85 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn reserve_rejects_invalid_cursor_without_underflow() {
+        let reg = ReservationRegistry::from_state(RegistryState {
+            program_hash: [0; 32],
+            party_id: 0,
+            capacity: 1,
+            next_index: 2,
+            slots: BTreeMap::new(),
+            masked_inputs: BTreeMap::new(),
+        });
+
+        let err = reg.reserve(1, 1).await.unwrap_err();
+        assert!(matches!(err, ReservationError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_invalid_persisted_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LmdbPreprocStore::open(dir.path()).unwrap();
+        let program_hash = [0x5A; 32];
+        let state = RegistryState {
+            program_hash,
+            party_id: 0,
+            capacity: 1,
+            next_index: 2,
+            slots: BTreeMap::new(),
+            masked_inputs: BTreeMap::new(),
+        };
+        let key = ReservationPersistenceKey::new(program_hash, 0)
+            .encode()
+            .unwrap();
+        let data = bincode::serialize(&state).unwrap();
+        store.store_blob(RESERVATION_NS, &key, &data).await.unwrap();
+
+        let err = match ReservationRegistry::load(&store, &program_hash, 0).await {
+            Ok(_) => panic!("invalid persisted state should be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ReservationError::InvalidState(_)));
+    }
+
+    #[test]
+    fn persistence_key_rejects_party_ids_outside_binary_key_domain() {
+        if usize::BITS <= u32::BITS {
+            return;
+        }
+
+        let oversized = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let err = ReservationPersistenceKey::new([0; 32], oversized)
+            .encode()
+            .expect_err("oversized party ID should be rejected");
+        assert!(matches!(
+            err,
+            PreprocStoreError::U32Overflow {
+                field: "reservation key party_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn try_from_state_rejects_masked_input_without_slot() {
+        let mut masked_inputs = BTreeMap::new();
+        masked_inputs.insert(0, vec![0xAA]);
+        let state = RegistryState {
+            program_hash: [0; 32],
+            party_id: 0,
+            capacity: 1,
+            next_index: 0,
+            slots: BTreeMap::new(),
+            masked_inputs,
+        };
+
+        let err = match ReservationRegistry::try_from_state(state) {
+            Ok(_) => panic!("invalid registry state should be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ReservationError::InvalidState(_)));
     }
 }
