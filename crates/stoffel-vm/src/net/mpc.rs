@@ -11,8 +11,9 @@ pub mod engine;
 pub mod helpers;
 #[cfg(feature = "honeybadger")]
 pub mod honeybadger;
+pub(crate) mod protocol_ids;
 pub mod session_config;
 
 pub use helpers::NetEnvelope;
 #[cfg(feature = "honeybadger")]
-pub use helpers::{default_node_opts, honeybadger_node_opts};
+pub use helpers::{default_node_opts, honeybadger_node_opts, honeybadger_protocol_instance_id};

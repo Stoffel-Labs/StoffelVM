@@ -155,7 +155,7 @@ where
         let threshold = topology.threshold();
 
         // Create the AvssMpcNode via MPCProtocol::setup
-        let instance_id_u32 = protocol_instance_id_u32(instance_id)?;
+        let instance_id_u32 = protocol_instance_id_u32(instance_id);
         let opts = AvssMpcNodeOpts::new(
             n_parties,
             threshold,

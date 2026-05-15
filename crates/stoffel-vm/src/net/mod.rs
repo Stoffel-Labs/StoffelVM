@@ -148,7 +148,7 @@ pub use mpc_engine::{
 
 // Re-export MPC helpers (HB-specific helpers gated)
 #[cfg(feature = "honeybadger")]
-pub use mpc::{default_node_opts, honeybadger_node_opts};
+pub use mpc::{default_node_opts, honeybadger_node_opts, honeybadger_protocol_instance_id};
 // Re-export HoneyBadger QUIC server
 #[cfg(feature = "honeybadger")]
 pub use hb_server::{

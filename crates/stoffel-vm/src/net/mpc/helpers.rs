@@ -5,6 +5,8 @@
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "honeybadger")]
+use super::protocol_ids::derive_protocol_instance_id_u32;
+#[cfg(feature = "honeybadger")]
 use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_FRACTIONAL_BITS;
 #[cfg(feature = "honeybadger")]
 use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_TOTAL_BITS;
@@ -31,10 +33,8 @@ fn derive_prandint_count(n_triples: usize, n_random_shares: usize) -> usize {
 }
 
 #[cfg(feature = "honeybadger")]
-fn honeybadger_instance_id_u32(instance_id: u64) -> Result<u32, String> {
-    u32::try_from(instance_id).map_err(|_| {
-        format!("HoneyBadger instance_id {instance_id} exceeds u32::MAX required by SessionId")
-    })
+pub fn honeybadger_protocol_instance_id(instance_id: u64) -> u32 {
+    derive_protocol_instance_id_u32(b"honeybadger", instance_id)
 }
 
 /// Convenience for creating default node options for a n-party network.
@@ -74,7 +74,7 @@ pub fn honeybadger_node_opts(
         threshold,
         n_triples,
         n_random_shares,
-        honeybadger_instance_id_u32(instance_id)?,
+        honeybadger_protocol_instance_id(instance_id),
         n_prandbit,
         n_prandint,
         l,
@@ -112,12 +112,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn honeybadger_node_opts_rejects_instance_ids_outside_protocol_domain() {
-        let err = honeybadger_node_opts(5, 1, 0, 0, u64::from(u32::MAX) + 1)
-            .expect_err("oversized instance ids must be rejected");
-        assert!(
-            err.contains("exceeds u32::MAX"),
-            "expected u32 overflow error, got: {err}"
+    fn honeybadger_node_opts_accepts_full_width_vm_instance_ids() {
+        honeybadger_node_opts(5, 1, 0, 0, u64::from(u32::MAX) + 1)
+            .expect("full-width VM instance ids must be projected into the protocol domain");
+    }
+
+    #[test]
+    fn honeybadger_protocol_instance_id_is_stable() {
+        let instance_id = u64::MAX - 9;
+
+        assert_eq!(
+            honeybadger_protocol_instance_id(instance_id),
+            honeybadger_protocol_instance_id(instance_id)
         );
     }
 }
