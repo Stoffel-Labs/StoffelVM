@@ -1,0 +1,129 @@
+//! MPC integration helpers for the Stoffel VM.
+//! Minimal public API kept to avoid cross-crate trait bound conflicts.
+//! Use the MpcEngine abstraction (net::mpc_engine) to attach an engine to VMState for VM usage.
+
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "honeybadger")]
+use super::protocol_ids::derive_protocol_instance_id_u32;
+#[cfg(feature = "honeybadger")]
+use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_FRACTIONAL_BITS;
+#[cfg(feature = "honeybadger")]
+use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_TOTAL_BITS;
+#[cfg(feature = "honeybadger")]
+use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNodeOpts;
+
+#[cfg(feature = "honeybadger")]
+const DEFAULT_MIN_PARTIES: usize = 5;
+#[cfg(feature = "honeybadger")]
+const DEFAULT_THRESHOLD: usize = 1;
+#[cfg(feature = "honeybadger")]
+const DEFAULT_SECURITY_PARAMETER_K: usize = 8;
+
+#[cfg(feature = "honeybadger")]
+#[allow(dead_code)]
+fn derive_prandbit_count(n_random_shares: usize) -> usize {
+    std::cmp::max(n_random_shares, DEFAULT_FIXED_POINT_FRACTIONAL_BITS)
+}
+
+#[cfg(feature = "honeybadger")]
+#[allow(dead_code)]
+fn derive_prandint_count(n_triples: usize, n_random_shares: usize) -> usize {
+    std::cmp::max(n_triples.max(1), n_random_shares.max(1))
+}
+
+#[cfg(feature = "honeybadger")]
+pub fn honeybadger_protocol_instance_id(instance_id: u64) -> u32 {
+    derive_protocol_instance_id_u32(b"honeybadger", instance_id)
+}
+
+/// Convenience for creating default node options for a n-party network.
+/// Customize n_triples / n_random_shares / instance_id as needed at callsite.
+#[cfg(feature = "honeybadger")]
+pub fn default_node_opts(
+    instance_id: u64,
+    n_triples: usize,
+    n_random_shares: usize,
+) -> HoneyBadgerMPCNodeOpts {
+    honeybadger_node_opts(
+        DEFAULT_MIN_PARTIES,
+        DEFAULT_THRESHOLD,
+        n_triples,
+        n_random_shares,
+        instance_id,
+    )
+    .expect("default_node_opts should never fail with valid defaults")
+}
+
+/// Build HoneyBadger node options, deriving ancillary preprocessing counts from existing inputs.
+#[cfg(feature = "honeybadger")]
+pub fn honeybadger_node_opts(
+    n_parties: usize,
+    threshold: usize,
+    n_triples: usize,
+    n_random_shares: usize,
+    instance_id: u64,
+) -> Result<HoneyBadgerMPCNodeOpts, String> {
+    let n_prandbit = 0;
+    let n_prandint = 0;
+    let l = DEFAULT_FIXED_POINT_TOTAL_BITS;
+    let k = DEFAULT_SECURITY_PARAMETER_K;
+
+    HoneyBadgerMPCNodeOpts::new(
+        n_parties,
+        threshold,
+        n_triples,
+        n_random_shares,
+        honeybadger_protocol_instance_id(instance_id),
+        n_prandbit,
+        n_prandint,
+        l,
+        k,
+        std::time::Duration::from_secs(600),
+    )
+    .map_err(|e| format!("Failed to create HoneyBadger node options: {:?}", e))
+}
+
+/// Network envelope used on QUIC to distinguish control messages (like handshakes)
+/// from protocol payloads. If deserialization of this wrapper fails on receive,
+/// the consumer must treat the bytes as a raw HoneyBadger WrappedMessage payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NetEnvelope {
+    /// Binary encoded handshake used for future extensibility. Current QUIC impl
+    /// still uses a text-line handshake on the first stream, but we support this
+    /// for forward-compatibility.
+    Handshake { role: String, id: usize },
+    /// Raw HoneyBadger message bytes (bincode of WrappedMessage from mpc crate).
+    HoneyBadger(Vec<u8>),
+}
+
+impl NetEnvelope {
+    pub fn serialize(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("envelope serialization should not fail")
+    }
+
+    pub fn try_deserialize(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+}
+
+#[cfg(all(test, feature = "honeybadger"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn honeybadger_node_opts_accepts_full_width_vm_instance_ids() {
+        honeybadger_node_opts(5, 1, 0, 0, u64::from(u32::MAX) + 1)
+            .expect("full-width VM instance ids must be projected into the protocol domain");
+    }
+
+    #[test]
+    fn honeybadger_protocol_instance_id_is_stable() {
+        let instance_id = u64::MAX - 9;
+
+        assert_eq!(
+            honeybadger_protocol_instance_id(instance_id),
+            honeybadger_protocol_instance_id(instance_id)
+        );
+    }
+}

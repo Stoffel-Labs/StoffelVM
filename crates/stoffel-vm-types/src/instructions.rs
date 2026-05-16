@@ -17,6 +17,8 @@ use crate::core_types::Value;
 /// Each opcode corresponds to a specific operation in the VM's instruction set.
 #[repr(u8)]
 pub enum ReducedOpcode {
+    // NOP
+    NOP = 0x17,
     // LD r1 [sp+0]
     LD = 0x00,
     // LDI r1 10
@@ -53,9 +55,9 @@ pub enum ReducedOpcode {
     JMPEQ = 0x0F,
     // JMPNEQ <jump_to>
     JMPNEQ = 0x10,
-    // JMPLT <jump_to> (Jump if Less Than, compare_flag == -1)
+    // JMPLT <jump_to> (Jump if last comparison was Less)
     JMPLT = 0x15,
-    // JMPGT <jump_to> (Jump if Greater Than, compare_flag == 1)
+    // JMPGT <jump_to> (Jump if last comparison was Greater)
     JMPGT = 0x16,
     // CALL <function>
     CALL = 0x11,
@@ -92,6 +94,8 @@ pub enum Operand {
 /// Instructions are later resolved to `ResolvedInstruction` for more efficient execution.
 #[derive(Debug, Clone, Hash)]
 pub enum Instruction {
+    // No operation
+    NOP,
     // Load value from stack to register
     LD(usize, i32), // LD r1, [sp+0]
     // Load immediate value to register
@@ -135,6 +139,8 @@ pub enum Instruction {
 /// registration and is used by the VM's execution engine.
 #[derive(Debug, Clone, Copy)]
 pub enum ResolvedInstruction {
+    // No operation
+    NOP,
     // Load value from stack to register
     LD(usize, i32), // LD r1, [sp+0]
     // Load immediate value to register

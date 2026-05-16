@@ -32,6 +32,8 @@ pub enum PreprocStoreError {
     NotFound,
     #[error("insufficient material: need {need}, available {available}")]
     Insufficient { need: u32, available: u32 },
+    #[error("{field} value {value} exceeds u32::MAX")]
+    U32Overflow { field: &'static str, value: u64 },
     #[error("task join: {0}")]
     Join(String),
 }
@@ -76,7 +78,8 @@ pub enum MaterialKind {
 
 /// Identifies a stored preprocessing blob.
 ///
-/// Construct via [`PreprocKey::new`] to reduce field boilerplate.
+/// Use [`PreprocKeyScope`] when deriving several material keys for the same
+/// program/party namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PreprocKey {
     pub program_hash: [u8; 32],
@@ -115,23 +118,80 @@ impl PreprocKey {
     }
 
     /// Encode as a compact byte key for LMDB lookups.
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, PreprocStoreError> {
         let mut buf = Vec::with_capacity(49);
         buf.extend_from_slice(b"pp:");
         buf.extend_from_slice(&self.program_hash);
         buf.push(field_kind_tag(self.field_kind));
-        buf.extend_from_slice(&(self.n as u32).to_le_bytes());
-        buf.extend_from_slice(&(self.t as u32).to_le_bytes());
-        buf.extend_from_slice(&(self.party_id as u32).to_le_bytes());
-        buf.push(self.kind as u8);
-        buf
+        buf.extend_from_slice(&usize_to_u32(self.n, "preprocessing key n")?.to_le_bytes());
+        buf.extend_from_slice(&usize_to_u32(self.t, "preprocessing key threshold")?.to_le_bytes());
+        buf.extend_from_slice(
+            &usize_to_u32(self.party_id, "preprocessing key party_id")?.to_le_bytes(),
+        );
+        buf.push(material_kind_tag(self.kind));
+        Ok(buf)
     }
 
     /// Encode the metadata key (distinct from the data key).
-    fn meta_key(&self) -> Vec<u8> {
-        let mut k = self.encode();
+    fn meta_key(&self) -> Result<Vec<u8>, PreprocStoreError> {
+        let mut k = self.encode()?;
         k.push(b'm');
-        k
+        Ok(k)
+    }
+}
+
+/// Common namespace for preprocessing material keys belonging to one party.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PreprocKeyScope {
+    pub program_hash: [u8; 32],
+    pub field_kind: MpcFieldKind,
+    pub n: usize,
+    pub t: usize,
+    pub party_id: usize,
+}
+
+impl PreprocKeyScope {
+    pub fn new(
+        program_hash: [u8; 32],
+        field_kind: MpcFieldKind,
+        n: usize,
+        t: usize,
+        party_id: usize,
+    ) -> Self {
+        Self {
+            program_hash,
+            field_kind,
+            n,
+            t,
+            party_id,
+        }
+    }
+
+    pub fn key(self, kind: MaterialKind) -> PreprocKey {
+        PreprocKey::new(
+            self.program_hash,
+            self.field_kind,
+            self.n,
+            self.t,
+            self.party_id,
+            kind,
+        )
+    }
+
+    pub fn beaver_triple(self) -> PreprocKey {
+        self.key(MaterialKind::BeaverTriple)
+    }
+
+    pub fn random_share(self) -> PreprocKey {
+        self.key(MaterialKind::RandomShare)
+    }
+
+    pub fn prand_bit(self) -> PreprocKey {
+        self.key(MaterialKind::PRandBit)
+    }
+
+    pub fn prand_int(self) -> PreprocKey {
+        self.key(MaterialKind::PRandInt)
     }
 }
 
@@ -141,6 +201,22 @@ fn field_kind_tag(fk: MpcFieldKind) -> u8 {
         MpcFieldKind::Bn254Fr => 1,
         MpcFieldKind::Curve25519Fr => 2,
     }
+}
+
+fn material_kind_tag(kind: MaterialKind) -> u8 {
+    match kind {
+        MaterialKind::BeaverTriple => 0,
+        MaterialKind::RandomShare => 1,
+        MaterialKind::PRandBit => 2,
+        MaterialKind::PRandInt => 3,
+    }
+}
+
+fn usize_to_u32(value: usize, field: &'static str) -> Result<u32, PreprocStoreError> {
+    u32::try_from(value).map_err(|_| PreprocStoreError::U32Overflow {
+        field,
+        value: u64::try_from(value).unwrap_or(u64::MAX),
+    })
 }
 
 /// Metadata stored separately from the raw data so that `reserve()` and
@@ -177,23 +253,91 @@ impl PreprocBlob {
         }
     }
 
+    pub fn try_new(data: Vec<u8>, item_size: u32, count: usize) -> Result<Self, PreprocStoreError> {
+        let count = usize_to_u32(count, "preprocessing item count")?;
+        Ok(Self::new(data, item_size, count))
+    }
+
     /// Byte slice of unconsumed items.
-    pub fn unconsumed_data(&self) -> &[u8] {
-        let offset = self.meta.consumed as usize * self.meta.item_size as usize;
-        &self.data[offset..]
+    pub fn unconsumed_data(&self) -> Result<&[u8], PreprocStoreError> {
+        let offset = byte_offset(
+            self.meta.consumed,
+            self.meta.item_size,
+            "preprocessing consumed offset",
+        )?;
+        self.data.get(offset..).ok_or_else(|| {
+            PreprocStoreError::Deserialization(format!(
+                "consumed offset {offset} out of range (data len {})",
+                self.data.len()
+            ))
+        })
     }
 
     /// Slice a single item at the given index.
     pub fn item_data(&self, index: u32) -> Option<&[u8]> {
-        let is = self.meta.item_size as usize;
-        let start = index as usize * is;
-        let end = start + is;
+        let is = u32_to_usize(self.meta.item_size, "preprocessing item size").ok()?;
+        let start = u32_to_usize(index, "preprocessing item index")
+            .ok()?
+            .checked_mul(is)?;
+        let end = start.checked_add(is)?;
         if end <= self.data.len() {
             Some(&self.data[start..end])
         } else {
             None
         }
     }
+}
+
+pub fn u32_index(value: u64, field: &'static str) -> Result<u32, PreprocStoreError> {
+    u32::try_from(value).map_err(|_| PreprocStoreError::U32Overflow { field, value })
+}
+
+fn u32_to_usize(value: u32, field: &'static str) -> Result<usize, PreprocStoreError> {
+    usize::try_from(value).map_err(|_| PreprocStoreError::U32Overflow {
+        field,
+        value: u64::from(value),
+    })
+}
+
+fn usize_to_u64(value: usize, field: &'static str) -> Result<u64, PreprocStoreError> {
+    u64::try_from(value)
+        .map_err(|_| PreprocStoreError::Serialization(format!("{field} {value} exceeds u64::MAX")))
+}
+
+fn u64_to_usize(value: u64, field: &'static str) -> Result<usize, PreprocStoreError> {
+    usize::try_from(value).map_err(|_| {
+        PreprocStoreError::Deserialization(format!("{field} {value} exceeds usize::MAX"))
+    })
+}
+
+fn byte_offset(
+    index: u32,
+    item_size: u32,
+    field: &'static str,
+) -> Result<usize, PreprocStoreError> {
+    let index = u32_to_usize(index, field)?;
+    let item_size = u32_to_usize(item_size, "preprocessing item size")?;
+    index.checked_mul(item_size).ok_or_else(|| {
+        PreprocStoreError::Deserialization(format!(
+            "{field} overflows usize: index={index}, item_size={item_size}"
+        ))
+    })
+}
+
+fn has_nonzero_item_size(
+    data: &[u8],
+    item_size: usize,
+    field: &'static str,
+) -> Result<bool, PreprocStoreError> {
+    if item_size != 0 {
+        return Ok(true);
+    }
+    if data.is_empty() {
+        return Ok(false);
+    }
+    Err(PreprocStoreError::Deserialization(format!(
+        "{field} item size is zero for non-empty data"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -413,20 +557,20 @@ impl PreprocStore for LmdbPreprocStore {
     async fn store(&self, key: &PreprocKey, blob: &PreprocBlob) -> Result<(), PreprocStoreError> {
         let meta_v = bincode::serialize(&blob.meta)?;
         self.put_multi(vec![
-            (key.meta_key(), meta_v),
-            (key.encode(), blob.data.clone()),
+            (key.meta_key()?, meta_v),
+            (key.encode()?, blob.data.clone()),
         ])
         .await
     }
 
     async fn load(&self, key: &PreprocKey) -> Result<Option<PreprocBlob>, PreprocStoreError> {
-        let meta_bytes = match self.get(key.meta_key()).await? {
+        let meta_bytes = match self.get(key.meta_key()?).await? {
             Some(b) => b,
             None => return Ok(None),
         };
         let meta: PreprocMeta = bincode::deserialize(&meta_bytes)?;
         let data = self
-            .get(key.encode())
+            .get(key.encode()?)
             .await?
             .ok_or(PreprocStoreError::NotFound)?;
         Ok(Some(PreprocBlob { meta, data }))
@@ -434,16 +578,23 @@ impl PreprocStore for LmdbPreprocStore {
 
     async fn reserve(&self, key: &PreprocKey, n: u32) -> Result<u32, PreprocStoreError> {
         let result = self
-            .rmw(key.meta_key(), move |raw| {
+            .rmw(key.meta_key()?, move |raw| {
                 let raw = raw.ok_or(PreprocStoreError::NotFound)?;
                 let mut meta: PreprocMeta = bincode::deserialize(raw)?;
-                if meta.consumed + n > meta.count {
+                let consumed =
+                    meta.consumed
+                        .checked_add(n)
+                        .ok_or(PreprocStoreError::U32Overflow {
+                            field: "preprocessing consumed count",
+                            value: u64::from(meta.consumed) + u64::from(n),
+                        })?;
+                if consumed > meta.count {
                     return Err(PreprocStoreError::Insufficient {
                         need: n,
                         available: meta.available(),
                     });
                 }
-                meta.consumed += n;
+                meta.consumed = consumed;
                 let v = bincode::serialize(&meta)?;
                 Ok(Some(v))
             })
@@ -458,7 +609,7 @@ impl PreprocStore for LmdbPreprocStore {
     }
 
     async fn available(&self, key: &PreprocKey) -> Result<u32, PreprocStoreError> {
-        match self.get(key.meta_key()).await? {
+        match self.get(key.meta_key()?).await? {
             Some(raw) => {
                 let meta: PreprocMeta = bincode::deserialize(&raw)?;
                 Ok(meta.available())
@@ -468,11 +619,11 @@ impl PreprocStore for LmdbPreprocStore {
     }
 
     async fn exists(&self, key: &PreprocKey) -> Result<bool, PreprocStoreError> {
-        Ok(self.get(key.meta_key()).await?.is_some())
+        Ok(self.get(key.meta_key()?).await?.is_some())
     }
 
     async fn delete(&self, key: &PreprocKey) -> Result<(), PreprocStoreError> {
-        self.delete_keys(vec![key.meta_key(), key.encode()]).await
+        self.delete_keys(vec![key.meta_key()?, key.encode()?]).await
     }
 
     async fn store_blob(
@@ -504,8 +655,8 @@ fn write_robust_share<F: FftField>(
     share.share[0]
         .serialize_with_mode(&mut *buf, Compress::Yes)
         .map_err(|e| PreprocStoreError::Serialization(e.to_string()))?;
-    buf.extend_from_slice(&(share.id as u64).to_le_bytes());
-    buf.extend_from_slice(&(share.degree as u64).to_le_bytes());
+    buf.extend_from_slice(&usize_to_u64(share.id, "robust share id")?.to_le_bytes());
+    buf.extend_from_slice(&usize_to_u64(share.degree, "robust share degree")?.to_le_bytes());
     Ok(())
 }
 
@@ -517,6 +668,11 @@ fn read_robust_share<F: FftField>(
     data: &[u8],
     item_size: usize,
 ) -> Result<RobustShare<F>, PreprocStoreError> {
+    if item_size < 16 {
+        return Err(PreprocStoreError::Deserialization(format!(
+            "robust share item size {item_size} is too small"
+        )));
+    }
     let field_size = item_size - 16;
     // Data originates from our own serialization so subgroup checks are not required.
     let elem = F::deserialize_with_mode(&data[..field_size], Compress::Yes, Validate::No)
@@ -525,12 +681,14 @@ fn read_robust_share<F: FftField>(
         data[field_size..field_size + 8]
             .try_into()
             .map_err(|_| PreprocStoreError::Deserialization("bad id bytes".into()))?,
-    ) as usize;
+    );
+    let id = u64_to_usize(id, "robust share id")?;
     let degree = u64::from_le_bytes(
         data[field_size + 8..field_size + 16]
             .try_into()
             .map_err(|_| PreprocStoreError::Deserialization("bad degree bytes".into()))?,
-    ) as usize;
+    );
+    let degree = u64_to_usize(degree, "robust share degree")?;
     Ok(RobustShare::new(elem, id, degree))
 }
 
@@ -542,7 +700,7 @@ pub fn serialize_robust_shares<F: FftField>(
     for s in shares {
         write_robust_share(s, &mut buf)?;
     }
-    Ok((buf, is as u32))
+    Ok((buf, usize_to_u32(is, "robust share item size")?))
 }
 
 pub fn deserialize_robust_shares<F: FftField>(
@@ -550,13 +708,16 @@ pub fn deserialize_robust_shares<F: FftField>(
     item_size: u32,
     offset: u32,
 ) -> Result<Vec<RobustShare<F>>, PreprocStoreError> {
-    let is = item_size as usize;
-    let start = offset as usize * is;
+    let is = u32_to_usize(item_size, "robust share item size")?;
+    if !has_nonzero_item_size(data, is, "robust share")? {
+        return Ok(Vec::new());
+    }
+    let start = byte_offset(offset, item_size, "robust share offset")?;
     let mut shares = Vec::new();
     let mut pos = start;
-    while pos + is <= data.len() {
+    while let Some(end) = pos.checked_add(is).filter(|end| *end <= data.len()) {
         shares.push(read_robust_share::<F>(&data[pos..], is)?);
-        pos += is;
+        pos = end;
     }
     Ok(shares)
 }
@@ -567,9 +728,14 @@ pub fn deserialize_one_robust_share<F: FftField>(
     item_size: u32,
     index: u32,
 ) -> Result<RobustShare<F>, PreprocStoreError> {
-    let is = item_size as usize;
-    let start = index as usize * is;
-    if start + is > data.len() {
+    let is = u32_to_usize(item_size, "robust share item size")?;
+    if is == 0 {
+        return Err(PreprocStoreError::Deserialization(
+            "robust share item size is zero".into(),
+        ));
+    }
+    let start = byte_offset(index, item_size, "robust share index")?;
+    if !matches!(start.checked_add(is), Some(end) if end <= data.len()) {
         return Err(PreprocStoreError::Deserialization(format!(
             "index {index} out of range (data len {})",
             data.len()
@@ -582,14 +748,18 @@ pub fn serialize_beaver_triples<F: FftField>(
     triples: &[ShamirBeaverTriple<F>],
 ) -> Result<(Vec<u8>, u32), PreprocStoreError> {
     let share_size = robust_share_size::<F>();
-    let triple_size = share_size * 3;
+    let triple_size = share_size.checked_mul(3).ok_or_else(|| {
+        PreprocStoreError::Serialization(format!(
+            "beaver triple item size overflows usize: share_size={share_size}"
+        ))
+    })?;
     let mut buf = Vec::with_capacity(triples.len() * triple_size);
     for t in triples {
         write_robust_share(&t.a, &mut buf)?;
         write_robust_share(&t.b, &mut buf)?;
         write_robust_share(&t.mult, &mut buf)?;
     }
-    Ok((buf, triple_size as u32))
+    Ok((buf, usize_to_u32(triple_size, "beaver triple item size")?))
 }
 
 pub fn deserialize_beaver_triples<F: FftField>(
@@ -597,17 +767,20 @@ pub fn deserialize_beaver_triples<F: FftField>(
     item_size: u32,
     offset: u32,
 ) -> Result<Vec<ShamirBeaverTriple<F>>, PreprocStoreError> {
-    let is = item_size as usize;
+    let is = u32_to_usize(item_size, "beaver triple item size")?;
+    if !has_nonzero_item_size(data, is, "beaver triple")? {
+        return Ok(Vec::new());
+    }
     let share_size = robust_share_size::<F>();
-    let start = offset as usize * is;
+    let start = byte_offset(offset, item_size, "beaver triple offset")?;
     let mut triples = Vec::new();
     let mut pos = start;
-    while pos + is <= data.len() {
+    while let Some(end) = pos.checked_add(is).filter(|end| *end <= data.len()) {
         let a = read_robust_share::<F>(&data[pos..], share_size)?;
         let b = read_robust_share::<F>(&data[pos + share_size..], share_size)?;
         let mult = read_robust_share::<F>(&data[pos + 2 * share_size..], share_size)?;
         triples.push(ShamirBeaverTriple::new(a, b, mult));
-        pos += is;
+        pos = end;
     }
     Ok(triples)
 }
@@ -622,7 +795,7 @@ pub fn serialize_prandbit_shares<F: FftField>(
         write_robust_share(s, &mut buf)?;
         buf.push(f.0);
     }
-    Ok((buf, item_size as u32))
+    Ok((buf, usize_to_u32(item_size, "prandbit item size")?))
 }
 
 pub fn deserialize_prandbit_shares<F: FftField>(
@@ -630,16 +803,19 @@ pub fn deserialize_prandbit_shares<F: FftField>(
     item_size: u32,
     offset: u32,
 ) -> Result<Vec<(RobustShare<F>, Gf2568)>, PreprocStoreError> {
-    let is = item_size as usize;
+    let is = u32_to_usize(item_size, "prandbit item size")?;
+    if !has_nonzero_item_size(data, is, "prandbit")? {
+        return Ok(Vec::new());
+    }
     let share_size = robust_share_size::<F>();
-    let start = offset as usize * is;
+    let start = byte_offset(offset, item_size, "prandbit offset")?;
     let mut result = Vec::new();
     let mut pos = start;
-    while pos + is <= data.len() {
+    while let Some(end) = pos.checked_add(is).filter(|end| *end <= data.len()) {
         let share = read_robust_share::<F>(&data[pos..], share_size)?;
         let f2_8 = Gf2568(data[pos + share_size]);
         result.push((share, f2_8));
-        pos += is;
+        pos = end;
     }
     Ok(result)
 }
@@ -665,7 +841,7 @@ where
         s.serialize_with_mode(&mut buf, Compress::Yes)
             .map_err(|e| PreprocStoreError::Serialization(e.to_string()))?;
     }
-    Ok((buf, item_size as u32))
+    Ok((buf, usize_to_u32(item_size, "feldman share item size")?))
 }
 
 pub fn deserialize_feldman_shares<F, G>(
@@ -678,17 +854,20 @@ where
     G: ark_ec::CurveGroup<ScalarField = F>,
 {
     use ark_serialize::CanonicalDeserialize;
-    let is = item_size as usize;
-    let start = offset as usize * is;
+    let is = u32_to_usize(item_size, "feldman share item size")?;
+    if !has_nonzero_item_size(data, is, "feldman share")? {
+        return Ok(Vec::new());
+    }
+    let start = byte_offset(offset, item_size, "feldman share offset")?;
     let mut shares = Vec::new();
     let mut pos = start;
-    while pos + is <= data.len() {
+    while let Some(end) = pos.checked_add(is).filter(|end| *end <= data.len()) {
         // Data originates from our own serialization so subgroup checks are not required.
         let share = stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare::<F, G>::deserialize_with_mode(
-            &data[pos..pos + is], Compress::Yes, Validate::No,
+            &data[pos..end], Compress::Yes, Validate::No,
         ).map_err(|e| PreprocStoreError::Deserialization(e.to_string()))?;
         shares.push(share);
-        pos += is;
+        pos = end;
     }
     Ok(shares)
 }
@@ -705,7 +884,11 @@ where
         return Ok((vec![], 0));
     }
     let share_size = triples[0].a.serialized_size(Compress::Yes);
-    let triple_size = share_size * 3;
+    let triple_size = share_size.checked_mul(3).ok_or_else(|| {
+        PreprocStoreError::Serialization(format!(
+            "AVSS triple item size overflows usize: share_size={share_size}"
+        ))
+    })?;
     let mut buf = Vec::with_capacity(triples.len() * triple_size);
     for t in triples {
         t.a.serialize_with_mode(&mut buf, Compress::Yes)
@@ -715,7 +898,7 @@ where
         t.c.serialize_with_mode(&mut buf, Compress::Yes)
             .map_err(|e| PreprocStoreError::Serialization(e.to_string()))?;
     }
-    Ok((buf, triple_size as u32))
+    Ok((buf, usize_to_u32(triple_size, "AVSS triple item size")?))
 }
 
 pub fn deserialize_avss_triples<F, G>(
@@ -728,12 +911,15 @@ where
     G: ark_ec::CurveGroup<ScalarField = F>,
 {
     use ark_serialize::CanonicalDeserialize;
-    let is = item_size as usize;
+    let is = u32_to_usize(item_size, "AVSS triple item size")?;
+    if !has_nonzero_item_size(data, is, "AVSS triple")? {
+        return Ok(Vec::new());
+    }
     let share_size = is / 3;
-    let start = offset as usize * is;
+    let start = byte_offset(offset, item_size, "AVSS triple offset")?;
     let mut triples = Vec::new();
     let mut pos = start;
-    while pos + is <= data.len() {
+    while let Some(end) = pos.checked_add(is).filter(|end| *end <= data.len()) {
         // Data originates from our own serialization so subgroup checks are not required.
         let a = stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare::<F, G>::deserialize_with_mode(
             &data[pos..pos + share_size], Compress::Yes, Validate::No,
@@ -745,7 +931,7 @@ where
             &data[pos + 2 * share_size..pos + 3 * share_size], Compress::Yes, Validate::No,
         ).map_err(|e| PreprocStoreError::Deserialization(e.to_string()))?;
         triples.push(stoffelmpc_mpc::avss_mpc::triple_gen::BeaverTriple { a, b, c });
-        pos += is;
+        pos = end;
     }
     Ok(triples)
 }
@@ -844,7 +1030,98 @@ mod tests {
         let rs = base.with_kind(MaterialKind::RandomShare);
         assert_eq!(rs.program_hash, base.program_hash);
         assert_eq!(rs.kind, MaterialKind::RandomShare);
-        assert_ne!(base.encode(), rs.encode());
+        assert_ne!(base.encode().unwrap(), rs.encode().unwrap());
+    }
+
+    #[test]
+    fn preproc_key_scope_preserves_shared_key_namespace() {
+        let scope = PreprocKeyScope::new([0xCD; 32], MpcFieldKind::Bls12_381Fr, 7, 2, 3);
+
+        let base = scope.beaver_triple();
+        let random = scope.random_share();
+        let prand_bit = scope.prand_bit();
+        let prand_int = scope.prand_int();
+
+        assert_eq!(base.program_hash, [0xCD; 32]);
+        assert_eq!(base.n, 7);
+        assert_eq!(base.t, 2);
+        assert_eq!(base.party_id, 3);
+        assert_eq!(base.kind, MaterialKind::BeaverTriple);
+        assert_eq!(random, base.with_kind(MaterialKind::RandomShare));
+        assert_eq!(prand_bit, base.with_kind(MaterialKind::PRandBit));
+        assert_eq!(prand_int, base.with_kind(MaterialKind::PRandInt));
+    }
+
+    #[test]
+    fn preproc_key_encode_rejects_values_outside_binary_key_domain() {
+        if usize::BITS <= u32::BITS {
+            return;
+        }
+        let oversized = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let key = PreprocKey::new(
+            [0xAB; 32],
+            MpcFieldKind::Bn254Fr,
+            oversized,
+            2,
+            1,
+            MaterialKind::BeaverTriple,
+        );
+        let err = key
+            .encode()
+            .expect_err("oversized party count should be rejected");
+        assert!(matches!(
+            err,
+            PreprocStoreError::U32Overflow {
+                field: "preprocessing key n",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn preproc_blob_try_new_rejects_counts_outside_metadata_domain() {
+        if usize::BITS <= u32::BITS {
+            return;
+        }
+        let oversized = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let err = PreprocBlob::try_new(Vec::new(), 0, oversized)
+            .expect_err("oversized item counts should be rejected");
+        assert!(matches!(
+            err,
+            PreprocStoreError::U32Overflow {
+                field: "preprocessing item count",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn preproc_blob_unconsumed_data_rejects_corrupt_consumed_offset() {
+        let blob = PreprocBlob {
+            meta: PreprocMeta {
+                count: 10,
+                consumed: 5,
+                item_size: 10,
+            },
+            data: vec![0; 10],
+        };
+        let err = blob
+            .unconsumed_data()
+            .expect_err("offset beyond data should be rejected");
+        assert!(
+            matches!(err, PreprocStoreError::Deserialization(_)),
+            "expected deserialization error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_feldman_shares_rejects_zero_item_size_with_data() {
+        let err = deserialize_feldman_shares::<Fr, ark_bn254::G1Projective>(&[1, 2, 3], 0, 0)
+            .expect_err("zero item size with data should be rejected");
+        assert!(
+            matches!(err, PreprocStoreError::Deserialization(_)),
+            "expected deserialization error, got: {err}"
+        );
     }
 
     #[tokio::test]

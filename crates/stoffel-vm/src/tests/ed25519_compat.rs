@@ -64,7 +64,7 @@ fn test_ark_eddsa_verified_by_dalek() {
         // Arkworks Fr canonical form may exceed l because arkworks uses
         // Montgomery form internally. Let's try reducing explicitly.
         let s_reduced = Scalar::from_bytes_mod_order(s_arr);
-        println!("S bytes (arkworks): {}", hex::encode(&s_arr));
+        println!("S bytes (arkworks): {}", hex::encode(s_arr));
         println!("S bytes (reduced):  {}", hex::encode(s_reduced.as_bytes()));
 
         // The issue: arkworks serialize_compressed for Fr produces

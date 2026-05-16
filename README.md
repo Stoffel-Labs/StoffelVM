@@ -72,13 +72,12 @@ Stoffel VM currently exposes the following runtime value variants:
 - `Value::Float(F64)`: 64-bit floating point
 - `Value::Bool(bool)`: Boolean value
 - `Value::String(String)`: String value
-- `Value::Object(usize)`: Object reference
-- `Value::Array(usize)`: Array reference
-- `Value::Foreign(usize)`: Foreign object reference
+- `Value::Object(ObjectRef)`: Object table reference
+- `Value::Array(ArrayRef)`: Array table reference
+- `Value::Foreign(ForeignObjectRef)`: Foreign object reference
 - `Value::Closure(Arc<Closure>)`: Function closure with captured environment
 - `Value::Unit`: Unit/void/nil value
 - `Value::Share(ShareType, ShareData)`: Secret-shared value for MPC
-- `Value::PendingReveal(usize)`: Internal marker used by batched reveal optimization
 
 ### Standard Library Builtins!
 
@@ -144,7 +143,7 @@ fn main() -> Result<(), String> {
         HashMap::new(),
     );
 
-    vm.register_function(hello_world);
+    vm.try_register_function(hello_world)?;
 
     let result = vm.execute("hello_world")?;
     println!("Program returned: {:?}", result);

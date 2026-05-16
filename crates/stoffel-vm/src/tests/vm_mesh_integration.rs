@@ -8,6 +8,15 @@
 //! 5. VMs executing bytecode that performs MPC multiplication
 //! 6. Results verification
 
+#![allow(
+    clippy::collapsible_match,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::unused_enumerate_index,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+
 use ark_bls12_381::Fr;
 use ark_ff::PrimeField;
 use ark_std::rand::{Rng, SeedableRng};
@@ -19,20 +28,20 @@ use stoffelmpc_mpc::common::SecretSharingScheme;
 use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::honeybadger::output::output::OutputClient;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use stoffelmpc_mpc::honeybadger::ProtocolType;
-use stoffelmpc_mpc::honeybadger::WrappedMessage;
 use stoffelnet::network_utils::ClientId;
 use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::core_vm::VirtualMachine;
+use crate::net::client_store::ClientShareIndex;
 use crate::net::hb_engine::HoneyBadgerMpcEngine;
-use crate::net::mpc_engine::MpcEngine;
 use crate::tests::mpc_multiplication_integration::{
     setup_honeybadger_quic_clients, setup_honeybadger_quic_network, HoneyBadgerQuicConfig,
-    HoneyBadgerQuicServer, RoutedNetwork,
+    RoutedNetwork,
 };
-use crate::tests::test_utils::{acquire_hb_itest_lock, init_crypto_provider, setup_test_tracing};
+use crate::tests::test_utils::{
+    acquire_hb_itest_lock, init_crypto_provider, read_vm_table_number, setup_test_tracing,
+};
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
@@ -311,7 +320,7 @@ async fn test_vm_mesh_full_integration() {
         let mut vm = VirtualMachine::new();
 
         // Attach MPC engine to VM, wrapping the already-running HB node for this party
-        let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+        let mpc_engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::try_from_existing_node_with_router(
             server.open_message_router.clone(),
             instance_id,
             sorted_pid,
@@ -319,9 +328,10 @@ async fn test_vm_mesh_full_integration() {
             threshold,
             server.network.clone().expect("network should be set"),
             server.node.clone(),
-        );
+        )
+        .expect("test topology should be valid");
 
-        vm.state.mpc_engine = Some(mpc_engine);
+        vm.set_mpc_engine(mpc_engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
 
         info!(
@@ -347,12 +357,9 @@ async fn test_vm_mesh_full_integration() {
                 .collect()
         };
 
-        let mut vm = vm_arc.lock();
-        let store = vm.state.client_store();
-        store.clear();
-        for (client_id, shares) in shares_for_party {
-            store.store_client_input(client_id, shares);
-        }
+        let vm = vm_arc.lock();
+        vm.try_replace_client_inputs(shares_for_party)
+            .expect("populate VM client inputs");
         info!("✓ VM {} client store populated", party_id);
     }
 
@@ -694,7 +701,7 @@ async fn test_vm_mesh_average_salary_integration() {
             .party_id
             .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::try_from_existing_node_with_router(
             server.open_message_router.clone(),
             instance_id,
             party_id,
@@ -702,8 +709,9 @@ async fn test_vm_mesh_average_salary_integration() {
             threshold,
             server.network.clone().expect("network should be set"),
             server.node.clone(),
-        );
-        vm.state.set_mpc_engine(engine);
+        )
+        .expect("test topology should be valid");
+        vm.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
     }
 
@@ -750,12 +758,9 @@ async fn test_vm_mesh_average_salary_integration() {
                 .map(|(client, shares)| (*client, shares.clone()))
                 .collect()
         };
-        let mut vm = vm_arc.lock();
-        let store = vm.state.client_store();
-        store.clear();
-        for (client_id, shares) in shares_for_party {
-            store.store_client_input(client_id, shares);
-        }
+        let vm = vm_arc.lock();
+        vm.try_replace_client_inputs(shares_for_party)
+            .expect("populate VM client inputs");
     }
 
     info!("Registering average salary program on all VMs...");
@@ -780,10 +785,9 @@ async fn test_vm_mesh_average_salary_integration() {
         let mut salary_sums: Vec<RobustShare<Fr>> = Vec::new();
         for (_party_id, vm_arc) in vms.iter().enumerate() {
             let vm = vm_arc.lock();
-            let store = vm.state.client_store();
             let mut sum: Option<RobustShare<Fr>> = None;
             for client_id in &client_ids {
-                if let Some(share) = store.get_client_share(*client_id, 0) {
+                if let Some(share) = vm.client_share::<Fr>(*client_id, ClientShareIndex::new(0)) {
                     sum = Some(match sum {
                         None => share.clone(),
                         Some(s) => (s + share.clone()).expect("Share addition failed"),
@@ -1518,7 +1522,7 @@ async fn test_vm_mesh_output_client_integration() {
             .party_id
             .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::try_from_existing_node_with_router(
             server.open_message_router.clone(),
             instance_id,
             party_id,
@@ -1526,8 +1530,9 @@ async fn test_vm_mesh_output_client_integration() {
             threshold,
             server.network.clone().expect("network should be set"),
             server.node.clone(),
-        );
-        vm.state.set_mpc_engine(engine);
+        )
+        .expect("test topology should be valid");
+        vm.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
     }
 
@@ -1546,12 +1551,9 @@ async fn test_vm_mesh_output_client_integration() {
                 .map(|(client, shares)| (*client, shares.clone()))
                 .collect()
         };
-        let mut vm = vm_arc.lock();
-        let store = vm.state.client_store();
-        store.clear();
-        for (client_id, shares) in shares_for_party {
-            store.store_client_input(client_id, shares);
-        }
+        let vm = vm_arc.lock();
+        vm.try_replace_client_inputs(shares_for_party)
+            .expect("populate VM client inputs");
     }
 
     // Step 8: Register and execute sum program (no reveal)
@@ -2036,7 +2038,7 @@ async fn test_vm_mesh_matrix_average_integration() {
             .party_id
             .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::try_from_existing_node_with_router(
             server.open_message_router.clone(),
             instance_id,
             party_id,
@@ -2044,8 +2046,9 @@ async fn test_vm_mesh_matrix_average_integration() {
             threshold,
             server.network.clone().expect("network should be set"),
             server.node.clone(),
-        );
-        vm.state.set_mpc_engine(engine);
+        )
+        .expect("test topology should be valid");
+        vm.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
     }
 
@@ -2064,12 +2067,9 @@ async fn test_vm_mesh_matrix_average_integration() {
                 .map(|(client, shares)| (*client, shares.clone()))
                 .collect()
         };
-        let mut vm = vm_arc.lock();
-        let store = vm.state.client_store();
-        store.clear();
-        for (client_id, shares) in shares_for_party {
-            store.store_client_input(client_id, shares);
-        }
+        let vm = vm_arc.lock();
+        vm.try_replace_client_inputs(shares_for_party)
+            .expect("populate VM client inputs");
         info!("✓ VM {} client store populated", party_id);
     }
 
@@ -2850,7 +2850,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             .party_id
             .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::try_from_existing_node_with_router(
             server.open_message_router.clone(),
             instance_id,
             party_id,
@@ -2858,8 +2858,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
             threshold,
             server.network.clone().expect("network should be set"),
             server.node.clone(),
-        );
-        vm.state.set_mpc_engine(engine);
+        )
+        .expect("test topology should be valid");
+        vm.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
     }
     info!(
@@ -2915,12 +2916,9 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
 
     for party_id in 0..n_parties {
         let vm_arc = &vms[party_id];
-        let mut vm = vm_arc.lock();
-        let store = vm.state.client_store();
-        store.clear();
-        for (client_id, shares) in shares_by_party[party_id].drain(..) {
-            store.store_client_input(client_id, shares);
-        }
+        let vm = vm_arc.lock();
+        vm.try_replace_client_inputs(shares_by_party[party_id].drain(..))
+            .expect("populate VM client inputs");
     }
     info!(
         "  ✓ Client stores hydrated in {:.2}s",
@@ -3004,8 +3002,8 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     // All parties should return arrays with the same averaged values
     for (pid, val) in &results {
         match val {
-            Value::Array(array_id) => {
-                info!("Party {} returned array with id {}", pid, array_id);
+            Value::Array(array_ref) => {
+                info!("Party {} returned array with id {}", pid, array_ref);
                 // We'll verify the array contents match expected averages
                 // The array stores revealed fixed-point values
             }
@@ -3020,61 +3018,43 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
     // For large matrices, only verify a sample to avoid excessive logging
     {
         let (first_pid, first_val) = &results[0];
-        if let Value::Array(array_id) = first_val {
-            let vm = vms[*first_pid].lock();
-            if let Some(arr) = vm.state.object_store.get_array(*array_id) {
-                info!(
-                    "Verifying {} averaged matrix elements (sampling first 10 and last 10):",
-                    arr.length()
+        if let Value::Array(array_ref) = first_val {
+            let mut vm = vms[*first_pid].lock();
+            let len = vm.read_array_len(*array_ref).unwrap();
+            info!(
+                "Verifying {} averaged matrix elements (sampling first 10 and last 10):",
+                len
+            );
+            let sample_indices: Vec<usize> = (0..10)
+                .chain((LARGE_MATRIX_SIZE - 10)..LARGE_MATRIX_SIZE)
+                .collect();
+            for &elem_idx in &sample_indices {
+                let computed_avg = read_vm_table_number(&mut vm, array_ref.id(), elem_idx).unwrap();
+                let expected = expected_averages[elem_idx];
+                let diff = (computed_avg - expected).abs();
+
+                let row = elem_idx / LARGE_MATRIX_COLS;
+                let col = elem_idx % LARGE_MATRIX_COLS;
+
+                assert!(
+                    diff <= 0.01,
+                    "Element [{},{}] mismatch: got {:.4}, expected {:.4} (diff {:.4})",
+                    row,
+                    col,
+                    computed_avg,
+                    expected,
+                    diff
                 );
-                let sample_indices: Vec<usize> = (0..10)
-                    .chain((LARGE_MATRIX_SIZE - 10)..LARGE_MATRIX_SIZE)
-                    .collect();
-                for &elem_idx in &sample_indices {
-                    // Arrays are 0-indexed in this VM
-                    let idx_val = Value::I64(elem_idx as i64);
-                    if let Some(elem_val) = arr.get(&idx_val) {
-                        // Extract the computed average value
-                        // SecretFixedPoint now reveals directly to f64 (via F64 wrapper)
-                        let computed_avg: f64 = match elem_val {
-                            Value::I64(v) => *v as f64,
-                            Value::Float(v) => v.0,
-                            other => {
-                                panic!("Element {} has unexpected type: {:?}", elem_idx, other)
-                            }
-                        };
-
-                        let expected = expected_averages[elem_idx];
-                        let diff = (computed_avg - expected).abs();
-
-                        let row = elem_idx / LARGE_MATRIX_COLS;
-                        let col = elem_idx % LARGE_MATRIX_COLS;
-
-                        assert!(
-                            diff <= 0.01,
-                            "Element [{},{}] mismatch: got {:.4}, expected {:.4} (diff {:.4})",
-                            row,
-                            col,
-                            computed_avg,
-                            expected,
-                            diff
-                        );
-                        info!(
-                            "  ✓ [{},{}] = {:.4} (expected {:.4})",
-                            row, col, computed_avg, expected
-                        );
-                    } else {
-                        panic!("Element {} not found in result array", elem_idx);
-                    }
-                }
                 info!(
-                    "  ... (verified {} sampled elements out of {})",
-                    sample_indices.len(),
-                    LARGE_MATRIX_SIZE
+                    "  ✓ [{},{}] = {:.4} (expected {:.4})",
+                    row, col, computed_avg, expected
                 );
-            } else {
-                panic!("Array {} not found in VM object store", array_id);
             }
+            info!(
+                "  ... (verified {} sampled elements out of {})",
+                sample_indices.len(),
+                LARGE_MATRIX_SIZE
+            );
         }
     }
 
@@ -3094,49 +3074,27 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
 
     let reference_vals: Vec<f64> = {
         let (first_pid, first_val) = &results[0];
-        let vm = vms[*first_pid].lock();
+        let mut vm = vms[*first_pid].lock();
         let array_id = match first_val {
-            Value::Array(id) => *id,
+            Value::Array(array_ref) => array_ref.id(),
             _ => panic!("Expected array"),
         };
-        let arr = vm
-            .state
-            .object_store
-            .get_array(array_id)
-            .expect("array exists");
         sample_indices
             .iter()
-            .map(|&i| {
-                let idx = Value::I64(i as i64);
-                match arr.get(&idx).expect("element exists") {
-                    Value::I64(v) => *v as f64,
-                    Value::Float(v) => v.0,
-                    _ => panic!("unexpected type"),
-                }
-            })
+            .map(|&i| read_vm_table_number(&mut vm, array_id, i).unwrap())
             .collect()
     };
 
     for (pid, val) in &results[1..] {
-        let vm = vms[*pid].lock();
+        let mut vm = vms[*pid].lock();
         let array_id = match val {
-            Value::Array(id) => *id,
+            Value::Array(array_ref) => array_ref.id(),
             _ => panic!("Expected array"),
         };
-        let arr = vm
-            .state
-            .object_store
-            .get_array(array_id)
-            .expect("array exists");
         for (sample_idx, (&i, &ref_val)) in
             sample_indices.iter().zip(reference_vals.iter()).enumerate()
         {
-            let idx = Value::I64(i as i64);
-            let party_val: f64 = match arr.get(&idx).expect("element exists") {
-                Value::I64(v) => *v as f64,
-                Value::Float(v) => v.0,
-                _ => panic!("unexpected type"),
-            };
+            let party_val = read_vm_table_number(&mut vm, array_id, i).unwrap();
             // Use approximate comparison for floating point
             let diff = (party_val - ref_val).abs();
             assert!(
@@ -3206,6 +3164,7 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
 /// Uses ClientStore.take_share_fixed to load shares as SecretFixedPoint type.
 /// After summing and revealing, the result is still in fixed-point format
 /// and needs to be unscaled for the final average.
+#[allow(dead_code)]
 fn build_matrix_average_program_fixed_point(
     matrix_size: usize,
 ) -> (Vec<Instruction>, HashMap<String, usize>) {
@@ -3367,6 +3326,7 @@ fn build_matrix_average_program_fixed_point(
 /// - Divide each sum by `num_clients` to get the average
 /// - Store results in an array and return it
 /// - Send averaged values back to each client
+#[allow(dead_code)]
 fn build_federated_average_program(
     matrix_size: usize,
     _num_clients: usize,
@@ -3535,7 +3495,7 @@ fn build_federated_average_program(
 /// - Properly handles the distinction between clear I64 values and secret shares
 #[tokio::test(flavor = "multi_thread")]
 async fn test_vm_mesh_bytecode_fixed_point_integration() {
-    use stoffel_vm_types::compiled_binary::utils::{load_from_file, to_vm_functions};
+    use stoffel_vm_types::compiled_binary::utils::{load_from_file, try_to_vm_functions};
 
     init_crypto_provider();
     setup_test_tracing();
@@ -3569,53 +3529,17 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
     );
     let compiled_binary =
         load_from_file(bytecode_path).expect("Failed to load compiled bytecode from .stflb file");
-    let mut vm_functions = to_vm_functions(&compiled_binary);
+    let vm_functions =
+        try_to_vm_functions(&compiled_binary).expect("compiled bytecode should be executable");
 
     info!("  Loaded {} functions from bytecode:", vm_functions.len());
-    for func in &mut vm_functions {
-        // The bytecode file may have been compiled with incorrect register counts.
-        // The compute_matrix_sum function uses registers 16, 17 (secret registers)
-        // but may have been compiled with only 8 registers.
-        // We need to ensure the register count is sufficient for the instructions.
-        let max_reg = func
-            .instructions
-            .iter()
-            .filter_map(|instr| {
-                // Extract register numbers from instructions
-                match instr {
-                    Instruction::MOV(dst, src) => Some((*dst).max(*src)),
-                    Instruction::LDI(reg, _) => Some(*reg),
-                    Instruction::ADD(dst, a, b) => Some((*dst).max(*a).max(*b)),
-                    Instruction::MUL(dst, a, b) => Some((*dst).max(*a).max(*b)),
-                    Instruction::DIV(dst, a, b) => Some((*dst).max(*a).max(*b)),
-                    Instruction::SUB(dst, a, b) => Some((*dst).max(*a).max(*b)),
-                    Instruction::RET(reg) => Some(*reg),
-                    Instruction::CMP(a, b) => Some((*a).max(*b)),
-                    Instruction::PUSHARG(reg) => Some(*reg),
-                    _ => None,
-                }
-            })
-            .max()
-            .unwrap_or(0);
-
-        // Ensure we have enough registers (add some padding for safety)
-        let required_regs = max_reg + 1;
-        if func.register_count < required_regs {
-            info!(
-                "    - {} (adjusting register_count from {} to {} based on instruction analysis)",
-                func.name,
-                func.register_count,
-                required_regs.max(32)
-            );
-            func.register_count = required_regs.max(32); // Use at least 32 registers for MPC programs
-        } else {
-            info!(
-                "    - {} ({} instructions, {} registers)",
-                func.name,
-                func.instructions.len(),
-                func.register_count
-            );
-        }
+    for func in &vm_functions {
+        info!(
+            "    - {} ({} instructions, {} frame registers)",
+            func.name(),
+            func.instructions().len(),
+            func.register_count()
+        );
     }
 
     // Generate test client data before network setup (client IDs must be registered at setup time)
@@ -3908,7 +3832,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
             .party_id
             .expect("party_id should be set after finalize_network()");
         let mut vm = VirtualMachine::new();
-        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+        let engine = HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::try_from_existing_node_with_router(
             server.open_message_router.clone(),
             instance_id,
             party_id,
@@ -3916,8 +3840,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
             threshold,
             server.network.clone().expect("network should be set"),
             server.node.clone(),
-        );
-        vm.state.set_mpc_engine(engine);
+        )
+        .expect("test topology should be valid");
+        vm.set_mpc_engine(engine);
         vms.push(Arc::new(parking_lot::Mutex::new(vm)));
     }
 
@@ -3936,12 +3861,9 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                 .map(|(client, shares)| (*client, shares.clone()))
                 .collect()
         };
-        let mut vm = vm_arc.lock();
-        let store = vm.state.client_store();
-        store.clear();
-        for (client_id, shares) in shares_for_party {
-            store.store_client_input(client_id, shares);
-        }
+        let vm = vm_arc.lock();
+        vm.try_replace_client_inputs(shares_for_party)
+            .expect("populate VM client inputs");
         info!("  VM {} client store populated", party_id);
     }
 
@@ -4071,62 +3993,51 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 
     // Display VM result matrix and compare with expected
     if let Some((first_pid, first_val)) = results.first() {
-        if let Value::Array(array_id) = first_val {
-            let vm = vms[*first_pid].lock();
-            if let Some(arr) = vm.state.object_store.get_array(*array_id) {
-                // Extract VM result values
-                let vm_results: Vec<f64> = (0..MATRIX_SIZE)
-                    .map(|i| {
-                        arr.get(&Value::I64(i as i64))
-                            .map(|v| match v {
-                                Value::Float(f) => f.0,
-                                Value::I64(i) => *i as f64,
-                                _ => 0.0,
-                            })
-                            .unwrap_or(0.0)
-                    })
+        if let Value::Array(array_ref) = first_val {
+            let mut vm = vms[*first_pid].lock();
+            let vm_results: Vec<f64> = (0..MATRIX_SIZE)
+                .map(|i| read_vm_table_number(&mut vm, array_ref.id(), i).unwrap_or(0.0))
+                .collect();
+
+            info!("");
+            info!("=== VM Computed Result Matrix (Federated Average) ===");
+            for row in 0..MATRIX_ROWS {
+                let row_values: Vec<String> = (0..MATRIX_COLS)
+                    .map(|col| format!("{:8.4}", vm_results[row * MATRIX_COLS + col]))
                     .collect();
+                info!("  [{}]", row_values.join(", "));
+            }
 
-                info!("");
-                info!("=== VM Computed Result Matrix (Federated Average) ===");
-                for row in 0..MATRIX_ROWS {
-                    let row_values: Vec<String> = (0..MATRIX_COLS)
-                        .map(|col| format!("{:8.4}", vm_results[row * MATRIX_COLS + col]))
-                        .collect();
-                    info!("  [{}]", row_values.join(", "));
+            // Compare with expected values
+            info!("");
+            info!("=== Comparison: Expected vs VM Result ===");
+            let mut max_diff: f64 = 0.0;
+            for row in 0..MATRIX_ROWS {
+                let mut row_comparisons = Vec::new();
+                for col in 0..MATRIX_COLS {
+                    let idx = row * MATRIX_COLS + col;
+                    let expected = expected_averages[idx];
+                    let actual = vm_results[idx];
+                    let diff = (expected - actual).abs();
+                    max_diff = max_diff.max(diff);
+                    row_comparisons.push(format!(
+                        "[{},{}]: exp={:.4}, got={:.4}, diff={:.6}",
+                        row, col, expected, actual, diff
+                    ));
                 }
+                for comp in row_comparisons {
+                    info!("  {}", comp);
+                }
+            }
+            info!("");
+            info!("Maximum element-wise difference: {:.6}", max_diff);
 
-                // Compare with expected values
-                info!("");
-                info!("=== Comparison: Expected vs VM Result ===");
-                let mut max_diff: f64 = 0.0;
-                for row in 0..MATRIX_ROWS {
-                    let mut row_comparisons = Vec::new();
-                    for col in 0..MATRIX_COLS {
-                        let idx = row * MATRIX_COLS + col;
-                        let expected = expected_averages[idx];
-                        let actual = vm_results[idx];
-                        let diff = (expected - actual).abs();
-                        max_diff = max_diff.max(diff);
-                        row_comparisons.push(format!(
-                            "[{},{}]: exp={:.4}, got={:.4}, diff={:.6}",
-                            row, col, expected, actual, diff
-                        ));
-                    }
-                    for comp in row_comparisons {
-                        info!("  {}", comp);
-                    }
-                }
-                info!("");
-                info!("Maximum element-wise difference: {:.6}", max_diff);
-
-                // Allow small fixed-point rounding errors
-                let tolerance = 0.01; // 1% tolerance for fixed-point arithmetic
-                if max_diff > tolerance {
-                    info!("WARNING: Difference exceeds tolerance of {:.4}", tolerance);
-                } else {
-                    info!("All values within tolerance of {:.4}", tolerance);
-                }
+            // Allow small fixed-point rounding errors
+            let tolerance = 0.01; // 1% tolerance for fixed-point arithmetic
+            if max_diff > tolerance {
+                info!("WARNING: Difference exceeds tolerance of {:.4}", tolerance);
+            } else {
+                info!("All values within tolerance of {:.4}", tolerance);
             }
         }
     }
@@ -4165,6 +4076,7 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
 ///    - Divides by num_clients
 ///    - Stores in result array
 /// 4. Returns the result array
+#[allow(dead_code)]
 fn build_manual_federated_average_program(
     num_elements: usize,
 ) -> (Vec<Instruction>, HashMap<String, usize>) {
@@ -4319,14 +4231,14 @@ fn build_manual_federated_average_program_with_type(
     instructions.push(Instruction::CALL("get_field".to_string()));
     instructions.push(Instruction::MOV(16, 0)); // reg16 = secret sum
 
-    // Reveal: MOV from secret (reg16) to clear (reg7)
-    // With auto-batching, this QUEUES the reveal (returns PendingReveal marker)
-    instructions.push(Instruction::MOV(7, 16)); // reg7 = PendingReveal or revealed value
+    // Reveal: MOV from secret (reg16) to clear (reg7).
+    // The VM may queue this reveal; the following PUSHARG resolves it before use.
+    instructions.push(Instruction::MOV(7, 16));
 
-    // Store in revealed_sums array (stores PendingReveal marker, not actual value yet)
+    // Store the resolved clear value in revealed_sums.
     instructions.push(Instruction::PUSHARG(9)); // revealed_sums array
     instructions.push(Instruction::PUSHARG(5)); // index
-    instructions.push(Instruction::PUSHARG(7)); // PendingReveal marker
+    instructions.push(Instruction::PUSHARG(7)); // resolved revealed value
     instructions.push(Instruction::CALL("set_field".to_string()));
 
     instructions.push(Instruction::ADD(5, 5, 3)); // reg5++

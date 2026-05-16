@@ -5051,11 +5051,12 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?rev=dfb4f795ba701369229915eff2cf3dc70d371380#dfb4f795ba701369229915eff2cf3dc70d371380"
+source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=dev#7b2e49ac2a3c2bf8510d94ddbf07bac0728a0206"
 dependencies = [
  "alloy",
  "alloy-primitives",
  "ark-bls12-381",
+ "ark-ec",
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
  "ark-std 0.5.0",
@@ -5075,6 +5076,7 @@ dependencies = [
  "ring",
  "rustls",
  "serde",
+ "stoffel-solidity-bindings",
  "stoffel-solidity-bindings-test",
  "stoffelmpc-mpc",
  "stoffelnet",
@@ -5082,14 +5084,24 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "tracing",
  "url",
  "x509-parser 0.18.1",
 ]
 
 [[package]]
+name = "stoffel-solidity-bindings"
+version = "0.1.0"
+source = "git+https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git?branch=test-coord#bd3e1f77ba77f78b5539deb739be45bdd23fae5f"
+dependencies = [
+ "alloy",
+ "serde",
+]
+
+[[package]]
 name = "stoffel-solidity-bindings-test"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git?branch=test-coord#0322199fb2d4c7260d53b6d3b21c7a6f3c6acd58"
+source = "git+https://github.com/Stoffel-Labs/Stoffel-solidity-SDK.git?branch=test-coord#bd3e1f77ba77f78b5539deb739be45bdd23fae5f"
 dependencies = [
  "alloy",
  "serde",

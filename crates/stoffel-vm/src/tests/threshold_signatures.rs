@@ -26,6 +26,8 @@
 //! Re-signing the same message produces a different (but equally valid)
 //! signature because the nonce is freshly random.
 
+#![allow(clippy::needless_range_loop, clippy::while_let_loop)]
+
 use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
 use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -47,8 +49,11 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::core_vm::VirtualMachine;
-use crate::net::avss_engine::AvssMpcEngine;
-use crate::tests::test_utils::{init_crypto_provider, setup_test_tracing};
+use crate::net::avss_engine::{AvssEngineConfig, AvssMpcEngine};
+use crate::net::MpcSessionConfig;
+use crate::tests::test_utils::{
+    init_crypto_provider, read_vm_table_byte_array, setup_test_tracing,
+};
 
 // ---------------------------------------------------------------------------
 // SimplePartyNetwork - party-id-based Network adapter (same as avss_e2e)
@@ -599,19 +604,9 @@ fn spawn_message_processors<F, G>(
 // Helper: extract byte array from VM Value::Array
 // ---------------------------------------------------------------------------
 
-fn extract_vm_byte_array(vm: &VirtualMachine, value: &Value) -> Vec<u8> {
+fn extract_vm_byte_array(vm: &mut VirtualMachine, value: &Value) -> Vec<u8> {
     match value {
-        Value::Array(arr_id) => {
-            let arr = vm.state.object_store.get_array(*arr_id).unwrap();
-            let len = arr.length();
-            let mut bytes = Vec::with_capacity(len);
-            for i in 0..len {
-                if let Some(Value::U8(b)) = arr.get(&Value::I64(i as i64)) {
-                    bytes.push(*b);
-                }
-            }
-            bytes
-        }
+        Value::Array(arr_ref) => read_vm_table_byte_array(vm, arr_ref.id()).unwrap(),
         other => panic!("Expected Array, got {:?}", other),
     }
 }
@@ -640,9 +635,7 @@ where
         let program = instructions.clone();
         let reg_count = register_count;
         handles.push(tokio::task::spawn_blocking(move || {
-            let mut vm = VirtualMachine::new();
-            vm.state.set_mpc_engine(engine);
-            crate::mpc_builtins::register_mpc_builtins(&mut vm);
+            let mut vm = VirtualMachine::builder().with_mpc_engine(engine).build();
 
             let func = VMFunction::new(
                 "main".to_string(),
@@ -706,16 +699,19 @@ async fn test_threshold_schnorr_ed25519() {
 
     let mut engines: Vec<Arc<AvssMpcEngine<Fr, EdwardsProjective>>> = Vec::with_capacity(n);
     for (i, node) in nodes.iter().enumerate() {
-        let engine = AvssMpcEngine::new(
+        let session = MpcSessionConfig::try_new(
             instance_id,
             node.node_id,
             n,
             t,
             node.network.clone().unwrap(),
+        )
+        .expect("test topology should be valid");
+        let engine = AvssMpcEngine::from_config(AvssEngineConfig::new(
+            session,
             node.sk_i,
             pk_maps[i].clone(),
-            vec![],
-        )
+        ))
         .await
         .expect("Failed to create engine");
         engine.start_async().await.expect("Failed to start engine");
@@ -783,10 +779,10 @@ async fn test_threshold_schnorr_ed25519() {
     ];
 
     info!("Running Schnorr signing program on {} parties...", n);
-    let results = run_program_on_all_parties(&engines, program, 14).await;
+    let mut results = run_program_on_all_parties(&engines, program, 14).await;
 
     let mut byte_results: Vec<Vec<u8>> = Vec::new();
-    for (vm, result) in &results {
+    for (vm, result) in &mut results {
         byte_results.push(extract_vm_byte_array(vm, result));
     }
 
@@ -910,16 +906,19 @@ async fn test_threshold_eddsa_ed25519() {
     // Create Ed25519 AVSS engines
     let mut engines: Vec<Arc<AvssMpcEngine<Fr, EdwardsProjective>>> = Vec::with_capacity(n);
     for (i, node) in nodes.iter().enumerate() {
-        let engine = AvssMpcEngine::new(
+        let session = MpcSessionConfig::try_new(
             instance_id,
             node.node_id,
             n,
             t,
             node.network.clone().unwrap(),
+        )
+        .expect("test topology should be valid");
+        let engine = AvssMpcEngine::from_config(AvssEngineConfig::new(
+            session,
             node.sk_i,
             pk_maps[i].clone(),
-            vec![],
-        )
+        ))
         .await
         .expect("Failed to create engine");
         engine.start_async().await.expect("Failed to start engine");
@@ -999,11 +998,11 @@ async fn test_threshold_eddsa_ed25519() {
     ];
 
     info!("Running EdDSA signing program on {} parties...", n);
-    let results = run_program_on_all_parties(&engines, program, 16).await;
+    let mut results = run_program_on_all_parties(&engines, program, 16).await;
 
     // Extract and verify consistency
     let mut byte_results: Vec<Vec<u8>> = Vec::new();
-    for (vm, result) in &results {
+    for (vm, result) in &mut results {
         let bytes = extract_vm_byte_array(vm, result);
         byte_results.push(bytes);
     }
@@ -1094,7 +1093,7 @@ async fn test_threshold_eddsa_ed25519() {
     // 2) ed25519-dalek third-party verification
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let pk_bytes: [u8; 32] = result[64..96].try_into().expect("pk must be 32 bytes");
-    let vk =
+    let _vk =
         VerifyingKey::from_bytes(&pk_bytes).expect("Failed to load public key into ed25519-dalek");
     println!("  Public key loaded into ed25519-dalek: YES");
 
@@ -1102,7 +1101,7 @@ async fn test_threshold_eddsa_ed25519() {
     let mut sig_bytes = [0u8; 64];
     sig_bytes[..32].copy_from_slice(&result[..32]); // R
     sig_bytes[32..].copy_from_slice(&result[32..64]); // S
-    let sig = Signature::from_bytes(&sig_bytes);
+    let _sig = Signature::from_bytes(&sig_bytes);
 
     // ed25519-dalek verification requires converting arkworks types to dalek types.
     // Arkworks Fr::serialize_compressed produces Montgomery form bytes, not standard
@@ -1135,7 +1134,7 @@ async fn test_threshold_eddsa_ed25519() {
     println!("  pk from VM:         {}", hex::encode(&result[64..96]));
     println!("  pk re-serialized:   {}", hex::encode(&pk_ark_bytes));
     println!("  S from VM:          {}", hex::encode(&result[32..64]));
-    println!("  S via BigInt:       {}", hex::encode(&s_fixed));
+    println!("  S via BigInt:       {}", hex::encode(s_fixed));
 
     // Build signature with BigInt-converted S and check with dalek
     let pk_arr: [u8; 32] = pk_ark_bytes.clone().try_into().unwrap();
@@ -1220,16 +1219,19 @@ async fn test_threshold_bls_signature() {
     // Create BLS12-381 AVSS engines
     let mut engines: Vec<Arc<AvssMpcEngine<Fr, G1Projective>>> = Vec::with_capacity(n);
     for (i, node) in nodes.iter().enumerate() {
-        let engine = AvssMpcEngine::new(
+        let session = MpcSessionConfig::try_new(
             instance_id,
             node.node_id,
             n,
             t,
             node.network.clone().unwrap(),
+        )
+        .expect("test topology should be valid");
+        let engine = AvssMpcEngine::from_config(AvssEngineConfig::new(
+            session,
             node.sk_i,
             pk_maps[i].clone(),
-            vec![],
-        )
+        ))
         .await
         .expect("Failed to create engine");
         engine.start_async().await.expect("Failed to start engine");
@@ -1281,11 +1283,11 @@ async fn test_threshold_bls_signature() {
     ];
 
     info!("Running BLS signing program on {} parties...", n);
-    let results = run_program_on_all_parties(&engines, program, 10).await;
+    let mut results = run_program_on_all_parties(&engines, program, 10).await;
 
     // Extract and verify consistency
     let mut byte_results: Vec<Vec<u8>> = Vec::new();
-    for (vm, result) in &results {
+    for (vm, result) in &mut results {
         let bytes = extract_vm_byte_array(vm, result);
         byte_results.push(bytes);
     }

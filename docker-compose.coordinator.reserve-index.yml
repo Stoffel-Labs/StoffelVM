@@ -72,6 +72,8 @@ services:
       - "1"
       - --n-inputs
       - "2"
+      - --output-clients
+      - /app/ids/clients/cert0.crt,/app/ids/clients/cert1.crt
       - --initial-mpc-nodes
       - /app/ids/nodes/cert0.crt,/app/ids/nodes/cert1.crt,/app/ids/nodes/cert2.crt,/app/ids/nodes/cert3.crt,/app/ids/nodes/cert4.crt
     volumes:

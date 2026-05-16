@@ -20,3 +20,5 @@ pub mod threshold_signatures;
 pub mod vm_mesh_integration;
 #[cfg(feature = "hb_itest")]
 pub mod vm_mpc_integration;
+#[cfg(all(feature = "hb_itest", feature = "avss_itest"))]
+pub mod vm_turmoil_e2e;
