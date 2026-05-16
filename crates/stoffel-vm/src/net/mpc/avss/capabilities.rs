@@ -402,9 +402,9 @@ where
             )?;
             self.broadcast_open_registry_payload_sync(wire_message)?;
 
-            let required = self.topology.threshold() + 1;
             let n = self.topology.n_parties();
             let t = self.topology.threshold();
+            let required = Self::byzantine_open_contribution_count(n, t)?;
 
             self.open_registry.open_bytes_wait(
                 self.topology.party_id(),
@@ -412,12 +412,13 @@ where
                 share_bytes,
                 required,
                 |collected| {
-                    let mut shares: Vec<FeldmanShamirShare<F, G>> =
-                        Vec::with_capacity(collected.len());
-                    for bytes in collected {
-                        shares.push(Self::decode_feldman_share(bytes)?);
-                    }
-                    let secret = Self::reconstruct_secret(&shares, n, t)?;
+                    let secret = Self::reconstruct_verified_secret(
+                        share_bytes,
+                        collected,
+                        n,
+                        t,
+                        "AVSS open_share_as_field",
+                    )?;
                     let mut out = Vec::new();
                     secret
                         .serialize_compressed(&mut out)
@@ -669,9 +670,9 @@ where
             )?;
             self.broadcast_open_registry_payload(wire_message).await?;
 
-            let required = self.topology.threshold() + 1;
             let n = self.topology.n_parties();
             let t = self.topology.threshold();
+            let required = Self::byzantine_open_contribution_count(n, t)?;
 
             self.open_registry
                 .open_share_async(
@@ -680,12 +681,13 @@ where
                     share_bytes.to_vec(),
                     required,
                     |collected| {
-                        let mut shares: Vec<FeldmanShamirShare<F, G>> =
-                            Vec::with_capacity(collected.len());
-                        for bytes in collected {
-                            shares.push(Self::decode_feldman_share(bytes)?);
-                        }
-                        let secret = Self::reconstruct_secret(&shares, n, t)?;
+                        let secret = Self::reconstruct_verified_secret(
+                            share_bytes,
+                            collected,
+                            n,
+                            t,
+                            "AVSS async_open_share",
+                        )?;
                         Self::field_to_clear_share_value(ty, secret)
                     },
                 )
@@ -716,9 +718,9 @@ where
             )?;
             self.broadcast_open_registry_payload(wire_message).await?;
 
-            let required = self.topology.threshold() + 1;
             let n = self.topology.n_parties();
             let t = self.topology.threshold();
+            let required = Self::byzantine_open_contribution_count(n, t)?;
 
             self.open_registry
                 .batch_open_async(
@@ -727,13 +729,18 @@ where
                     shares.to_vec(),
                     required,
                     |collected, pos| {
-                        let mut decoded_shares: Vec<FeldmanShamirShare<F, G>> =
-                            Vec::with_capacity(collected.len());
-                        for bytes in collected {
-                            decoded_shares.push(Self::decode_feldman_share(bytes)?);
-                        }
-                        let secret = Self::reconstruct_secret(&decoded_shares, n, t)
-                            .map_err(|e| format!("batch reconstruct_secret pos {}: {}", pos, e))?;
+                        let expected_share = shares.get(pos).ok_or_else(|| {
+                            format!(
+                                "AVSS async_batch_open_shares missing local share at position {pos}"
+                            )
+                        })?;
+                        let secret = Self::reconstruct_verified_secret(
+                            expected_share,
+                            collected,
+                            n,
+                            t,
+                            &format!("AVSS async_batch_open_shares pos {pos}"),
+                        )?;
                         Self::field_to_clear_share_value(ty, secret)
                     },
                 )
@@ -779,9 +786,9 @@ where
             )?;
             self.broadcast_open_registry_payload(wire_message).await?;
 
-            let required = self.topology.threshold() + 1;
             let n = self.topology.n_parties();
             let t = self.topology.threshold();
+            let required = Self::byzantine_open_contribution_count(n, t)?;
 
             self.open_registry
                 .open_bytes_async(
@@ -790,12 +797,13 @@ where
                     share_bytes.to_vec(),
                     required,
                     |collected| {
-                        let mut shares: Vec<FeldmanShamirShare<F, G>> =
-                            Vec::with_capacity(collected.len());
-                        for bytes in collected {
-                            shares.push(Self::decode_feldman_share(bytes)?);
-                        }
-                        let secret = Self::reconstruct_secret(&shares, n, t)?;
+                        let secret = Self::reconstruct_verified_secret(
+                            share_bytes,
+                            collected,
+                            n,
+                            t,
+                            "AVSS async_open_share_as_field",
+                        )?;
                         let mut out = Vec::new();
                         secret
                             .serialize_compressed(&mut out)

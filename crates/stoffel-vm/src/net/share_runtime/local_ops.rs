@@ -207,7 +207,11 @@ impl MpcShareRuntime<'_> {
         template: &ShareData,
         result_bytes: Vec<u8>,
     ) -> VmResult<ShareData> {
-        share_algebra::preserve_share_data_format(self.engine.field_kind(), template, result_bytes)
-            .map_mpc_backend_err("preserve_share_data_format")
+        share_algebra::preserve_share_data_format_for_curve(
+            self.engine.curve_config(),
+            template,
+            result_bytes,
+        )
+        .map_mpc_backend_err("preserve_share_data_format")
     }
 }

@@ -1,9 +1,11 @@
 use super::*;
 use crate::foreign_functions::ForeignFunctionCallbackError;
-use crate::net::client_store::{ClientShare, ClientShareIndex};
+use crate::net::client_store::{ClientOutputShareCount, ClientShare, ClientShareIndex};
 use crate::net::mpc_engine::{
     AbaSessionId, AsyncMpcEngine, AsyncMpcEngineConsensus, MpcCapabilities, MpcEngine,
-    MpcEngineConsensus, MpcEngineResult, MpcPartyId, MpcSessionTopology, RbcSessionId,
+    MpcEngineClientOutput, MpcEngineConsensus, MpcEngineError, MpcEngineFieldOpen,
+    MpcEngineMultiplication, MpcEngineOpenInExponent, MpcEngineRandomness, MpcEngineResult,
+    MpcExponentGroup, MpcPartyId, MpcSessionTopology, RbcSessionId,
 };
 use crate::runtime_hooks::{HookCallbackError, HookEvent, HookId};
 use crate::VirtualMachineError;
@@ -11,6 +13,7 @@ use crate::VirtualMachineErrorKind;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::error::Error;
+use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +24,8 @@ use stoffel_vm_types::core_types::{
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
 use stoffel_vm_types::registers::RegisterLayout;
+use stoffelnet::network_utils::ClientId;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn callback_error(error: &VirtualMachineError) -> &ForeignFunctionCallbackError {
     let mut source = error.source();
@@ -472,6 +477,956 @@ impl AsyncMpcEngineConsensus for BarrierConsensusEngine {
         self.aba_result_calls.fetch_add(1, Ordering::SeqCst);
         Ok(true)
     }
+}
+
+const TURMOIL_RBC_HOST: &str = "rbc-peer";
+const TURMOIL_VM_HOST: &str = "vm";
+const TURMOIL_RBC_PORT: u16 = 18_731;
+
+#[derive(Clone, Copy)]
+enum TurmoilRbcServerBehavior {
+    DelayPartyTwo,
+    HoldFirstResponse,
+}
+
+struct TurmoilConsensusEngine {
+    peer_host: &'static str,
+    peer_port: u16,
+    rbc_receive_started: AtomicUsize,
+    rbc_receive_finished: AtomicUsize,
+}
+
+impl TurmoilConsensusEngine {
+    const fn new(peer_host: &'static str, peer_port: u16) -> Self {
+        Self {
+            peer_host,
+            peer_port,
+            rbc_receive_started: AtomicUsize::new(0),
+            rbc_receive_finished: AtomicUsize::new(0),
+        }
+    }
+
+    fn io_failure(operation: &'static str, error: io::Error) -> MpcEngineError {
+        MpcEngineError::operation_failed(operation, error.to_string())
+    }
+}
+
+impl MpcEngine for TurmoilConsensusEngine {
+    fn protocol_name(&self) -> &'static str {
+        "turmoil-consensus"
+    }
+
+    fn topology(&self) -> MpcSessionTopology {
+        MpcSessionTopology::try_new(13, 1, 3, 1).expect("test topology should be valid")
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn start(&self) -> MpcEngineResult<()> {
+        Ok(())
+    }
+
+    fn input_share(&self, _clear: ClearShareInput) -> MpcEngineResult<ShareData> {
+        Ok(ShareData::Opaque(Vec::new()))
+    }
+
+    fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> MpcEngineResult<ClearShareValue> {
+        Err(MpcEngineError::operation_failed(
+            "open_share",
+            "not used by network consensus tests",
+        ))
+    }
+
+    fn capabilities(&self) -> MpcCapabilities {
+        MpcCapabilities::CONSENSUS
+    }
+
+    fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> {
+        Some(self)
+    }
+}
+
+impl MpcEngineConsensus for TurmoilConsensusEngine {
+    fn rbc_broadcast(&self, _message: &[u8]) -> MpcEngineResult<RbcSessionId> {
+        Err(MpcEngineError::operation_failed(
+            "rbc_broadcast",
+            "sync rbc_broadcast should not be used by async VM execution",
+        ))
+    }
+
+    fn rbc_receive(&self, _from_party: MpcPartyId, _timeout_ms: u64) -> MpcEngineResult<Vec<u8>> {
+        Err(MpcEngineError::operation_failed(
+            "rbc_receive",
+            "sync rbc_receive should not be used by async VM execution",
+        ))
+    }
+
+    fn rbc_receive_any(&self, _timeout_ms: u64) -> MpcEngineResult<(MpcPartyId, Vec<u8>)> {
+        Err(MpcEngineError::operation_failed(
+            "rbc_receive_any",
+            "sync rbc_receive_any should not be used by async VM execution",
+        ))
+    }
+
+    fn aba_propose(&self, _value: bool) -> MpcEngineResult<AbaSessionId> {
+        Err(MpcEngineError::operation_failed(
+            "aba_propose",
+            "sync aba_propose should not be used by async VM execution",
+        ))
+    }
+
+    fn aba_result(&self, _session_id: AbaSessionId, _timeout_ms: u64) -> MpcEngineResult<bool> {
+        Err(MpcEngineError::operation_failed(
+            "aba_result",
+            "sync aba_result should not be used by async VM execution",
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncMpcEngine for TurmoilConsensusEngine {
+    fn as_async_consensus_ops(&self) -> Option<&dyn AsyncMpcEngineConsensus> {
+        Some(self)
+    }
+
+    async fn open_share_async(
+        &self,
+        _ty: ShareType,
+        _share_bytes: &[u8],
+    ) -> MpcEngineResult<ClearShareValue> {
+        Err(MpcEngineError::operation_failed(
+            "async_open_share",
+            "not used by network consensus tests",
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncMpcEngineConsensus for TurmoilConsensusEngine {
+    async fn rbc_broadcast_async(&self, _message: &[u8]) -> MpcEngineResult<RbcSessionId> {
+        Ok(RbcSessionId::new(11))
+    }
+
+    async fn rbc_receive_async(
+        &self,
+        from_party: MpcPartyId,
+        timeout_ms: u64,
+    ) -> MpcEngineResult<Vec<u8>> {
+        self.rbc_receive_started.fetch_add(1, Ordering::SeqCst);
+
+        let receive = async {
+            let mut stream = turmoil::net::TcpStream::connect((self.peer_host, self.peer_port))
+                .await
+                .map_err(|error| Self::io_failure("async_rbc_receive.connect", error))?;
+
+            stream
+                .write_all(&(from_party.id() as u64).to_be_bytes())
+                .await
+                .map_err(|error| Self::io_failure("async_rbc_receive.write_party", error))?;
+
+            let mut len_buf = [0u8; 4];
+            stream
+                .read_exact(&mut len_buf)
+                .await
+                .map_err(|error| Self::io_failure("async_rbc_receive.read_len", error))?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > 1024 {
+                return Err(MpcEngineError::operation_failed(
+                    "async_rbc_receive",
+                    format!("message length {len} exceeds test limit"),
+                ));
+            }
+
+            let mut message = vec![0u8; len];
+            stream
+                .read_exact(&mut message)
+                .await
+                .map_err(|error| Self::io_failure("async_rbc_receive.read_message", error))?;
+
+            Ok(message)
+        };
+
+        let result = tokio::time::timeout(Duration::from_millis(timeout_ms), receive)
+            .await
+            .map_err(|_| {
+                MpcEngineError::operation_failed(
+                    "async_rbc_receive",
+                    format!("timed out after {timeout_ms} ms"),
+                )
+            })?;
+
+        self.rbc_receive_finished.fetch_add(1, Ordering::SeqCst);
+        result
+    }
+
+    async fn rbc_receive_any_async(
+        &self,
+        _timeout_ms: u64,
+    ) -> MpcEngineResult<(MpcPartyId, Vec<u8>)> {
+        Err(MpcEngineError::operation_failed(
+            "async_rbc_receive_any",
+            "not used by network consensus tests",
+        ))
+    }
+
+    async fn aba_propose_async(&self, _value: bool) -> MpcEngineResult<AbaSessionId> {
+        Err(MpcEngineError::operation_failed(
+            "async_aba_propose",
+            "not used by network consensus tests",
+        ))
+    }
+
+    async fn aba_result_async(
+        &self,
+        _session_id: AbaSessionId,
+        _timeout_ms: u64,
+    ) -> MpcEngineResult<bool> {
+        Err(MpcEngineError::operation_failed(
+            "async_aba_result",
+            "not used by network consensus tests",
+        ))
+    }
+}
+
+async fn run_turmoil_rbc_peer(
+    behavior: TurmoilRbcServerBehavior,
+) -> std::result::Result<(), io::Error> {
+    let listener = turmoil::net::TcpListener::bind(("0.0.0.0", TURMOIL_RBC_PORT)).await?;
+    loop {
+        let (socket, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            if let Err(error) = serve_turmoil_rbc_connection(socket, behavior).await {
+                panic!("turmoil RBC peer connection failed: {error}");
+            }
+        });
+    }
+}
+
+async fn serve_turmoil_rbc_connection(
+    mut socket: turmoil::net::TcpStream,
+    behavior: TurmoilRbcServerBehavior,
+) -> std::result::Result<(), io::Error> {
+    let mut party_buf = [0u8; 8];
+    socket.read_exact(&mut party_buf).await?;
+    let from_party = u64::from_be_bytes(party_buf) as usize;
+
+    match behavior {
+        TurmoilRbcServerBehavior::DelayPartyTwo if from_party == 2 => {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        TurmoilRbcServerBehavior::DelayPartyTwo => {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        TurmoilRbcServerBehavior::HoldFirstResponse if from_party == 2 => {
+            turmoil::hold(TURMOIL_RBC_HOST, TURMOIL_VM_HOST);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        TurmoilRbcServerBehavior::HoldFirstResponse => {}
+    }
+
+    let message = format!("from-{from_party}").into_bytes();
+    socket
+        .write_all(&(message.len() as u32).to_be_bytes())
+        .await?;
+    socket.write_all(&message).await?;
+
+    if matches!(behavior, TurmoilRbcServerBehavior::HoldFirstResponse) && from_party == 2 {
+        turmoil::release(TURMOIL_RBC_HOST, TURMOIL_VM_HOST);
+    }
+
+    Ok(())
+}
+
+const TURMOIL_ASYNC_OP_COUNT: usize = 15;
+const TURMOIL_RPC_TIMEOUT_MS: u64 = 1_000;
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurmoilAsyncOperation {
+    InputShare = 1,
+    Multiply = 2,
+    Open = 3,
+    BatchOpen = 4,
+    SendOutput = 5,
+    OpenExpGroup = 6,
+    Random = 7,
+    OpenField = 8,
+    OpenExpCustom = 9,
+    RbcBroadcast = 10,
+    RbcReceive = 11,
+    RbcReceiveAny = 12,
+    AbaPropose = 13,
+    AbaResult = 14,
+    AbaProposeAndWait = 15,
+}
+
+impl TurmoilAsyncOperation {
+    const fn index(self) -> usize {
+        self as usize - 1
+    }
+
+    const fn code(self) -> u8 {
+        self as u8
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::InputShare),
+            2 => Some(Self::Multiply),
+            3 => Some(Self::Open),
+            4 => Some(Self::BatchOpen),
+            5 => Some(Self::SendOutput),
+            6 => Some(Self::OpenExpGroup),
+            7 => Some(Self::Random),
+            8 => Some(Self::OpenField),
+            9 => Some(Self::OpenExpCustom),
+            10 => Some(Self::RbcBroadcast),
+            11 => Some(Self::RbcReceive),
+            12 => Some(Self::RbcReceiveAny),
+            13 => Some(Self::AbaPropose),
+            14 => Some(Self::AbaResult),
+            15 => Some(Self::AbaProposeAndWait),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TurmoilAllOpsServerBehavior {
+    Normal,
+    DelayRbcFromPartyTwoPastTimeout,
+    TruncateOpenResponse,
+    OversizedOpenFieldResponse,
+    OutOfRangeReceiveAnyParty,
+}
+
+struct TurmoilAllOpsEngine {
+    peer_host: &'static str,
+    peer_port: u16,
+    started: [AtomicUsize; TURMOIL_ASYNC_OP_COUNT],
+    finished: [AtomicUsize; TURMOIL_ASYNC_OP_COUNT],
+}
+
+impl TurmoilAllOpsEngine {
+    fn new(peer_host: &'static str, peer_port: u16) -> Self {
+        Self {
+            peer_host,
+            peer_port,
+            started: std::array::from_fn(|_| AtomicUsize::new(0)),
+            finished: std::array::from_fn(|_| AtomicUsize::new(0)),
+        }
+    }
+
+    fn started(&self, operation: TurmoilAsyncOperation) -> usize {
+        self.started[operation.index()].load(Ordering::SeqCst)
+    }
+
+    fn finished(&self, operation: TurmoilAsyncOperation) -> usize {
+        self.finished[operation.index()].load(Ordering::SeqCst)
+    }
+
+    async fn rpc(
+        &self,
+        operation: TurmoilAsyncOperation,
+        payload: Vec<u8>,
+        timeout_ms: u64,
+    ) -> MpcEngineResult<Vec<u8>> {
+        self.started[operation.index()].fetch_add(1, Ordering::SeqCst);
+
+        let exchange = async {
+            let mut stream = turmoil::net::TcpStream::connect((self.peer_host, self.peer_port))
+                .await
+                .map_err(|error| Self::io_failure(operation, "connect", error))?;
+            stream
+                .write_all(&[operation.code()])
+                .await
+                .map_err(|error| Self::io_failure(operation, "write_operation", error))?;
+            stream
+                .write_all(&(payload.len() as u32).to_be_bytes())
+                .await
+                .map_err(|error| Self::io_failure(operation, "write_len", error))?;
+            stream
+                .write_all(&payload)
+                .await
+                .map_err(|error| Self::io_failure(operation, "write_payload", error))?;
+
+            let mut len_buf = [0u8; 4];
+            stream
+                .read_exact(&mut len_buf)
+                .await
+                .map_err(|error| Self::io_failure(operation, "read_len", error))?;
+            let response_len = u32::from_be_bytes(len_buf) as usize;
+            if response_len > 4096 {
+                return Err(MpcEngineError::operation_failed(
+                    "turmoil_rpc",
+                    format!("{operation:?} response length {response_len} exceeds test limit"),
+                ));
+            }
+
+            let mut response = vec![0u8; response_len];
+            stream
+                .read_exact(&mut response)
+                .await
+                .map_err(|error| Self::io_failure(operation, "read_payload", error))?;
+            Ok(response)
+        };
+
+        let response = tokio::time::timeout(Duration::from_millis(timeout_ms), exchange)
+            .await
+            .map_err(|_| {
+                MpcEngineError::operation_failed(
+                    "turmoil_rpc",
+                    format!("{operation:?} timed out after {timeout_ms} ms"),
+                )
+            })??;
+
+        self.finished[operation.index()].fetch_add(1, Ordering::SeqCst);
+        Ok(response)
+    }
+
+    fn io_failure(
+        operation: TurmoilAsyncOperation,
+        step: &'static str,
+        error: io::Error,
+    ) -> MpcEngineError {
+        MpcEngineError::operation_failed(
+            "turmoil_rpc",
+            format!("{operation:?} {step} failed: {error}"),
+        )
+    }
+
+    fn clear_payload(clear: ClearShareInput) -> Vec<u8> {
+        let value = match clear.value() {
+            ClearShareValue::Integer(value) => value as u8,
+            ClearShareValue::FixedPoint(_) => 0,
+            ClearShareValue::Boolean(value) => u8::from(value),
+        };
+        vec![value]
+    }
+
+    fn first_share_byte(bytes: &[u8]) -> u8 {
+        bytes.first().copied().unwrap_or_default()
+    }
+}
+
+impl MpcEngine for TurmoilAllOpsEngine {
+    fn protocol_name(&self) -> &'static str {
+        "turmoil-all-ops"
+    }
+
+    fn topology(&self) -> MpcSessionTopology {
+        MpcSessionTopology::try_new(17, 1, 4, 1).expect("test topology should be valid")
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn start(&self) -> MpcEngineResult<()> {
+        Ok(())
+    }
+
+    fn input_share(&self, _clear: ClearShareInput) -> MpcEngineResult<ShareData> {
+        Err(MpcEngineError::operation_failed(
+            "input_share",
+            "sync input_share should not be used by async VM execution",
+        ))
+    }
+
+    fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> MpcEngineResult<ClearShareValue> {
+        Err(MpcEngineError::operation_failed(
+            "open_share",
+            "sync open_share should not be used by async VM execution",
+        ))
+    }
+
+    fn capabilities(&self) -> MpcCapabilities {
+        MpcCapabilities::MULTIPLICATION
+            | MpcCapabilities::CLIENT_OUTPUT
+            | MpcCapabilities::OPEN_IN_EXP
+            | MpcCapabilities::RANDOMNESS
+            | MpcCapabilities::FIELD_OPEN
+            | MpcCapabilities::CONSENSUS
+    }
+
+    fn as_multiplication(&self) -> Option<&dyn MpcEngineMultiplication> {
+        Some(self)
+    }
+
+    fn as_client_output(&self) -> Option<&dyn MpcEngineClientOutput> {
+        Some(self)
+    }
+
+    fn as_open_in_exp(&self) -> Option<&dyn MpcEngineOpenInExponent> {
+        Some(self)
+    }
+
+    fn as_randomness(&self) -> Option<&dyn MpcEngineRandomness> {
+        Some(self)
+    }
+
+    fn as_field_open(&self) -> Option<&dyn MpcEngineFieldOpen> {
+        Some(self)
+    }
+
+    fn as_consensus(&self) -> Option<&dyn MpcEngineConsensus> {
+        Some(self)
+    }
+}
+
+impl MpcEngineMultiplication for TurmoilAllOpsEngine {
+    fn multiply_share(
+        &self,
+        _ty: ShareType,
+        _left: &[u8],
+        _right: &[u8],
+    ) -> MpcEngineResult<ShareData> {
+        Err(MpcEngineError::operation_failed(
+            "multiply_share",
+            "sync multiply_share should not be used by async VM execution",
+        ))
+    }
+}
+
+impl MpcEngineClientOutput for TurmoilAllOpsEngine {
+    fn send_output_to_client(
+        &self,
+        _client_id: ClientId,
+        _shares: &[u8],
+        _output_share_count: ClientOutputShareCount,
+    ) -> MpcEngineResult<()> {
+        Err(MpcEngineError::operation_failed(
+            "send_output_to_client",
+            "sync send_output_to_client should not be used by async VM execution",
+        ))
+    }
+}
+
+impl MpcEngineOpenInExponent for TurmoilAllOpsEngine {
+    fn open_share_in_exp(
+        &self,
+        _ty: ShareType,
+        _share_bytes: &[u8],
+        _generator_bytes: &[u8],
+    ) -> MpcEngineResult<Vec<u8>> {
+        Err(MpcEngineError::operation_failed(
+            "open_share_in_exp",
+            "sync open_share_in_exp should not be used by async VM execution",
+        ))
+    }
+
+    fn supports_exponent_group(&self, _group: MpcExponentGroup) -> bool {
+        true
+    }
+}
+
+impl MpcEngineRandomness for TurmoilAllOpsEngine {
+    fn random_share(&self, _ty: ShareType) -> MpcEngineResult<ShareData> {
+        Err(MpcEngineError::operation_failed(
+            "random_share",
+            "sync random_share should not be used by async VM execution",
+        ))
+    }
+}
+
+impl MpcEngineFieldOpen for TurmoilAllOpsEngine {
+    fn open_share_as_field(&self, _ty: ShareType, _share_bytes: &[u8]) -> MpcEngineResult<Vec<u8>> {
+        Err(MpcEngineError::operation_failed(
+            "open_share_as_field",
+            "sync open_share_as_field should not be used by async VM execution",
+        ))
+    }
+}
+
+impl MpcEngineConsensus for TurmoilAllOpsEngine {
+    fn rbc_broadcast(&self, _message: &[u8]) -> MpcEngineResult<RbcSessionId> {
+        Err(MpcEngineError::operation_failed(
+            "rbc_broadcast",
+            "sync rbc_broadcast should not be used by async VM execution",
+        ))
+    }
+
+    fn rbc_receive(&self, _from_party: MpcPartyId, _timeout_ms: u64) -> MpcEngineResult<Vec<u8>> {
+        Err(MpcEngineError::operation_failed(
+            "rbc_receive",
+            "sync rbc_receive should not be used by async VM execution",
+        ))
+    }
+
+    fn rbc_receive_any(&self, _timeout_ms: u64) -> MpcEngineResult<(MpcPartyId, Vec<u8>)> {
+        Err(MpcEngineError::operation_failed(
+            "rbc_receive_any",
+            "sync rbc_receive_any should not be used by async VM execution",
+        ))
+    }
+
+    fn aba_propose(&self, _value: bool) -> MpcEngineResult<AbaSessionId> {
+        Err(MpcEngineError::operation_failed(
+            "aba_propose",
+            "sync aba_propose should not be used by async VM execution",
+        ))
+    }
+
+    fn aba_result(&self, _session_id: AbaSessionId, _timeout_ms: u64) -> MpcEngineResult<bool> {
+        Err(MpcEngineError::operation_failed(
+            "aba_result",
+            "sync aba_result should not be used by async VM execution",
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncMpcEngine for TurmoilAllOpsEngine {
+    fn as_async_consensus_ops(&self) -> Option<&dyn AsyncMpcEngineConsensus> {
+        Some(self)
+    }
+
+    async fn input_share_async(&self, clear: ClearShareInput) -> MpcEngineResult<ShareData> {
+        let response = self
+            .rpc(
+                TurmoilAsyncOperation::InputShare,
+                Self::clear_payload(clear),
+                TURMOIL_RPC_TIMEOUT_MS,
+            )
+            .await?;
+        Ok(ShareData::Opaque(response))
+    }
+
+    async fn multiply_share_async(
+        &self,
+        _ty: ShareType,
+        left: &[u8],
+        right: &[u8],
+    ) -> MpcEngineResult<ShareData> {
+        let response = self
+            .rpc(
+                TurmoilAsyncOperation::Multiply,
+                vec![Self::first_share_byte(left), Self::first_share_byte(right)],
+                TURMOIL_RPC_TIMEOUT_MS,
+            )
+            .await?;
+        Ok(ShareData::Opaque(response))
+    }
+
+    async fn open_share_async(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+    ) -> MpcEngineResult<ClearShareValue> {
+        let response = self
+            .rpc(
+                TurmoilAsyncOperation::Open,
+                share_bytes.to_vec(),
+                TURMOIL_RPC_TIMEOUT_MS,
+            )
+            .await?;
+        Ok(ClearShareValue::Integer(
+            response.first().copied().unwrap_or_default() as i64,
+        ))
+    }
+
+    async fn batch_open_shares_async(
+        &self,
+        _ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> MpcEngineResult<Vec<ClearShareValue>> {
+        let payload = shares
+            .iter()
+            .map(|share| Self::first_share_byte(share))
+            .collect();
+        let response = self
+            .rpc(
+                TurmoilAsyncOperation::BatchOpen,
+                payload,
+                TURMOIL_RPC_TIMEOUT_MS,
+            )
+            .await?;
+        Ok(response
+            .into_iter()
+            .map(|value| ClearShareValue::Integer(value as i64))
+            .collect())
+    }
+
+    async fn random_share_async(&self, _ty: ShareType) -> MpcEngineResult<ShareData> {
+        let response = self
+            .rpc(
+                TurmoilAsyncOperation::Random,
+                Vec::new(),
+                TURMOIL_RPC_TIMEOUT_MS,
+            )
+            .await?;
+        Ok(ShareData::Opaque(response))
+    }
+
+    async fn open_share_as_field_async(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+    ) -> MpcEngineResult<Vec<u8>> {
+        self.rpc(
+            TurmoilAsyncOperation::OpenField,
+            share_bytes.to_vec(),
+            TURMOIL_RPC_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn open_share_in_exp_async(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> MpcEngineResult<Vec<u8>> {
+        let mut payload = share_bytes.to_vec();
+        payload.extend_from_slice(generator_bytes);
+        self.rpc(
+            TurmoilAsyncOperation::OpenExpCustom,
+            payload,
+            TURMOIL_RPC_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn open_share_in_exp_group_async(
+        &self,
+        group: MpcExponentGroup,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        generator_bytes: &[u8],
+    ) -> MpcEngineResult<Vec<u8>> {
+        let mut payload = group.as_str().as_bytes().to_vec();
+        payload.push(0);
+        payload.extend_from_slice(share_bytes);
+        payload.extend_from_slice(generator_bytes);
+        self.rpc(
+            TurmoilAsyncOperation::OpenExpGroup,
+            payload,
+            TURMOIL_RPC_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn send_output_to_client_async(
+        &self,
+        client_id: ClientId,
+        shares: &[u8],
+        output_share_count: ClientOutputShareCount,
+    ) -> MpcEngineResult<()> {
+        let mut payload = (client_id as u64).to_be_bytes().to_vec();
+        payload.extend_from_slice(&(output_share_count.count() as u64).to_be_bytes());
+        payload.extend_from_slice(shares);
+        self.rpc(
+            TurmoilAsyncOperation::SendOutput,
+            payload,
+            TURMOIL_RPC_TIMEOUT_MS,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncMpcEngineConsensus for TurmoilAllOpsEngine {
+    async fn rbc_broadcast_async(&self, message: &[u8]) -> MpcEngineResult<RbcSessionId> {
+        let response = self
+            .rpc(
+                TurmoilAsyncOperation::RbcBroadcast,
+                message.to_vec(),
+                TURMOIL_RPC_TIMEOUT_MS,
+            )
+            .await?;
+        Ok(RbcSessionId::new(bytes_to_u64(&response)))
+    }
+
+    async fn rbc_receive_async(
+        &self,
+        from_party: MpcPartyId,
+        timeout_ms: u64,
+    ) -> MpcEngineResult<Vec<u8>> {
+        self.rpc(
+            TurmoilAsyncOperation::RbcReceive,
+            (from_party.id() as u64).to_be_bytes().to_vec(),
+            timeout_ms,
+        )
+        .await
+    }
+
+    async fn rbc_receive_any_async(
+        &self,
+        timeout_ms: u64,
+    ) -> MpcEngineResult<(MpcPartyId, Vec<u8>)> {
+        let response = self
+            .rpc(TurmoilAsyncOperation::RbcReceiveAny, Vec::new(), timeout_ms)
+            .await?;
+        let (party_bytes, message) = response.split_at(response.len().min(8));
+        Ok((
+            MpcPartyId::new(bytes_to_u64(party_bytes) as usize),
+            message.to_vec(),
+        ))
+    }
+
+    async fn aba_propose_async(&self, value: bool) -> MpcEngineResult<AbaSessionId> {
+        let response = self
+            .rpc(
+                TurmoilAsyncOperation::AbaPropose,
+                vec![u8::from(value)],
+                TURMOIL_RPC_TIMEOUT_MS,
+            )
+            .await?;
+        Ok(AbaSessionId::new(bytes_to_u64(&response)))
+    }
+
+    async fn aba_result_async(
+        &self,
+        session_id: AbaSessionId,
+        timeout_ms: u64,
+    ) -> MpcEngineResult<bool> {
+        let response = self
+            .rpc(
+                TurmoilAsyncOperation::AbaResult,
+                session_id.id().to_be_bytes().to_vec(),
+                timeout_ms,
+            )
+            .await?;
+        Ok(response.first().copied().unwrap_or_default() != 0)
+    }
+
+    async fn aba_propose_and_wait_async(
+        &self,
+        value: bool,
+        timeout_ms: u64,
+    ) -> MpcEngineResult<bool> {
+        let response = self
+            .rpc(
+                TurmoilAsyncOperation::AbaProposeAndWait,
+                vec![u8::from(value)],
+                timeout_ms,
+            )
+            .await?;
+        Ok(response.first().copied().unwrap_or_default() != 0)
+    }
+}
+
+async fn run_turmoil_all_ops_peer(
+    behavior: TurmoilAllOpsServerBehavior,
+) -> std::result::Result<(), io::Error> {
+    let listener = turmoil::net::TcpListener::bind(("0.0.0.0", TURMOIL_RBC_PORT)).await?;
+    loop {
+        let (socket, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let _ = serve_turmoil_all_ops_connection(socket, behavior).await;
+        });
+    }
+}
+
+async fn serve_turmoil_all_ops_connection(
+    mut socket: turmoil::net::TcpStream,
+    behavior: TurmoilAllOpsServerBehavior,
+) -> std::result::Result<(), io::Error> {
+    let mut op_buf = [0u8; 1];
+    socket.read_exact(&mut op_buf).await?;
+    let operation = TurmoilAsyncOperation::from_code(op_buf[0])
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown test operation"))?;
+
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    socket.read_exact(&mut payload).await?;
+
+    let delay_ms = match (behavior, operation, bytes_to_u64(&payload)) {
+        (
+            TurmoilAllOpsServerBehavior::DelayRbcFromPartyTwoPastTimeout,
+            TurmoilAsyncOperation::RbcReceive,
+            2,
+        ) => 200,
+        _ => u64::from(operation.code() % 7) + 1,
+    };
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+    match (behavior, operation, payload.as_slice()) {
+        (TurmoilAllOpsServerBehavior::TruncateOpenResponse, TurmoilAsyncOperation::Open, [33]) => {
+            socket.write_all(&2u32.to_be_bytes()).await?;
+            socket.write_all(&[33]).await?;
+            return Ok(());
+        }
+        (
+            TurmoilAllOpsServerBehavior::OversizedOpenFieldResponse,
+            TurmoilAsyncOperation::OpenField,
+            [44],
+        ) => {
+            socket.write_all(&4097u32.to_be_bytes()).await?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let response = turmoil_all_ops_response(operation, &payload, behavior);
+    socket
+        .write_all(&(response.len() as u32).to_be_bytes())
+        .await?;
+    socket.write_all(&response).await?;
+    Ok(())
+}
+
+fn turmoil_all_ops_response(
+    operation: TurmoilAsyncOperation,
+    payload: &[u8],
+    behavior: TurmoilAllOpsServerBehavior,
+) -> Vec<u8> {
+    match operation {
+        TurmoilAsyncOperation::InputShare => payload.to_vec(),
+        TurmoilAsyncOperation::Multiply => {
+            let left = payload.first().copied().unwrap_or_default();
+            let right = payload.get(1).copied().unwrap_or_default();
+            vec![left.wrapping_mul(right)]
+        }
+        TurmoilAsyncOperation::Open | TurmoilAsyncOperation::BatchOpen => payload.to_vec(),
+        TurmoilAsyncOperation::SendOutput => vec![1],
+        TurmoilAsyncOperation::OpenExpGroup => prefixed_bytes(b"exp-group:", payload),
+        TurmoilAsyncOperation::Random => vec![91],
+        TurmoilAsyncOperation::OpenField => prefixed_bytes(b"field:", payload),
+        TurmoilAsyncOperation::OpenExpCustom => prefixed_bytes(b"exp-custom:", payload),
+        TurmoilAsyncOperation::RbcBroadcast => 701u64.to_be_bytes().to_vec(),
+        TurmoilAsyncOperation::RbcReceive => format!("from-{}", bytes_to_u64(payload)).into_bytes(),
+        TurmoilAsyncOperation::RbcReceiveAny => {
+            let party_id = if matches!(
+                behavior,
+                TurmoilAllOpsServerBehavior::OutOfRangeReceiveAnyParty
+            ) {
+                u64::MAX
+            } else {
+                3
+            };
+            let mut response = party_id.to_be_bytes().to_vec();
+            response.extend_from_slice(b"any-3");
+            response
+        }
+        TurmoilAsyncOperation::AbaPropose => {
+            let session_id = 800 + u64::from(payload.first().copied().unwrap_or_default() != 0);
+            session_id.to_be_bytes().to_vec()
+        }
+        TurmoilAsyncOperation::AbaResult => vec![1],
+        TurmoilAsyncOperation::AbaProposeAndWait => {
+            vec![u8::from(payload.first().copied().unwrap_or_default() != 0)]
+        }
+    }
+}
+
+fn prefixed_bytes(prefix: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut response = prefix.to_vec();
+    response.extend_from_slice(payload);
+    response
+}
+
+fn bytes_to_u64(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let copy_len = bytes.len().min(buf.len());
+    let start = buf.len() - copy_len;
+    buf[start..].copy_from_slice(&bytes[..copy_len]);
+    u64::from_be_bytes(buf)
 }
 
 struct TrackingMemory {
@@ -1720,6 +2675,14 @@ fn async_share_from_clear_open_call_function(name: &str, clear_value: i64) -> VM
 }
 
 fn async_rbc_receive_call_function(name: &str, from_party: usize) -> VMFunction {
+    async_rbc_receive_call_function_with_timeout(name, from_party, 1_000)
+}
+
+fn async_rbc_receive_call_function_with_timeout(
+    name: &str,
+    from_party: usize,
+    timeout_ms: u64,
+) -> VMFunction {
     VMFunction::new(
         name.to_string(),
         Vec::new(),
@@ -1729,9 +2692,42 @@ fn async_rbc_receive_call_function(name: &str, from_party: usize) -> VMFunction 
         vec![
             Instruction::LDI(1, Value::I64(from_party as i64)),
             Instruction::PUSHARG(1),
-            Instruction::LDI(2, Value::I64(1_000)),
+            Instruction::LDI(2, Value::I64(timeout_ms as i64)),
             Instruction::PUSHARG(2),
             Instruction::CALL("Rbc.receive".to_string()),
+            Instruction::RET(0),
+        ],
+        HashMap::new(),
+    )
+}
+
+fn unary_builtin_arg_function(name: &str, builtin: &str) -> VMFunction {
+    VMFunction::new(
+        name.to_string(),
+        vec!["arg".to_string()],
+        Vec::new(),
+        None,
+        1,
+        vec![
+            Instruction::PUSHARG(0),
+            Instruction::CALL(builtin.to_string()),
+            Instruction::RET(0),
+        ],
+        HashMap::new(),
+    )
+}
+
+fn binary_builtin_arg_function(name: &str, builtin: &str) -> VMFunction {
+    VMFunction::new(
+        name.to_string(),
+        vec!["left".to_string(), "right".to_string()],
+        Vec::new(),
+        None,
+        2,
+        vec![
+            Instruction::PUSHARG(0),
+            Instruction::PUSHARG(1),
+            Instruction::CALL(builtin.to_string()),
             Instruction::RET(0),
         ],
         HashMap::new(),
@@ -1860,6 +2856,922 @@ async fn execute_many_async_yields_on_rbc_receive_builtin_call() {
     );
     assert_eq!(engine.rbc_receive_started.load(Ordering::SeqCst), 2);
     assert_eq!(engine.rbc_receive_finished.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn turmoil_execute_many_async_preserves_order_when_rbc_responses_reorder() -> turmoil::Result {
+    let mut sim = turmoil::Builder::new()
+        .rng_seed(0x5154_4f46)
+        .enable_random_order()
+        .simulation_duration(Duration::from_secs(5))
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(10))
+        .build();
+
+    sim.host(TURMOIL_RBC_HOST, || async {
+        run_turmoil_rbc_peer(TurmoilRbcServerBehavior::DelayPartyTwo).await?;
+        Ok(())
+    });
+
+    sim.client(TURMOIL_VM_HOST, async {
+        let engine = Arc::new(TurmoilConsensusEngine::new(
+            TURMOIL_RBC_HOST,
+            TURMOIL_RBC_PORT,
+        ));
+        let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+        let mut vm = VirtualMachine::builder()
+            .with_standard_library(false)
+            .with_mpc_engine(runtime_engine)
+            .build();
+        vm.register_function(async_rbc_receive_call_function("receive_slow", 2));
+        vm.register_function(async_rbc_receive_call_function("receive_fast", 3));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            vm.execute_many_async(["receive_slow", "receive_fast"], engine.as_ref()),
+        )
+        .await
+        .expect("reordered network responses should not stall VM execution")?;
+
+        assert_eq!(
+            result,
+            vec![
+                Value::String("from-2".to_string()),
+                Value::String("from-3".to_string())
+            ]
+        );
+        assert_eq!(engine.rbc_receive_started.load(Ordering::SeqCst), 2);
+        assert_eq!(engine.rbc_receive_finished.load(Ordering::SeqCst), 2);
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+fn turmoil_execute_async_resumes_after_held_rbc_response() -> turmoil::Result {
+    let mut sim = turmoil::Builder::new()
+        .rng_seed(0x484f_4c44)
+        .simulation_duration(Duration::from_secs(5))
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(5))
+        .build();
+
+    sim.host(TURMOIL_RBC_HOST, || async {
+        run_turmoil_rbc_peer(TurmoilRbcServerBehavior::HoldFirstResponse).await?;
+        Ok(())
+    });
+
+    sim.client(TURMOIL_VM_HOST, async {
+        let engine = Arc::new(TurmoilConsensusEngine::new(
+            TURMOIL_RBC_HOST,
+            TURMOIL_RBC_PORT,
+        ));
+        let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+        let mut vm = VirtualMachine::builder()
+            .with_standard_library(false)
+            .with_mpc_engine(runtime_engine)
+            .build();
+        vm.register_function(async_rbc_receive_call_function("receive_after_hold", 2));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            vm.execute_async("receive_after_hold", engine.as_ref()),
+        )
+        .await
+        .expect("held RBC response should be released within the simulated timeout")?;
+
+        assert_eq!(result, Value::String("from-2".to_string()));
+        assert_eq!(engine.rbc_receive_started.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.rbc_receive_finished.load(Ordering::SeqCst), 1);
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+fn turmoil_async_rbc_partition_error_does_not_poison_vm_template() -> turmoil::Result {
+    let mut sim = turmoil::Builder::new()
+        .rng_seed(0x5041_5254)
+        .simulation_duration(Duration::from_secs(5))
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(5))
+        .build();
+
+    sim.host(TURMOIL_RBC_HOST, || async {
+        run_turmoil_rbc_peer(TurmoilRbcServerBehavior::DelayPartyTwo).await?;
+        Ok(())
+    });
+
+    sim.client(TURMOIL_VM_HOST, async {
+        let engine = Arc::new(TurmoilConsensusEngine::new(
+            TURMOIL_RBC_HOST,
+            TURMOIL_RBC_PORT,
+        ));
+        let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+        let mut vm = VirtualMachine::builder()
+            .with_standard_library(false)
+            .with_mpc_engine(runtime_engine)
+            .build();
+        vm.register_function(async_rbc_receive_call_function_with_timeout(
+            "receive_partitioned",
+            2,
+            50,
+        ));
+        vm.register_function(async_rbc_receive_call_function("receive_after_repair", 3));
+
+        turmoil::partition(TURMOIL_VM_HOST, TURMOIL_RBC_HOST);
+        let error = vm
+            .execute_async("receive_partitioned", engine.as_ref())
+            .await
+            .expect_err("partitioned RBC receive should fail through the async effect path");
+        assert!(
+            error.to_string().contains("async_rbc_receive"),
+            "unexpected partition error: {error}"
+        );
+
+        turmoil::repair(TURMOIL_VM_HOST, TURMOIL_RBC_HOST);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            vm.execute_many_async(["receive_after_repair"], engine.as_ref()),
+        )
+        .await
+        .expect("repaired network should let the VM template run again")?;
+
+        assert_eq!(result, vec![Value::String("from-3".to_string())]);
+        assert!(engine.rbc_receive_started.load(Ordering::SeqCst) >= 2);
+        assert!(engine.rbc_receive_finished.load(Ordering::SeqCst) >= 2);
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+fn turmoil_async_mpc_builtins_cover_every_async_backend_operation() -> turmoil::Result {
+    let mut sim = turmoil::Builder::new()
+        .rng_seed(0x414c_4c4f)
+        .enable_random_order()
+        .simulation_duration(Duration::from_secs(10))
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(8))
+        .build();
+
+    sim.host(TURMOIL_RBC_HOST, || async {
+        run_turmoil_all_ops_peer(TurmoilAllOpsServerBehavior::Normal).await?;
+        Ok(())
+    });
+
+    sim.client(TURMOIL_VM_HOST, async {
+        let engine = Arc::new(TurmoilAllOpsEngine::new(TURMOIL_RBC_HOST, TURMOIL_RBC_PORT));
+        let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+        let ty = ShareType::secret_int(64);
+        let mut vm = VirtualMachine::builder()
+            .with_standard_library(false)
+            .with_mpc_engine(runtime_engine)
+            .build();
+
+        vm.register_function(VMFunction::new(
+            "turmoil_from_clear".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            2,
+            vec![
+                Instruction::LDI(1, Value::I64(7)),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Share.from_clear".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(unary_builtin_arg_function("turmoil_open_arg", "Share.open"));
+        vm.register_function(binary_builtin_arg_function("turmoil_mul_args", "Share.mul"));
+        vm.register_function(unary_builtin_arg_function(
+            "turmoil_batch_open_arg",
+            "Share.batch_open",
+        ));
+        vm.register_function(VMFunction::new(
+            "turmoil_send_to_client".to_string(),
+            vec!["share".to_string()],
+            Vec::new(),
+            None,
+            2,
+            vec![
+                Instruction::LDI(1, Value::I64(9)),
+                Instruction::PUSHARG(0),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Share.send_to_client".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(VMFunction::new(
+            "turmoil_open_exp".to_string(),
+            vec!["share".to_string()],
+            Vec::new(),
+            None,
+            2,
+            vec![
+                Instruction::LDI(1, Value::String("bls12-381-g1".to_string())),
+                Instruction::PUSHARG(0),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Share.open_exp".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(VMFunction::new(
+            "turmoil_random".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            1,
+            vec![
+                Instruction::CALL("Share.random".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(unary_builtin_arg_function(
+            "turmoil_open_field",
+            "Share.open_field",
+        ));
+        vm.register_function(binary_builtin_arg_function(
+            "turmoil_open_exp_custom",
+            "Share.open_exp_custom",
+        ));
+        vm.register_function(VMFunction::new(
+            "turmoil_rbc_broadcast".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            2,
+            vec![
+                Instruction::LDI(1, Value::String("broadcast-message".to_string())),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Rbc.broadcast".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(async_rbc_receive_call_function("turmoil_rbc_receive", 2));
+        vm.register_function(VMFunction::new(
+            "turmoil_rbc_receive_any".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            2,
+            vec![
+                Instruction::LDI(1, Value::I64(1_000)),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Rbc.receive_any".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(VMFunction::new(
+            "turmoil_aba_propose".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            2,
+            vec![
+                Instruction::LDI(1, Value::Bool(true)),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Aba.propose".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(VMFunction::new(
+            "turmoil_aba_result".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            3,
+            vec![
+                Instruction::LDI(1, Value::I64(801)),
+                Instruction::PUSHARG(1),
+                Instruction::LDI(2, Value::I64(1_000)),
+                Instruction::PUSHARG(2),
+                Instruction::CALL("Aba.result".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(VMFunction::new(
+            "turmoil_aba_propose_and_wait".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            3,
+            vec![
+                Instruction::LDI(1, Value::Bool(true)),
+                Instruction::PUSHARG(1),
+                Instruction::LDI(2, Value::I64(1_000)),
+                Instruction::PUSHARG(2),
+                Instruction::CALL("Aba.propose_and_wait".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+
+        let from_clear = vm
+            .execute_async("turmoil_from_clear", engine.as_ref())
+            .await?;
+        assert!(matches!(from_clear, Value::Object(_)));
+        assert_eq!(
+            vm.execute_async_with_args("turmoil_open_arg", &[from_clear.clone()], engine.as_ref(),)
+                .await?,
+            Value::I64(7)
+        );
+
+        let multiplied = vm
+            .execute_async_with_args(
+                "turmoil_mul_args",
+                &[
+                    Value::Share(ty, ShareData::Opaque(vec![3])),
+                    Value::Share(ty, ShareData::Opaque(vec![4])),
+                ],
+                engine.as_ref(),
+            )
+            .await?;
+        assert_eq!(
+            vm.execute_async_with_args("turmoil_open_arg", &[multiplied], engine.as_ref())
+                .await?,
+            Value::I64(12)
+        );
+
+        let shares = vm.create_array_ref(2).expect("create shares array");
+        vm.push_array_values(
+            shares,
+            &[
+                Value::Share(ty, ShareData::Opaque(vec![5])),
+                Value::Share(ty, ShareData::Opaque(vec![6])),
+            ],
+        )
+        .expect("seed shares array");
+        let batch_result = vm
+            .execute_async_with_args(
+                "turmoil_batch_open_arg",
+                &[Value::from(shares)],
+                engine.as_ref(),
+            )
+            .await?;
+        let Value::Array(batch_result_ref) = batch_result else {
+            panic!("Share.batch_open should return an array");
+        };
+        assert_eq!(vm.read_array_len(batch_result_ref).expect("array len"), 2);
+        assert_eq!(
+            vm.read_table_field(TableRef::from(batch_result_ref), &Value::I64(0))
+                .expect("read first batch value"),
+            Some(Value::I64(5))
+        );
+        assert_eq!(
+            vm.read_table_field(TableRef::from(batch_result_ref), &Value::I64(1))
+                .expect("read second batch value"),
+            Some(Value::I64(6))
+        );
+
+        assert_eq!(
+            vm.execute_async_with_args(
+                "turmoil_send_to_client",
+                &[Value::Share(ty, ShareData::Opaque(vec![42]))],
+                engine.as_ref(),
+            )
+            .await?,
+            Value::Bool(true)
+        );
+
+        let random_share = vm.execute_async("turmoil_random", engine.as_ref()).await?;
+        assert_eq!(
+            vm.execute_async_with_args("turmoil_open_arg", &[random_share], engine.as_ref())
+                .await?,
+            Value::I64(91)
+        );
+
+        let field_bytes = vm
+            .execute_async_with_args(
+                "turmoil_open_field",
+                &[Value::Share(ty, ShareData::Opaque(vec![77]))],
+                engine.as_ref(),
+            )
+            .await?;
+        assert_eq!(
+            vm.read_byte_array(&field_bytes)
+                .expect("Share.open_field should return bytes"),
+            b"field:M".to_vec()
+        );
+
+        let exp_bytes = vm
+            .execute_async_with_args(
+                "turmoil_open_exp",
+                &[Value::Share(ty, ShareData::Opaque(vec![88]))],
+                engine.as_ref(),
+            )
+            .await?;
+        assert!(vm
+            .read_byte_array(&exp_bytes)
+            .expect("Share.open_exp should return bytes")
+            .starts_with(b"exp-group:"));
+
+        let generator = vm
+            .create_byte_array(&[1, 2, 3])
+            .expect("create custom generator bytes");
+        let exp_custom_bytes = vm
+            .execute_async_with_args(
+                "turmoil_open_exp_custom",
+                &[Value::Share(ty, ShareData::Opaque(vec![89])), generator],
+                engine.as_ref(),
+            )
+            .await?;
+        assert_eq!(
+            vm.read_byte_array(&exp_custom_bytes)
+                .expect("Share.open_exp_custom should return bytes"),
+            b"exp-custom:Y\x01\x02\x03".to_vec()
+        );
+
+        assert_eq!(
+            vm.execute_async("turmoil_rbc_broadcast", engine.as_ref())
+                .await?,
+            Value::I64(701)
+        );
+        assert_eq!(
+            vm.execute_async("turmoil_rbc_receive", engine.as_ref())
+                .await?,
+            Value::String("from-2".to_string())
+        );
+        let receive_any = vm
+            .execute_async("turmoil_rbc_receive_any", engine.as_ref())
+            .await?;
+        let Value::Object(receive_any_ref) = receive_any else {
+            panic!("Rbc.receive_any should return an object");
+        };
+        assert_eq!(
+            vm.read_table_field(
+                TableRef::from(receive_any_ref),
+                &Value::String("party_id".to_string())
+            )
+            .expect("read receive_any party"),
+            Some(Value::I64(3))
+        );
+        assert_eq!(
+            vm.read_table_field(
+                TableRef::from(receive_any_ref),
+                &Value::String("message".to_string())
+            )
+            .expect("read receive_any message"),
+            Some(Value::String("any-3".to_string()))
+        );
+
+        assert_eq!(
+            vm.execute_async("turmoil_aba_propose", engine.as_ref())
+                .await?,
+            Value::I64(801)
+        );
+        assert_eq!(
+            vm.execute_async("turmoil_aba_result", engine.as_ref())
+                .await?,
+            Value::Bool(true)
+        );
+        assert_eq!(
+            vm.execute_async("turmoil_aba_propose_and_wait", engine.as_ref())
+                .await?,
+            Value::Bool(true)
+        );
+
+        assert_eq!(engine.started(TurmoilAsyncOperation::InputShare), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::InputShare), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Multiply), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::Multiply), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Open), 3);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::Open), 3);
+        assert_eq!(engine.started(TurmoilAsyncOperation::BatchOpen), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::BatchOpen), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::SendOutput), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::SendOutput), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::OpenExpGroup), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::OpenExpGroup), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Random), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::Random), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::OpenField), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::OpenField), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::OpenExpCustom), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::OpenExpCustom), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::RbcBroadcast), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::RbcBroadcast), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::RbcReceive), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::RbcReceive), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::RbcReceiveAny), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::RbcReceiveAny), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::AbaPropose), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::AbaPropose), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::AbaResult), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::AbaResult), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::AbaProposeAndWait), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::AbaProposeAndWait), 1);
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+fn turmoil_secret_register_program_resumes_across_networked_input_mul_and_open() -> turmoil::Result
+{
+    let mut sim = turmoil::Builder::new()
+        .rng_seed(0x5241_4d31)
+        .simulation_duration(Duration::from_secs(10))
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(8))
+        .build();
+
+    sim.host(TURMOIL_RBC_HOST, || async {
+        run_turmoil_all_ops_peer(TurmoilAllOpsServerBehavior::Normal).await?;
+        Ok(())
+    });
+
+    sim.client(TURMOIL_VM_HOST, async {
+        let engine = Arc::new(TurmoilAllOpsEngine::new(TURMOIL_RBC_HOST, TURMOIL_RBC_PORT));
+        let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+        let mut vm = VirtualMachine::builder()
+            .with_standard_library(false)
+            .with_mpc_builtins(false)
+            .with_register_layout(RegisterLayout::new(2))
+            .with_mpc_engine(runtime_engine)
+            .build();
+        vm.register_function(VMFunction::new(
+            "secret_register_math".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            4,
+            vec![
+                Instruction::LDI(2, Value::I64(10)),
+                Instruction::LDI(3, Value::I64(5)),
+                Instruction::MUL(2, 2, 3),
+                Instruction::MOV(0, 2),
+                Instruction::LDI(1, Value::I64(2)),
+                Instruction::ADD(0, 0, 1),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+
+        let result = vm
+            .execute_async("secret_register_math", engine.as_ref())
+            .await?;
+        assert_eq!(result, Value::I64(52));
+        assert_eq!(engine.started(TurmoilAsyncOperation::InputShare), 2);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::InputShare), 2);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Multiply), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::Multiply), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Open), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::Open), 1);
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+fn turmoil_execute_many_async_runs_mixed_programs_under_randomized_network_order() -> turmoil::Result
+{
+    let mut sim = turmoil::Builder::new()
+        .rng_seed(0x4d49_5844)
+        .enable_random_order()
+        .simulation_duration(Duration::from_secs(10))
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(25))
+        .build();
+
+    sim.host(TURMOIL_RBC_HOST, || async {
+        run_turmoil_all_ops_peer(TurmoilAllOpsServerBehavior::Normal).await?;
+        Ok(())
+    });
+
+    sim.client(TURMOIL_VM_HOST, async {
+        let engine = Arc::new(TurmoilAllOpsEngine::new(TURMOIL_RBC_HOST, TURMOIL_RBC_PORT));
+        let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+        let ty = ShareType::secret_int(64);
+        let mut vm = VirtualMachine::builder()
+            .with_standard_library(false)
+            .with_register_layout(RegisterLayout::new(4))
+            .with_mpc_engine(runtime_engine)
+            .build();
+
+        vm.register_function(VMFunction::new(
+            "mixed_open".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            2,
+            vec![
+                Instruction::LDI(1, Value::Share(ty, ShareData::Opaque(vec![21]))),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Share.open".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(async_rbc_receive_call_function("mixed_rbc", 4));
+        vm.register_function(VMFunction::new(
+            "mixed_aba_wait".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            3,
+            vec![
+                Instruction::LDI(1, Value::Bool(true)),
+                Instruction::PUSHARG(1),
+                Instruction::LDI(2, Value::I64(1_000)),
+                Instruction::PUSHARG(2),
+                Instruction::CALL("Aba.propose_and_wait".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(VMFunction::new(
+            "mixed_secret_math".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            6,
+            vec![
+                Instruction::LDI(4, Value::I64(6)),
+                Instruction::LDI(5, Value::I64(5)),
+                Instruction::MUL(4, 4, 5),
+                Instruction::MOV(0, 4),
+                Instruction::LDI(1, Value::I64(2)),
+                Instruction::ADD(0, 0, 1),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+
+        let result = vm
+            .execute_many_async(
+                [
+                    "mixed_open",
+                    "mixed_rbc",
+                    "mixed_aba_wait",
+                    "mixed_secret_math",
+                ],
+                engine.as_ref(),
+            )
+            .await?;
+        assert_eq!(
+            result,
+            vec![
+                Value::I64(21),
+                Value::String("from-4".to_string()),
+                Value::Bool(true),
+                Value::I64(32),
+            ]
+        );
+        assert_eq!(engine.started(TurmoilAsyncOperation::InputShare), 2);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Multiply), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Open), 2);
+        assert_eq!(engine.started(TurmoilAsyncOperation::RbcReceive), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::AbaProposeAndWait), 1);
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+fn turmoil_late_rbc_response_after_timeout_does_not_poison_later_effects() -> turmoil::Result {
+    let mut sim = turmoil::Builder::new()
+        .rng_seed(0x5449_4d45)
+        .simulation_duration(Duration::from_secs(10))
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(5))
+        .build();
+
+    sim.host(TURMOIL_RBC_HOST, || async {
+        run_turmoil_all_ops_peer(TurmoilAllOpsServerBehavior::DelayRbcFromPartyTwoPastTimeout)
+            .await?;
+        Ok(())
+    });
+
+    sim.client(TURMOIL_VM_HOST, async {
+        let engine = Arc::new(TurmoilAllOpsEngine::new(TURMOIL_RBC_HOST, TURMOIL_RBC_PORT));
+        let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+        let mut vm = VirtualMachine::builder()
+            .with_standard_library(false)
+            .with_mpc_engine(runtime_engine)
+            .build();
+        vm.register_function(async_rbc_receive_call_function_with_timeout(
+            "receive_timeout",
+            2,
+            25,
+        ));
+        vm.register_function(async_rbc_receive_call_function_with_timeout(
+            "receive_later",
+            3,
+            1_000,
+        ));
+
+        let error = vm
+            .execute_async("receive_timeout", engine.as_ref())
+            .await
+            .expect_err("late RBC response should time out");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected timeout error: {error}"
+        );
+
+        let result = vm.execute_async("receive_later", engine.as_ref()).await?;
+        assert_eq!(result, Value::String("from-3".to_string()));
+        assert_eq!(engine.started(TurmoilAsyncOperation::RbcReceive), 2);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::RbcReceive), 1);
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+fn turmoil_truncated_async_response_surfaces_error_and_vm_recovers() -> turmoil::Result {
+    let mut sim = turmoil::Builder::new()
+        .rng_seed(0x5452_554e)
+        .simulation_duration(Duration::from_secs(10))
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(5))
+        .build();
+
+    sim.host(TURMOIL_RBC_HOST, || async {
+        run_turmoil_all_ops_peer(TurmoilAllOpsServerBehavior::TruncateOpenResponse).await?;
+        Ok(())
+    });
+
+    sim.client(TURMOIL_VM_HOST, async {
+        let engine = Arc::new(TurmoilAllOpsEngine::new(TURMOIL_RBC_HOST, TURMOIL_RBC_PORT));
+        let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+        let ty = ShareType::secret_int(64);
+        let mut vm = VirtualMachine::builder()
+            .with_standard_library(false)
+            .with_mpc_engine(runtime_engine)
+            .build();
+        vm.register_function(unary_builtin_arg_function("network_open", "Share.open"));
+
+        let error = vm
+            .execute_async_with_args(
+                "network_open",
+                &[Value::Share(ty, ShareData::Opaque(vec![33]))],
+                engine.as_ref(),
+            )
+            .await
+            .expect_err("truncated response body should fail the async open effect");
+        assert!(
+            error.to_string().contains("read_payload"),
+            "unexpected truncated response error: {error}"
+        );
+
+        let result = vm
+            .execute_async_with_args(
+                "network_open",
+                &[Value::Share(ty, ShareData::Opaque(vec![34]))],
+                engine.as_ref(),
+            )
+            .await?;
+        assert_eq!(result, Value::I64(34));
+        assert_eq!(engine.started(TurmoilAsyncOperation::Open), 2);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::Open), 1);
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+fn turmoil_oversized_async_response_is_rejected_before_allocation() -> turmoil::Result {
+    let mut sim = turmoil::Builder::new()
+        .rng_seed(0x4f56_4552)
+        .simulation_duration(Duration::from_secs(10))
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(5))
+        .build();
+
+    sim.host(TURMOIL_RBC_HOST, || async {
+        run_turmoil_all_ops_peer(TurmoilAllOpsServerBehavior::OversizedOpenFieldResponse).await?;
+        Ok(())
+    });
+
+    sim.client(TURMOIL_VM_HOST, async {
+        let engine = Arc::new(TurmoilAllOpsEngine::new(TURMOIL_RBC_HOST, TURMOIL_RBC_PORT));
+        let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+        let ty = ShareType::secret_int(64);
+        let mut vm = VirtualMachine::builder()
+            .with_standard_library(false)
+            .with_mpc_engine(runtime_engine)
+            .build();
+        vm.register_function(unary_builtin_arg_function(
+            "network_open_field",
+            "Share.open_field",
+        ));
+
+        let error = vm
+            .execute_async_with_args(
+                "network_open_field",
+                &[Value::Share(ty, ShareData::Opaque(vec![44]))],
+                engine.as_ref(),
+            )
+            .await
+            .expect_err("oversized response length should be rejected before allocation");
+        assert!(
+            error.to_string().contains("response length 4097"),
+            "unexpected oversized response error: {error}"
+        );
+
+        let result = vm
+            .execute_async_with_args(
+                "network_open_field",
+                &[Value::Share(ty, ShareData::Opaque(vec![45]))],
+                engine.as_ref(),
+            )
+            .await?;
+        assert_eq!(
+            vm.read_byte_array(&result)
+                .expect("successful open_field should return bytes"),
+            b"field:-".to_vec()
+        );
+        assert_eq!(engine.started(TurmoilAsyncOperation::OpenField), 2);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::OpenField), 1);
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+fn turmoil_malicious_receive_any_party_id_is_rejected_without_poisoning_vm() -> turmoil::Result {
+    if (usize::MAX as u128) <= (i64::MAX as u128) {
+        return Ok(());
+    }
+
+    let mut sim = turmoil::Builder::new()
+        .rng_seed(0x4241_4450)
+        .simulation_duration(Duration::from_secs(10))
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(5))
+        .build();
+
+    sim.host(TURMOIL_RBC_HOST, || async {
+        run_turmoil_all_ops_peer(TurmoilAllOpsServerBehavior::OutOfRangeReceiveAnyParty).await?;
+        Ok(())
+    });
+
+    sim.client(TURMOIL_VM_HOST, async {
+        let engine = Arc::new(TurmoilAllOpsEngine::new(TURMOIL_RBC_HOST, TURMOIL_RBC_PORT));
+        let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+        let mut vm = VirtualMachine::builder()
+            .with_standard_library(false)
+            .with_mpc_engine(runtime_engine)
+            .build();
+        vm.register_function(VMFunction::new(
+            "malicious_receive_any".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            2,
+            vec![
+                Instruction::LDI(1, Value::I64(1_000)),
+                Instruction::PUSHARG(1),
+                Instruction::CALL("Rbc.receive_any".to_string()),
+                Instruction::RET(0),
+            ],
+            HashMap::new(),
+        ));
+        vm.register_function(async_rbc_receive_call_function(
+            "receive_after_bad_party",
+            3,
+        ));
+
+        let error = vm
+            .execute_async("malicious_receive_any", engine.as_ref())
+            .await
+            .expect_err("out-of-range party id should fail object materialization");
+        assert!(
+            error.to_string().contains("party_id"),
+            "unexpected malicious receive_any error: {error}"
+        );
+
+        let result = vm
+            .execute_async("receive_after_bad_party", engine.as_ref())
+            .await?;
+        assert_eq!(result, Value::String("from-3".to_string()));
+        assert_eq!(engine.started(TurmoilAsyncOperation::RbcReceiveAny), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::RbcReceiveAny), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::RbcReceive), 1);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::RbcReceive), 1);
+        Ok(())
+    });
+
+    sim.run()
 }
 
 #[tokio::test]

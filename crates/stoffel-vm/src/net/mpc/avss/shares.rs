@@ -6,6 +6,7 @@ use ark_std::rand::{Rng, SeedableRng};
 use std::sync::Arc;
 use stoffel_vm_types::core_types::{ClearShareValue, ShareData, ShareType};
 use stoffelmpc_mpc::avss_mpc::AvssSessionId;
+use stoffelmpc_mpc::common::share::avss::verify_feldman;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::{MPCProtocol, ProtocolSessionId, SecretSharingScheme};
 use tracing::info;
@@ -329,6 +330,71 @@ where
         let (_, secret) = FeldmanShamirShare::<F, G>::recover_secret(shares, n, t)
             .map_err(|e| format!("Failed to recover secret: {:?}", e))?;
         Ok(secret)
+    }
+
+    pub(super) fn byzantine_open_contribution_count(n: usize, t: usize) -> Result<usize, String> {
+        let required_valid = t
+            .checked_add(1)
+            .ok_or_else(|| "AVSS open valid contribution count overflowed".to_string())?;
+        let required_collected = n
+            .checked_sub(t)
+            .ok_or_else(|| "AVSS open topology has threshold above party count".to_string())?;
+
+        if required_collected < required_valid {
+            return Err(format!(
+                "AVSS open requires n - t >= t + 1, got n={n}, t={t}"
+            ));
+        }
+
+        Ok(required_collected)
+    }
+
+    pub(super) fn reconstruct_verified_secret(
+        expected_share_bytes: &[u8],
+        collected: &[Vec<u8>],
+        n: usize,
+        t: usize,
+        context: &str,
+    ) -> Result<F, String> {
+        let expected_share = Self::decode_feldman_share(expected_share_bytes)?;
+        let required_valid = t
+            .checked_add(1)
+            .ok_or_else(|| format!("{context}: valid contribution count overflowed"))?;
+
+        if !verify_feldman(expected_share.clone()) {
+            return Err(format!(
+                "{context}: local Feldman share failed commitment verification"
+            ));
+        }
+
+        let mut verified = Vec::with_capacity(required_valid);
+        for share_bytes in collected {
+            let Ok(share) = Self::decode_feldman_share(share_bytes) else {
+                continue;
+            };
+
+            if share.commitments != expected_share.commitments {
+                continue;
+            }
+
+            if verify_feldman(share.clone()) {
+                verified.push(share);
+                if verified.len() == required_valid {
+                    break;
+                }
+            }
+        }
+
+        if verified.len() < required_valid {
+            return Err(format!(
+                "{context}: collected {} contributions but only {} valid Feldman shares matched the local commitments; need {}",
+                collected.len(),
+                verified.len(),
+                required_valid
+            ));
+        }
+
+        Self::reconstruct_secret(&verified, n, t)
     }
 
     #[inline]

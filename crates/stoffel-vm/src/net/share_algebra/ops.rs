@@ -7,7 +7,7 @@ use ark_ff::{FftField, PrimeField};
 use stoffel_vm_types::core_types::ShareType;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 
-use crate::net::curve::{field_from_i64, MpcFieldKind};
+use crate::net::curve::{field_from_i64, MpcCurveConfig};
 
 #[derive(Debug, Clone, Copy)]
 enum ShareBinaryOp {
@@ -27,48 +27,51 @@ pub(super) enum ShareScalarOp {
     Mul,
 }
 
-pub(crate) fn add_share(
-    field_kind: MpcFieldKind,
+pub(crate) fn add_share_for_curve(
+    curve_config: MpcCurveConfig,
     _ty: ShareType,
     lhs_bytes: &[u8],
     rhs_bytes: &[u8],
 ) -> ShareAlgebraResult<Vec<u8>> {
-    dispatch_share_curve!(
-        field_kind,
+    dispatch_share_curve_config!(
+        curve_config,
         share_binary_op_typed(lhs_bytes, rhs_bytes, ShareBinaryOp::Add)
     )
 }
 
-pub(crate) fn sub_share(
-    field_kind: MpcFieldKind,
+pub(crate) fn sub_share_for_curve(
+    curve_config: MpcCurveConfig,
     _ty: ShareType,
     lhs_bytes: &[u8],
     rhs_bytes: &[u8],
 ) -> ShareAlgebraResult<Vec<u8>> {
-    dispatch_share_curve!(
-        field_kind,
+    dispatch_share_curve_config!(
+        curve_config,
         share_binary_op_typed(lhs_bytes, rhs_bytes, ShareBinaryOp::Sub)
     )
 }
 
-pub(crate) fn neg_share(
-    field_kind: MpcFieldKind,
+pub(crate) fn neg_share_for_curve(
+    curve_config: MpcCurveConfig,
     _ty: ShareType,
     share_bytes: &[u8],
 ) -> ShareAlgebraResult<Vec<u8>> {
-    dispatch_share_curve!(
-        field_kind,
+    dispatch_share_curve_config!(
+        curve_config,
         share_unary_op_typed(share_bytes, ShareUnaryOp::Neg)
     )
 }
 
-pub(crate) fn mul_share_field(
-    field_kind: MpcFieldKind,
+pub(crate) fn mul_share_field_for_curve(
+    curve_config: MpcCurveConfig,
     _ty: ShareType,
     share_bytes: &[u8],
     scalar_bytes: &[u8],
 ) -> ShareAlgebraResult<Vec<u8>> {
-    dispatch_share_curve!(field_kind, share_field_mul_typed(share_bytes, scalar_bytes))
+    dispatch_share_curve_config!(
+        curve_config,
+        share_field_mul_typed(share_bytes, scalar_bytes)
+    )
 }
 
 pub(super) fn share_scalar_op_typed<F, G>(

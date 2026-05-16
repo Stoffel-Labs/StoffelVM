@@ -145,9 +145,17 @@ impl OpenMessageRouter {
             return Ok(false);
         }
 
-        let message: ExpOpenWireMessage =
-            bincode::deserialize(&payload[HB_EXP_OPEN_WIRE_PREFIX.len()..])
-                .map_err(|e| format!("deserialize open-exp payload: {}", e))?;
+        let body = &payload[HB_EXP_OPEN_WIRE_PREFIX.len()..];
+        if body.len() > MAX_WIRE_MESSAGE_LEN {
+            return Err(format!(
+                "open-exp wire payload too large: {} bytes (max {})",
+                body.len(),
+                MAX_WIRE_MESSAGE_LEN
+            ));
+        }
+
+        let message: ExpOpenWireMessage = bincode::deserialize(body)
+            .map_err(|e| format!("deserialize open-exp payload: {}", e))?;
 
         if authenticated_sender_id == UNKNOWN_SENDER_ID {
             tracing::warn!(
@@ -218,14 +226,30 @@ impl OpenMessageRouter {
             return Ok(false);
         }
 
-        let message: ExpOpenWireMessage =
-            bincode::deserialize(&payload[prefix.len()..]).map_err(|e| {
-                if use_g2_registry {
-                    format!("deserialize avss g2 open-exp payload: {}", e)
-                } else {
-                    format!("deserialize avss open-exp payload: {}", e)
-                }
-            })?;
+        let body = &payload[prefix.len()..];
+        if body.len() > MAX_WIRE_MESSAGE_LEN {
+            return Err(if use_g2_registry {
+                format!(
+                    "avss g2 open-exp wire payload too large: {} bytes (max {})",
+                    body.len(),
+                    MAX_WIRE_MESSAGE_LEN
+                )
+            } else {
+                format!(
+                    "avss open-exp wire payload too large: {} bytes (max {})",
+                    body.len(),
+                    MAX_WIRE_MESSAGE_LEN
+                )
+            });
+        }
+
+        let message: ExpOpenWireMessage = bincode::deserialize(body).map_err(|e| {
+            if use_g2_registry {
+                format!("deserialize avss g2 open-exp payload: {}", e)
+            } else {
+                format!("deserialize avss open-exp payload: {}", e)
+            }
+        })?;
 
         if authenticated_sender_id == UNKNOWN_SENDER_ID {
             tracing::warn!(

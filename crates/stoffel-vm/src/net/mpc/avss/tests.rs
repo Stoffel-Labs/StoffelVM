@@ -10,6 +10,63 @@ use stoffelmpc_mpc::common::ProtocolSessionId;
 use stoffelnet::transports::quic::QuicNetworkManager;
 
 #[test]
+fn upstream_ransha_commitment_transform_produces_verifiable_ed25519_shares() {
+    use ark_ed25519::{EdwardsProjective, Fr as EdFr};
+    use ark_ff::Zero;
+    use stoffelmpc_mpc::common::share::{apply_vandermonde, make_vandermonde};
+    use stoffelmpc_mpc::common::SecretSharingScheme;
+
+    let n = 5;
+    let t = 1;
+    let receiver_index = 0;
+    let ids: Vec<_> = (1..=n).collect();
+    let mut rng = test_rng();
+
+    let mut shares_deg_t = Vec::with_capacity(n);
+    for _ in 0..n {
+        let secret = EdFr::rand(&mut rng);
+        let shares = FeldmanShamirShare::<EdFr, EdwardsProjective>::compute_shares(
+            secret,
+            n,
+            t,
+            Some(&ids),
+            &mut rng,
+        )
+        .expect("compute Feldman shares");
+        shares_deg_t.push(shares[receiver_index].clone());
+    }
+
+    let shares = shares_deg_t
+        .iter()
+        .map(|share| share.feldmanshare.clone())
+        .collect::<Vec<_>>();
+    let vandermonde_matrix = make_vandermonde::<EdFr>(n, n - 1).expect("make Vandermonde matrix");
+    let r_deg_t = apply_vandermonde(&vandermonde_matrix, &shares).expect("apply Vandermonde");
+
+    let mut computed = Vec::with_capacity(n);
+    for k in 0..n {
+        let mut commitments = vec![EdwardsProjective::zero(); t + 1];
+        for i in 0..n {
+            let factor = vandermonde_matrix[k][i];
+            for (dst, src) in commitments
+                .iter_mut()
+                .zip(shares_deg_t[i].commitments.iter())
+            {
+                *dst += *src * factor;
+            }
+        }
+        computed.push(FeldmanShamirShare {
+            feldmanshare: r_deg_t[k].clone(),
+            commitments,
+        });
+    }
+
+    for share in &computed[2 * t..] {
+        assert!(verify_feldman(share.clone()));
+    }
+}
+
+#[test]
 fn test_feldman_share_serialization() {
     let mut rng = test_rng();
 
@@ -338,6 +395,170 @@ fn test_avss_input_share_reconstruction() {
         recovered, secret,
         "Reconstructed secret should match original"
     );
+}
+
+#[test]
+fn avss_open_reconstruction_filters_byzantine_feldman_contributions() {
+    let n = 4;
+    let t = 1;
+    let secret = Fr::from(12345u64);
+    let honest_shares = generate_feldman_shares(secret, n, t);
+    let byzantine_shares = generate_feldman_shares(Fr::from(99999u64), n, t);
+
+    let local_share =
+        Bls12381AvssMpcEngine::encode_feldman_share(&honest_shares[0]).expect("encode local");
+    let malformed_share = vec![0xde, 0xad, 0xbe, 0xef];
+    let mismatched_commitments =
+        Bls12381AvssMpcEngine::encode_feldman_share(&byzantine_shares[1]).expect("encode bad");
+    let second_valid =
+        Bls12381AvssMpcEngine::encode_feldman_share(&honest_shares[1]).expect("encode valid");
+
+    let collected = vec![
+        local_share.clone(),
+        malformed_share.clone(),
+        mismatched_commitments.clone(),
+        second_valid,
+    ];
+    let recovered = Bls12381AvssMpcEngine::reconstruct_verified_secret(
+        &local_share,
+        &collected,
+        n,
+        t,
+        "test open",
+    )
+    .expect("one malformed and one mismatched share should be ignored");
+    assert_eq!(recovered, secret);
+
+    let insufficient = vec![local_share.clone(), malformed_share, mismatched_commitments];
+    let err = Bls12381AvssMpcEngine::reconstruct_verified_secret(
+        &local_share,
+        &insufficient,
+        n,
+        t,
+        "test open",
+    )
+    .expect_err("one valid share is not enough for t=1 reconstruction");
+    assert!(
+        err.contains("only 1 valid Feldman shares") && err.contains("need 2"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn avss_open_reconstruction_rejects_non_verifiable_local_feldman_share() {
+    let n = 4;
+    let t = 1;
+    let secret = Fr::from(12345u64);
+    let honest_shares = generate_feldman_shares(secret, n, t);
+    let mut corrupted_local = honest_shares[0].clone();
+    corrupted_local.commitments = vec![G1::generator(); t + 1];
+
+    assert!(
+        !verify_feldman(corrupted_local.clone()),
+        "test setup should model a local Feldman share with invalid commitments"
+    );
+
+    let local_share =
+        Bls12381AvssMpcEngine::encode_feldman_share(&corrupted_local).expect("encode local");
+    let second_valid =
+        Bls12381AvssMpcEngine::encode_feldman_share(&honest_shares[1]).expect("encode valid");
+    let collected = vec![local_share.clone(), second_valid];
+
+    let err = Bls12381AvssMpcEngine::reconstruct_verified_secret(
+        &local_share,
+        &collected,
+        n,
+        t,
+        "test open",
+    )
+    .expect_err("invalid local Feldman commitment should be rejected");
+    assert!(
+        err.contains("local Feldman share failed commitment verification"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn avss_open_registry_waits_for_n_minus_t_and_tolerates_one_bad_share() {
+    let n = 4;
+    let t = 1;
+    let instance_id = 98001;
+    let type_key = "avss-int-64";
+    let secret = Fr::from(12345u64);
+    let honest_shares = generate_feldman_shares(secret, n, t);
+    let byzantine_shares = generate_feldman_shares(Fr::from(99999u64), n, t);
+
+    let local_share =
+        Bls12381AvssMpcEngine::encode_feldman_share(&honest_shares[0]).expect("encode local");
+    let bad_share =
+        Bls12381AvssMpcEngine::encode_feldman_share(&byzantine_shares[1]).expect("encode bad");
+    let valid_share =
+        Bls12381AvssMpcEngine::encode_feldman_share(&honest_shares[1]).expect("encode valid");
+
+    let router = Arc::new(crate::net::open_registry::OpenMessageRouter::new());
+    let registry = router.register_instance(instance_id);
+    let required = Bls12381AvssMpcEngine::byzantine_open_contribution_count(n, t)
+        .expect("valid byzantine topology");
+
+    let expected_share = local_share.clone();
+    let waiter = tokio::spawn(async move {
+        registry
+            .open_share_async(
+                0,
+                type_key.to_string(),
+                expected_share.clone(),
+                required,
+                move |collected| {
+                    let secret = Bls12381AvssMpcEngine::reconstruct_verified_secret(
+                        &expected_share,
+                        collected,
+                        n,
+                        t,
+                        "registry open",
+                    )?;
+                    Bls12381AvssMpcEngine::field_to_clear_share_value(
+                        ShareType::default_secret_int(),
+                        secret,
+                    )
+                },
+            )
+            .await
+    });
+
+    let bad_message = crate::net::open_registry::encode_single_share_wire_message(
+        instance_id,
+        type_key,
+        1,
+        &bad_share,
+    )
+    .expect("encode bad wire message");
+    assert!(router
+        .try_handle_wire_message(1, &bad_message)
+        .expect("route bad wire message"));
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "open should wait for n - t contributions instead of reconstructing from one honest and one bad share"
+    );
+
+    let valid_message = crate::net::open_registry::encode_single_share_wire_message(
+        instance_id,
+        type_key,
+        2,
+        &valid_share,
+    )
+    .expect("encode valid wire message");
+    assert!(router
+        .try_handle_wire_message(2, &valid_message)
+        .expect("route valid wire message"));
+
+    let opened = tokio::time::timeout(tokio::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("open should complete after n - t contributions")
+        .expect("open task should not panic")
+        .expect("open should reconstruct from valid Feldman shares");
+    assert_eq!(opened, ClearShareValue::Integer(12345));
 }
 
 #[test]

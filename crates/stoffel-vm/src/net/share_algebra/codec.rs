@@ -7,7 +7,7 @@ use stoffel_vm_types::core_types::ShareData;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 
-use crate::net::curve::MpcFieldKind;
+use crate::net::curve::MpcCurveConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LocalShareFormat {
@@ -52,16 +52,16 @@ pub(super) fn encode_share_bytes_typed<T: CanonicalSerialize>(
     Ok(encoded)
 }
 
-pub(crate) fn preserve_share_data_format(
-    field_kind: MpcFieldKind,
+pub(crate) fn preserve_share_data_format_for_curve(
+    curve_config: MpcCurveConfig,
     template: &ShareData,
     result_bytes: Vec<u8>,
 ) -> ShareAlgebraResult<ShareData> {
     match template {
         ShareData::Opaque(_) => Ok(ShareData::Opaque(result_bytes)),
         ShareData::Feldman { .. } => {
-            dispatch_share_curve!(
-                field_kind,
+            dispatch_share_curve_config!(
+                curve_config,
                 feldman_share_data_from_bytes_typed(result_bytes)
             )
         }

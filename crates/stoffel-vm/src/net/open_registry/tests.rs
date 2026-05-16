@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use stoffel_vm_types::core_types::ClearShareValue;
 
-use super::wire::{MAX_WIRE_MESSAGE_LEN, OPEN_REGISTRY_WIRE_PREFIX};
+use super::wire::{
+    AVSS_EXP_WIRE_PREFIX, AVSS_G2_EXP_WIRE_PREFIX, HB_EXP_OPEN_WIRE_PREFIX, MAX_WIRE_MESSAGE_LEN,
+    OPEN_REGISTRY_WIRE_PREFIX,
+};
 use super::*;
 
 #[test]
@@ -85,6 +88,78 @@ fn oversized_payload_is_rejected() {
     let result = router.try_handle_wire_message(0, &msg);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("too large"));
+}
+
+#[test]
+fn oversized_exp_payloads_are_rejected_before_deserialize() {
+    let router = OpenMessageRouter::new();
+
+    let mut hb = Vec::new();
+    hb.extend_from_slice(HB_EXP_OPEN_WIRE_PREFIX);
+    hb.extend(vec![0u8; MAX_WIRE_MESSAGE_LEN + 1]);
+    let err = router
+        .try_handle_hb_open_exp_wire_message(0, &hb)
+        .expect_err("oversized HoneyBadger open-exp payload must be rejected");
+    assert!(
+        err.contains("open-exp wire payload too large"),
+        "unexpected error: {err}"
+    );
+
+    let mut avss = Vec::new();
+    avss.extend_from_slice(AVSS_EXP_WIRE_PREFIX);
+    avss.extend(vec![0u8; MAX_WIRE_MESSAGE_LEN + 1]);
+    let err = router
+        .try_handle_avss_open_exp_wire_message(0, &avss)
+        .expect_err("oversized AVSS open-exp payload must be rejected");
+    assert!(
+        err.contains("avss open-exp wire payload too large"),
+        "unexpected error: {err}"
+    );
+
+    let mut avss_g2 = Vec::new();
+    avss_g2.extend_from_slice(AVSS_G2_EXP_WIRE_PREFIX);
+    avss_g2.extend(vec![0u8; MAX_WIRE_MESSAGE_LEN + 1]);
+    let err = router
+        .try_handle_avss_g2_exp_wire_message(0, &avss_g2)
+        .expect_err("oversized AVSS G2 open-exp payload must be rejected");
+    assert!(
+        err.contains("avss g2 open-exp wire payload too large"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn avss_exp_wire_rejects_share_id_mismatch_without_inserting() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(20011);
+    let payload = encode_avss_open_exp_wire_message(20011, 1, 1, b"point")
+        .expect("serialize AVSS open-exp payload");
+
+    let err = router
+        .try_handle_avss_open_exp_wire_message(1, &payload)
+        .expect_err("AVSS share_id must be party_id + 1");
+    assert!(
+        err.contains("avss open-exp share_id mismatch"),
+        "unexpected error: {err}"
+    );
+    assert!(registry.exp.lock().is_empty());
+}
+
+#[test]
+fn avss_g2_exp_wire_rejects_share_id_mismatch_without_inserting() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(20012);
+    let payload = encode_avss_g2_open_exp_wire_message(20012, 1, 1, b"point")
+        .expect("serialize AVSS G2 open-exp payload");
+
+    let err = router
+        .try_handle_avss_g2_exp_wire_message(1, &payload)
+        .expect_err("AVSS G2 share_id must be party_id + 1");
+    assert!(
+        err.contains("avss g2 open-exp share_id mismatch"),
+        "unexpected error: {err}"
+    );
+    assert!(registry.exp_g2.lock().is_empty());
 }
 
 #[test]

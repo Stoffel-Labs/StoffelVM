@@ -7,10 +7,10 @@ use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::SecretSharingScheme;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 
-use crate::net::curve::{field_to_i64, fixed_point_scale_as_f64, MpcFieldKind};
+use crate::net::curve::{field_to_i64, fixed_point_scale_as_f64, MpcCurveConfig};
 
-pub(crate) fn interpolate_local(
-    field_kind: MpcFieldKind,
+pub(crate) fn interpolate_local_for_curve(
+    curve_config: MpcCurveConfig,
     ty: ShareType,
     shares: &[Vec<u8>],
     n_parties: usize,
@@ -20,8 +20,8 @@ pub(crate) fn interpolate_local(
         return Err(ShareAlgebraError::InterpolationEmpty);
     }
 
-    dispatch_share_curve!(
-        field_kind,
+    dispatch_share_curve_config!(
+        curve_config,
         share_interpolate_local_typed(ty, shares, n_parties, threshold)
     )
 }

@@ -7,6 +7,7 @@ use crate::net::mpc_engine::{
 };
 use ark_ec::CurveGroup;
 use ark_std::rand::SeedableRng;
+use std::any::TypeId;
 use std::sync::{atomic::Ordering, Arc};
 use stoffel_vm_types::core_types::{
     ClearShareInput, ClearShareValue, ShareData, ShareType, BOOLEAN_SECRET_INT_BITS,
@@ -190,9 +191,9 @@ where
             )?;
             self.broadcast_open_registry_payload_sync(wire_message)?;
 
-            let required = self.topology.threshold() + 1;
             let n = self.topology.n_parties();
             let t = self.topology.threshold();
+            let required = Self::byzantine_open_contribution_count(n, t)?;
 
             self.open_registry.open_share_wait(
                 self.topology.party_id(),
@@ -200,12 +201,13 @@ where
                 share_bytes,
                 required,
                 |collected| {
-                    let mut shares: Vec<FeldmanShamirShare<F, G>> =
-                        Vec::with_capacity(collected.len());
-                    for bytes in collected {
-                        shares.push(Self::decode_feldman_share(bytes)?);
-                    }
-                    let secret = Self::reconstruct_secret(&shares, n, t)?;
+                    let secret = Self::reconstruct_verified_secret(
+                        share_bytes,
+                        collected,
+                        n,
+                        t,
+                        "AVSS open_share",
+                    )?;
                     Self::field_to_clear_share_value(ty, secret)
                 },
             )
@@ -234,9 +236,9 @@ where
             )?;
             self.broadcast_open_registry_payload_sync(wire_message)?;
 
-            let required = self.topology.threshold() + 1;
             let n = self.topology.n_parties();
             let t = self.topology.threshold();
+            let required = Self::byzantine_open_contribution_count(n, t)?;
 
             self.open_registry.batch_open_wait(
                 self.topology.party_id(),
@@ -244,13 +246,16 @@ where
                 shares,
                 required,
                 |collected, pos| {
-                    let mut decoded_shares: Vec<FeldmanShamirShare<F, G>> =
-                        Vec::with_capacity(collected.len());
-                    for bytes in collected {
-                        decoded_shares.push(Self::decode_feldman_share(bytes)?);
-                    }
-                    let secret = Self::reconstruct_secret(&decoded_shares, n, t)
-                        .map_err(|e| format!("batch reconstruct_secret pos {}: {}", pos, e))?;
+                    let expected_share = shares.get(pos).ok_or_else(|| {
+                        format!("AVSS batch_open_shares missing local share at position {pos}")
+                    })?;
+                    let secret = Self::reconstruct_verified_secret(
+                        expected_share,
+                        collected,
+                        n,
+                        t,
+                        &format!("AVSS batch_open_shares pos {pos}"),
+                    )?;
                     Self::field_to_clear_share_value(ty, secret)
                 },
             )
@@ -263,7 +268,17 @@ where
     }
 
     fn curve_config(&self) -> MpcCurveConfig {
-        F::CURVE_CONFIG
+        if TypeId::of::<G>() == TypeId::of::<ark_bls12_381::G1Projective>() {
+            MpcCurveConfig::Bls12_381
+        } else if TypeId::of::<G>() == TypeId::of::<ark_bn254::G1Projective>() {
+            MpcCurveConfig::Bn254
+        } else if TypeId::of::<G>() == TypeId::of::<ark_curve25519::EdwardsProjective>() {
+            MpcCurveConfig::Curve25519
+        } else if TypeId::of::<G>() == TypeId::of::<ark_ed25519::EdwardsProjective>() {
+            MpcCurveConfig::Ed25519
+        } else {
+            F::CURVE_CONFIG
+        }
     }
 
     fn capabilities(&self) -> MpcCapabilities {

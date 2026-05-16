@@ -78,7 +78,12 @@ pub trait MpcEngine: Send + Sync {
         lhs_bytes: &[u8],
         rhs_bytes: &[u8],
     ) -> ShareAlgebraResult<Vec<u8>> {
-        crate::net::share_algebra::add_share(self.field_kind(), ty, lhs_bytes, rhs_bytes)
+        crate::net::share_algebra::add_share_for_curve(
+            self.curve_config(),
+            ty,
+            lhs_bytes,
+            rhs_bytes,
+        )
     }
 
     /// Locally subtract two shares owned by this party.
@@ -88,12 +93,17 @@ pub trait MpcEngine: Send + Sync {
         lhs_bytes: &[u8],
         rhs_bytes: &[u8],
     ) -> ShareAlgebraResult<Vec<u8>> {
-        crate::net::share_algebra::sub_share(self.field_kind(), ty, lhs_bytes, rhs_bytes)
+        crate::net::share_algebra::sub_share_for_curve(
+            self.curve_config(),
+            ty,
+            lhs_bytes,
+            rhs_bytes,
+        )
     }
 
     /// Locally negate a share owned by this party.
     fn neg_share_local(&self, ty: ShareType, share_bytes: &[u8]) -> ShareAlgebraResult<Vec<u8>> {
-        crate::net::share_algebra::neg_share(self.field_kind(), ty, share_bytes)
+        crate::net::share_algebra::neg_share_for_curve(self.curve_config(), ty, share_bytes)
     }
 
     /// Locally add a clear scalar to a share owned by this party.
@@ -103,7 +113,12 @@ pub trait MpcEngine: Send + Sync {
         share_bytes: &[u8],
         scalar: i64,
     ) -> ShareAlgebraResult<Vec<u8>> {
-        crate::net::share_algebra::add_share_scalar(self.field_kind(), ty, share_bytes, scalar)
+        crate::net::share_algebra::add_share_scalar_for_curve(
+            self.curve_config(),
+            ty,
+            share_bytes,
+            scalar,
+        )
     }
 
     /// Locally subtract a clear scalar from a share owned by this party.
@@ -113,7 +128,12 @@ pub trait MpcEngine: Send + Sync {
         share_bytes: &[u8],
         scalar: i64,
     ) -> ShareAlgebraResult<Vec<u8>> {
-        crate::net::share_algebra::sub_share_scalar(self.field_kind(), ty, share_bytes, scalar)
+        crate::net::share_algebra::sub_share_scalar_for_curve(
+            self.curve_config(),
+            ty,
+            share_bytes,
+            scalar,
+        )
     }
 
     /// Locally subtract a share from a clear scalar.
@@ -123,7 +143,12 @@ pub trait MpcEngine: Send + Sync {
         scalar: i64,
         share_bytes: &[u8],
     ) -> ShareAlgebraResult<Vec<u8>> {
-        crate::net::share_algebra::scalar_sub_share(self.field_kind(), ty, scalar, share_bytes)
+        crate::net::share_algebra::scalar_sub_share_for_curve(
+            self.curve_config(),
+            ty,
+            scalar,
+            share_bytes,
+        )
     }
 
     /// Locally multiply a share by a clear scalar.
@@ -133,7 +158,12 @@ pub trait MpcEngine: Send + Sync {
         share_bytes: &[u8],
         scalar: i64,
     ) -> ShareAlgebraResult<Vec<u8>> {
-        crate::net::share_algebra::mul_share_scalar(self.field_kind(), ty, share_bytes, scalar)
+        crate::net::share_algebra::mul_share_scalar_for_curve(
+            self.curve_config(),
+            ty,
+            share_bytes,
+            scalar,
+        )
     }
 
     /// Locally divide a share by a clear scalar.
@@ -143,7 +173,12 @@ pub trait MpcEngine: Send + Sync {
         share_bytes: &[u8],
         scalar: i64,
     ) -> ShareAlgebraResult<Vec<u8>> {
-        crate::net::share_algebra::div_share_scalar(self.field_kind(), ty, share_bytes, scalar)
+        crate::net::share_algebra::div_share_scalar_for_curve(
+            self.curve_config(),
+            ty,
+            share_bytes,
+            scalar,
+        )
     }
 
     /// Locally multiply a share by a serialized field element.
@@ -153,7 +188,12 @@ pub trait MpcEngine: Send + Sync {
         share_bytes: &[u8],
         scalar_bytes: &[u8],
     ) -> ShareAlgebraResult<Vec<u8>> {
-        crate::net::share_algebra::mul_share_field(self.field_kind(), ty, share_bytes, scalar_bytes)
+        crate::net::share_algebra::mul_share_field_for_curve(
+            self.curve_config(),
+            ty,
+            share_bytes,
+            scalar_bytes,
+        )
     }
 
     /// Locally reconstruct a secret from explicit share bytes.
@@ -162,8 +202,8 @@ pub trait MpcEngine: Send + Sync {
         ty: ShareType,
         shares: &[Vec<u8>],
     ) -> ShareAlgebraResult<Value> {
-        crate::net::share_algebra::interpolate_local(
-            self.field_kind(),
+        crate::net::share_algebra::interpolate_local_for_curve(
+            self.curve_config(),
             ty,
             shares,
             self.party_count().count(),
