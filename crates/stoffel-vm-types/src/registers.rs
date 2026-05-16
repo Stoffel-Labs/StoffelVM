@@ -77,6 +77,31 @@ pub enum RegisterMoveKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClearRegisterCopyResult {
+    Copied,
+    NotClearRegister,
+    RegisterOutOfBounds,
+    SourcePendingReveal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClearRegisterReadResult {
+    Read(Value),
+    NotClearRegister,
+    RegisterOutOfBounds,
+    SourcePendingReveal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SecretRegisterCopyResult {
+    Copied,
+    NotSecretRegister,
+    RegisterOutOfBounds,
+    SourcePendingReveal,
+    SourceNotSecretValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegisterLayout {
     secret_start: usize,
 }
@@ -149,6 +174,7 @@ impl RegisterSlot {
         Self::PendingReveal
     }
 
+    #[inline]
     pub fn as_value(&self) -> Option<&Value> {
         match self {
             Self::Ready(value) => Some(value),
@@ -214,8 +240,8 @@ impl RegisterFile {
         let secret_len = absolute_len.saturating_sub(layout.secret_start());
         Self {
             layout,
-            clear: SmallVec::from_vec(vec![RegisterSlot::default(); clear_len]),
-            secret: SmallVec::from_vec(vec![RegisterSlot::default(); secret_len]),
+            clear: default_slots(clear_len),
+            secret: default_slots(secret_len),
         }
     }
 
@@ -303,6 +329,163 @@ impl RegisterFile {
             .map(|slot| std::mem::replace(slot, RegisterSlot::ready(value)))
     }
 
+    #[inline]
+    pub fn copy_clear_value(
+        &mut self,
+        dest: RegisterIndex,
+        src: RegisterIndex,
+    ) -> ClearRegisterCopyResult {
+        let dest_index = dest.index();
+        let src_index = src.index();
+
+        if dest_index < self.clear.len() && src_index < self.clear.len() {
+            return self.copy_clear_bank_value(dest_index, src_index);
+        }
+
+        let register_count = self.len();
+        if dest_index >= register_count || src_index >= register_count {
+            ClearRegisterCopyResult::RegisterOutOfBounds
+        } else {
+            ClearRegisterCopyResult::NotClearRegister
+        }
+    }
+
+    #[inline]
+    pub fn write_clear_value_from_ref(
+        &mut self,
+        dest: RegisterIndex,
+        value: &Value,
+    ) -> ClearRegisterCopyResult {
+        let dest_index = dest.index();
+
+        if dest_index < self.clear.len() {
+            let value = clone_clear_register_value(value);
+            match &mut self.clear[dest_index] {
+                RegisterSlot::Ready(dest_value) => *dest_value = value,
+                slot @ RegisterSlot::PendingReveal => *slot = RegisterSlot::ready(value),
+            }
+            return ClearRegisterCopyResult::Copied;
+        }
+
+        if dest_index >= self.len() {
+            ClearRegisterCopyResult::RegisterOutOfBounds
+        } else {
+            ClearRegisterCopyResult::NotClearRegister
+        }
+    }
+
+    #[inline]
+    pub fn clone_clear_value(&self, src: RegisterIndex) -> ClearRegisterReadResult {
+        let src_index = src.index();
+
+        if src_index < self.clear.len() {
+            return match self.clear[src_index].as_value() {
+                Some(value) => ClearRegisterReadResult::Read(clone_clear_register_value(value)),
+                None => ClearRegisterReadResult::SourcePendingReveal,
+            };
+        }
+
+        if src_index >= self.len() {
+            ClearRegisterReadResult::RegisterOutOfBounds
+        } else {
+            ClearRegisterReadResult::NotClearRegister
+        }
+    }
+
+    #[inline]
+    pub fn copy_secret_value(
+        &mut self,
+        dest: RegisterIndex,
+        src: RegisterIndex,
+    ) -> SecretRegisterCopyResult {
+        let dest_index = dest.index();
+        let src_index = src.index();
+        let register_count = self.len();
+
+        if dest_index >= register_count || src_index >= register_count {
+            return SecretRegisterCopyResult::RegisterOutOfBounds;
+        }
+
+        let secret_start = self.layout.secret_start();
+        if dest_index < secret_start || src_index < secret_start {
+            return SecretRegisterCopyResult::NotSecretRegister;
+        }
+
+        self.copy_secret_bank_value(dest_index - secret_start, src_index - secret_start)
+    }
+
+    #[inline]
+    fn copy_secret_bank_value(
+        &mut self,
+        dest_index: usize,
+        src_index: usize,
+    ) -> SecretRegisterCopyResult {
+        if dest_index == src_index {
+            return match self.secret[src_index].as_value() {
+                Some(Value::Share(_, _) | Value::Unit) => SecretRegisterCopyResult::Copied,
+                Some(_) => SecretRegisterCopyResult::SourceNotSecretValue,
+                None => SecretRegisterCopyResult::SourcePendingReveal,
+            };
+        }
+
+        let (dest_slot, src_slot) = if dest_index < src_index {
+            let (left, right) = self.secret.split_at_mut(src_index);
+            (&mut left[dest_index], &right[0])
+        } else {
+            let (left, right) = self.secret.split_at_mut(dest_index);
+            (&mut right[0], &left[src_index])
+        };
+
+        let Some(src_value) = src_slot.as_value() else {
+            return SecretRegisterCopyResult::SourcePendingReveal;
+        };
+        let Some(value) = clone_secret_register_value(src_value) else {
+            return SecretRegisterCopyResult::SourceNotSecretValue;
+        };
+
+        match dest_slot {
+            RegisterSlot::Ready(dest_value) => *dest_value = value,
+            RegisterSlot::PendingReveal => *dest_slot = RegisterSlot::ready(value),
+        }
+
+        SecretRegisterCopyResult::Copied
+    }
+
+    #[inline]
+    fn copy_clear_bank_value(
+        &mut self,
+        dest_index: usize,
+        src_index: usize,
+    ) -> ClearRegisterCopyResult {
+        if dest_index == src_index {
+            return if self.clear[src_index].as_value().is_some() {
+                ClearRegisterCopyResult::Copied
+            } else {
+                ClearRegisterCopyResult::SourcePendingReveal
+            };
+        }
+
+        let (dest_slot, src_slot) = if dest_index < src_index {
+            let (left, right) = self.clear.split_at_mut(src_index);
+            (&mut left[dest_index], &right[0])
+        } else {
+            let (left, right) = self.clear.split_at_mut(dest_index);
+            (&mut right[0], &left[src_index])
+        };
+
+        let Some(src_value) = src_slot.as_value() else {
+            return ClearRegisterCopyResult::SourcePendingReveal;
+        };
+
+        let value = clone_clear_register_value(src_value);
+        match dest_slot {
+            RegisterSlot::Ready(dest_value) => *dest_value = value,
+            RegisterSlot::PendingReveal => *dest_slot = RegisterSlot::ready(value),
+        }
+
+        ClearRegisterCopyResult::Copied
+    }
+
     pub fn set_pending_reveal(&mut self, register: RegisterIndex) -> Option<RegisterSlot> {
         self.get_slot_mut(register)
             .map(|slot| std::mem::replace(slot, RegisterSlot::pending_reveal()))
@@ -319,6 +502,42 @@ impl RegisterFile {
             .chain(self.secret.iter_mut())
             .filter_map(RegisterSlot::as_value_mut)
     }
+}
+
+#[inline]
+fn clone_clear_register_value(value: &Value) -> Value {
+    match value {
+        Value::I64(value) => Value::I64(*value),
+        Value::I32(value) => Value::I32(*value),
+        Value::I16(value) => Value::I16(*value),
+        Value::I8(value) => Value::I8(*value),
+        Value::U8(value) => Value::U8(*value),
+        Value::U16(value) => Value::U16(*value),
+        Value::U32(value) => Value::U32(*value),
+        Value::U64(value) => Value::U64(*value),
+        Value::Float(value) => Value::Float(*value),
+        Value::Bool(value) => Value::Bool(*value),
+        Value::Object(value) => Value::Object(*value),
+        Value::Array(value) => Value::Array(*value),
+        Value::Foreign(value) => Value::Foreign(*value),
+        Value::Unit => Value::Unit,
+        _ => value.clone(),
+    }
+}
+
+#[inline]
+fn clone_secret_register_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Share(ty, data) => Some(Value::Share(*ty, data.clone())),
+        Value::Unit => Some(Value::Unit),
+        _ => None,
+    }
+}
+
+fn default_slots(len: usize) -> SmallVec<[RegisterSlot; 16]> {
+    let mut slots = SmallVec::new();
+    slots.resize(len, RegisterSlot::default());
+    slots
 }
 
 impl Default for RegisterFile {
@@ -438,6 +657,117 @@ mod tests {
         assert_eq!(
             layout.address(r(4)),
             RegisterAddress::new(RegisterBank::Secret, 2)
+        );
+    }
+
+    #[test]
+    fn register_file_copies_clear_values_within_clear_bank() {
+        let mut registers = RegisterFile::new(RegisterLayout::new(2), 3);
+        *registers.get_mut(r(0)).expect("clear register r0") = Value::I64(10);
+        *registers.get_mut(r(1)).expect("clear register r1") = Value::I64(20);
+        *registers.get_mut(r(2)).expect("secret register r2") = Value::I64(30);
+
+        assert_eq!(
+            registers.copy_clear_value(r(0), r(1)),
+            ClearRegisterCopyResult::Copied
+        );
+        assert_eq!(registers.get(r(0)), Some(&Value::I64(20)));
+        assert_eq!(
+            registers.copy_clear_value(r(1), r(2)),
+            ClearRegisterCopyResult::NotClearRegister
+        );
+        assert_eq!(
+            registers.copy_clear_value(r(2), r(1)),
+            ClearRegisterCopyResult::NotClearRegister
+        );
+    }
+
+    #[test]
+    fn register_file_clear_copy_reports_pending_source() {
+        let mut registers = RegisterFile::new(RegisterLayout::new(2), 2);
+        registers
+            .set_pending_reveal(r(1))
+            .expect("clear register r1 exists");
+
+        assert_eq!(
+            registers.copy_clear_value(r(0), r(1)),
+            ClearRegisterCopyResult::SourcePendingReveal
+        );
+    }
+
+    #[test]
+    fn register_file_clear_copy_distinguishes_secret_registers_from_out_of_bounds() {
+        let mut registers = RegisterFile::new(RegisterLayout::new(2), 4);
+
+        assert_eq!(
+            registers.copy_clear_value(r(0), r(2)),
+            ClearRegisterCopyResult::NotClearRegister
+        );
+        assert_eq!(
+            registers.copy_clear_value(r(0), r(4)),
+            ClearRegisterCopyResult::RegisterOutOfBounds
+        );
+    }
+
+    #[test]
+    fn register_file_writes_clear_value_from_borrowed_source() {
+        let mut registers = RegisterFile::new(RegisterLayout::new(2), 4);
+        let source = Value::I64(42);
+
+        assert_eq!(
+            registers.write_clear_value_from_ref(r(0), &source),
+            ClearRegisterCopyResult::Copied
+        );
+        assert_eq!(registers.get(r(0)), Some(&Value::I64(42)));
+        assert_eq!(
+            registers.write_clear_value_from_ref(r(2), &source),
+            ClearRegisterCopyResult::NotClearRegister
+        );
+        assert_eq!(
+            registers.write_clear_value_from_ref(r(4), &source),
+            ClearRegisterCopyResult::RegisterOutOfBounds
+        );
+    }
+
+    #[test]
+    fn register_file_copies_secret_values_within_secret_bank() {
+        let mut registers = RegisterFile::new(RegisterLayout::new(2), 4);
+        let share = Value::Share(
+            crate::core_types::ShareType::secret_int(64),
+            crate::core_types::ShareData::Opaque(vec![7]),
+        );
+        *registers.get_mut(r(2)).expect("secret register r2") = share.clone();
+
+        assert_eq!(
+            registers.copy_secret_value(r(3), r(2)),
+            SecretRegisterCopyResult::Copied
+        );
+        assert_eq!(registers.get(r(3)), Some(&share));
+        assert_eq!(
+            registers.copy_secret_value(r(1), r(2)),
+            SecretRegisterCopyResult::NotSecretRegister
+        );
+        assert_eq!(
+            registers.copy_secret_value(r(3), r(4)),
+            SecretRegisterCopyResult::RegisterOutOfBounds
+        );
+    }
+
+    #[test]
+    fn register_file_secret_copy_reports_pending_and_clear_sources() {
+        let mut registers = RegisterFile::new(RegisterLayout::new(2), 4);
+        *registers.get_mut(r(2)).expect("secret register r2") = Value::I64(7);
+        registers
+            .set_pending_reveal(r(3))
+            .expect("secret register r3 exists");
+
+        assert_eq!(
+            registers.copy_secret_value(r(3), r(2)),
+            SecretRegisterCopyResult::SourceNotSecretValue
+        );
+        assert_eq!(
+            registers.copy_secret_value(r(2), r(3)),
+            SecretRegisterCopyResult::SourcePendingReveal
         );
     }
 

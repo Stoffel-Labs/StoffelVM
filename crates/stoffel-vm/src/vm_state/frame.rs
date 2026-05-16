@@ -2,12 +2,37 @@ use super::VMState;
 use crate::error::{VmError, VmResult};
 use crate::reveal_destination::{FrameDepth, RevealDestination};
 use crate::runtime_hooks::{HookEvent, HookRegister, RegisterWritePreviousValue};
-use crate::runtime_instruction::RuntimeRegister;
+use crate::runtime_instruction::{RuntimeFunction, RuntimeRegister};
+use std::sync::Arc;
 use stoffel_vm_types::activations::ActivationRecord;
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::registers::{RegisterIndex, RegisterLayout};
 
 impl VMState {
+    pub(super) fn push_activation_frame(
+        &mut self,
+        record: ActivationRecord,
+        runtime_function: Option<Arc<RuntimeFunction>>,
+    ) {
+        debug_assert_eq!(self.call_stack.len(), self.frame_runtime_functions.len());
+        self.call_stack.push(record);
+        self.frame_runtime_functions.push(runtime_function);
+    }
+
+    pub(super) fn pop_activation_frame(&mut self) -> Option<ActivationRecord> {
+        debug_assert_eq!(self.call_stack.len(), self.frame_runtime_functions.len());
+        let runtime_function = self.frame_runtime_functions.pop();
+        let record = self.call_stack.pop();
+        debug_assert_eq!(record.is_some(), runtime_function.is_some());
+        record
+    }
+
+    pub(super) fn truncate_activation_frames(&mut self, depth: usize) {
+        self.call_stack.truncate(depth);
+        self.frame_runtime_functions.truncate(depth);
+        debug_assert_eq!(self.call_stack.len(), self.frame_runtime_functions.len());
+    }
+
     /// Get the current activation record or return a VM error instead of panicking.
     #[inline]
     pub(crate) fn current_frame(&self) -> VmResult<&ActivationRecord> {
@@ -22,6 +47,23 @@ impl VMState {
         self.call_stack
             .current_mut()
             .ok_or(VmError::NoActiveActivationRecord)
+    }
+
+    pub(super) fn current_runtime_function(&mut self) -> VmResult<Arc<RuntimeFunction>> {
+        let frame_depth = self.current_frame_depth()?.depth();
+        if let Some(Some(runtime_function)) = self.frame_runtime_functions.get(frame_depth) {
+            return Ok(Arc::clone(runtime_function));
+        }
+
+        let function_name = self.current_frame()?.function_name().to_owned();
+        let runtime_function = self.program.runtime_function(&function_name)?;
+        let slot = self
+            .frame_runtime_functions
+            .get_mut(frame_depth)
+            .ok_or(VmError::NoActiveActivationRecord)?;
+        *slot = Some(Arc::clone(&runtime_function));
+
+        Ok(runtime_function)
     }
 
     #[inline]
@@ -72,12 +114,45 @@ impl VMState {
         value: Value,
         hooks_enabled: bool,
     ) -> VmResult<()> {
+        if !hooks_enabled {
+            return self.assign_current_register_without_previous(register, value);
+        }
+
         let (old_value, value) = self.assign_current_register(register, value)?;
 
-        if hooks_enabled {
-            let event = HookEvent::RegisterWrite(self.hook_register(register)?, old_value, value);
-            self.trigger_hook_with_snapshot(&event)?;
+        let event = HookEvent::RegisterWrite(self.hook_register(register)?, old_value, value);
+        self.trigger_hook_with_snapshot(&event)?;
+        Ok(())
+    }
+
+    pub(super) fn assign_current_register_without_previous(
+        &mut self,
+        register: RuntimeRegister,
+        value: Value,
+    ) -> VmResult<()> {
+        if !self.mpc_runtime.has_any_pending_reveals() {
+            let register_index = register.register_index();
+            let register_number = register.index();
+            let record = self.current_frame_mut()?;
+            Self::ensure_frame_contains_register(record, register)?;
+
+            if record.register_layout().is_clear(register_index) {
+                if let Some(slot) = record.register_mut(register_index) {
+                    *slot = value;
+                    return Ok(());
+                }
+
+                let register_count = record.register_count();
+                record
+                    .replace_register_value(register_index, value)
+                    .ok_or_else(|| Self::register_out_of_bounds(register_number, register_count))?;
+                return Ok(());
+            }
         }
+
+        let (register_index, register_number, value) =
+            self.prepare_current_register_write(register, value)?;
+        self.replace_current_register_value(register_index, register_number, value)?;
         Ok(())
     }
 
@@ -86,6 +161,19 @@ impl VMState {
         register: RuntimeRegister,
         value: Value,
     ) -> VmResult<(RegisterWritePreviousValue, Value)> {
+        let (register_index, register_number, value) =
+            self.prepare_current_register_write(register, value)?;
+        let old_value =
+            self.replace_current_register_value(register_index, register_number, value.clone())?;
+        Ok((RegisterWritePreviousValue::from(old_value), value))
+    }
+
+    #[inline]
+    fn prepare_current_register_write(
+        &mut self,
+        register: RuntimeRegister,
+        value: Value,
+    ) -> VmResult<(RegisterIndex, usize, Value)> {
         let register_index = register.register_index();
         let register_number = register.index();
         let layout = {
@@ -94,29 +182,40 @@ impl VMState {
             record.register_layout()
         };
         let value = self.prepare_register_write_value_for_layout(layout, register_index, value)?;
-        let frame_depth = self.current_frame_depth()?;
-        let destination = RevealDestination::new(frame_depth, register);
-        self.mpc_runtime.cancel_reveal_destination(destination);
+        if self.mpc_runtime.has_any_pending_reveals() {
+            let frame_depth = self.current_frame_depth()?;
+            let destination = RevealDestination::new(frame_depth, register);
+            self.mpc_runtime.cancel_reveal_destination(destination);
+        }
 
+        Ok((register_index, register_number, value))
+    }
+
+    #[inline]
+    fn replace_current_register_value(
+        &mut self,
+        register_index: RegisterIndex,
+        register_number: usize,
+        value: Value,
+    ) -> VmResult<stoffel_vm_types::registers::RegisterSlot> {
         let record = self.current_frame_mut()?;
         let register_count = record.register_count();
-        let old_value = record
-            .replace_register_value(register_index, value.clone())
-            .ok_or_else(|| Self::register_out_of_bounds(register_number, register_count))?;
-        Ok((RegisterWritePreviousValue::from(old_value), value))
+        record
+            .replace_register_value(register_index, value)
+            .ok_or_else(|| Self::register_out_of_bounds(register_number, register_count))
     }
 
     pub(super) fn ensure_frame_contains_register(
         record: &ActivationRecord,
         register: RuntimeRegister,
     ) -> VmResult<()> {
-        let register_index = register.register_index();
-        if record.register_exists(register_index) {
+        let register_count = record.register_count();
+        if register.index() < register_count {
             Ok(())
         } else {
             Err(Self::register_out_of_bounds(
                 register.index(),
-                record.register_count(),
+                register_count,
             ))
         }
     }
@@ -225,7 +324,7 @@ impl VMState {
             .collect::<Result<Vec<_>, _>>()?;
 
         for (reg, value) in results {
-            self.assign_current_register(reg, value)?;
+            self.assign_current_register_without_previous(reg, value)?;
         }
 
         Ok(())

@@ -304,6 +304,39 @@ impl Array {
         Ok(())
     }
 
+    pub fn try_push_values(&mut self, values: &[Value]) -> TableMemoryResult<usize> {
+        let start = self.length_hint;
+        for (offset, value) in values.iter().enumerate() {
+            let idx = start
+                .checked_add(offset)
+                .ok_or(TableMemoryError::ArrayPushLengthOverflow)?;
+            let idx_i64 =
+                i64::try_from(idx).map_err(|_| TableMemoryError::VmIntegerRangeExceeded {
+                    label: "Array index",
+                    value: idx,
+                })?;
+            let new_len = idx
+                .checked_add(1)
+                .ok_or(TableMemoryError::ArrayLengthOverflow { index: idx_i64 })?;
+            i64::try_from(new_len).map_err(|_| TableMemoryError::VmIntegerRangeExceeded {
+                label: "Array length",
+                value: new_len,
+            })?;
+
+            self.length_hint = self.length_hint.max(new_len);
+            if idx < ARRAY_DENSE_INDEX_LIMIT {
+                if idx >= self.elements.len() {
+                    self.elements.resize(idx + 1, Value::Unit);
+                }
+                self.elements[idx] = value.clone();
+            } else {
+                self.extra_fields.insert(Value::I64(idx_i64), value.clone());
+            }
+        }
+
+        Ok(self.length_hint)
+    }
+
     pub fn length(&self) -> usize {
         self.length_hint
     }
@@ -1757,18 +1790,7 @@ impl TableMemory for ObjectStore {
         let array = self
             .get_array_ref_mut(array_ref)
             .ok_or_else(|| ObjectStore::array_not_found(array_ref))?;
-        let start = array.length();
-        for (offset, value) in values.iter().enumerate() {
-            let idx = start
-                .checked_add(offset)
-                .ok_or(TableMemoryError::ArrayPushLengthOverflow)?;
-            let idx = i64::try_from(idx).map_err(|_| TableMemoryError::VmIntegerRangeExceeded {
-                label: "Array index",
-                value: idx,
-            })?;
-            array.try_set(Value::I64(idx), value.clone())?;
-        }
-        Ok(array.length())
+        array.try_push_values(values)
     }
 
     fn read_object_ref_len(&mut self, object_ref: ObjectRef) -> TableMemoryResult<usize> {
@@ -2598,6 +2620,20 @@ mod tests {
             } | TableMemoryError::ArrayLengthOverflow { .. }
                 | TableMemoryError::ArrayPushLengthOverflow
         ));
+    }
+
+    #[test]
+    fn array_push_appends_without_redecoding_numeric_keys() {
+        let mut array = Array::new();
+
+        let len = array
+            .try_push_values(&[Value::I64(10), Value::I64(11)])
+            .expect("append values");
+
+        assert_eq!(len, 2);
+        assert_eq!(array.length(), 2);
+        assert_eq!(array.get(&Value::I64(0)), Some(&Value::I64(10)));
+        assert_eq!(array.get(&Value::I64(1)), Some(&Value::I64(11)));
     }
 
     #[test]

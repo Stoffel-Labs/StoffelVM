@@ -1323,6 +1323,11 @@ fn table_memory_read_errors_propagate_through_set_field_builtin() {
         .with_table_memory(FailingReadMemory::new())
         .build();
     let object_id = vm.create_object_ref().expect("create object").id();
+    vm.register_hook(
+        |event| matches!(event, HookEvent::ObjectFieldWrite(_, _, _, _)),
+        |_, _| Ok(()),
+        0,
+    );
 
     let err = vm
         .execute_with_args(
@@ -1333,7 +1338,7 @@ fn table_memory_read_errors_propagate_through_set_field_builtin() {
                 Value::I64(42),
             ],
         )
-        .expect_err("set_field old-value reads must propagate table memory failures");
+        .expect_err("set_field hook old-value reads must propagate table memory failures");
     let err = err.to_string();
 
     assert!(
@@ -1344,6 +1349,25 @@ fn table_memory_read_errors_propagate_through_set_field_builtin() {
         !err.contains("get_field failed"),
         "table memory errors should propagate without builtin-specific string wrapping: {err}"
     );
+}
+
+#[test]
+fn set_field_without_hooks_does_not_read_old_value() {
+    let mut vm = VirtualMachine::builder()
+        .with_mpc_builtins(false)
+        .with_table_memory(FailingReadMemory::new())
+        .build();
+    let object_id = vm.create_object_ref().expect("create object").id();
+
+    vm.execute_with_args(
+        "set_field",
+        &[
+            Value::from(ObjectRef::new(object_id)),
+            Value::String("answer".to_string()),
+            Value::I64(42),
+        ],
+    )
+    .expect("set_field without hooks should not perform an old-value table read");
 }
 
 #[test]
@@ -1366,11 +1390,16 @@ fn table_memory_builtins_use_mutating_read_boundary() {
         .expect("get_field should use mutable table read");
     assert_eq!(result, Value::I64(41));
 
+    vm.register_hook(
+        |event| matches!(event, HookEvent::ObjectFieldWrite(_, _, _, _)),
+        |_, _| Ok(()),
+        0,
+    );
     vm.execute_with_args(
         "set_field",
         &[Value::from(ObjectRef::new(object_id)), key, Value::I64(42)],
     )
-    .expect("set_field old-value lookup should use mutable table read");
+    .expect("hooked set_field old-value lookup should use mutable table read");
 
     assert_eq!(reads.load(Ordering::SeqCst), 2);
 }
@@ -1707,6 +1736,43 @@ fn async_rbc_receive_call_function(name: &str, from_party: usize) -> VMFunction 
         ],
         HashMap::new(),
     )
+}
+
+#[tokio::test]
+async fn execute_many_async_accepts_empty_invocation_batch() {
+    let vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_builtins(false)
+        .build();
+
+    let result = vm
+        .execute_many_async(Vec::<&str>::new(), &ClonePreservedEngine)
+        .await
+        .expect("empty async invocation batch should succeed");
+
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn execute_many_async_single_invocation_uses_async_entry_path() {
+    let engine = Arc::new(BarrierOpenEngine::new(1));
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_builtins(false)
+        .with_register_layout(RegisterLayout::new(1))
+        .with_mpc_engine(runtime_engine)
+        .build();
+    vm.register_function(async_open_function("open_single", 37));
+
+    let result = vm
+        .execute_many_async(["open_single"], engine.as_ref())
+        .await
+        .expect("single async invocation should succeed");
+
+    assert_eq!(result, vec![Value::I64(37)]);
+    assert_eq!(engine.open_started.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.open_finished.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

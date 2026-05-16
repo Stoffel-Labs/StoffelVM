@@ -58,14 +58,16 @@ pub(crate) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
             .read_table_field(table_ref, &key)?
             .unwrap_or(Value::Unit);
 
-        match table_ref {
-            TableRef::Object(object_ref) => {
-                let event = HookEvent::ObjectFieldRead(object_ref, key, value.clone());
-                ctx.trigger_hook_with_snapshot(&event)?;
-            }
-            TableRef::Array(array_ref) => {
-                let event = HookEvent::ArrayElementRead(array_ref, key, value.clone());
-                ctx.trigger_hook_with_snapshot(&event)?;
+        if ctx.hooks_enabled() {
+            match table_ref {
+                TableRef::Object(object_ref) => {
+                    let event = HookEvent::ObjectFieldRead(object_ref, key, value.clone());
+                    ctx.trigger_hook_with_snapshot(&event)?;
+                }
+                TableRef::Array(array_ref) => {
+                    let event = HookEvent::ArrayElementRead(array_ref, key, value.clone());
+                    ctx.trigger_hook_with_snapshot(&event)?;
+                }
             }
         }
 
@@ -73,19 +75,26 @@ pub(crate) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
     });
 
     register_standard_builtin!("set_field", |mut ctx| {
-        let (target, key, new_value) = {
+        let (table_ref, key, new_value) = {
             let args = ctx.named_args("set_field");
             args.require_min(3, "3 arguments: object, key, and value")?;
-            (args.cloned(0)?, args.cloned(1)?, args.cloned(2)?)
+            (
+                args.table_ref(0, "First argument")?,
+                args.cloned(1)?,
+                args.cloned(2)?,
+            )
         };
 
-        let table_ref = TableRef::try_from(&target)?;
+        let hooks_enabled = ctx.hooks_enabled();
+        if !hooks_enabled {
+            ctx.set_table_field(table_ref, key, new_value)?;
+            return Ok(Value::Unit);
+        }
+
         let old_value = ctx
             .read_table_field(table_ref, &key)?
             .unwrap_or(Value::Unit);
-
         ctx.set_table_field(table_ref, key.clone(), new_value.clone())?;
-
         match table_ref {
             TableRef::Object(object_ref) => {
                 let event = HookEvent::ObjectFieldWrite(object_ref, key, old_value, new_value);
@@ -113,14 +122,13 @@ pub(crate) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
     });
 
     register_standard_builtin!("array_push", |mut ctx| {
-        let (array_ref, values) = {
+        let array_ref = {
             let args = ctx.named_args("array_push");
             args.require_min(2, "at least 2 arguments: array and value")?;
-            let array_ref = args.array_ref(0, "First argument")?;
-            (array_ref, args.tail_from(1)?.to_vec())
+            args.array_ref(0, "First argument")?
         };
 
-        let len = ctx.push_array_ref_values(array_ref, &values)?;
+        let len = ctx.push_array_args_from(array_ref, 1, "array_push")?;
         Ok(Value::I64(usize_to_vm_i64(len, "array length")?))
     });
 

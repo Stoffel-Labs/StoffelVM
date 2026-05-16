@@ -18,15 +18,16 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 use stoffel_vm_types::core_types::{Closure, ShareType, Upvalue, Value};
 use stoffel_vm_types::instructions::Instruction;
+use stoffel_vm_types::registers::RegisterIndex;
 
 struct PreparedVmFrame {
-    register_args: Vec<Value>,
+    register_args: SmallVec<[Value; 8]>,
     upvalues: Vec<Upvalue>,
     closure: Option<Arc<Closure>>,
 }
 
 impl PreparedVmFrame {
-    fn entry(register_args: Vec<Value>) -> Self {
+    fn entry(register_args: SmallVec<[Value; 8]>) -> Self {
         Self {
             register_args,
             upvalues: Vec::new(),
@@ -34,7 +35,7 @@ impl PreparedVmFrame {
         }
     }
 
-    fn function(register_args: Vec<Value>, upvalues: Vec<Upvalue>) -> Self {
+    fn function(register_args: SmallVec<[Value; 8]>, upvalues: Vec<Upvalue>) -> Self {
         Self {
             register_args,
             upvalues,
@@ -42,7 +43,11 @@ impl PreparedVmFrame {
         }
     }
 
-    fn closure(register_args: Vec<Value>, upvalues: Vec<Upvalue>, closure: Arc<Closure>) -> Self {
+    fn closure(
+        register_args: SmallVec<[Value; 8]>,
+        upvalues: Vec<Upvalue>,
+        closure: Arc<Closure>,
+    ) -> Self {
         Self {
             register_args,
             upvalues,
@@ -98,47 +103,83 @@ impl VMState {
         function_name: &str,
         hooks_enabled: bool,
     ) -> VmResult<InstructionOutcome> {
-        let function = self.program.call_target(function_name)?;
+        let function = self.call_target(function_name)?;
 
         match function {
             CallTarget::Vm(target) => {
-                let args = self.current_stack_args_clone()?;
-                let prepared = self.prepare_vm_call(&target, &args)?;
-                let drained_args = self.drain_call_args(hooks_enabled)?;
-                debug_assert_eq!(drained_args.as_slice(), args.as_slice());
-                if let Err(error) =
-                    self.call_vm_function(&target, drained_args.as_slice(), prepared, hooks_enabled)
-                {
-                    self.restore_call_args_after_error(drained_args)?;
-                    return Err(error);
+                let arg_count = self.current_frame()?.stack().len();
+                if arg_count == 0 {
+                    if !hooks_enabled
+                        && target.parameters().is_empty()
+                        && target.upvalues().is_empty()
+                    {
+                        self.push_empty_vm_frame_without_hooks(&target);
+                    } else {
+                        let prepared = self.prepare_vm_call_without_args(&target)?;
+                        self.call_vm_function(&target, &[], prepared, hooks_enabled)?;
+                    }
+                } else {
+                    if !hooks_enabled && self.can_move_call_args_directly(&target, arg_count) {
+                        let upvalues = self.collect_vm_call_upvalues(&target)?;
+                        let drained_args = self.drain_call_args(false)?;
+                        let prepared =
+                            PreparedVmFrame::function(drained_args.into_values(), upvalues);
+                        self.push_prepared_vm_frame(&target, prepared)?;
+                    } else {
+                        let prepared = {
+                            let args = self.current_frame()?.stack();
+                            self.prepare_vm_call(&target, args)?
+                        };
+                        let drained_args = self.drain_call_args(hooks_enabled)?;
+                        if let Err(error) = self.call_vm_function(
+                            &target,
+                            drained_args.as_slice(),
+                            prepared,
+                            hooks_enabled,
+                        ) {
+                            self.restore_call_args_after_error(drained_args)?;
+                            return Err(error);
+                        }
+                    }
                 }
             }
             CallTarget::Foreign(foreign_func) => {
-                let args = self.drain_call_args(hooks_enabled)?;
-                let outcome = match self.call_foreign_function_internal(
-                    function_name,
-                    foreign_func.as_ref(),
-                    args.as_slice(),
-                    hooks_enabled,
-                    args.checkpoint(),
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        self.restore_call_args_after_error(args)?;
-                        return Err(error);
+                let arg_count = self.current_frame()?.stack().len();
+                if arg_count == 0 {
+                    let checkpoint = CallStackCheckpoint::new(self.call_stack.len());
+                    let outcome = self.call_foreign_function_internal(
+                        function_name,
+                        foreign_func.as_ref(),
+                        &[],
+                        hooks_enabled,
+                        checkpoint,
+                    )?;
+                    if let InstructionOutcome::Return(_) = outcome {
+                        return Ok(outcome);
                     }
-                };
-                if let InstructionOutcome::Return(_) = outcome {
-                    return Ok(outcome);
+                } else {
+                    let args = self.drain_call_args(hooks_enabled)?;
+                    let outcome = match self.call_foreign_function_internal(
+                        function_name,
+                        foreign_func.as_ref(),
+                        args.as_slice(),
+                        hooks_enabled,
+                        args.checkpoint(),
+                    ) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            self.restore_call_args_after_error(args)?;
+                            return Err(error);
+                        }
+                    };
+                    if let InstructionOutcome::Return(_) = outcome {
+                        return Ok(outcome);
+                    }
                 }
             }
         }
 
         Ok(InstructionOutcome::Continue)
-    }
-
-    fn current_stack_args_clone(&self) -> VmResult<SmallVec<[Value; 8]>> {
-        Ok(self.current_frame()?.stack().iter().cloned().collect())
     }
 
     fn validate_vm_call_arity(&self, target: &VmCallTarget, actual: usize) -> VmResult<()> {
@@ -151,6 +192,18 @@ impl VMState {
             });
         }
         Ok(())
+    }
+
+    pub(super) fn call_target(&mut self, function_name: &str) -> VmResult<CallTarget> {
+        if let Some((cached_name, target)) = &self.last_call_target {
+            if cached_name.as_ref() == function_name {
+                return Ok(target.clone());
+            }
+        }
+
+        let target = self.program.call_target(function_name)?;
+        self.last_call_target = Some((Arc::from(function_name), target.clone()));
+        Ok(target)
     }
 
     fn prepare_vm_entry_call(
@@ -172,6 +225,27 @@ impl VMState {
 
     fn prepare_vm_call(&self, target: &VmCallTarget, args: &[Value]) -> VmResult<PreparedVmFrame> {
         self.validate_vm_call_arity(target, args.len())?;
+        let upvalues = self.collect_vm_call_upvalues(target)?;
+        let prepared_args = self.prepare_register_arguments(args)?;
+        Ok(PreparedVmFrame::function(prepared_args, upvalues))
+    }
+
+    fn prepare_vm_call_without_args(&self, target: &VmCallTarget) -> VmResult<PreparedVmFrame> {
+        self.validate_vm_call_arity(target, 0)?;
+        let upvalues = self.collect_vm_call_upvalues(target)?;
+
+        Ok(PreparedVmFrame::function(SmallVec::new(), upvalues))
+    }
+
+    fn can_move_call_args_directly(&self, target: &VmCallTarget, arg_count: usize) -> bool {
+        if target.parameters().len() != arg_count || arg_count > target.frame_register_count() {
+            return false;
+        }
+
+        (0..arg_count).all(|register| self.register_layout.is_clear(RegisterIndex::new(register)))
+    }
+
+    fn collect_vm_call_upvalues(&self, target: &VmCallTarget) -> VmResult<Vec<Upvalue>> {
         let mut upvalues = Vec::with_capacity(target.upvalues().len());
         for name in target.upvalues() {
             let value = self
@@ -179,8 +253,8 @@ impl VMState {
                 .ok_or_else(|| VmError::UpvalueNotFound { name: name.clone() })?;
             upvalues.push(Upvalue::new(name.clone(), value));
         }
-        let prepared_args = self.prepare_register_arguments(args)?;
-        Ok(PreparedVmFrame::function(prepared_args, upvalues))
+
+        Ok(upvalues)
     }
 
     fn drain_call_args(&mut self, hooks_enabled: bool) -> VmResult<DrainedCallArgs> {
@@ -213,7 +287,7 @@ impl VMState {
         function_name: &str,
         hooks_enabled: bool,
     ) -> VmResult<Option<PendingMpcOperation>> {
-        let CallTarget::Foreign(foreign_func) = self.program.call_target(function_name)? else {
+        let CallTarget::Foreign(foreign_func) = self.call_target(function_name)? else {
             return Ok(None);
         };
         let Some(builtin) = foreign_func.mpc_online_builtin_kind() else {
@@ -443,12 +517,17 @@ impl VMState {
     ) -> VmResult<()> {
         let record = target.instantiate_frame(
             self.register_layout,
-            &prepared.register_args,
+            prepared.register_args,
             prepared.upvalues,
             prepared.closure,
         )?;
-        self.call_stack.push(record);
+        self.push_activation_frame(record, Some(target.runtime_function()));
         Ok(())
+    }
+
+    fn push_empty_vm_frame_without_hooks(&mut self, target: &VmCallTarget) {
+        let record = target.instantiate_empty_frame(self.register_layout);
+        self.push_activation_frame(record, Some(target.runtime_function()));
     }
 
     fn call_vm_function(
@@ -524,11 +603,17 @@ impl VMState {
             upvalues.push(Upvalue::new(name.clone(), value));
         }
 
-        let closure = Closure::new(function_name.clone(), upvalues.clone());
-        let event = HookEvent::ClosureCreated(function_name, upvalues);
-        self.trigger_hook_with_snapshot(&event)?;
+        if self.hooks_enabled() {
+            let closure = Closure::new(function_name.clone(), upvalues.clone());
+            let event = HookEvent::ClosureCreated(function_name, upvalues);
+            self.trigger_hook_with_snapshot(&event)?;
+            return Ok(Value::Closure(Arc::new(closure)));
+        }
 
-        Ok(Value::Closure(Arc::new(closure)))
+        Ok(Value::Closure(Arc::new(Closure::new(
+            function_name,
+            upvalues,
+        ))))
     }
 
     pub(crate) fn get_upvalue_value(&self, name: &str) -> VmResult<Value> {
@@ -536,8 +621,10 @@ impl VMState {
         for upvalue in record.upvalues().iter().rev() {
             if upvalue.name() == name {
                 let value = upvalue.value().clone();
-                let event = HookEvent::UpvalueRead(name.to_owned(), value.clone());
-                self.trigger_hook_with_snapshot(&event)?;
+                if self.hooks_enabled() {
+                    let event = HookEvent::UpvalueRead(name.to_owned(), value.clone());
+                    self.trigger_hook_with_snapshot(&event)?;
+                }
 
                 return Ok(value);
             }
@@ -549,6 +636,7 @@ impl VMState {
     }
 
     pub(crate) fn set_upvalue_value(&mut self, name: &str, new_value: Value) -> VmResult<()> {
+        let hooks_enabled = self.hooks_enabled();
         let (old_value, current_closure_arc) = {
             let record = self.current_frame_mut()?;
 
@@ -558,7 +646,7 @@ impl VMState {
                     .ok_or_else(|| VmError::UpvalueWriteNotFound {
                         name: name.to_owned(),
                     })?;
-            let old_value = upvalue.value().clone();
+            let old_value = hooks_enabled.then(|| upvalue.value().clone());
             upvalue.set_value(new_value.clone());
 
             let current_closure_arc = record.closure().cloned();
@@ -566,8 +654,10 @@ impl VMState {
             (old_value, current_closure_arc)
         };
 
-        let event = HookEvent::UpvalueWrite(name.to_owned(), old_value, new_value.clone());
-        self.trigger_hook_with_snapshot(&event)?;
+        if let Some(old_value) = old_value {
+            let event = HookEvent::UpvalueWrite(name.to_owned(), old_value, new_value.clone());
+            self.trigger_hook_with_snapshot(&event)?;
+        }
 
         if let Some(current_closure) = current_closure_arc {
             let mut new_closure = (*current_closure).clone();
@@ -594,12 +684,14 @@ impl VMState {
         hooks_enabled: bool,
         checkpoint: CallStackCheckpoint,
     ) -> VmResult<InstructionOutcome> {
-        let call_target = HookCallTarget::foreign_function(function_name);
-
-        if hooks_enabled {
+        let call_target = if hooks_enabled {
+            let call_target = HookCallTarget::foreign_function(function_name);
             let event = HookEvent::BeforeFunctionCall(call_target.clone(), args.to_vec());
             self.trigger_hook_with_snapshot(&event)?;
-        }
+            Some(call_target)
+        } else {
+            None
+        };
 
         let context = ForeignFunctionContext::new(args, self);
         let result = foreign_func.call(context)?;
@@ -613,7 +705,11 @@ impl VMState {
         }
 
         let return_register = self.current_return_register()?;
-        self.complete_foreign_function_return(return_register, call_target, result, hooks_enabled)?;
+        if let Some(call_target) = call_target {
+            self.complete_foreign_function_return(return_register, call_target, result, true)?;
+        } else {
+            self.assign_current_register_without_previous(return_register, result)?;
+        }
 
         Ok(InstructionOutcome::Continue)
     }
@@ -625,18 +721,20 @@ impl VMState {
         result: Value,
         hooks_enabled: bool,
     ) -> VmResult<()> {
-        let (old_value, result) = self.assign_current_register(return_register, result)?;
-        if hooks_enabled {
-            let reg_event = HookEvent::RegisterWrite(
-                self.hook_register(return_register)?,
-                old_value,
-                result.clone(),
-            );
-            self.trigger_hook_with_snapshot(&reg_event)?;
-
-            let fn_event = HookEvent::AfterFunctionCall(call_target, result);
-            self.trigger_hook_with_snapshot(&fn_event)?;
+        if !hooks_enabled {
+            return self.assign_current_register_without_previous(return_register, result);
         }
+
+        let (old_value, result) = self.assign_current_register(return_register, result)?;
+        let reg_event = HookEvent::RegisterWrite(
+            self.hook_register(return_register)?,
+            old_value,
+            result.clone(),
+        );
+        self.trigger_hook_with_snapshot(&reg_event)?;
+
+        let fn_event = HookEvent::AfterFunctionCall(call_target, result);
+        self.trigger_hook_with_snapshot(&fn_event)?;
 
         Ok(())
     }
@@ -661,7 +759,6 @@ impl VMState {
         checkpoint: CallStackCheckpoint,
     ) -> VmResult<InstructionOutcome> {
         let frame_depth = self.current_frame_depth()?;
-        let returning_from = self.current_hook_call_target()?;
         self.mpc_runtime.clear_frame_reveals(frame_depth);
 
         self.update_closure_upvalues()?;
@@ -673,28 +770,36 @@ impl VMState {
                     self.trigger_hook_with_snapshot(&event)?;
                 }
             }
-            self.call_stack.pop();
+            self.pop_activation_frame();
             self.clear_current_instruction();
             return Ok(InstructionOutcome::Return(return_value));
         }
 
-        self.call_stack.pop();
+        if !hooks_enabled {
+            self.pop_activation_frame();
+            self.sync_current_instruction_to_current_frame();
+
+            let return_register = self.current_return_register()?;
+            self.assign_current_register_without_previous(return_register, return_value)?;
+            return Ok(InstructionOutcome::Continue);
+        }
+
+        let returning_from = self.current_hook_call_target()?;
+        self.pop_activation_frame();
         self.sync_current_instruction_to_current_frame();
 
         let return_register = self.current_return_register()?;
         let (old_value, return_value) =
             self.assign_current_register(return_register, return_value)?;
-        if hooks_enabled {
-            let event = HookEvent::RegisterWrite(
-                self.hook_register(return_register)?,
-                old_value,
-                return_value.clone(),
-            );
-            self.trigger_hook_with_snapshot(&event)?;
+        let event = HookEvent::RegisterWrite(
+            self.hook_register(return_register)?,
+            old_value,
+            return_value.clone(),
+        );
+        self.trigger_hook_with_snapshot(&event)?;
 
-            let event = HookEvent::AfterFunctionCall(returning_from, return_value);
-            self.trigger_hook_with_snapshot(&event)?;
-        }
+        let event = HookEvent::AfterFunctionCall(returning_from, return_value);
+        self.trigger_hook_with_snapshot(&event)?;
 
         Ok(InstructionOutcome::Continue)
     }

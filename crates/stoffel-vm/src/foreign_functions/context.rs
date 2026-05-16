@@ -72,6 +72,10 @@ impl<'a> ForeignFunctionContext<'a> {
         self.services.trigger_hook_with_snapshot(event)
     }
 
+    pub(crate) fn hooks_enabled(&self) -> bool {
+        self.services.hooks_enabled()
+    }
+
     pub(crate) fn create_closure_value(
         &mut self,
         function_name: String,

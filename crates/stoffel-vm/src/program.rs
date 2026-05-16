@@ -14,26 +14,28 @@ use stoffel_vm_types::registers::RegisterLayout;
 /// The executor must mutate `VMState` after lookup, so it cannot keep a borrow
 /// into the program map. This type avoids cloning the whole function body and
 /// resolved instruction stream for every call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct VmCallTarget {
-    name: String,
+    name: Arc<str>,
     parameters: Vec<String>,
     upvalues: Vec<String>,
     frame_register_count: usize,
+    runtime: Arc<RuntimeFunction>,
 }
 
 impl VmCallTarget {
-    fn from_vm_function(function: &VMFunction) -> Self {
+    fn from_vm_function(function: &VMFunction, runtime: Arc<RuntimeFunction>) -> Self {
         Self {
-            name: function.name().to_owned(),
+            name: Arc::from(function.name()),
             parameters: function.parameters().to_vec(),
             upvalues: function.upvalues().to_vec(),
             frame_register_count: function.register_count(),
+            runtime,
         }
     }
 
     pub(crate) fn name(&self) -> &str {
-        &self.name
+        self.name.as_ref()
     }
 
     pub(crate) fn parameters(&self) -> &[String] {
@@ -44,30 +46,54 @@ impl VmCallTarget {
         &self.upvalues
     }
 
-    #[cfg(test)]
+    pub(crate) fn runtime_function(&self) -> Arc<RuntimeFunction> {
+        Arc::clone(&self.runtime)
+    }
+
     pub(crate) fn frame_register_count(&self) -> usize {
         self.frame_register_count
     }
 
-    pub(crate) fn instantiate_frame(
+    pub(crate) fn instantiate_frame<I>(
         &self,
         layout: RegisterLayout,
-        register_args: &[Value],
+        register_args: I,
         upvalues: Vec<Upvalue>,
         closure: Option<Arc<Closure>>,
-    ) -> ActivationResult<ActivationRecord> {
-        let mut record = ActivationRecord::for_function(
-            self.name.clone(),
+    ) -> ActivationResult<ActivationRecord>
+    where
+        I: IntoIterator<Item = Value>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let mut record = ActivationRecord::for_function_with_local_capacity(
+            Arc::clone(&self.name),
             layout,
             self.frame_register_count,
             upvalues,
             closure,
+            self.parameters.len(),
         );
-        record.bind_parameters(&self.parameters, register_args)?;
+        let register_args = register_args.into_iter();
+        if !self.parameters.is_empty() || register_args.len() != 0 {
+            record.bind_owned_parameters(&self.parameters, register_args)?;
+        }
         Ok(record)
+    }
+
+    pub(crate) fn instantiate_empty_frame(&self, layout: RegisterLayout) -> ActivationRecord {
+        debug_assert!(self.parameters.is_empty());
+        debug_assert!(self.upvalues.is_empty());
+        ActivationRecord::for_function(
+            Arc::clone(&self.name),
+            layout,
+            self.frame_register_count,
+            Vec::new(),
+            None,
+        )
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum CallTarget {
     Vm(Arc<VmCallTarget>),
     Foreign(Arc<ForeignFunction>),
@@ -111,11 +137,11 @@ impl Program {
         let registered = match function {
             Function::VM(mut function) => {
                 function.resolve_instructions()?;
-                let call_target = VmCallTarget::from_vm_function(&function);
-                let runtime = RuntimeFunction::from_vm_function(&function)?;
+                let runtime = Arc::new(RuntimeFunction::from_vm_function(&function)?);
+                let call_target = VmCallTarget::from_vm_function(&function, Arc::clone(&runtime));
                 RegisteredFunction::Vm {
                     source: Arc::from(function),
-                    runtime: Arc::new(runtime),
+                    runtime,
                     call_target: Arc::new(call_target),
                 }
             }
@@ -327,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_call_target_lookup_reuses_cached_metadata() {
+    fn vm_call_target_lookup_reuses_resolved_metadata() {
         let mut program = Program::new();
         program
             .try_insert(Function::vm(vm_function("main")))
@@ -344,8 +370,23 @@ mod tests {
     }
 
     #[test]
-    fn vm_call_target_instantiates_activation_frame_from_cached_metadata() {
-        let function = VMFunction::new(
+    fn vm_call_target_reuses_resolved_runtime_payload() {
+        let mut program = Program::new();
+        program
+            .try_insert(Function::vm(vm_function("main")))
+            .expect("program registration");
+
+        let runtime = program.runtime_function("main").expect("runtime function");
+        let CallTarget::Vm(target) = program.call_target("main").expect("call target") else {
+            panic!("main should be a VM call target");
+        };
+
+        assert!(Arc::ptr_eq(&runtime, &target.runtime_function()));
+    }
+
+    #[test]
+    fn vm_call_target_instantiates_activation_frame_from_resolved_metadata() {
+        let mut function = VMFunction::new(
             "callee".to_string(),
             vec!["x".to_string()],
             vec!["outer".to_string()],
@@ -354,14 +395,20 @@ mod tests {
             Vec::new(),
             HashMap::new(),
         );
-        let target = VmCallTarget::from_vm_function(&function);
+        function
+            .resolve_instructions()
+            .expect("function should resolve");
+        let runtime = Arc::new(
+            RuntimeFunction::from_vm_function(&function).expect("runtime function should lower"),
+        );
+        let target = VmCallTarget::from_vm_function(&function, runtime);
         let upvalues = vec![Upvalue::new("outer".to_string(), Value::I64(9))];
         let closure = Arc::new(Closure::new("callee".to_string(), Vec::new()));
 
         let frame = target
             .instantiate_frame(
                 RegisterLayout::new(1),
-                &[Value::I64(7)],
+                vec![Value::I64(7)],
                 upvalues,
                 Some(Arc::clone(&closure)),
             )
@@ -507,22 +554,27 @@ mod tests {
 
         let runtime = program.runtime_function("main").expect("runtime function");
         assert_eq!(runtime.len(), 3);
+        assert!(runtime
+            .get_instruction(InstructionPointer::new(3))
+            .is_none());
 
-        let fetched = FetchedInstruction::fetch(InstructionPointer::new(0), Arc::clone(&runtime))
+        let fetched = FetchedInstruction::fetch(InstructionPointer::new(0), &runtime)
             .expect("first instruction");
+        let (runtime_instruction, _) = fetched.instructions();
         assert!(matches!(
-            fetched.runtime_instruction(),
+            runtime_instruction,
             RuntimeInstruction::LoadImmediate {
                 value: Value::I64(7),
                 dest
             } if dest.index() == 0
         ));
 
-        let fetched = FetchedInstruction::fetch(InstructionPointer::new(1), Arc::clone(&runtime))
+        let fetched = FetchedInstruction::fetch(InstructionPointer::new(1), &runtime)
             .expect("call instruction");
+        let (runtime_instruction, _) = fetched.instructions();
         assert!(matches!(
-            fetched.runtime_instruction(),
-            RuntimeInstruction::Call { function } if function == "native"
+            runtime_instruction,
+            RuntimeInstruction::Call { function } if function.as_ref() == "native"
         ));
     }
 }

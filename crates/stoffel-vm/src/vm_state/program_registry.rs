@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 impl VMState {
     pub(crate) fn try_insert_function(&mut self, function: Function) -> VmResult<()> {
-        self.program.try_insert(function)
+        self.program.try_insert(function)?;
+        self.last_call_target = None;
+        Ok(())
     }
 
     pub(crate) fn has_function(&self, name: &str) -> bool {

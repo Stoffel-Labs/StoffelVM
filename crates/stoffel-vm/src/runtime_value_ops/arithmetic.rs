@@ -10,6 +10,10 @@ pub(crate) fn add(
     right: &Value,
     share_runtime: ShareRuntimeProvider<'_>,
 ) -> ValueOpResult<Value> {
+    if let Some(result) = try_clear_add(left, right) {
+        return result;
+    }
+
     if let Some(pair) = matching_share_pair("ADD", left, right)? {
         let data = share_runtime()?.add_data(pair.share_type, pair.left_data, pair.right_data)?;
         return Ok(Value::Share(pair.share_type, data));
@@ -25,39 +29,7 @@ pub(crate) fn add(
         return Ok(Value::Share(share_type, data));
     }
 
-    match (left, right) {
-        (Value::I64(a), Value::I64(b)) => Ok(Value::I64(checked_integer_result(
-            "ADD",
-            a.checked_add(*b),
-        )?)),
-        (Value::I32(a), Value::I32(b)) => Ok(Value::I32(checked_integer_result(
-            "ADD",
-            a.checked_add(*b),
-        )?)),
-        (Value::I16(a), Value::I16(b)) => Ok(Value::I16(checked_integer_result(
-            "ADD",
-            a.checked_add(*b),
-        )?)),
-        (Value::I8(a), Value::I8(b)) => {
-            Ok(Value::I8(checked_integer_result("ADD", a.checked_add(*b))?))
-        }
-        (Value::U8(a), Value::U8(b)) => {
-            Ok(Value::U8(checked_integer_result("ADD", a.checked_add(*b))?))
-        }
-        (Value::U16(a), Value::U16(b)) => Ok(Value::U16(checked_integer_result(
-            "ADD",
-            a.checked_add(*b),
-        )?)),
-        (Value::U32(a), Value::U32(b)) => Ok(Value::U32(checked_integer_result(
-            "ADD",
-            a.checked_add(*b),
-        )?)),
-        (Value::U64(a), Value::U64(b)) => Ok(Value::U64(checked_integer_result(
-            "ADD",
-            a.checked_add(*b),
-        )?)),
-        _ => type_error("ADD"),
-    }
+    type_error("ADD")
 }
 
 pub(crate) fn sub(
@@ -65,6 +37,10 @@ pub(crate) fn sub(
     right: &Value,
     share_runtime: ShareRuntimeProvider<'_>,
 ) -> ValueOpResult<Value> {
+    if let Some(result) = try_clear_sub(left, right) {
+        return result;
+    }
+
     if let Some(pair) = matching_share_pair("SUB", left, right)? {
         let data = share_runtime()?.sub_data(pair.share_type, pair.left_data, pair.right_data)?;
         return Ok(Value::Share(pair.share_type, data));
@@ -80,39 +56,7 @@ pub(crate) fn sub(
         return Ok(Value::Share(share_type, data));
     }
 
-    match (left, right) {
-        (Value::I64(a), Value::I64(b)) => Ok(Value::I64(checked_integer_result(
-            "SUB",
-            a.checked_sub(*b),
-        )?)),
-        (Value::I32(a), Value::I32(b)) => Ok(Value::I32(checked_integer_result(
-            "SUB",
-            a.checked_sub(*b),
-        )?)),
-        (Value::I16(a), Value::I16(b)) => Ok(Value::I16(checked_integer_result(
-            "SUB",
-            a.checked_sub(*b),
-        )?)),
-        (Value::I8(a), Value::I8(b)) => {
-            Ok(Value::I8(checked_integer_result("SUB", a.checked_sub(*b))?))
-        }
-        (Value::U8(a), Value::U8(b)) => {
-            Ok(Value::U8(checked_integer_result("SUB", a.checked_sub(*b))?))
-        }
-        (Value::U16(a), Value::U16(b)) => Ok(Value::U16(checked_integer_result(
-            "SUB",
-            a.checked_sub(*b),
-        )?)),
-        (Value::U32(a), Value::U32(b)) => Ok(Value::U32(checked_integer_result(
-            "SUB",
-            a.checked_sub(*b),
-        )?)),
-        (Value::U64(a), Value::U64(b)) => Ok(Value::U64(checked_integer_result(
-            "SUB",
-            a.checked_sub(*b),
-        )?)),
-        _ => type_error("SUB"),
-    }
+    type_error("SUB")
 }
 
 pub(crate) fn mul(
@@ -120,6 +64,10 @@ pub(crate) fn mul(
     right: &Value,
     share_runtime: ShareRuntimeProvider<'_>,
 ) -> ValueOpResult<Value> {
+    if let Some(result) = try_clear_mul(left, right) {
+        return result;
+    }
+
     if let Some(pair) = matching_share_pair("MUL", left, right)? {
         let data = share_runtime()?.multiply_share_data(
             pair.share_type,
@@ -139,39 +87,7 @@ pub(crate) fn mul(
         return Ok(Value::Share(share_type, data));
     }
 
-    match (left, right) {
-        (Value::I64(a), Value::I64(b)) => Ok(Value::I64(checked_integer_result(
-            "MUL",
-            a.checked_mul(*b),
-        )?)),
-        (Value::I32(a), Value::I32(b)) => Ok(Value::I32(checked_integer_result(
-            "MUL",
-            a.checked_mul(*b),
-        )?)),
-        (Value::I16(a), Value::I16(b)) => Ok(Value::I16(checked_integer_result(
-            "MUL",
-            a.checked_mul(*b),
-        )?)),
-        (Value::I8(a), Value::I8(b)) => {
-            Ok(Value::I8(checked_integer_result("MUL", a.checked_mul(*b))?))
-        }
-        (Value::U8(a), Value::U8(b)) => {
-            Ok(Value::U8(checked_integer_result("MUL", a.checked_mul(*b))?))
-        }
-        (Value::U16(a), Value::U16(b)) => Ok(Value::U16(checked_integer_result(
-            "MUL",
-            a.checked_mul(*b),
-        )?)),
-        (Value::U32(a), Value::U32(b)) => Ok(Value::U32(checked_integer_result(
-            "MUL",
-            a.checked_mul(*b),
-        )?)),
-        (Value::U64(a), Value::U64(b)) => Ok(Value::U64(checked_integer_result(
-            "MUL",
-            a.checked_mul(*b),
-        )?)),
-        _ => type_error("MUL"),
-    }
+    type_error("MUL")
 }
 
 pub(crate) fn div(
@@ -179,6 +95,10 @@ pub(crate) fn div(
     right: &Value,
     share_runtime: ShareRuntimeProvider<'_>,
 ) -> ValueOpResult<Value> {
+    if let Some(result) = try_clear_div(left, right) {
+        return result;
+    }
+
     if matching_share_pair("DIV", left, right)?.is_some() {
         return unsupported("Share/Share division is not supported on secret shares");
     }
@@ -188,7 +108,65 @@ pub(crate) fn div(
         return Ok(Value::Share(share_type, data));
     }
 
-    match (left, right) {
+    type_error("DIV")
+}
+
+pub(crate) fn modulo(left: &Value, right: &Value) -> ValueOpResult<Value> {
+    if let Some(result) = try_clear_modulo(left, right) {
+        return result;
+    }
+
+    if matching_share_pair("MOD", left, right)?.is_some() {
+        return unsupported("Share/Share modulo is not supported on secret shares");
+    }
+
+    type_error("MOD")
+}
+
+pub(crate) fn try_clear_add(left: &Value, right: &Value) -> Option<ValueOpResult<Value>> {
+    Some(match (left, right) {
+        (Value::I64(a), Value::I64(b)) => checked_value("ADD", a.checked_add(*b), Value::I64),
+        (Value::I32(a), Value::I32(b)) => checked_value("ADD", a.checked_add(*b), Value::I32),
+        (Value::I16(a), Value::I16(b)) => checked_value("ADD", a.checked_add(*b), Value::I16),
+        (Value::I8(a), Value::I8(b)) => checked_value("ADD", a.checked_add(*b), Value::I8),
+        (Value::U8(a), Value::U8(b)) => checked_value("ADD", a.checked_add(*b), Value::U8),
+        (Value::U16(a), Value::U16(b)) => checked_value("ADD", a.checked_add(*b), Value::U16),
+        (Value::U32(a), Value::U32(b)) => checked_value("ADD", a.checked_add(*b), Value::U32),
+        (Value::U64(a), Value::U64(b)) => checked_value("ADD", a.checked_add(*b), Value::U64),
+        _ => return None,
+    })
+}
+
+pub(crate) fn try_clear_sub(left: &Value, right: &Value) -> Option<ValueOpResult<Value>> {
+    Some(match (left, right) {
+        (Value::I64(a), Value::I64(b)) => checked_value("SUB", a.checked_sub(*b), Value::I64),
+        (Value::I32(a), Value::I32(b)) => checked_value("SUB", a.checked_sub(*b), Value::I32),
+        (Value::I16(a), Value::I16(b)) => checked_value("SUB", a.checked_sub(*b), Value::I16),
+        (Value::I8(a), Value::I8(b)) => checked_value("SUB", a.checked_sub(*b), Value::I8),
+        (Value::U8(a), Value::U8(b)) => checked_value("SUB", a.checked_sub(*b), Value::U8),
+        (Value::U16(a), Value::U16(b)) => checked_value("SUB", a.checked_sub(*b), Value::U16),
+        (Value::U32(a), Value::U32(b)) => checked_value("SUB", a.checked_sub(*b), Value::U32),
+        (Value::U64(a), Value::U64(b)) => checked_value("SUB", a.checked_sub(*b), Value::U64),
+        _ => return None,
+    })
+}
+
+pub(crate) fn try_clear_mul(left: &Value, right: &Value) -> Option<ValueOpResult<Value>> {
+    Some(match (left, right) {
+        (Value::I64(a), Value::I64(b)) => checked_value("MUL", a.checked_mul(*b), Value::I64),
+        (Value::I32(a), Value::I32(b)) => checked_value("MUL", a.checked_mul(*b), Value::I32),
+        (Value::I16(a), Value::I16(b)) => checked_value("MUL", a.checked_mul(*b), Value::I16),
+        (Value::I8(a), Value::I8(b)) => checked_value("MUL", a.checked_mul(*b), Value::I8),
+        (Value::U8(a), Value::U8(b)) => checked_value("MUL", a.checked_mul(*b), Value::U8),
+        (Value::U16(a), Value::U16(b)) => checked_value("MUL", a.checked_mul(*b), Value::U16),
+        (Value::U32(a), Value::U32(b)) => checked_value("MUL", a.checked_mul(*b), Value::U32),
+        (Value::U64(a), Value::U64(b)) => checked_value("MUL", a.checked_mul(*b), Value::U64),
+        _ => return None,
+    })
+}
+
+pub(crate) fn try_clear_div(left: &Value, right: &Value) -> Option<ValueOpResult<Value>> {
+    Some(match (left, right) {
         (Value::I64(a), Value::I64(b)) => checked_div_i64(*a, *b).map(Value::I64),
         (Value::I32(a), Value::I32(b)) => checked_div_i32(*a, *b).map(Value::I32),
         (Value::I16(a), Value::I16(b)) => checked_div_i16(*a, *b).map(Value::I16),
@@ -198,27 +176,20 @@ pub(crate) fn div(
         (Value::U32(a), Value::U32(b)) => checked_div_u32(*a, *b).map(Value::U32),
         (Value::U64(a), Value::U64(b)) => checked_div_u64(*a, *b).map(Value::U64),
         (Value::Float(a), Value::I64(b)) => {
-            ensure_nonzero_i64(*b, "Division")?;
-            Ok(Value::Float(F64(a.0 / *b as f64)))
+            ensure_nonzero_i64(*b, "Division").map(|()| Value::Float(F64(a.0 / *b as f64)))
         }
         (Value::I64(a), Value::Float(b)) => {
-            ensure_nonzero_f64(b.0, "Division")?;
-            Ok(Value::Float(F64(*a as f64 / b.0)))
+            ensure_nonzero_f64(b.0, "Division").map(|()| Value::Float(F64(*a as f64 / b.0)))
         }
         (Value::Float(a), Value::Float(b)) => {
-            ensure_nonzero_f64(b.0, "Division")?;
-            Ok(Value::Float(F64(a.0 / b.0)))
+            ensure_nonzero_f64(b.0, "Division").map(|()| Value::Float(F64(a.0 / b.0)))
         }
-        _ => type_error("DIV"),
-    }
+        _ => return None,
+    })
 }
 
-pub(crate) fn modulo(left: &Value, right: &Value) -> ValueOpResult<Value> {
-    if matching_share_pair("MOD", left, right)?.is_some() {
-        return unsupported("Share/Share modulo is not supported on secret shares");
-    }
-
-    match (left, right) {
+pub(crate) fn try_clear_modulo(left: &Value, right: &Value) -> Option<ValueOpResult<Value>> {
+    Some(match (left, right) {
         (Value::I64(a), Value::I64(b)) => checked_rem_i64(*a, *b).map(Value::I64),
         (Value::I32(a), Value::I32(b)) => checked_rem_i32(*a, *b).map(Value::I32),
         (Value::I16(a), Value::I16(b)) => checked_rem_i16(*a, *b).map(Value::I16),
@@ -227,8 +198,16 @@ pub(crate) fn modulo(left: &Value, right: &Value) -> ValueOpResult<Value> {
         (Value::U16(a), Value::U16(b)) => checked_rem_u16(*a, *b).map(Value::U16),
         (Value::U32(a), Value::U32(b)) => checked_rem_u32(*a, *b).map(Value::U32),
         (Value::U64(a), Value::U64(b)) => checked_rem_u64(*a, *b).map(Value::U64),
-        _ => type_error("MOD"),
-    }
+        _ => return None,
+    })
+}
+
+fn checked_value<T>(
+    operation: &'static str,
+    result: Option<T>,
+    wrap: impl FnOnce(T) -> Value,
+) -> ValueOpResult<Value> {
+    checked_integer_result(operation, result).map(wrap)
 }
 
 fn ensure_nonzero_i64(value: i64, operation: &'static str) -> ValueOpResult<()> {

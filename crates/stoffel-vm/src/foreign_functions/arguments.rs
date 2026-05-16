@@ -1,6 +1,6 @@
 use super::ForeignFunctionCallbackResult;
 use crate::value_conversions::{value_to_u64, value_to_usize};
-use stoffel_vm_types::core_types::{ArrayRef, ObjectRef, Value};
+use stoffel_vm_types::core_types::{ArrayRef, ObjectRef, TableRef, Value};
 
 /// Named argument view for a VM foreign-function call.
 ///
@@ -103,6 +103,15 @@ impl<'a> ForeignArguments<'a> {
     ) -> ForeignFunctionCallbackResult<ArrayRef> {
         ArrayRef::try_from(self.get(index)?)
             .map_err(|_| format!("{argument_name} must be an array").into())
+    }
+
+    /// Read an argument as a VM object-or-array table reference.
+    pub fn table_ref(
+        &self,
+        index: usize,
+        _argument_name: &'static str,
+    ) -> ForeignFunctionCallbackResult<TableRef> {
+        Ok(TableRef::try_from(self.get(index)?)?)
     }
 
     /// Read an argument as a VM array id.

@@ -1,5 +1,5 @@
 use crate::program::Program;
-use std::{cmp::Ordering, fmt};
+use std::{cmp::Ordering, fmt, sync::Arc};
 use stoffel_vm_types::activations::{ActivationRecord, CompareFlag, InstructionPointer};
 use stoffel_vm_types::core_types::{ArrayRef, ObjectRef, Upvalue, Value};
 use stoffel_vm_types::instructions::Instruction;
@@ -292,13 +292,13 @@ pub enum HookEvent {
 /// depending on VM internals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstructionCursor {
-    function_name: String,
+    function_name: Arc<str>,
     instruction_pointer: InstructionPointer,
 }
 
 impl InstructionCursor {
     pub(crate) fn new(
-        function_name: impl Into<String>,
+        function_name: impl Into<Arc<str>>,
         instruction_pointer: InstructionPointer,
     ) -> Self {
         Self {
@@ -308,7 +308,7 @@ impl InstructionCursor {
     }
 
     pub fn function_name(&self) -> &str {
-        &self.function_name
+        self.function_name.as_ref()
     }
 
     pub fn instruction_pointer(&self) -> InstructionPointer {
@@ -611,6 +611,7 @@ pub struct Hook {
 /// Hook manager to handle hook registration and triggering
 pub struct HookManager {
     hooks: Vec<Hook>,
+    enabled_hooks: usize,
     next_hook_id: usize,
 }
 
@@ -624,12 +625,17 @@ impl HookManager {
     pub fn new() -> Self {
         HookManager {
             hooks: Vec::new(),
+            enabled_hooks: 0,
             next_hook_id: 1,
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.hooks.is_empty()
+    }
+
+    pub fn has_enabled_hooks(&self) -> bool {
+        self.enabled_hooks != 0
     }
 
     pub fn try_register_hook(
@@ -652,6 +658,7 @@ impl HookManager {
             enabled: true,
             priority,
         });
+        self.enabled_hooks += 1;
 
         self.hooks
             .sort_by_key(|hook| std::cmp::Reverse(hook.priority));
@@ -671,13 +678,22 @@ impl HookManager {
     }
 
     pub fn unregister_hook(&mut self, hook_id: HookId) -> bool {
-        let len = self.hooks.len();
-        self.hooks.retain(|hook| hook.id != hook_id);
-        len != self.hooks.len()
+        let Some(index) = self.hooks.iter().position(|hook| hook.id == hook_id) else {
+            return false;
+        };
+
+        let hook = self.hooks.remove(index);
+        if hook.enabled {
+            self.enabled_hooks -= 1;
+        }
+        true
     }
 
     pub fn enable_hook(&mut self, hook_id: HookId) -> bool {
         if let Some(hook) = self.hooks.iter_mut().find(|h| h.id == hook_id) {
+            if !hook.enabled {
+                self.enabled_hooks += 1;
+            }
             hook.enabled = true;
             return true;
         }
@@ -686,6 +702,9 @@ impl HookManager {
 
     pub fn disable_hook(&mut self, hook_id: HookId) -> bool {
         if let Some(hook) = self.hooks.iter_mut().find(|h| h.id == hook_id) {
+            if hook.enabled {
+                self.enabled_hooks -= 1;
+            }
             hook.enabled = false;
             return true;
         }
@@ -693,8 +712,8 @@ impl HookManager {
     }
 
     pub fn trigger_with_context(&self, event: &HookEvent, context: &HookContext) -> HookResult<()> {
-        // Fast path: if no hooks are registered, return immediately
-        if self.hooks.is_empty() {
+        // Fast path: if no enabled hooks are registered, return immediately.
+        if !self.has_enabled_hooks() {
             return Ok(());
         }
 
@@ -905,6 +924,7 @@ mod tests {
     fn hook_registration_reports_id_overflow_without_mutating_manager() {
         let mut manager = HookManager {
             hooks: Vec::new(),
+            enabled_hooks: 0,
             next_hook_id: usize::MAX,
         };
 
@@ -997,5 +1017,34 @@ mod tests {
             .expect("trigger hooks");
 
         assert_eq!(&*calls.lock(), &[2, 1]);
+    }
+
+    #[test]
+    fn hook_manager_tracks_enabled_hooks_for_execution_fast_path() {
+        let mut manager = HookManager::new();
+        assert!(manager.is_empty());
+        assert!(!manager.has_enabled_hooks());
+
+        let first = manager
+            .try_register_hook(Box::new(|_| true), Box::new(|_, _| Ok(())), 0)
+            .expect("register first hook");
+        let second = manager
+            .try_register_hook(Box::new(|_| true), Box::new(|_, _| Ok(())), 0)
+            .expect("register second hook");
+
+        assert!(!manager.is_empty());
+        assert!(manager.has_enabled_hooks());
+
+        assert!(manager.disable_hook(first));
+        assert!(manager.has_enabled_hooks());
+        assert!(manager.disable_hook(second));
+        assert!(!manager.has_enabled_hooks());
+
+        assert!(manager.enable_hook(first));
+        assert!(manager.has_enabled_hooks());
+        assert!(manager.unregister_hook(first));
+        assert!(!manager.has_enabled_hooks());
+        assert!(manager.unregister_hook(second));
+        assert!(manager.is_empty());
     }
 }

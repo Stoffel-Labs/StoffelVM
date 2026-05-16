@@ -64,10 +64,16 @@ impl ForeignOutputServices for VMState {
 }
 
 pub(crate) trait ForeignHookServices {
+    fn hooks_enabled(&self) -> bool;
+
     fn trigger_hook_with_snapshot(&self, event: &HookEvent) -> VmResult<()>;
 }
 
 impl ForeignHookServices for VMState {
+    fn hooks_enabled(&self) -> bool {
+        VMState::hooks_enabled(self)
+    }
+
     fn trigger_hook_with_snapshot(&self, event: &HookEvent) -> VmResult<()> {
         VMState::trigger_hook_with_snapshot(self, event)
     }

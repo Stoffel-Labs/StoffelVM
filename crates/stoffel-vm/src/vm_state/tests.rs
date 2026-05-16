@@ -18,6 +18,7 @@ use crate::runtime_instruction::{
 use crate::vm_state::mpc_operation::PendingMpcOperation;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use std::sync::{Arc, Mutex};
+use stoffel_vm_types::activations::CompareFlag;
 use stoffel_vm_types::core_types::{
     ClearShareInput, ClearShareValue, Closure, ShareData, ShareType, Value, F64,
 };
@@ -59,6 +60,26 @@ fn call_stack_checkpoint_keeps_typed_frame_depth_boundary() {
     assert!(checkpoint.is_current_depth(2));
     assert!(checkpoint.is_returning_from_entry_frame(3));
     assert!(!checkpoint.is_returning_from_entry_frame(4));
+}
+
+#[test]
+fn function_registration_clears_vm_local_call_target_cache() {
+    let mut vm = VMState::new();
+    vm.try_insert_function(Function::foreign(ForeignFunction::new(
+        "cached",
+        Arc::new(|_| Ok(Value::Unit)),
+    )))
+    .expect("register cached function");
+
+    let _ = vm.call_target("cached").expect("resolve call target");
+    assert!(vm.last_call_target.is_some());
+
+    vm.try_insert_function(Function::foreign(ForeignFunction::new(
+        "new_function",
+        Arc::new(|_| Ok(Value::Unit)),
+    )))
+    .expect("register new function");
+    assert!(vm.last_call_target.is_none());
 }
 
 impl MpcEngine for DummyFieldEngine {
@@ -2468,6 +2489,25 @@ fn send_output_to_client_uses_output_capability_trait() {
     assert_eq!(
         engine.calls.lock().unwrap().as_slice(),
         &[(7, vec![1, 2, 3], output_share_count)]
+    );
+}
+
+#[test]
+fn cmp_updates_compare_flag_for_ready_clear_registers() {
+    let mut vm = VMState::new();
+    vm.push_activation_record(ActivationRecord::with_registers(
+        "test",
+        RegisterFile::from(vec![Value::I64(1), Value::I64(2)]),
+        vec![],
+        None,
+    ));
+
+    vm.execute_cmp(runtime_reg(0, 2), runtime_reg(1, 2))
+        .expect("ready clear registers should compare");
+
+    assert_eq!(
+        vm.current_frame().unwrap().compare_flag(),
+        CompareFlag::Less
     );
 }
 

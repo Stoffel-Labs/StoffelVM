@@ -324,6 +324,10 @@ impl MpcRuntimeState {
         self.reveal_batcher.has_pending_frame(frame_depth)
     }
 
+    pub(super) fn has_any_pending_reveals(&self) -> bool {
+        self.reveal_batcher.has_pending()
+    }
+
     pub(super) fn has_pending_reveal_destination(&self, destination: RevealDestination) -> bool {
         self.reveal_batcher.has_pending_destination(destination)
     }

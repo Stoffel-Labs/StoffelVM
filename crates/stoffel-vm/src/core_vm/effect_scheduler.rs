@@ -29,12 +29,17 @@ impl AsyncEffectScheduler {
         checkpoint: CallStackCheckpoint,
         engine: &E,
     ) -> VmResult<Value> {
+        let mut engine_identity_checked = false;
+
         loop {
             match state.run_until_effect_or_budget_to_depth(checkpoint, self.local_budget)? {
                 VmRunSlice::Complete(value) => return Ok(value),
                 VmRunSlice::BudgetExhausted => tokio::task::yield_now().await,
                 VmRunSlice::Yield(effect) => {
-                    state.ensure_async_engine_matches(engine)?;
+                    if !engine_identity_checked {
+                        state.ensure_async_engine_matches(engine)?;
+                        engine_identity_checked = true;
+                    }
                     let completed = effect.execute(engine).await?;
                     state.apply_completed_vm_effect(completed)?;
                 }

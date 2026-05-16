@@ -91,6 +91,12 @@ impl StackOffset {
     }
 
     pub(crate) fn resolve_index(self, stack_len: usize) -> VmResult<usize> {
+        if self.0 == 0 {
+            return stack_len
+                .checked_sub(1)
+                .ok_or(VmError::StackAddressOutOfBounds { offset: self.0 });
+        }
+
         let stack_len = i64::try_from(stack_len).map_err(|_| VmError::StackLengthOverflow)?;
         let index = stack_len
             .checked_add(i64::from(self.0))
@@ -133,6 +139,7 @@ struct RuntimeInstructionEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeInstruction {
+    Noop,
     LoadStack {
         dest: RuntimeRegister,
         offset: StackOffset,
@@ -167,7 +174,7 @@ pub(crate) enum RuntimeInstruction {
         target: JumpTarget,
     },
     Call {
-        function: String,
+        function: Arc<str>,
     },
     Return {
         src: RuntimeRegister,
@@ -224,10 +231,22 @@ impl RuntimeFunction {
         Ok(Self { instructions })
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.instructions.len()
     }
 
+    #[inline]
+    pub(crate) fn get_instruction(
+        &self,
+        instruction_pointer: InstructionPointer,
+    ) -> Option<FetchedInstruction<'_>> {
+        self.instructions
+            .get(instruction_pointer.index())
+            .map(|entry| FetchedInstruction { entry })
+    }
+
+    #[cfg(test)]
     fn instruction_entry(
         &self,
         instruction_pointer: InstructionPointer,
@@ -235,38 +254,39 @@ impl RuntimeFunction {
         let index = instruction_pointer.index();
         self.instructions
             .get(index)
-            .ok_or(VmError::InstructionOutOfBounds { index })
+            .ok_or_else(|| VmError::InstructionOutOfBounds { index })
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct FetchedInstruction {
-    function: Arc<RuntimeFunction>,
-    instruction_pointer: InstructionPointer,
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FetchedInstruction<'function> {
+    entry: &'function RuntimeInstructionEntry,
 }
 
-impl FetchedInstruction {
+impl<'function> FetchedInstruction<'function> {
+    #[cfg(test)]
     pub(crate) fn fetch(
         instruction_pointer: InstructionPointer,
-        function: Arc<RuntimeFunction>,
+        function: &'function RuntimeFunction,
     ) -> VmResult<Self> {
-        function.instruction_entry(instruction_pointer)?;
-        Ok(FetchedInstruction {
-            function,
-            instruction_pointer,
-        })
+        let entry = function.instruction_entry(instruction_pointer)?;
+        Ok(FetchedInstruction { entry })
     }
 
+    #[inline]
     pub(crate) fn hook_instruction(&self) -> &Instruction {
-        &self.entry().hook_instruction
+        &self.entry.hook_instruction
     }
 
+    #[inline]
     pub(crate) fn runtime_instruction(&self) -> &RuntimeInstruction {
-        &self.entry().runtime_instruction
+        &self.entry.runtime_instruction
     }
 
-    fn entry(&self) -> &RuntimeInstructionEntry {
-        &self.function.instructions[self.instruction_pointer.index()]
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn instructions(&self) -> (&RuntimeInstruction, &Instruction) {
+        (self.runtime_instruction(), self.hook_instruction())
     }
 }
 
@@ -275,6 +295,7 @@ fn lower_instruction(
     resolved: &ResolvedInstruction,
 ) -> VmResult<RuntimeInstruction> {
     Ok(match *resolved {
+        ResolvedInstruction::NOP => RuntimeInstruction::Noop,
         ResolvedInstruction::LD(dest, offset) => RuntimeInstruction::LoadStack {
             dest: reg(vm_function, dest)?,
             offset: StackOffset::new(offset),
@@ -373,7 +394,7 @@ fn lower_instruction(
         ResolvedInstruction::CALL(func_idx) => {
             let func_name = get_function_name_from_constant(vm_function, func_idx)?;
             RuntimeInstruction::Call {
-                function: func_name,
+                function: Arc::from(func_name),
             }
         }
         ResolvedInstruction::RET(src) => RuntimeInstruction::Return {
@@ -474,6 +495,24 @@ mod tests {
                 register: 3,
                 register_count: 3
             })
+        ));
+    }
+
+    #[test]
+    fn lowering_preserves_noop_as_dispatch_only_instruction() {
+        let function = VMFunction::new(
+            "noop".to_owned(),
+            vec![],
+            vec![],
+            None,
+            1,
+            vec![Instruction::NOP],
+            HashMap::new(),
+        );
+
+        assert!(matches!(
+            lower_instruction(&function, &ResolvedInstruction::NOP).unwrap(),
+            RuntimeInstruction::Noop
         ));
     }
 

@@ -136,6 +136,19 @@ fn compare_rejects_secret_shares() {
 }
 
 #[test]
+fn clear_compare_helper_handles_ordered_values() {
+    assert_eq!(
+        try_clear_compare(&Value::I64(2), &Value::I64(7)).expect("i64 is comparable"),
+        std::cmp::Ordering::Less
+    );
+    assert_eq!(
+        try_clear_compare(&Value::Bool(true), &Value::Bool(false)).expect("bool is comparable"),
+        std::cmp::Ordering::Greater
+    );
+    assert!(try_clear_compare(&Value::I64(1), &Value::U64(1)).is_none());
+}
+
+#[test]
 fn unsupported_secret_bit_ops_classify_any_share_type() {
     let fixed_share = Value::Share(
         ShareType::default_secret_fixed_point(),

@@ -210,6 +210,8 @@ pub struct CompiledFunction {
 /// instead of embedding values directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompiledInstruction {
+    // No operation
+    NOP,
     // Load value from stack to register
     LD(usize, i32), // LD r1, [sp+0]
     // Load immediate value to register
@@ -323,6 +325,7 @@ impl CompiledBinary {
         // Convert instructions
         for instruction in vm_function.instructions() {
             let compiled = match instruction {
+                Instruction::NOP => CompiledInstruction::NOP,
                 Instruction::LD(reg, offset) => CompiledInstruction::LD(*reg, *offset),
                 Instruction::LDI(reg, value) => {
                     let const_idx = self.add_constant_if_new(value, constant_map);
@@ -398,6 +401,7 @@ impl CompiledBinary {
         F: FnMut(usize) -> BinaryResult<Value>,
     {
         Ok(match instruction {
+            CompiledInstruction::NOP => Instruction::NOP,
             CompiledInstruction::LD(reg, offset) => Instruction::LD(*reg, *offset),
             CompiledInstruction::LDI(reg, const_idx) => {
                 Instruction::LDI(*reg, constant_lookup(*const_idx)?)
@@ -697,6 +701,9 @@ impl CompiledBinary {
         writer: &mut W,
     ) -> BinaryResult<()> {
         match instruction {
+            CompiledInstruction::NOP => {
+                writer.write_all(&[ReducedOpcode::NOP as u8])?;
+            }
             CompiledInstruction::LD(reg, offset) => {
                 writer.write_all(&[ReducedOpcode::LD as u8])?;
                 write_usize_as_u32(writer, *reg, "LD register")?;
@@ -1072,6 +1079,7 @@ impl CompiledBinary {
         let opcode = opcode_byte[0];
 
         match opcode {
+            x if x == ReducedOpcode::NOP as u8 => Ok(CompiledInstruction::NOP),
             x if x == ReducedOpcode::LD as u8 => {
                 let reg = read_usize_u32(reader, "LD register")?;
 
@@ -1361,7 +1369,11 @@ mod tests {
             vec![],
             None,
             2,
-            vec![Instruction::LDI(0, Value::I64(42)), Instruction::RET(0)],
+            vec![
+                Instruction::NOP,
+                Instruction::LDI(0, Value::I64(42)),
+                Instruction::RET(0),
+            ],
             HashMap::new(),
         );
 
@@ -1374,7 +1386,7 @@ mod tests {
         assert_eq!(binary.functions.len(), 1);
         assert_eq!(binary.functions[0].name, "test_function");
         assert_eq!(binary.functions[0].register_count, 2);
-        assert_eq!(binary.functions[0].instructions.len(), 2);
+        assert_eq!(binary.functions[0].instructions.len(), 3);
 
         // Convert back to VM functions
         let vm_functions = binary.to_vm_functions();
@@ -1383,10 +1395,15 @@ mod tests {
         assert_eq!(vm_functions.len(), 1);
         assert_eq!(vm_functions[0].name(), "test_function");
         assert_eq!(vm_functions[0].register_count(), 2);
-        assert_eq!(vm_functions[0].instructions().len(), 2);
+        assert_eq!(vm_functions[0].instructions().len(), 3);
 
         // Check that the instructions were converted correctly
         match &vm_functions[0].instructions()[0] {
+            Instruction::NOP => {}
+            _ => panic!("Expected NOP instruction"),
+        }
+
+        match &vm_functions[0].instructions()[1] {
             Instruction::LDI(reg, value) => {
                 assert_eq!(*reg, 0);
                 assert_eq!(*value, Value::I64(42));
@@ -1394,7 +1411,7 @@ mod tests {
             _ => panic!("Expected LDI instruction"),
         }
 
-        match &vm_functions[0].instructions()[1] {
+        match &vm_functions[0].instructions()[2] {
             Instruction::RET(reg) => {
                 assert_eq!(*reg, 0);
             }
@@ -1441,7 +1458,11 @@ mod tests {
             vec![],
             None,
             1,
-            vec![Instruction::LDI(0, Value::I64(42)), Instruction::RET(0)],
+            vec![
+                Instruction::NOP,
+                Instruction::LDI(0, Value::I64(42)),
+                Instruction::RET(0),
+            ],
             HashMap::new(),
         );
         let mut binary = CompiledBinary::from_vm_functions(&[function]);
@@ -1585,7 +1606,11 @@ mod tests {
             vec![],
             None,
             2,
-            vec![Instruction::LDI(0, Value::I64(42)), Instruction::RET(0)],
+            vec![
+                Instruction::NOP,
+                Instruction::LDI(0, Value::I64(42)),
+                Instruction::RET(0),
+            ],
             HashMap::new(),
         );
 
@@ -1605,7 +1630,7 @@ mod tests {
         assert_eq!(deserialized.functions.len(), 1);
         assert_eq!(deserialized.functions[0].name, "test_function");
         assert_eq!(deserialized.functions[0].register_count, 2);
-        assert_eq!(deserialized.functions[0].instructions.len(), 2);
+        assert_eq!(deserialized.functions[0].instructions.len(), 3);
 
         // Convert back to VM functions
         let vm_functions = deserialized.to_vm_functions();
@@ -1614,7 +1639,11 @@ mod tests {
         assert_eq!(vm_functions.len(), 1);
         assert_eq!(vm_functions[0].name(), "test_function");
         assert_eq!(vm_functions[0].register_count(), 2);
-        assert_eq!(vm_functions[0].instructions().len(), 2);
+        assert_eq!(vm_functions[0].instructions().len(), 3);
+        assert!(matches!(
+            vm_functions[0].instructions()[0],
+            Instruction::NOP
+        ));
     }
 
     #[test]

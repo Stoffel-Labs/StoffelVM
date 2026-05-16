@@ -139,6 +139,20 @@ impl<'a> ForeignFunctionContext<'a> {
         Ok(self.services.push_array_ref_values(array_ref, values)?)
     }
 
+    /// Append this call's argument tail directly to a VM array.
+    pub fn push_array_args_from(
+        &mut self,
+        array_ref: ArrayRef,
+        start: usize,
+        function: &'static str,
+    ) -> ForeignFunctionCallbackResult<usize> {
+        let values = self
+            .args
+            .get(start..)
+            .ok_or_else(|| format!("{function} missing arguments starting at {start}"))?;
+        Ok(self.services.push_array_ref_values(array_ref, values)?)
+    }
+
     /// Create a VM object and populate it with fields.
     pub fn create_object_with_fields<I>(
         &mut self,

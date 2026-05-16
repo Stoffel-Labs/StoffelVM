@@ -36,14 +36,14 @@ impl VMState {
 
     /// Check if hooks are enabled (fast path).
     #[inline(always)]
-    pub(super) fn hooks_enabled(&self) -> bool {
-        !self.hook_manager.is_empty()
+    pub(crate) fn hooks_enabled(&self) -> bool {
+        self.hook_manager.has_enabled_hooks()
     }
 
     /// Trigger a hook event with a snapshot of the current VM state.
     #[inline]
     pub(crate) fn trigger_hook_with_snapshot(&self, event: &HookEvent) -> VmResult<()> {
-        if self.hook_manager.is_empty() {
+        if !self.hook_manager.has_enabled_hooks() {
             return Ok(());
         }
 

@@ -278,6 +278,9 @@ impl VMFunction {
         for (idx, instruction) in self.instructions.iter().enumerate() {
             validate_instruction_registers(&self.name, idx, instruction, self.register_count)?;
             match instruction {
+                Instruction::NOP => {
+                    resolved.push(ResolvedInstruction::NOP);
+                }
                 Instruction::LD(reg, offset) => {
                     resolved.push(ResolvedInstruction::LD(*reg, *offset));
                 }
@@ -385,6 +388,7 @@ fn referenced_register_count(
 
 fn max_referenced_register(instruction: &Instruction) -> Option<usize> {
     match instruction {
+        Instruction::NOP => None,
         Instruction::LD(reg, _)
         | Instruction::LDI(reg, _)
         | Instruction::RET(reg)
@@ -418,6 +422,7 @@ fn validate_instruction_registers(
     register_count: usize,
 ) -> FunctionResult<()> {
     match instruction {
+        Instruction::NOP => {}
         Instruction::LD(dest, _)
         | Instruction::LDI(dest, _)
         | Instruction::RET(dest)

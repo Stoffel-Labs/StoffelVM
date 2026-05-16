@@ -10,7 +10,10 @@
 //! - Instruction pointer
 
 use crate::core_types::{Closure, Upvalue, Value};
-use crate::registers::{RegisterFile, RegisterIndex, RegisterLayout, RegisterSlot};
+use crate::registers::{
+    ClearRegisterCopyResult, RegisterFile, RegisterIndex, RegisterLayout, RegisterSlot,
+    SecretRegisterCopyResult,
+};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -169,6 +172,14 @@ impl InstructionPointer {
         self.0.checked_sub(1).map(Self)
     }
 
+    fn advance_after_fetch(self) -> Self {
+        let index = self
+            .0
+            .checked_add(1)
+            .expect("fetched instruction pointer must be advanceable");
+        Self(index)
+    }
+
     fn try_advance(self, function: &str) -> ActivationResult<Self> {
         self.0
             .checked_add(1)
@@ -269,7 +280,7 @@ impl fmt::Debug for ActivationStack {
 #[derive(Clone)]
 pub struct ActivationRecord {
     /// Name of the function being executed
-    function_name: String,
+    function_name: Arc<str>,
     /// Local variables by name
     locals: FxHashMap<String, Value>,
     /// Register values (optimized for small functions)
@@ -289,15 +300,37 @@ pub struct ActivationRecord {
 impl ActivationRecord {
     /// Create an empty call frame for a VM function.
     pub fn for_function(
-        function_name: impl Into<String>,
+        function_name: impl Into<Arc<str>>,
         layout: RegisterLayout,
         register_count: usize,
         upvalues: Vec<Upvalue>,
         closure: Option<Arc<Closure>>,
     ) -> Self {
+        Self::for_function_with_local_capacity(
+            function_name,
+            layout,
+            register_count,
+            upvalues,
+            closure,
+            0,
+        )
+    }
+
+    /// Create an empty call frame with preallocated local storage.
+    pub fn for_function_with_local_capacity(
+        function_name: impl Into<Arc<str>>,
+        layout: RegisterLayout,
+        register_count: usize,
+        upvalues: Vec<Upvalue>,
+        closure: Option<Arc<Closure>>,
+        local_capacity: usize,
+    ) -> Self {
+        let mut locals = FxHashMap::default();
+        locals.reserve(local_capacity);
+
         ActivationRecord {
             function_name: function_name.into(),
-            locals: FxHashMap::default(),
+            locals,
             registers: RegisterFile::new(layout, register_count),
             upvalues,
             stack: SmallVec::new(),
@@ -309,7 +342,7 @@ impl ActivationRecord {
 
     /// Create a frame around an existing register file.
     pub fn with_registers(
-        function_name: impl Into<String>,
+        function_name: impl Into<Arc<str>>,
         registers: RegisterFile,
         upvalues: Vec<Upvalue>,
         closure: Option<Arc<Closure>>,
@@ -334,7 +367,7 @@ impl ActivationRecord {
     ) -> ActivationResult<()> {
         if parameters.len() != args.len() {
             return Err(ActivationError::FunctionArityMismatch {
-                function: self.function_name.clone(),
+                function: self.function_name.to_string(),
                 expected: parameters.len(),
                 actual: args.len(),
             });
@@ -346,6 +379,8 @@ impl ActivationRecord {
                 register_count: self.registers.len(),
             });
         }
+
+        self.locals.reserve(parameters.len());
 
         for ((name, value), slot) in parameters
             .iter()
@@ -359,8 +394,53 @@ impl ActivationRecord {
         Ok(())
     }
 
+    /// Bind already-prepared argument values to ABI registers and local names.
+    ///
+    /// Runtime call frames own their prepared argument buffer. Consuming it here
+    /// lets the frame move values into registers instead of cloning each
+    /// argument once for the register file and once for the local-name mirror.
+    pub fn bind_owned_parameters<I>(
+        &mut self,
+        parameters: &[String],
+        args: I,
+    ) -> ActivationResult<()>
+    where
+        I: IntoIterator<Item = Value>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let args = args.into_iter();
+        let actual = args.len();
+        if parameters.len() != actual {
+            return Err(ActivationError::FunctionArityMismatch {
+                function: self.function_name.to_string(),
+                expected: parameters.len(),
+                actual,
+            });
+        }
+
+        if parameters.len() > self.registers.len() {
+            return Err(ActivationError::RegisterOutOfBounds {
+                register: self.registers.len(),
+                register_count: self.registers.len(),
+            });
+        }
+
+        self.locals.reserve(parameters.len());
+
+        for ((name, value), slot) in parameters.iter().zip(args).zip(self.registers.iter_mut()) {
+            self.locals.insert(name.clone(), value.clone());
+            *slot = value;
+        }
+
+        Ok(())
+    }
+
     pub fn function_name(&self) -> &str {
-        &self.function_name
+        self.function_name.as_ref()
+    }
+
+    pub fn function_name_arc(&self) -> Arc<str> {
+        Arc::clone(&self.function_name)
     }
 
     pub fn local(&self, name: &str) -> Option<&Value> {
@@ -401,6 +481,34 @@ impl ActivationRecord {
         value: Value,
     ) -> Option<RegisterSlot> {
         self.registers.replace_value(index, value)
+    }
+
+    #[inline]
+    pub fn copy_clear_register_value(
+        &mut self,
+        dest: RegisterIndex,
+        src: RegisterIndex,
+    ) -> ClearRegisterCopyResult {
+        self.registers.copy_clear_value(dest, src)
+    }
+
+    #[inline]
+    pub fn copy_secret_register_value(
+        &mut self,
+        dest: RegisterIndex,
+        src: RegisterIndex,
+    ) -> SecretRegisterCopyResult {
+        self.registers.copy_secret_value(dest, src)
+    }
+
+    #[inline]
+    pub fn copy_stack_value_to_clear_register(
+        &mut self,
+        dest: RegisterIndex,
+        stack_index: usize,
+    ) -> Option<ClearRegisterCopyResult> {
+        let stack_value = self.stack.get(stack_index)?;
+        Some(self.registers.write_clear_value_from_ref(dest, stack_value))
     }
 
     pub fn set_register_pending_reveal(&mut self, index: RegisterIndex) -> Option<RegisterSlot> {
@@ -471,8 +579,14 @@ impl ActivationRecord {
     }
 
     pub fn try_advance_instruction_pointer(&mut self) -> ActivationResult<()> {
-        self.instruction_pointer = self.instruction_pointer.try_advance(&self.function_name)?;
+        self.instruction_pointer = self
+            .instruction_pointer
+            .try_advance(self.function_name.as_ref())?;
         Ok(())
+    }
+
+    pub fn advance_instruction_pointer_after_fetch(&mut self) {
+        self.instruction_pointer = self.instruction_pointer.advance_after_fetch();
     }
 
     #[track_caller]
@@ -628,6 +742,24 @@ mod tests {
                 &[Value::I64(1), Value::I64(2)],
             )
             .expect("valid parameter binding");
+
+        assert_eq!(frame.register(r(0)), Some(&Value::I64(1)));
+        assert_eq!(frame.register(r(1)), Some(&Value::I64(2)));
+        assert_eq!(frame.local("x"), Some(&Value::I64(1)));
+        assert_eq!(frame.local("y"), Some(&Value::I64(2)));
+    }
+
+    #[test]
+    fn bind_owned_parameters_moves_values_into_registers_and_keeps_locals() {
+        let mut frame =
+            ActivationRecord::for_function("main", RegisterLayout::default(), 2, Vec::new(), None);
+
+        frame
+            .bind_owned_parameters(
+                &["x".to_string(), "y".to_string()],
+                vec![Value::I64(1), Value::I64(2)],
+            )
+            .expect("valid owned parameter binding");
 
         assert_eq!(frame.register(r(0)), Some(&Value::I64(1)));
         assert_eq!(frame.register(r(1)), Some(&Value::I64(2)));

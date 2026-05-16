@@ -29,16 +29,17 @@ pub(crate) enum VmRunSlice {
 #[derive(Debug)]
 pub(crate) struct VmEffect {
     operation: PendingMpcOperation,
-    after_instruction: Instruction,
+    after_instruction: Option<Instruction>,
     hooks_enabled: bool,
 }
 
 impl VmEffect {
     pub(super) fn new(
         operation: PendingMpcOperation,
-        after_instruction: Instruction,
+        after_instruction: Option<Instruction>,
         hooks_enabled: bool,
     ) -> Self {
+        debug_assert_eq!(after_instruction.is_some(), hooks_enabled);
         Self {
             operation,
             after_instruction,
@@ -62,12 +63,12 @@ impl VmEffect {
 #[derive(Debug)]
 pub(crate) struct CompletedVmEffect {
     operation: CompletedMpcOperation,
-    after_instruction: Instruction,
+    after_instruction: Option<Instruction>,
     hooks_enabled: bool,
 }
 
 impl CompletedVmEffect {
-    pub(super) fn into_parts(self) -> (CompletedMpcOperation, Instruction, bool) {
+    pub(super) fn into_parts(self) -> (CompletedMpcOperation, Option<Instruction>, bool) {
         (self.operation, self.after_instruction, self.hooks_enabled)
     }
 }

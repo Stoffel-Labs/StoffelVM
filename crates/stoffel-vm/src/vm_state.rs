@@ -16,10 +16,12 @@
 use crate::error::VmResult;
 use crate::net::mpc_engine::MpcEngine;
 use crate::output::{StdoutOutputSink, VmOutputResult, VmOutputSink};
-use crate::program::Program;
+use crate::program::{CallTarget, Program};
 use crate::reveal_destination::FrameDepth;
 use crate::runtime_hooks::{HookManager, InstructionCursor};
+use crate::runtime_instruction::RuntimeFunction;
 use mpc_runtime::MpcRuntimeState;
+use smallvec::SmallVec;
 use std::sync::Arc;
 #[cfg(test)]
 use stoffel_vm_types::activations::ActivationRecord;
@@ -97,8 +99,19 @@ impl VMStateConfig {
 pub(crate) struct VMState {
     /// Registered program functions (both VM and foreign)
     program: Program,
+    /// Last resolved call target, scoped to this VM state.
+    ///
+    /// Runtime instruction payloads are shared across cloned programs, so call
+    /// target caching must stay VM-local rather than living in `RuntimeFunction`.
+    last_call_target: Option<(Arc<str>, CallTarget)>,
     /// Stack of activation records for function calls
     call_stack: ActivationStack,
+    /// Runtime instruction payloads aligned with `call_stack`.
+    ///
+    /// The VM crate owns lowered instructions, while `ActivationRecord` lives in
+    /// `stoffel-vm-types`. Keeping the resolved payload alongside each frame
+    /// preserves that crate boundary and avoids per-instruction registry lookups.
+    frame_runtime_functions: SmallVec<[Option<Arc<RuntimeFunction>>; 8]>,
     /// Current instruction cursor exposed to hook snapshots.
     current_instruction: Option<InstructionCursor>,
     /// Storage for Lua-like table objects and arrays.
@@ -173,7 +186,9 @@ impl VMState {
 
         VMState {
             program: Program::new(),
+            last_call_target: None,
             call_stack: ActivationStack::new(),
+            frame_runtime_functions: SmallVec::new(),
             current_instruction: None,
             table_memory: config.table_memory,
             foreign_objects: ForeignObjectStorage::new(),
@@ -198,7 +213,7 @@ impl VMState {
 
     #[cfg(test)]
     pub(crate) fn push_activation_record(&mut self, record: ActivationRecord) {
-        self.call_stack.push(record);
+        self.push_activation_frame(record, None);
     }
 
     /// Get the number of active call frames on the VM call stack.
@@ -210,7 +225,7 @@ impl VMState {
     pub(crate) fn unwind_call_stack_to(&mut self, checkpoint: CallStackCheckpoint) {
         self.mpc_runtime
             .clear_reveals_at_or_above(checkpoint.frame_depth_floor());
-        self.call_stack.truncate(checkpoint.depth());
+        self.truncate_activation_frames(checkpoint.depth());
         self.sync_current_instruction_to_current_frame();
     }
 
@@ -224,7 +239,10 @@ impl VMState {
         self.register_layout
     }
 
-    pub(crate) fn prepare_register_arguments(&self, args: &[Value]) -> VmResult<Vec<Value>> {
+    pub(crate) fn prepare_register_arguments(
+        &self,
+        args: &[Value],
+    ) -> VmResult<SmallVec<[Value; 8]>> {
         self.prepare_register_arguments_for_layout(self.register_layout, args)
     }
 
@@ -242,7 +260,7 @@ impl VMState {
 
     pub(super) fn set_current_instruction(
         &mut self,
-        function_name: impl Into<String>,
+        function_name: impl Into<Arc<str>>,
         instruction_pointer: InstructionPointer,
     ) {
         self.current_instruction = Some(InstructionCursor::new(function_name, instruction_pointer));
@@ -258,7 +276,7 @@ impl VMState {
                 .instruction_pointer()
                 .previous()
                 .map(|instruction_pointer| {
-                    InstructionCursor::new(record.function_name().to_owned(), instruction_pointer)
+                    InstructionCursor::new(record.function_name_arc(), instruction_pointer)
                 })
         });
     }
@@ -267,17 +285,16 @@ impl VMState {
         &self,
         layout: RegisterLayout,
         args: &[Value],
-    ) -> VmResult<Vec<Value>> {
-        args.iter()
-            .enumerate()
-            .map(|(register, value)| {
-                self.prepare_register_write_value_for_layout(
-                    layout,
-                    RegisterIndex::new(register),
-                    value.clone(),
-                )
-            })
-            .collect()
+    ) -> VmResult<SmallVec<[Value; 8]>> {
+        let mut prepared = SmallVec::with_capacity(args.len());
+        for (register, value) in args.iter().enumerate() {
+            prepared.push(self.prepare_register_write_value_for_layout(
+                layout,
+                RegisterIndex::new(register),
+                value.clone(),
+            )?);
+        }
+        Ok(prepared)
     }
 
     /// Get a reference to the current (top) activation record.

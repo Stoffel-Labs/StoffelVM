@@ -609,9 +609,11 @@ impl VMState {
         let (operation, after_instruction, hooks_enabled) = effect.into_parts();
         self.apply_completed_mpc_operation(operation, hooks_enabled)?;
 
-        if hooks_enabled {
+        if let Some(after_instruction) = after_instruction {
             let event = HookEvent::AfterInstructionExecute(after_instruction);
             self.trigger_hook_with_snapshot(&event)?;
+        } else {
+            debug_assert!(!hooks_enabled);
         }
 
         Ok(())

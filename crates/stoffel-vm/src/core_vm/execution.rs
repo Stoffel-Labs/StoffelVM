@@ -171,20 +171,36 @@ impl VirtualMachine {
         E: AsyncMpcEngine + ?Sized,
         I: IntoIterator<Item = VmEntryInvocation>,
     {
-        let mut executions = Vec::new();
+        let mut invocations = invocations.into_iter();
+        let Some(first) = invocations.next() else {
+            return Ok(Vec::new());
+        };
+        let Some(second) = invocations.next() else {
+            return Ok(vec![
+                self.execute_entry_invocation_async(first, async_engine)
+                    .await?,
+            ]);
+        };
+
+        let (remaining_lower_bound, _) = invocations.size_hint();
+        let mut executions = Vec::with_capacity(remaining_lower_bound.saturating_add(2));
+        executions.push(self.execute_entry_invocation_async(first, async_engine));
+        executions.push(self.execute_entry_invocation_async(second, async_engine));
         for invocation in invocations {
-            let mut vm = self.try_clone_with_independent_state()?;
-            executions.push(async move {
-                vm.execute_async_with_args(
-                    invocation.function_name(),
-                    invocation.args(),
-                    async_engine,
-                )
-                .await
-            });
+            executions.push(self.execute_entry_invocation_async(invocation, async_engine));
         }
 
         futures::future::try_join_all(executions).await
+    }
+
+    async fn execute_entry_invocation_async<E: AsyncMpcEngine + ?Sized>(
+        &self,
+        invocation: VmEntryInvocation,
+        async_engine: &E,
+    ) -> VirtualMachineResult<Value> {
+        let mut vm = self.try_clone_with_independent_state()?;
+        vm.execute_async_with_args(invocation.function_name(), invocation.args(), async_engine)
+            .await
     }
 
     /// Execute a function specifically for benchmarking purposes.

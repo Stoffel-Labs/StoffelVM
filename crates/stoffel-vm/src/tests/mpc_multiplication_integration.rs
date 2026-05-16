@@ -15,7 +15,7 @@
     clippy::while_let_loop
 )]
 
-use crate::net::mpc::honeybadger_node_opts;
+use crate::net::mpc::{honeybadger_node_opts, honeybadger_protocol_instance_id};
 use ark_ff::{FftField, PrimeField};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
@@ -655,7 +655,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
             client_id,
             n_parties,
             threshold,
-            instance_id as u32,
+            honeybadger_protocol_instance_id(instance_id),
             inputs,
             input_len,
         )?;
