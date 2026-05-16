@@ -1,10 +1,13 @@
 use std::env;
+#[cfg(feature = "honeybadger")]
 use std::fs;
 use std::net::SocketAddr;
 use std::process::exit;
 use std::str::FromStr;
 
+#[cfg(feature = "honeybadger")]
 use alloy::signers::local::PrivateKeySigner;
+#[cfg(feature = "honeybadger")]
 use alloy_primitives::Address;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 use ark_ec::{CurveGroup, PrimeGroup};
@@ -17,10 +20,18 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
-use stoffel_mpc_coordinator::off_chain::node_rpc::{NodeRPCClient, NodeRPCServer};
-use stoffel_mpc_coordinator::off_chain::OffChainCoordinator;
+#[cfg(feature = "honeybadger")]
+use stoffel_mpc_coordinator::off_chain::node_rpc::{
+    NodeRPCClient as OffChainNodeRPCClient, NodeRPCServer as OffChainNodeRPCServer,
+};
+#[cfg(feature = "honeybadger")]
+use stoffel_mpc_coordinator::off_chain::OffChainCoordinatorClient;
+#[cfg(feature = "honeybadger")]
 use stoffel_mpc_coordinator::on_chain;
-use stoffel_mpc_coordinator::Coordinator;
+#[cfg(feature = "honeybadger")]
+use stoffel_mpc_coordinator::on_chain::node_rpc::NodeRPCClient as OnChainNodeRPCClient;
+#[cfg(feature = "honeybadger")]
+use stoffel_mpc_coordinator::{Coordinator, Round};
 use stoffel_vm::core_vm::VirtualMachine;
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 use stoffel_vm::net::curve::{field_from_i64, field_to_i64, SupportedMpcField};
@@ -29,9 +40,12 @@ use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
 #[cfg(feature = "honeybadger")]
 use stoffel_vm::net::mpc_engine::MpcEngine;
 #[cfg(feature = "honeybadger")]
-use stoffel_vm::net::{honeybadger_node_opts, spawn_receive_loops_split};
 use stoffel_vm::net::{
-    program_id_from_bytes, register_and_wait_for_session_with_program, run_bootnode_with_config,
+    honeybadger_node_opts, honeybadger_protocol_instance_id, spawn_receive_loops_split,
+};
+use stoffel_vm::net::{
+    program_id_from_bytes, register_and_wait_for_session, run_bootnode_with_config,
+    SessionRegistrationConfig,
 };
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
@@ -53,9 +67,25 @@ use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
+#[cfg(any(feature = "honeybadger", feature = "avss"))]
 use tokio::sync::mpsc;
+#[cfg(feature = "honeybadger")]
 use x509_parser::prelude::*;
 
+#[cfg(feature = "honeybadger")]
+type HbCoordinatorField = ark_bls12_381::Fr;
+#[cfg(feature = "honeybadger")]
+type HbCoordinatorShare = RobustShare<HbCoordinatorField>;
+#[cfg(feature = "honeybadger")]
+type HbOffChainCoordinator = OffChainCoordinatorClient<HbCoordinatorField, HbCoordinatorShare>;
+#[cfg(feature = "honeybadger")]
+type HbOffChainNodeRpcClient = OffChainNodeRPCClient<HbCoordinatorField, HbCoordinatorShare>;
+#[cfg(feature = "honeybadger")]
+type HbOffChainNodeRpcServer = OffChainNodeRPCServer<HbCoordinatorField, HbCoordinatorShare>;
+#[cfg(feature = "honeybadger")]
+type HbOnChainNodeRpcClient = OnChainNodeRPCClient<HbCoordinatorField, HbCoordinatorShare>;
+
+#[cfg(feature = "honeybadger")]
 fn extract_pubkey_from_cert(cert_der: &[u8]) -> Vec<u8> {
     let (_, parsed) = X509Certificate::from_der(cert_der).expect("parse X.509 cert");
     parsed
@@ -66,6 +96,24 @@ fn extract_pubkey_from_cert(cert_der: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
+#[cfg(feature = "honeybadger")]
+fn parse_on_chain_client_addresses(
+    node_ids: &[String],
+    expected_clients: &[String],
+) -> Vec<Address> {
+    let raw_ids = if node_ids.is_empty() {
+        expected_clients
+    } else {
+        node_ids
+    };
+
+    raw_ids
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| Address::from_str(s.trim()).expect("Invalid on-chain client address"))
+        .collect()
+}
+
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 fn format_coordinator_outputs<F>(outputs: &[F]) -> String
 where
@@ -74,13 +122,9 @@ where
     let rendered = outputs
         .iter()
         .copied()
-        .map(|output| {
-            let signed = field_to_i64(output);
-            if field_from_i64::<F>(signed) == output {
-                signed.to_string()
-            } else {
-                format!("{output:?}")
-            }
+        .map(|output| match field_to_i64(output) {
+            Ok(signed) if field_from_i64::<F>(signed) == output => signed.to_string(),
+            _ => format!("{output:?}"),
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -129,9 +173,13 @@ fn store_reserved_client_inputs<F, I>(
             exit(13);
         }
 
-        vm.state
-            .client_store()
-            .store_client_input(reserved_index, shares);
+        if let Err(error) = vm.try_store_client_input(reserved_index, shares) {
+            eprintln!(
+                "Failed to store input shares for reserved client index {}: {}",
+                reserved_index, error
+            );
+            exit(13);
+        }
     }
 }
 
@@ -151,7 +199,9 @@ where
     };
 
     let store = Arc::new(LmdbPreprocStore::open(path)?);
-    engine.set_preproc_store(store, program_hash);
+    engine
+        .preproc_persistence_ops()?
+        .set_preproc_store(store, program_hash)?;
     engine.set_preproc_store_party_id(persistent_party_id);
     Ok(())
 }
@@ -165,9 +215,7 @@ where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
-    let reservation = engine
-        .as_reservation()
-        .ok_or("HoneyBadger engine does not support reserved mask retrieval")?;
+    let reservation = engine.reservation_ops()?;
     let share_bytes = reservation.get_mask_share(reserved_index).await?;
     ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.as_slice())
         .map_err(|e| format!("deserialize reserved mask share {reserved_index}: {:?}", e))
@@ -327,7 +375,7 @@ impl Network for ClientNetworkAdapter {
 /// but the network layer needs transport-derived IDs to route messages.
 #[cfg(any(feature = "honeybadger", feature = "avss"))]
 struct ServerClientAdapter {
-    inner: Arc<QuicNetworkManager>,
+    inner: QuicNetworkManager,
     /// Maps sequential index → transport-derived client ID
     client_id_map: Vec<ClientId>,
 }
@@ -358,9 +406,7 @@ impl Network for ServerClientAdapter {
     }
 
     fn parties_mut(&mut self) -> Vec<&mut Self::NodeType> {
-        // Safety: we hold Arc, can't get &mut easily; the MPC protocol
-        // never calls this on the server adapter.
-        unimplemented!("parties_mut not needed for server client adapter")
+        self.inner.parties_mut()
     }
 
     fn config(&self) -> &Self::NetworkConfig {
@@ -371,8 +417,8 @@ impl Network for ServerClientAdapter {
         self.inner.node(id)
     }
 
-    fn node_mut(&mut self, _id: stoffelnet::network_utils::PartyId) -> Option<&mut Self::NodeType> {
-        unimplemented!("node_mut not needed for server client adapter")
+    fn node_mut(&mut self, id: stoffelnet::network_utils::PartyId) -> Option<&mut Self::NodeType> {
+        self.inner.node_mut(id)
     }
 
     async fn send_to_client(
@@ -417,6 +463,37 @@ fn fail_removed_flag(raw_args: &[String], old_flag: &str, replacement_hint: &str
     if is_flag_present(raw_args, old_flag) {
         eprintln!("Error: `{}` was removed. {}", old_flag, replacement_hint);
         exit(2);
+    }
+}
+
+fn print_vm_result(vm: &mut VirtualMachine, result: Value) {
+    let result = if matches!(result, Value::Share(_, _)) && vm.mpc_runtime_info().is_some() {
+        eprintln!("Program returned a secret share, revealing...");
+        match vm.open_share_value(&result) {
+            Ok(revealed) => revealed,
+            Err(e) => {
+                eprintln!("Failed to reveal returned share: {}", e);
+                result
+            }
+        }
+    } else {
+        result
+    };
+
+    match &result {
+        Value::Array(arr_ref) => {
+            if let Some(bytes) = vm
+                .read_byte_array(&Value::from(*arr_ref))
+                .ok()
+                .filter(|bytes| !bytes.is_empty())
+            {
+                let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                println!("Program returned: byte[{}] 0x{}", bytes.len(), hex);
+            } else {
+                println!("Program returned: {:?}", result);
+            }
+        }
+        _ => println!("Program returned: {:?}", result),
     }
 }
 
@@ -704,30 +781,34 @@ async fn sync_client_set_across_parties(
 }
 
 #[cfg(feature = "honeybadger")]
-async fn run_hb_client_protocol_for_curve<F: PrimeField>(
-    _cid: ClientId,
+struct HbClientProtocolConfig {
     n: usize,
     t: usize,
-    inputs_str: &str,
     input_len: usize,
     instance_id: u64,
     client_index: u8,
     local_position: usize,
+}
+
+#[cfg(feature = "honeybadger")]
+async fn run_hb_client_protocol_for_curve<F: PrimeField>(
+    config: HbClientProtocolConfig,
+    inputs_str: &str,
     network_for_process: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
     mut msg_rx: mpsc::Receiver<(usize, Vec<u8>)>,
 ) -> Result<(), String> {
-    let instance_id = instance_id as u32;
+    let instance_id = honeybadger_protocol_instance_id(config.instance_id);
     // Use the sequential client_index (0, 1, ...) as the MPC identity,
     // not the transport-derived cid, because the session_id only has
     // 8 bits for the client_id field.
-    let mpc_cid = client_index as usize;
+    let mpc_cid = config.client_index as usize;
     let mut mpc_client = HoneyBadgerMPCClient::<F, Avid<HbSessionId>>::new(
         mpc_cid,
-        n,
-        t,
+        config.n,
+        config.t,
         instance_id,
         parse_inputs_as_field::<F>(inputs_str),
-        input_len,
+        config.input_len,
     )
     .map_err(|e| format!("Failed to create MPC client: {:?}", e))?;
 
@@ -752,7 +833,7 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
             let guard = network_for_process.lock().await;
             ClientNetworkAdapter {
                 inner: (*guard).clone(),
-                local_position,
+                local_position: config.local_position,
             }
         };
 
@@ -772,7 +853,7 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
             }
         }
 
-        if messages_processed >= n {
+        if messages_processed >= config.n {
             // Keep connection alive long enough for servers to drain their
             // preprocessing backlog and process our input messages.
             eprintln!(
@@ -794,28 +875,16 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
 #[cfg(feature = "honeybadger")]
 async fn run_hb_client_for_curve(
     curve_config: MpcCurveConfig,
-    cid: ClientId,
-    n: usize,
-    t: usize,
+    config: HbClientProtocolConfig,
     inputs_str: &str,
-    input_len: usize,
-    instance_id: u64,
-    client_index: u8,
-    local_position: usize,
     network_for_process: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
     msg_rx: mpsc::Receiver<(usize, Vec<u8>)>,
 ) -> Result<(), String> {
     match curve_config {
         MpcCurveConfig::Bls12_381 => {
             run_hb_client_protocol_for_curve::<ark_bls12_381::Fr>(
-                cid,
-                n,
-                t,
+                config,
                 inputs_str,
-                input_len,
-                instance_id,
-                client_index,
-                local_position,
                 network_for_process,
                 msg_rx,
             )
@@ -823,14 +892,8 @@ async fn run_hb_client_for_curve(
         }
         MpcCurveConfig::Bn254 => {
             run_hb_client_protocol_for_curve::<ark_bn254::Fr>(
-                cid,
-                n,
-                t,
+                config,
                 inputs_str,
-                input_len,
-                instance_id,
-                client_index,
-                local_position,
                 network_for_process,
                 msg_rx,
             )
@@ -838,14 +901,8 @@ async fn run_hb_client_for_curve(
         }
         MpcCurveConfig::Curve25519 => {
             run_hb_client_protocol_for_curve::<ark_curve25519::Fr>(
-                cid,
-                n,
-                t,
+                config,
                 inputs_str,
-                input_len,
-                instance_id,
-                client_index,
-                local_position,
                 network_for_process,
                 msg_rx,
             )
@@ -853,14 +910,8 @@ async fn run_hb_client_for_curve(
         }
         MpcCurveConfig::Ed25519 => {
             run_hb_client_protocol_for_curve::<ark_ed25519::Fr>(
-                cid,
-                n,
-                t,
+                config,
                 inputs_str,
-                input_len,
-                instance_id,
-                client_index,
-                local_position,
                 network_for_process,
                 msg_rx,
             )
@@ -1009,19 +1060,20 @@ async fn run_as_client(
     );
 
     let network_for_process = network.clone();
-    let client_id_for_task = cid;
     let inputs_for_task = inputs_str.clone();
+    let protocol_config = HbClientProtocolConfig {
+        n,
+        t,
+        input_len,
+        instance_id,
+        client_index,
+        local_position,
+    };
     let process_handle = tokio::spawn(async move {
         run_hb_client_for_curve(
             curve_config,
-            client_id_for_task,
-            n,
-            t,
+            protocol_config,
             &inputs_for_task,
-            input_len,
-            instance_id,
-            client_index,
-            local_position,
             network_for_process,
             msg_rx,
         )
@@ -1055,8 +1107,7 @@ async fn run_as_client(
 }
 
 #[cfg(feature = "honeybadger")]
-async fn setup_hb_party_for_curve<F, G>(
-    vm: &mut VirtualMachine,
+struct HbPartySetup<'a> {
     net: Arc<QuicNetworkManager>,
     my_id: usize,
     persistent_party_id: usize,
@@ -1065,12 +1116,30 @@ async fn setup_hb_party_for_curve<F, G>(
     instance_id: u64,
     expected_client_count: Option<usize>,
     program_hash: [u8; 32],
-    preproc_store_path: Option<&str>,
+    preproc_store_path: Option<&'a str>,
+}
+
+#[cfg(feature = "honeybadger")]
+async fn setup_hb_party_for_curve<F, G>(
+    vm: &mut VirtualMachine,
+    setup: HbPartySetup<'_>,
 ) -> Result<Arc<HoneyBadgerMpcEngine<F, G>>, String>
 where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
+    let HbPartySetup {
+        net,
+        my_id,
+        persistent_party_id,
+        n,
+        t,
+        instance_id,
+        expected_client_count,
+        program_hash,
+        preproc_store_path,
+    } = setup;
+
     // ---- Phase 1: Wait for clients ----
     let mut input_ids: Vec<ClientId> = Vec::new();
 
@@ -1187,7 +1256,7 @@ where
     // Clone 2: the engine node — used for preprocessing initiation only.
     // Created via from_existing_node which wraps it in Arc<Mutex>.
     let open_message_router = Arc::new(stoffel_vm::net::OpenMessageRouter::new());
-    let engine = HoneyBadgerMpcEngine::<F, G>::from_existing_node_with_router(
+    let engine = HoneyBadgerMpcEngine::<F, G>::try_from_existing_node_with_router(
         open_message_router.clone(),
         instance_id,
         my_id,
@@ -1195,7 +1264,8 @@ where
         t,
         net.clone(),
         mpc_node, // moved, not cloned
-    );
+    )
+    .map_err(|error| format!("Invalid HoneyBadger MPC topology: {error}"))?;
 
     configure_hb_preproc_store(
         &engine,
@@ -1231,7 +1301,7 @@ where
             tokio::select! {
                 Some((sender_id, raw_msg)) = server_rx.recv() => {
                     msg_count += 1;
-                    if msg_count <= 5 || msg_count % 1000 == 0 {
+                    if msg_count <= 5 || msg_count.is_multiple_of(1000) {
                         eprintln!(
                             "[party {}] Processing message #{} from sender {} ({} bytes)",
                             process_party_id, msg_count, sender_id, raw_msg.len()
@@ -1288,7 +1358,7 @@ where
         // Create a server-side network adapter that remaps sequential client
         // indices to transport-derived client IDs for send_to_client().
         let server_adapter = Arc::new(ServerClientAdapter {
-            inner: net.clone(),
+            inner: (*net).clone(),
             client_id_map: client_index_map.iter().map(|(_, tid)| *tid).collect(),
         });
 
@@ -1364,9 +1434,7 @@ where
                 .find(|(i, _)| *i == idx)
                 .map(|(_, tid)| *tid)
                 .unwrap_or(idx);
-            vm.state
-                .client_store()
-                .store_client_input(transport_cid, shares);
+            vm.try_store_client_input(transport_cid, shares)?;
             eprintln!(
                 "[party {}] Stored inputs for client {} (index {})",
                 my_id, transport_cid, idx
@@ -1585,19 +1653,13 @@ where
     let pk_map = Arc::new(pk_map);
 
     // ---- Phase 3: Create engine directly with existing network ----
-    use stoffel_vm::net::avss_engine::AvssMpcEngine;
-    let engine = AvssMpcEngine::<F, G>::new(
-        instance_id,
-        my_id,
-        n,
-        t,
-        net.clone(),
-        sk_i,
-        pk_map,
-        mpc_input_ids,
-    )
-    .await
-    .map_err(|e| format!("Failed to create AVSS engine: {}", e))?;
+    use stoffel_vm::net::avss_engine::{AvssEngineConfig, AvssMpcEngine};
+    let session = stoffel_vm::net::MpcSessionConfig::try_new(instance_id, my_id, n, t, net.clone())
+        .map_err(|error| format!("Invalid AVSS MPC topology: {error}"))?
+        .with_input_ids(mpc_input_ids);
+    let engine = AvssMpcEngine::<F, G>::from_config(AvssEngineConfig::new(session, sk_i, pk_map))
+        .await
+        .map_err(|e| format!("Failed to create AVSS engine: {}", e))?;
 
     engine
         .start_async()
@@ -1621,42 +1683,37 @@ where
         let net_clone = net.clone();
         let authenticated_sender_id = conn.remote_party_id().unwrap_or(peer_id);
         tokio::spawn(async move {
-            loop {
-                match conn.receive().await {
-                    Ok(data) => {
-                        if let Ok(true) = open_message_router
-                            .try_handle_wire_message(authenticated_sender_id, &data)
-                        {
-                            continue;
-                        }
-                        if let Ok(true) = open_message_router
-                            .try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data)
-                        {
-                            continue;
-                        }
-                        if let Ok(true) = open_message_router
-                            .try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data)
-                        {
-                            continue;
-                        }
-                        if let Err(e) = engine
-                            .process_wrapped_message_with_network(
-                                authenticated_sender_id,
-                                &data,
-                                net_clone.clone(),
-                            )
-                            .await
-                        {
-                            let _ = tx.send((authenticated_sender_id, data)).await;
-                            if !e.contains("deserialize") && !e.contains("process failed") {
-                                eprintln!(
-                                    "[AVSS] Party failed to process message from {}: {}",
-                                    authenticated_sender_id, e
-                                );
-                            }
-                        }
+            while let Ok(data) = conn.receive().await {
+                if let Ok(true) =
+                    open_message_router.try_handle_wire_message(authenticated_sender_id, &data)
+                {
+                    continue;
+                }
+                if let Ok(true) = open_message_router
+                    .try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data)
+                {
+                    continue;
+                }
+                if let Ok(true) = open_message_router
+                    .try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data)
+                {
+                    continue;
+                }
+                if let Err(e) = engine
+                    .process_wrapped_message_with_network(
+                        authenticated_sender_id,
+                        &data,
+                        net_clone.clone(),
+                    )
+                    .await
+                {
+                    let _ = tx.send((authenticated_sender_id, data)).await;
+                    if !e.contains("deserialize") && !e.contains("process failed") {
+                        eprintln!(
+                            "[AVSS] Party failed to process message from {}: {}",
+                            authenticated_sender_id, e
+                        );
                     }
-                    Err(_) => break,
                 }
             }
         });
@@ -1673,14 +1730,9 @@ where
                 }
                 let txx = client_tx.clone();
                 tokio::spawn(async move {
-                    loop {
-                        match conn.receive().await {
-                            Ok(data) => {
-                                if txx.send((cid, data)).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
+                    while let Ok(data) = conn.receive().await {
+                        if txx.send((cid, data)).await.is_err() {
+                            break;
                         }
                     }
                 });
@@ -1715,7 +1767,7 @@ where
                 {
                     eprintln!(
                         "[party {}] Failed to process client message from {} (idx {}): {:?}",
-                        processing_engine.party_id(),
+                        processing_engine.party().id(),
                         client_id,
                         mpc_sender_id,
                         e
@@ -1740,7 +1792,7 @@ where
             .collect();
 
         let server_adapter = Arc::new(ServerClientAdapter {
-            inner: net.clone(),
+            inner: (*net).clone(),
             client_id_map: client_index_map.iter().map(|(_, tid)| *tid).collect(),
         });
 
@@ -1810,9 +1862,7 @@ where
                 .find(|(i, _)| *i == idx)
                 .map(|(_, tid)| *tid)
                 .unwrap_or(idx);
-            vm.state
-                .client_store()
-                .store_client_input_feldman(transport_cid, shares);
+            vm.try_store_client_input_feldman(transport_cid, shares)?;
             eprintln!(
                 "[party {}] Stored inputs for client {} (index {})",
                 my_id, transport_cid, idx
@@ -1820,7 +1870,7 @@ where
         }
     }
 
-    vm.state.set_mpc_engine(engine);
+    vm.set_mpc_engine(engine);
     Ok(())
 }
 
@@ -1834,7 +1884,6 @@ async fn main() {
         print_usage_and_exit();
     }
 
-    let path_opt: Option<String>;
     let mut entry: String = "main".to_string();
 
     let mut trace_instr = false;
@@ -1863,8 +1912,8 @@ async fn main() {
     let mut expected_clients: Vec<String> = Vec::new();
     let mut eth_node_addr: Option<String> = None;
     let mut wallet_sk_str: Option<String> = None;
-    let mut contract_addr: Option<Address> = None;
-    let mut node_ids: Vec<Address> = Vec::new();
+    let mut contract_addr: Option<String> = None;
+    let mut node_ids: Vec<String> = Vec::new();
     let mut coordinator_client_index: Option<u64> = None;
     let mut preproc_store_path: Option<String> = None;
 
@@ -2037,16 +2086,12 @@ async fn main() {
             }
             "--on-chain-coord" => {
                 if let Some(v) = args_iter.next() {
-                    contract_addr =
-                        Some(Address::from_str(&v).expect("invalid smart contract address"));
+                    contract_addr = Some(v);
                 }
             }
             "--node-ids" => {
                 if let Some(v) = args_iter.next() {
-                    node_ids = v
-                        .split(',')
-                        .map(|s| Address::from_str(s.trim()).expect("invalid node address"))
-                        .collect();
+                    node_ids = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
             "--eth-node" => {
@@ -2093,6 +2138,23 @@ async fn main() {
         }
     }
 
+    #[cfg(not(feature = "honeybadger"))]
+    let _ = (
+        &client_inputs,
+        &server_addrs,
+        &rpc_addr,
+        &key_der,
+        &cert_der,
+        &timestamp,
+        &expected_clients,
+        &contract_addr,
+        &eth_node_addr,
+        &wallet_sk_str,
+        &node_ids,
+        &coordinator_client_index,
+        &preproc_store_path,
+    );
+
     // Bootnode-only mode (no program execution)
     if as_bootnode && !as_leader {
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:9000".parse().unwrap());
@@ -2113,151 +2175,183 @@ async fn main() {
     if as_client {
         // Coordinator-based client mode
         if contract_addr.is_some() || coord_addr.is_some() {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("install rustls crypto");
+            #[cfg(not(feature = "honeybadger"))]
+            {
+                eprintln!("Error: coordinator client mode requires the 'honeybadger' feature");
+                exit(2);
+            }
 
-            let t = threshold.unwrap_or(1);
-            let input_str = client_inputs.expect("--inputs required in client mode");
-            let input_values: Vec<i64> = input_str
-                .split(',')
-                .map(|s| s.trim().parse().expect("invalid input value"))
-                .collect();
-            if input_values.len() != 1 {
-                eprintln!(
+            #[cfg(feature = "honeybadger")]
+            {
+                rustls::crypto::ring::default_provider()
+                    .install_default()
+                    .expect("install rustls crypto");
+
+                let t = threshold.unwrap_or(1);
+                let input_str = client_inputs.expect("--inputs required in client mode");
+                let input_values: Vec<i64> = input_str
+                    .split(',')
+                    .map(|s| s.trim().parse().expect("invalid input value"))
+                    .collect();
+                if input_values.len() != 1 {
+                    eprintln!(
                     "Error: coordinator client mode currently supports exactly one input value; got {}",
                     input_values.len()
                 );
-                exit(2);
-            }
-            let reserved_index = coordinator_client_index.unwrap_or_else(|| {
+                    exit(2);
+                }
+                let reserved_index = coordinator_client_index.unwrap_or_else(|| {
                 eprintln!(
                     "Error: coordinator client mode requires --client-index to claim a reserved input slot"
                 );
                 exit(2);
             });
 
-            if let Some(contract) = contract_addr {
-                // On-chain client mode
-                let eth_addr = eth_node_addr
-                    .as_ref()
-                    .expect("--eth-node required for on-chain client mode");
-                let wallet = wallet_sk_str
-                    .as_ref()
-                    .expect("--wallet-sk required for on-chain client mode");
-                let provider = on_chain::ws_connect(eth_addr, wallet).await;
-                let mut coord =
-                    on_chain::setup_coord(provider, contract, t as u64, 1, key_der.clone()).await;
-                let signer = PrivateKeySigner::from_str(wallet).unwrap();
-                let client_addr = signer.address();
+                if let Some(ref contract) = contract_addr {
+                    // On-chain client mode
+                    let cert = cert_der.clone().expect("--cert required in client mode");
+                    let key = key_der.clone().expect("--key required in client mode");
+                    let eth_node = eth_node_addr
+                        .as_deref()
+                        .expect("--eth-node required in on-chain client mode");
+                    let wallet_sk = wallet_sk_str
+                        .as_deref()
+                        .expect("--wallet-sk required in on-chain client mode");
+                    let signer =
+                        PrivateKeySigner::from_str(wallet_sk).expect("Invalid --wallet-sk");
+                    let client_addr = signer.address();
+                    let eth = on_chain::ws_connect(eth_node, wallet_sk).await;
+                    let contract_addr =
+                        Address::from_str(contract).expect("Invalid --on-chain-coord address");
+                    let mut coord = on_chain::setup_coord::<
+                        _,
+                        HbCoordinatorField,
+                        HbCoordinatorShare,
+                    >(
+                        eth, contract_addr, t as u64, 1, Some(key.clone())
+                    )
+                    .await;
 
-                coord.wait_for_pp().await.unwrap();
-                coord.wait_for_input_mask_init().await.unwrap();
-                coord.reserve_mask_index(reserved_index).await.unwrap();
-                eprintln!(
-                    "[on-chain client] obtained reserved index {}",
-                    reserved_index
-                );
+                    coord.wait_for_round(Round::Preprocessing).await.unwrap();
+                    coord
+                        .wait_for_round(Round::InputMaskReservation)
+                        .await
+                        .unwrap();
+                    coord.reserve_mask_index(reserved_index).await.unwrap();
 
-                let base_nonce = coord.base_nonce().await;
-                let sig = on_chain::generate_client_sig(base_nonce, reserved_index, signer).await;
-
-                let rpc_addrs: Vec<(String, u16)> = server_addrs
-                    .iter()
-                    .map(|a| (a.ip().to_string(), a.port()))
-                    .collect();
-                let node_rpc_client = on_chain::node_rpc::NodeRPCClient::start_rpc_client(
-                    t,
-                    rpc_addrs,
-                    cert_der.unwrap(),
-                    key_der.unwrap(),
-                )
-                .await;
-                let mask = node_rpc_client
-                    .receive_mask(sig.as_bytes().to_vec(), client_addr)
+                    let sig = on_chain::generate_client_sig(
+                        coord.base_nonce().await,
+                        reserved_index,
+                        signer,
+                    )
                     .await
                     .unwrap();
 
-                coord.wait_for_input().await.unwrap();
-                let masked = mask + ark_bls12_381::Fr::from(input_values[0] as u64);
-                coord
-                    .send_masked_input(masked, reserved_index)
-                    .await
-                    .unwrap();
+                    let rpc_addrs: Vec<(String, u16)> = server_addrs
+                        .iter()
+                        .map(|a| (a.ip().to_string(), a.port()))
+                        .collect();
+                    let node_rpc_client =
+                        HbOnChainNodeRpcClient::start_rpc_client(t, rpc_addrs, cert, key).await;
+                    let mask = node_rpc_client
+                        .receive_mask(sig.as_bytes().to_vec(), client_addr)
+                        .await
+                        .unwrap();
 
-                coord.wait_for_mpc().await.unwrap();
-                coord.wait_for_outputs().await.unwrap();
-                let outputs = coord.obtain_outputs().await.unwrap();
-                println!("outputs: {}", format_coordinator_outputs(&outputs));
-                return;
-            } else {
-                // Off-chain client mode
-                let cert = cert_der.clone().expect("--cert required in client mode");
-                let key = key_der.clone().expect("--key required in client mode");
+                    coord.wait_for_round(Round::InputCollection).await.unwrap();
+                    let masked = mask + ark_bls12_381::Fr::from(input_values[0] as u64);
+                    coord
+                        .send_masked_input(masked, reserved_index)
+                        .await
+                        .unwrap();
 
-                let ca = coord_addr.as_ref().unwrap();
-                let mut coord: OffChainCoordinator<ark_bls12_381::Fr> =
-                    OffChainCoordinator::start_rpc_client(
+                    coord.wait_for_round(Round::MPCExecution).await.unwrap();
+                    coord
+                        .wait_for_round(Round::OutputDistribution)
+                        .await
+                        .unwrap();
+                    let outputs = coord.obtain_outputs().await.unwrap();
+                    println!("outputs: {}", format_coordinator_outputs(&outputs));
+                    return;
+                } else {
+                    // Off-chain client mode
+                    let cert = cert_der.clone().expect("--cert required in client mode");
+                    let key = key_der.clone().expect("--key required in client mode");
+
+                    let ca = coord_addr.as_ref().unwrap();
+                    let mut coord: HbOffChainCoordinator = HbOffChainCoordinator::start_rpc_client(
                         &ca.0,
                         ca.1,
                         timestamp.expect("--timestamp required in client mode"),
                         t as u64,
                         1,
-                        cert,
-                        key,
+                        cert.clone(),
+                        key.clone(),
                     )
-                    .await;
-
-                coord.wait_for_pp().await.unwrap();
-                coord.wait_for_input_mask_init().await.unwrap();
-                coord.reserve_mask_index(reserved_index).await.unwrap();
-
-                let rpc_addrs: Vec<(String, u16)> = server_addrs
-                    .iter()
-                    .map(|a| (a.ip().to_string(), a.port()))
-                    .collect();
-                let node_rpc_client: NodeRPCClient<ark_bls12_381::Fr> =
-                    NodeRPCClient::start_rpc_client(
-                        t,
-                        rpc_addrs,
-                        cert_der.unwrap(),
-                        key_der.unwrap(),
-                    )
-                    .await;
-                let mask = node_rpc_client.receive_mask().await.unwrap();
-
-                coord.wait_for_input().await.unwrap();
-                let masked = mask + ark_bls12_381::Fr::from(input_values[0] as u64);
-                coord
-                    .send_masked_input(masked, reserved_index)
                     .await
-                    .unwrap();
+                    .unwrap_or_else(|error| {
+                        eprintln!("Failed to connect to off-chain coordinator: {error}");
+                        exit(13);
+                    });
 
-                coord.wait_for_mpc().await.unwrap();
-                coord.wait_for_outputs().await.unwrap();
-                let outputs = coord.obtain_outputs().await.unwrap();
-                println!("outputs: {}", format_coordinator_outputs(&outputs));
-                return;
+                    coord.wait_for_round(Round::Preprocessing).await.unwrap();
+                    coord
+                        .wait_for_round(Round::InputMaskReservation)
+                        .await
+                        .unwrap();
+                    coord.reserve_mask_index(reserved_index).await.unwrap();
+
+                    let rpc_addrs: Vec<(String, u16)> = server_addrs
+                        .iter()
+                        .map(|a| (a.ip().to_string(), a.port()))
+                        .collect();
+                    let node_rpc_client: HbOffChainNodeRpcClient =
+                        HbOffChainNodeRpcClient::start_rpc_client(t, rpc_addrs, cert, key)
+                            .await
+                            .unwrap_or_else(|error| {
+                                eprintln!("Failed to connect to node RPC servers: {error}");
+                                exit(13);
+                            });
+                    let mask = node_rpc_client.receive_mask().await.unwrap();
+
+                    coord.wait_for_round(Round::InputCollection).await.unwrap();
+                    let masked = mask + ark_bls12_381::Fr::from(input_values[0] as u64);
+                    coord
+                        .send_masked_input(masked, reserved_index)
+                        .await
+                        .unwrap();
+
+                    coord.wait_for_round(Round::MPCExecution).await.unwrap();
+                    coord
+                        .wait_for_round(Round::OutputDistribution)
+                        .await
+                        .unwrap();
+                    let outputs = coord.obtain_outputs().await.unwrap();
+                    println!("outputs: {}", format_coordinator_outputs(&outputs));
+                    return;
+                }
             }
         }
 
         // Direct client mode (no coordinator)
         #[cfg(feature = "honeybadger")]
-        run_as_client(
-            n_parties,
-            threshold,
-            mpc_backend.as_deref(),
-            mpc_curve.as_deref(),
-            client_inputs,
-            server_addrs,
-        )
-        .await;
+        {
+            run_as_client(
+                n_parties,
+                threshold,
+                mpc_backend.as_deref(),
+                mpc_curve.as_deref(),
+                client_inputs,
+                server_addrs,
+            )
+            .await;
+            return;
+        }
         #[cfg(not(feature = "honeybadger"))]
         {
             eprintln!("Error: client mode requires the 'honeybadger' feature");
             exit(2);
         }
-        return;
     }
 
     // Resolve MPC backend kind
@@ -2291,14 +2385,12 @@ async fn main() {
     }
 
     // Validate incompatible flag combinations
-    if !backend_kind.supports_client_input() {
-        if as_client {
-            eprintln!(
-                "Error: {} backend does not support client mode",
-                backend_kind.name()
-            );
-            exit(2);
-        }
+    if !backend_kind.supports_client_input() && as_client {
+        eprintln!(
+            "Error: {} backend does not support client mode",
+            backend_kind.name()
+        );
+        exit(2);
     }
 
     if expected_client_count.is_some() && !backend_kind.supports_client_input() {
@@ -2309,7 +2401,7 @@ async fn main() {
         exit(2);
     }
 
-    path_opt = if !positional.is_empty() {
+    let path_opt = if !positional.is_empty() {
         Some(positional.remove(0))
     } else {
         None
@@ -2389,17 +2481,19 @@ async fn main() {
 
         // Register with our own bootnode and wait for session
         // Leader uploads program bytes so other parties can fetch them
-        let session_info = match register_and_wait_for_session_with_program(
+        let session_info = match register_and_wait_for_session(
             &mut mgr,
-            bind, // bootnode is on our bind address
-            my_id,
-            party_bind,
-            program_id,
-            &entry,
-            n,
-            t,
-            Duration::from_secs(120), // 2 minute timeout for all parties to join
-            Some(bytes),              // Leader uploads program bytes
+            SessionRegistrationConfig {
+                bootnode: bind, // bootnode is on our bind address
+                my_party_id: my_id,
+                my_listen: party_bind,
+                program_id,
+                entry: entry.clone(),
+                n_parties: n,
+                threshold: t,
+                timeout: Duration::from_secs(120), // 2 minute timeout for all parties to join
+                program_bytes: Some(bytes),        // Leader uploads program bytes
+            },
         )
         .await
         {
@@ -2470,17 +2564,19 @@ async fn main() {
         // Register with bootnode and wait for session to be announced
         // This blocks until all n parties have registered
         // Upload program bytes so bootnode can distribute to parties that don't have it
-        let session_info = match register_and_wait_for_session_with_program(
+        let session_info = match register_and_wait_for_session(
             &mut mgr,
-            bootnode,
-            my_id,
-            actual_listen,
-            program_id,
-            &entry,
-            n,
-            t,
-            Duration::from_secs(120), // 2 minute timeout for all parties to join
-            Some(bytes),              // Upload program bytes
+            SessionRegistrationConfig {
+                bootnode,
+                my_party_id: my_id,
+                my_listen: actual_listen,
+                program_id,
+                entry: entry.clone(),
+                n_parties: n,
+                threshold: t,
+                timeout: Duration::from_secs(120), // 2 minute timeout for all parties to join
+                program_bytes: Some(bytes),        // Upload program bytes
+            },
         )
         .await
         {
@@ -2529,7 +2625,13 @@ async fn main() {
     };
     let mut f = File::open(&load_path).expect("open binary file");
     let binary = CompiledBinary::deserialize(&mut f).expect("deserialize compiled binary");
-    let functions = binary.to_vm_functions();
+    let functions = match binary.try_to_vm_functions() {
+        Ok(functions) => functions,
+        Err(err) => {
+            eprintln!("Error: invalid compiled program: {:?}", err);
+            exit(3);
+        }
+    };
     if functions.is_empty() {
         eprintln!("Error: compiled program contains no functions");
         exit(3);
@@ -2537,12 +2639,13 @@ async fn main() {
 
     // Initialize VM
     let mut vm = VirtualMachine::new();
-    // Register standard library in case the program uses builtins like `print`
-    vm.register_standard_library();
 
     // Register all functions
     for f in functions {
-        vm.register_function(f);
+        if let Err(err) = vm.try_register_function(f) {
+            eprintln!("Error: invalid VM function: {}", err);
+            exit(3);
+        }
     }
 
     // Register debugging hooks based on flags
@@ -2602,11 +2705,14 @@ async fn main() {
                     let fn_name = ctx
                         .get_function_name()
                         .unwrap_or_else(|| "<unknown>".to_string());
+                    let bank = if idx.is_secret() { "secret" } else { "clear" };
                     eprintln!(
-                        "[regs][depth {}][{}] R{} -> {:?}",
+                        "[regs][depth {}][{}] R{} ({}[{}]) -> {:?}",
                         ctx.get_call_depth(),
                         fn_name,
-                        idx,
+                        idx.index(),
+                        bank,
+                        idx.bank_index(),
                         val
                     );
                     Ok(())
@@ -2615,11 +2721,14 @@ async fn main() {
                     let fn_name = ctx
                         .get_function_name()
                         .unwrap_or_else(|| "<unknown>".to_string());
+                    let bank = if idx.is_secret() { "secret" } else { "clear" };
                     eprintln!(
-                        "[regs][depth {}][{}] R{}: {:?} -> {:?}",
+                        "[regs][depth {}][{}] R{} ({}[{}]): {:?} -> {:?}",
                         ctx.get_call_depth(),
                         fn_name,
-                        idx,
+                        idx.index(),
+                        bank,
+                        idx.bank_index(),
                         old,
                         new
                     );
@@ -2645,7 +2754,7 @@ async fn main() {
             |event, ctx: &HookContext| match event {
                 HookEvent::BeforeFunctionCall(func, args) => {
                     eprintln!(
-                        "[stack][depth {}] CALL {:?} with {:?}",
+                        "[stack][depth {}] CALL {} with {:?}",
                         ctx.get_call_depth(),
                         func,
                         args
@@ -2654,7 +2763,7 @@ async fn main() {
                 }
                 HookEvent::AfterFunctionCall(func, ret) => {
                     eprintln!(
-                        "[stack][depth {}] RET  {:?} => {:?}",
+                        "[stack][depth {}] RET  {} => {:?}",
                         ctx.get_call_depth(),
                         func,
                         ret
@@ -2692,259 +2801,73 @@ async fn main() {
     }
 
     // =====================================================================
-    // ON-CHAIN COORDINATOR: Self-contained flow
+    // COORDINATOR (or no coordinator)
     // =====================================================================
-    if contract_addr.is_some() {
-        if let Some(net) = net_opt.clone() {
-            let my_id = net.local_party_id();
-            let n = session_n_parties.unwrap_or_else(|| net.parties().len());
-            let t = session_threshold.unwrap_or(1);
-            let instance_id =
-                session_instance_id.expect("session instance_id should be set in party mode");
 
-            let contract = contract_addr.unwrap();
-            let eth_addr = eth_node_addr
-                .as_ref()
-                .expect("--eth-node required for on-chain coordinator");
-            let wallet = wallet_sk_str
-                .as_ref()
-                .expect("--wallet-sk required for on-chain coordinator");
-            let provider = on_chain::ws_connect(eth_addr, wallet).await;
-            let mut coord_instance =
-                on_chain::setup_coord(provider, contract, t as u64, 1, None).await;
-            let coord_for_rpc = coord_instance.coord();
+    // Coordinator initialization (both leader and party modes)
+    #[cfg(feature = "honeybadger")]
+    let mut coord_opt: Option<HbOffChainCoordinator> = None;
+    #[cfg(feature = "honeybadger")]
+    let mut node_rpc_opt: Option<HbOffChainNodeRpcServer> = None;
+    #[cfg(feature = "honeybadger")]
+    let mut input_ids: Vec<Vec<u8>> = Vec::new();
+    #[cfg(feature = "honeybadger")]
+    let mut on_chain_input_ids: Vec<Address> = Vec::new();
+    #[cfg(feature = "honeybadger")]
+    let mut on_chain_output_clients: Vec<(Vec<u8>, Address)> = Vec::new();
 
-            // Grant roles (leader only)
-            if as_leader {
-                coord_instance.grant_roles(node_ids.clone()).await.unwrap();
-            }
+    #[cfg(not(feature = "honeybadger"))]
+    if coord_addr.is_some() || contract_addr.is_some() {
+        eprintln!("Error: coordinator mode requires the 'honeybadger' feature");
+        exit(2);
+    }
 
-            // Parse expected client addresses (on-chain uses Ethereum addresses)
-            let input_addrs: Vec<Address> = expected_clients
-                .iter()
-                .map(|s| Address::from_str(s).expect("invalid client Ethereum address"))
-                .collect();
+    #[cfg(feature = "honeybadger")]
+    let mut on_chain_coord_opt = if let Some(ref contract) = contract_addr {
+        let eth_node = eth_node_addr
+            .as_deref()
+            .expect("--eth-node required in on-chain coordinator mode");
+        let wallet_sk = wallet_sk_str
+            .as_deref()
+            .expect("--wallet-sk required in on-chain coordinator mode");
+        let eth = on_chain::ws_connect(eth_node, wallet_sk).await;
+        let contract = Address::from_str(contract).expect("Invalid --on-chain-coord address");
+        on_chain_input_ids = parse_on_chain_client_addresses(&node_ids, &expected_clients);
+        Some(
+            on_chain::setup_coord::<_, HbCoordinatorField, HbCoordinatorShare>(
+                eth,
+                contract,
+                session_threshold.unwrap_or(1) as u64,
+                1,
+                None,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
-            // Setup NodeRPC server
-            let rpc = rpc_addr
-                .as_ref()
-                .expect("--rpc-bind required with on-chain coordinator");
-            let mut node_rpc = on_chain::node_rpc::NodeRPCServer::start(
+    #[cfg(feature = "honeybadger")]
+    let mut on_chain_node_rpc_opt = if let (Some(ref rpc), Some(ref coord)) =
+        (rpc_addr.as_ref(), on_chain_coord_opt.as_ref())
+    {
+        Some(
+            on_chain::node_rpc::NodeRPCServer::start(
                 &rpc.0,
                 rpc.1,
-                coord_for_rpc,
+                coord.coord(),
                 cert_der.clone().expect("--cert required"),
                 key_der.clone().expect("--key required"),
             )
-            .await;
+            .await,
+        )
+    } else {
+        None
+    };
 
-            // Coordinator preprocessing trigger
-            if as_leader {
-                coord_instance.trigger_pp().await.unwrap();
-            }
-            coord_instance.wait_for_pp().await.unwrap();
-
-            // Setup HB engine (BLS12-381 only for on-chain coordinator)
-            let engine =
-                match setup_hb_party_for_curve::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>(
-                    &mut vm,
-                    net.clone(),
-                    my_id,
-                    party_id.unwrap_or(0usize),
-                    n,
-                    t,
-                    instance_id,
-                    None, // coordinator handles clients
-                    program_id,
-                    preproc_store_path.as_deref(),
-                )
-                .await
-                {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("[party {}] HoneyBadger setup failed: {}", my_id, e);
-                        exit(13);
-                    }
-                };
-
-            // Mask distribution
-            if !input_addrs.is_empty() {
-                let precomputed_mask_shares = if preproc_store_path.is_some() {
-                    None
-                } else {
-                    Some(
-                        engine
-                            .node_handle()
-                            .lock()
-                            .await
-                            .preprocessing_material
-                            .lock()
-                            .await
-                            .take_random_shares(input_addrs.len())
-                            .unwrap_or_else(|e| {
-                                eprintln!("take_random_shares: {}", e);
-                                exit(13);
-                            }),
-                    )
-                };
-
-                if let Some(ref mask_shares) = precomputed_mask_shares {
-                    for (i, share) in mask_shares.iter().enumerate() {
-                        node_rpc
-                            .add_mask_share(i as u64, share.clone())
-                            .await
-                            .unwrap_or_else(|e| {
-                                eprintln!("add_mask_share: {:?}", e);
-                                exit(13);
-                            });
-                    }
-                }
-
-                if as_leader {
-                    coord_instance.init_input_masks().await.unwrap();
-                }
-                coord_instance.wait_for_input_mask_init().await.unwrap();
-
-                let client_to_index = coord_instance
-                    .wait_for_indices(input_addrs.len() as u64)
-                    .await
-                    .unwrap();
-
-                let mask_shares = if let Some(mask_shares) = precomputed_mask_shares {
-                    mask_shares
-                } else {
-                    let mask_shares = load_reserved_mask_shares(
-                        &engine,
-                        input_addrs.len(),
-                        client_to_index.values().copied(),
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("load_reserved_mask_shares: {}", e);
-                        exit(13);
-                    });
-
-                    for idx in client_to_index.values().copied() {
-                        node_rpc
-                            .add_mask_share(idx, mask_shares[idx as usize].clone())
-                            .await
-                            .unwrap_or_else(|e| {
-                                eprintln!("add_mask_share: {:?}", e);
-                                exit(13);
-                            });
-                    }
-
-                    mask_shares
-                };
-
-                for (addr, idx) in &client_to_index {
-                    node_rpc
-                        .add_reserved_index(*addr, *idx)
-                        .await
-                        .unwrap_or_else(|e| {
-                            eprintln!("add_reserved_index: {:?}", e);
-                            exit(13);
-                        });
-                }
-
-                // On-chain client auth
-                for addr in &input_addrs {
-                    if coord_instance.wait_for_client_auth(*addr).await.unwrap() {
-                        node_rpc.add_auth_status(*addr).await.unwrap_or_else(|e| {
-                            eprintln!("add_auth_status: {:?}", e);
-                            exit(13);
-                        });
-                        eprintln!("[party {}] client {:?} authenticated", my_id, addr);
-                    } else {
-                        eprintln!("[party {}] client {:?} auth failed", my_id, addr);
-                        exit(13);
-                    }
-                }
-
-                if as_leader {
-                    coord_instance.trigger_input().await.unwrap();
-                }
-                coord_instance.wait_for_input().await.unwrap();
-
-                let client_inputs = coord_instance
-                    .wait_for_inputs(input_addrs.len() as u64, mask_shares)
-                    .await
-                    .unwrap();
-                store_reserved_client_inputs(&mut vm, &client_to_index, client_inputs);
-            }
-
-            vm.state.set_mpc_engine(engine);
-
-            // MPC execution phase
-            if as_leader {
-                coord_instance.trigger_mpc().await.unwrap();
-            }
-            coord_instance.wait_for_mpc().await.unwrap();
-
-            eprintln!("Starting VM execution of '{}'...", agreed_entry);
-
-            // Execute entry function
-            match vm.execute(&agreed_entry) {
-                Ok(result) => {
-                    let output_share = match &result {
-                        Value::Share(_ty, share_data) => share_data.as_bytes().to_vec(),
-                        _ => {
-                            println!("Program returned: {:?}", result);
-                            vec![]
-                        }
-                    };
-
-                    if !output_share.is_empty() {
-                        if as_leader {
-                            coord_instance.trigger_outputs().await.unwrap();
-                        }
-                        coord_instance.wait_for_outputs().await.unwrap();
-
-                        let ids_and_addrs = node_rpc.ids_and_addrs().await;
-                        for client_addr in input_addrs.iter() {
-                            let id = &ids_and_addrs
-                                .iter()
-                                .find(|(_, addr)| addr == client_addr)
-                                .expect("client address not found in node RPC")
-                                .0;
-                            let share: RobustShare<ark_bls12_381::Fr> =
-                                ark_serialize::CanonicalDeserialize::deserialize_compressed(
-                                    output_share.as_slice(),
-                                )
-                                .expect("deserialize output share");
-                            coord_instance
-                                .send_output_shares(*client_addr, id.clone(), vec![share])
-                                .await
-                                .unwrap();
-                        }
-                        if as_leader {
-                            coord_instance.finalize().await.unwrap();
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("Execution error in '{}': {}", agreed_entry, err);
-                    exit(4);
-                }
-            }
-            return;
-        } else {
-            eprintln!("Error: on-chain coordinator requires party mode (--leader or --bootstrap)");
-            exit(2);
-        }
-    }
-
-    // =====================================================================
-    // OFF-CHAIN COORDINATOR (or no coordinator): existing flow
-    // =====================================================================
-
-    // Off-chain coordinator initialization (both leader and party modes)
-    let mut coord_opt: Option<OffChainCoordinator<ark_bls12_381::Fr>> = None;
-    let mut node_rpc_opt: Option<NodeRPCServer<ark_bls12_381::Fr>> = None;
-    let mut input_ids: Vec<Vec<u8>> = Vec::new();
-
+    #[cfg(feature = "honeybadger")]
     if let Some(ref ca) = coord_addr {
-        let coord = OffChainCoordinator::start_rpc_client(
+        let coord = HbOffChainCoordinator::start_rpc_client(
             &ca.0,
             ca.1,
             timestamp.expect("--timestamp required"),
@@ -2953,7 +2876,11 @@ async fn main() {
             cert_der.clone().expect("--cert required"),
             key_der.clone().expect("--key required"),
         )
-        .await;
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to connect to off-chain coordinator: {error}");
+            exit(13);
+        });
         coord_opt = Some(coord);
 
         input_ids = expected_clients
@@ -2962,13 +2889,17 @@ async fn main() {
             .collect();
 
         if let Some(ref rpc) = rpc_addr {
-            let node_rpc = NodeRPCServer::start(
+            let node_rpc = HbOffChainNodeRpcServer::start(
                 &rpc.0,
                 rpc.1,
                 cert_der.clone().unwrap(),
                 key_der.clone().unwrap(),
             )
-            .await;
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("Failed to start node RPC server: {error}");
+                exit(13);
+            });
             node_rpc_opt = Some(node_rpc);
         }
     }
@@ -3010,9 +2941,15 @@ async fn main() {
                 // Phase 1: Coordinator preprocessing trigger
                 if let Some(ref mut coord) = coord_opt {
                     if as_leader {
-                        coord.trigger_pp().await.unwrap();
+                        coord.start_preprocessing().await.unwrap();
                     }
-                    coord.wait_for_pp().await.unwrap();
+                    coord.wait_for_round(Round::Preprocessing).await.unwrap();
+                }
+                if let Some(ref mut coord) = on_chain_coord_opt {
+                    if as_leader {
+                        coord.start_preprocessing().await.unwrap();
+                    }
+                    coord.wait_for_round(Round::Preprocessing).await.unwrap();
                 }
 
                 // Phase 2: Create MPC engine + preprocessing + coordinator input phases
@@ -3020,15 +2957,17 @@ async fn main() {
                     ($F:ty, $G:ty) => {{
                         let engine = match setup_hb_party_for_curve::<$F, $G>(
                             &mut vm,
-                            net.clone(),
-                            my_id,
-                            party_id.unwrap_or(0usize),
-                            n,
-                            t,
-                            instance_id,
-                            expected_client_count,
-                            program_id,
-                            preproc_store_path.as_deref(),
+                            HbPartySetup {
+                                net: net.clone(),
+                                my_id,
+                                persistent_party_id: party_id.unwrap_or(0usize),
+                                n,
+                                t,
+                                instance_id,
+                                expected_client_count,
+                                program_hash: program_id,
+                                preproc_store_path: preproc_store_path.as_deref(),
+                            },
                         )
                         .await
                         {
@@ -3038,26 +2977,30 @@ async fn main() {
                                 exit(13);
                             }
                         };
-                        vm.state.set_mpc_engine(engine);
+                        vm.set_mpc_engine(engine);
                     }};
                 }
 
                 // Bls12_381 path with coordinator support
-                if coord_opt.is_some() && matches!(curve_config, MpcCurveConfig::Bls12_381) {
+                if (coord_opt.is_some() || on_chain_coord_opt.is_some())
+                    && matches!(curve_config, MpcCurveConfig::Bls12_381)
+                {
                     let engine = match setup_hb_party_for_curve::<
                         ark_bls12_381::Fr,
                         ark_bls12_381::G1Projective,
                     >(
                         &mut vm,
-                        net.clone(),
-                        my_id,
-                        party_id.unwrap_or(0usize),
-                        n,
-                        t,
-                        instance_id,
-                        None, // coordinator handles clients
-                        program_id,
-                        preproc_store_path.as_deref(),
+                        HbPartySetup {
+                            net: net.clone(),
+                            my_id,
+                            persistent_party_id: party_id.unwrap_or(0usize),
+                            n,
+                            t,
+                            instance_id,
+                            expected_client_count: None, // coordinator handles clients
+                            program_hash: program_id,
+                            preproc_store_path: preproc_store_path.as_deref(),
+                        },
                     )
                     .await
                     {
@@ -3067,6 +3010,7 @@ async fn main() {
                             exit(13);
                         }
                     };
+                    vm.set_mpc_engine(engine.clone());
 
                     // Coordinator mask distribution + input collection
                     if let Some(ref mut coord) = coord_opt {
@@ -3107,9 +3051,12 @@ async fn main() {
                             }
 
                             if as_leader {
-                                coord.init_input_masks().await.unwrap();
+                                coord.reserve_input_masks().await.unwrap();
                             }
-                            coord.wait_for_input_mask_init().await.unwrap();
+                            coord
+                                .wait_for_round(Round::InputMaskReservation)
+                                .await
+                                .unwrap();
 
                             let client_to_index = coord
                                 .wait_for_indices(input_ids.len() as u64)
@@ -3154,9 +3101,9 @@ async fn main() {
                             }
 
                             if as_leader {
-                                coord.trigger_input().await.unwrap();
+                                coord.collect_inputs().await.unwrap();
                             }
-                            coord.wait_for_input().await.unwrap();
+                            coord.wait_for_round(Round::InputCollection).await.unwrap();
 
                             let client_inputs = coord
                                 .wait_for_inputs(input_ids.len() as u64, mask_shares)
@@ -3166,7 +3113,107 @@ async fn main() {
                         }
                     }
 
-                    vm.state.set_mpc_engine(engine);
+                    if let Some(ref mut coord) = on_chain_coord_opt {
+                        let node_rpc = on_chain_node_rpc_opt
+                            .as_mut()
+                            .expect("--rpc-bind required with on-chain coordinator");
+
+                        if !on_chain_input_ids.is_empty() {
+                            let precomputed_mask_shares = if preproc_store_path.is_some() {
+                                None
+                            } else {
+                                Some(
+                                    engine
+                                        .node_handle()
+                                        .lock()
+                                        .await
+                                        .preprocessing_material
+                                        .lock()
+                                        .await
+                                        .take_random_shares(on_chain_input_ids.len())
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("take_random_shares: {}", e);
+                                            exit(13);
+                                        }),
+                                )
+                            };
+
+                            if let Some(ref mask_shares) = precomputed_mask_shares {
+                                for (i, share) in mask_shares.iter().cloned().enumerate() {
+                                    node_rpc
+                                        .add_mask_share(i as u64, share)
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("add_mask_share: {:?}", e);
+                                            exit(13);
+                                        });
+                                }
+                            }
+
+                            if as_leader {
+                                coord.reserve_input_masks().await.unwrap();
+                            }
+                            coord
+                                .wait_for_round(Round::InputMaskReservation)
+                                .await
+                                .unwrap();
+
+                            let client_to_index = coord
+                                .wait_for_indices(on_chain_input_ids.len() as u64)
+                                .await
+                                .unwrap();
+
+                            let mask_shares = if let Some(mask_shares) = precomputed_mask_shares {
+                                mask_shares
+                            } else {
+                                let mask_shares = load_reserved_mask_shares(
+                                    &engine,
+                                    on_chain_input_ids.len(),
+                                    client_to_index.values().copied(),
+                                )
+                                .await
+                                .unwrap_or_else(|e| {
+                                    eprintln!("load_reserved_mask_shares: {}", e);
+                                    exit(13);
+                                });
+
+                                for idx in client_to_index.values().copied() {
+                                    node_rpc
+                                        .add_mask_share(idx, mask_shares[idx as usize].clone())
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("add_mask_share: {:?}", e);
+                                            exit(13);
+                                        });
+                                }
+
+                                mask_shares
+                            };
+
+                            for (cid, idx) in &client_to_index {
+                                node_rpc
+                                    .add_reserved_index(*cid, *idx)
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        eprintln!("add_reserved_index: {:?}", e);
+                                        exit(13);
+                                    });
+                            }
+
+                            on_chain_output_clients = node_rpc.ids_and_addrs().await;
+
+                            if as_leader {
+                                coord.collect_inputs().await.unwrap();
+                            }
+                            coord.wait_for_round(Round::InputCollection).await.unwrap();
+
+                            let client_inputs = coord
+                                .wait_for_inputs(on_chain_input_ids.len() as u64, mask_shares)
+                                .await
+                                .unwrap();
+                            store_reserved_client_inputs(&mut vm, &client_to_index, client_inputs);
+                        }
+                    }
                 } else {
                     // No coordinator or non-Bls12_381 curves
                     match curve_config {
@@ -3238,15 +3285,29 @@ async fn main() {
                     my_id
                 );
             }
+
+            #[cfg(not(any(feature = "honeybadger", feature = "avss")))]
+            MpcBackendKind::NoBackend => {
+                eprintln!("Error: party mode requires an enabled MPC backend feature");
+                exit(2);
+            }
         }
     }
 
     // Coordinator: signal MPC execution phase
+    #[cfg(feature = "honeybadger")]
     if let Some(ref mut coord) = coord_opt {
         if as_leader {
-            coord.trigger_mpc().await.unwrap();
+            coord.start_mpc().await.unwrap();
         }
-        coord.wait_for_mpc().await.unwrap();
+        coord.wait_for_round(Round::MPCExecution).await.unwrap();
+    }
+    #[cfg(feature = "honeybadger")]
+    if let Some(ref mut coord) = on_chain_coord_opt {
+        if as_leader {
+            coord.start_mpc().await.unwrap();
+        }
+        coord.wait_for_round(Round::MPCExecution).await.unwrap();
     }
 
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
@@ -3254,94 +3315,110 @@ async fn main() {
     // Execute entry function
     match vm.execute(&agreed_entry) {
         Ok(result) => {
-            if let Some(ref mut coord) = coord_opt {
-                // Coordinator output delivery
-                let output_share = match &result {
-                    Value::Share(_ty, share_data) => share_data.as_bytes().to_vec(),
-                    _ => {
-                        println!("Program returned: {:?}", result);
-                        vec![]
-                    }
-                };
+            #[cfg(feature = "honeybadger")]
+            {
+                let mut handled_by_coordinator = false;
 
-                if !output_share.is_empty() {
-                    if as_leader {
-                        coord.trigger_outputs().await.unwrap();
-                    }
-                    coord.wait_for_outputs().await.unwrap();
-                    for cid in input_ids.iter() {
-                        let share: RobustShare<ark_bls12_381::Fr> =
-                            ark_serialize::CanonicalDeserialize::deserialize_compressed(
-                                output_share.as_slice(),
-                            )
-                            .expect("deserialize output share");
-                        if let Err(e) = coord
-                            .send_output_shares(cid.clone(), cid.clone(), vec![share])
-                            .await
-                        {
-                            eprintln!(
-                                "Warning: failed to submit output shares for client {:?}: {}",
-                                cid, e
-                            );
+                if let Some(ref mut coord) = coord_opt {
+                    handled_by_coordinator = true;
+                    // Coordinator output delivery
+                    let output_share = match &result {
+                        Value::Share(_ty, share_data) => share_data.as_bytes().to_vec(),
+                        _ => {
+                            println!("Program returned: {:?}", result);
+                            vec![]
                         }
-                    }
-                    if as_leader {
-                        if let Err(e) = coord.finalize().await {
-                            eprintln!(
-                                "Warning: failed to finalize off-chain coordinator round: {}",
-                                e
-                            );
+                    };
+
+                    if !output_share.is_empty() {
+                        if as_leader {
+                            coord.send_output().await.unwrap();
+                        }
+                        coord
+                            .wait_for_round(Round::OutputDistribution)
+                            .await
+                            .unwrap();
+                        for cid in input_ids.iter() {
+                            let share: RobustShare<ark_bls12_381::Fr> =
+                                ark_serialize::CanonicalDeserialize::deserialize_compressed(
+                                    output_share.as_slice(),
+                                )
+                                .expect("deserialize output share");
+                            if let Err(e) = coord
+                                .send_output_shares(cid.clone(), cid.clone(), vec![share])
+                                .await
+                            {
+                                eprintln!(
+                                    "Warning: failed to submit output shares for client {:?}: {}",
+                                    cid, e
+                                );
+                            }
+                        }
+                        if as_leader {
+                            if let Err(e) = coord.finalize().await {
+                                eprintln!(
+                                    "Warning: failed to finalize off-chain coordinator round: {}",
+                                    e
+                                );
+                            }
                         }
                     }
                 }
-            } else {
-                // No coordinator — auto-reveal as before
-                let result = if let Value::Share(ty, ref sd) = result {
-                    if let Some(engine) = vm.state.mpc_engine() {
-                        eprintln!("Program returned a secret share, revealing...");
-                        match engine.open_share(ty, sd.as_bytes()) {
-                            Ok(revealed) => revealed,
-                            Err(e) => {
-                                eprintln!("Failed to reveal returned share: {}", e);
-                                result
-                            }
-                        }
-                    } else {
-                        result
-                    }
-                } else {
-                    result
-                };
-                // Pretty-print the result
-                match &result {
-                    Value::Array(arr_id) => {
-                        if let Some(arr) = vm.state.object_store.get_array(*arr_id) {
-                            let len = arr.length();
-                            let mut bytes = Vec::with_capacity(len);
-                            let mut is_byte_array = true;
-                            for i in 0..len {
-                                match arr.get(&Value::I64(i as i64)) {
-                                    Some(Value::U8(b)) => bytes.push(*b),
-                                    _ => {
-                                        is_byte_array = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if is_byte_array && !bytes.is_empty() {
-                                let hex: String =
-                                    bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                                println!("Program returned: byte[{}] 0x{}", bytes.len(), hex);
-                            } else {
-                                println!("Program returned: {:?}", result);
-                            }
-                        } else {
+
+                if let Some(ref mut coord) = on_chain_coord_opt {
+                    handled_by_coordinator = true;
+                    let output_share = match &result {
+                        Value::Share(_ty, share_data) => share_data.as_bytes().to_vec(),
+                        _ => {
                             println!("Program returned: {:?}", result);
+                            vec![]
+                        }
+                    };
+
+                    if !output_share.is_empty() {
+                        if as_leader {
+                            coord.send_output().await.unwrap();
+                        }
+                        coord
+                            .wait_for_round(Round::OutputDistribution)
+                            .await
+                            .unwrap();
+
+                        for (key, client_addr) in on_chain_output_clients.iter() {
+                            let share: RobustShare<ark_bls12_381::Fr> =
+                                ark_serialize::CanonicalDeserialize::deserialize_compressed(
+                                    output_share.as_slice(),
+                                )
+                                .expect("deserialize output share");
+                            if let Err(e) = coord
+                                .send_output_shares(*client_addr, key.clone(), vec![share])
+                                .await
+                            {
+                                eprintln!(
+                                    "Warning: failed to submit output shares for client {:?}: {}",
+                                    client_addr, e
+                                );
+                            }
+                        }
+
+                        if as_leader {
+                            if let Err(e) = coord.finalize().await {
+                                eprintln!(
+                                    "Warning: failed to finalize on-chain coordinator round: {}",
+                                    e
+                                );
+                            }
                         }
                     }
-                    _ => println!("Program returned: {:?}", result),
+                }
+
+                if !handled_by_coordinator {
+                    print_vm_result(&mut vm, result);
                 }
             }
+
+            #[cfg(not(feature = "honeybadger"))]
+            print_vm_result(&mut vm, result);
         }
         Err(err) => {
             eprintln!("Execution error in '{}': {}", agreed_entry, err);
@@ -3379,10 +3456,10 @@ Flags:
   --off-chain-coord <addr:port>
                           Off-chain coordinator address
   --on-chain-coord <address>
-                          On-chain coordinator smart contract address
-  --node-ids <addrs>      Comma-separated Ethereum addresses of MPC nodes (on-chain, leader only)
-  --eth-node <url>        Ethereum node WebSocket URL (on-chain coordinator)
-  --wallet-sk <hex>       Wallet secret key hex (on-chain coordinator)
+                          On-chain coordinator contract address
+  --node-ids <addrs>      Comma-separated on-chain client addresses
+  --eth-node <url>        Ethereum WebSocket RPC endpoint for on-chain coordinator mode
+  --wallet-sk <hex>       Ethereum private key for on-chain coordinator transactions
   --rpc-bind <addr:port>  Node RPC server bind address (for mask distribution)
   --cert <path>           Path to DER-encoded X.509 certificate
   --key <path>            Path to DER-encoded private key
@@ -3390,7 +3467,7 @@ Flags:
   --client-index <u64>    Reserved coordinator input index (coordinator client mode)
   --preproc-store <path>  Persistent HoneyBadger preprocessing store directory
   --expected-clients <cert-paths-or-addrs>
-                          Comma-separated client cert paths (off-chain) or Ethereum addresses (on-chain)
+                          Comma-separated client cert paths for off-chain or addresses for on-chain mode
   -h, --help              Show this help
 
 Required environment:
@@ -3461,7 +3538,7 @@ Examples:
     exit(1);
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "honeybadger", feature = "avss")))]
 mod tests {
     use super::format_coordinator_outputs;
 

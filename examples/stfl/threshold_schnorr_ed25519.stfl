@@ -1,0 +1,22 @@
+# Threshold Schnorr signature over Ed25519.
+#
+# Result layout: R(32) || s(32) || pk(32).
+
+main main() -> bytes:
+  var secret_key = Share.random()
+  var public_key = Share.get_commitment(secret_key, 0)
+
+  var nonce = Share.random()
+  var nonce_commitment = Share.get_commitment(nonce, 0)
+
+  var message = Bytes.from_string("test message for schnorr")
+  var challenge_input = Bytes.concat(nonce_commitment, message)
+  var challenge_hash = Crypto.sha256(challenge_input)
+  var challenge = Crypto.hash_to_field(challenge_hash, "ed25519")
+
+  var scaled_secret_key = Share.mul_field(secret_key, challenge)
+  var response_share = Share.add(nonce, scaled_secret_key)
+  var response = Share.open_field(response_share)
+
+  var signature = Bytes.concat(nonce_commitment, response)
+  return Bytes.concat(signature, public_key)

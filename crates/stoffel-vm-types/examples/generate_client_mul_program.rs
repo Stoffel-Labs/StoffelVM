@@ -65,6 +65,6 @@ fn main() {
     println!("  - Takes input from client 1 (share 0)");
     println!("  - Adds them together (local secret share operation)");
     println!("  - Returns the result (share)");
-    println!("");
+    println!();
     println!("Expected result for inputs 15 and 25: 40");
 }

@@ -12,9 +12,7 @@ pub fn create_vmfunction(
     instructions: Vec<Instruction>,
     labels: HashMap<String, usize>,
 ) -> VMFunction {
-    VMFunction {
-        resolved_instructions: None,
-        constant_values: None,
+    VMFunction::new(
         name,
         parameters,
         upvalues,
@@ -22,5 +20,5 @@ pub fn create_vmfunction(
         register_count,
         instructions,
         labels,
-    }
+    )
 }

@@ -1,6 +1,6 @@
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm_types::{
-    compiled_binary::utils::{from_vm_functions, load_from_file, save_to_file, to_vm_functions},
+    compiled_binary::utils::{from_vm_functions, load_from_file, save_to_file, try_to_vm_functions},
     core_types::Value,
     functions::VMFunction,
     instructions::Instruction,
@@ -19,20 +19,20 @@ use stoffel_vm_types::{
 #[test]
 fn test_execute_program_from_stoffel_bytecode_mul_clear() {
     // Build a simple function (human-readable form)
-    let func = VMFunction {
-        name: "main".to_string(),
-        parameters: vec![],
-        upvalues: vec![],
-        parent: None,
-        register_count: 3,
-        instructions: vec![
+    let func = VMFunction::new(
+        "main".to_string(),
+        vec![],
+        vec![],
+        None,
+        3,
+        vec![
             Instruction::LDI(0, Value::I64(42)),
             Instruction::LDI(1, Value::I64(37)),
             Instruction::MUL(2, 0, 1),
             Instruction::RET(2),
         ],
-        labels: Default::default(),
-    };
+        Default::default(),
+    );
 
     // Compile to a bytecode binary
     let binary = from_vm_functions(&[func]);
@@ -46,12 +46,11 @@ fn test_execute_program_from_stoffel_bytecode_mul_clear() {
     let loaded = load_from_file(&path).expect("failed to load compiled bytecode");
 
     // Convert back to VM functions (the VM only sees functions reconstructed from bytecode)
-    let vm_functions = to_vm_functions(&loaded);
+    let vm_functions = try_to_vm_functions(&loaded).expect("compiled bytecode should be valid");
     assert!(!vm_functions.is_empty());
 
     // Execute the loaded program via VM
     let mut vm = VirtualMachine::new();
-    vm.register_standard_library();
     for f in vm_functions {
         vm.register_function(f);
     }

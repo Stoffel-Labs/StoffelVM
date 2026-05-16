@@ -5,7 +5,17 @@
 //! deterministic public-key-based party ID assignment, and a thin `MpcNetwork`
 //! wrapper that only overrides `broadcast()` (self-skip to prevent AVID RBC
 //! amplification) and `send_to_client()` (logical-ID bridging).
-use crate::net::mpc::honeybadger_node_opts;
+
+#![allow(
+    clippy::expect_fun_call,
+    clippy::field_reassign_with_default,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::unused_enumerate_index,
+    clippy::while_let_loop
+)]
+
+use crate::net::mpc::{honeybadger_node_opts, honeybadger_protocol_instance_id};
 use ark_ff::{FftField, PrimeField};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
@@ -16,14 +26,12 @@ use stoffelmpc_mpc::honeybadger::{
     HoneyBadgerError, HoneyBadgerMPCClient, HoneyBadgerMPCNode, HoneyBadgerMPCNodeOpts,
 };
 use stoffelnet::network_utils::{ClientId, Network, NetworkError, Node, PartyId, VerifiedOrdering};
-use stoffelnet::transports::quic::{
-    NetworkManager, PeerConnection, QuicNetworkConfig, QuicNetworkManager,
-};
+use stoffelnet::transports::quic::{NetworkManager, PeerConnection, QuicNetworkManager};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 // ---------------------------------------------------------------------------
 // MpcNetwork – thin wrapper over QuicNetworkManager
@@ -647,7 +655,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
             client_id,
             n_parties,
             threshold,
-            instance_id as u32,
+            honeybadger_protocol_instance_id(instance_id),
             inputs,
             input_len,
         )?;
@@ -731,6 +739,7 @@ impl<F: FftField + 'static> HoneyBadgerQuicClient<F> {
         client
     }
 
+    #[allow(dead_code)]
     pub async fn add_server_with_id(&mut self, party_id: PartyId, address: SocketAddr) {
         self.server_addresses.push(address);
         let mut manager = self.network.lock().await;
@@ -1302,6 +1311,13 @@ mod tests {
 
         // Wait for all preprocessing tasks to complete
         let results = futures::future::join_all(preprocessing_handles).await;
+        for (i, result) in results.iter().enumerate() {
+            match result {
+                Ok(Ok(())) => info!("Server {} preprocessing: SUCCESS", i),
+                Ok(Err(e)) => panic!("Server {} preprocessing FAILED: {}", i, e),
+                Err(e) => panic!("Server {} task PANICKED: {:?}", i, e),
+            }
+        }
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         for (_, server) in servers.iter_mut().enumerate() {
@@ -1686,6 +1702,13 @@ mod tests {
 
         // Wait for all preprocessing tasks to complete
         let results = futures::future::join_all(preprocessing_handles).await;
+        for (i, result) in results.iter().enumerate() {
+            match result {
+                Ok(Ok(())) => info!("Server {} preprocessing: SUCCESS", i),
+                Ok(Err(e)) => panic!("Server {} preprocessing FAILED: {}", i, e),
+                Err(e) => panic!("Server {} task PANICKED: {:?}", i, e),
+            }
+        }
 
         for (_, server) in servers.iter_mut().enumerate() {
             let local_shares = server

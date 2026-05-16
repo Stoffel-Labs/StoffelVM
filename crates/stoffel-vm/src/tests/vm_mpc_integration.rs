@@ -7,14 +7,15 @@
 //! 4. VM executing bytecode that performs MPC multiplication on shares
 //! 5. Opening the results to verify correctness
 
+#![allow(clippy::field_reassign_with_default)]
+
 use ark_bls12_381::Fr;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
 use std::net::SocketAddr;
 use std::time::Duration;
-use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol, SecretSharingScheme};
+use stoffelmpc_mpc::common::{MPCProtocol, PreprocessingMPCProtocol};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use stoffelmpc_mpc::honeybadger::ProtocolType;
 use stoffelnet::network_utils::ClientId;
 use tracing::info;
 

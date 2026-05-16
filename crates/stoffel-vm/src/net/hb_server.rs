@@ -38,6 +38,17 @@ impl Default for HoneyBadgerQuicConfig {
     }
 }
 
+/// Errors raised by the QUIC server lifecycle wrapper.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HoneyBadgerQuicServerError {
+    #[error("cannot add peer after start() has been called")]
+    AlreadyStarted,
+    #[error("server is not started; call start() before {operation}")]
+    NotStarted { operation: &'static str },
+    #[error("server setup state has already been consumed")]
+    SetupStateConsumed,
+}
+
 /// A HoneyBadger MPC server node using QUIC networking.
 ///
 /// This struct manages the networking layer for a HoneyBadger MPC node,
@@ -129,18 +140,20 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
     }
 
     /// Adds a peer node to connect to. Must be called before start().
-    pub async fn add_peer(&mut self, peer_id: PartyId, address: SocketAddr) {
+    pub async fn add_peer(
+        &mut self,
+        peer_id: PartyId,
+        address: SocketAddr,
+    ) -> Result<(), HoneyBadgerQuicServerError> {
         if let Some(ref mut builder) = self.network_builder {
             builder.add_node_with_party_id(peer_id, address);
             info!(
                 "Added peer {} at {} to node {}",
                 peer_id, address, self.node_id
             );
+            Ok(())
         } else {
-            panic!(
-                "Cannot add peer after start() has been called on node {}",
-                self.node_id
-            );
+            Err(HoneyBadgerQuicServerError::AlreadyStarted)
         }
     }
 
@@ -148,7 +161,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
     ///
     /// This spawns a background task that accepts incoming connections
     /// and routes received messages to the channel.
-    pub async fn start(&mut self) -> Result<(), HoneyBadgerError> {
+    pub async fn start(&mut self) -> Result<(), HoneyBadgerQuicServerError> {
         if self.connection_task.is_some() {
             warn!("Server already started");
             return Ok(());
@@ -158,7 +171,7 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
         let network = Arc::new(
             self.network_builder
                 .take()
-                .expect("start() called but network_builder is None"),
+                .ok_or(HoneyBadgerQuicServerError::SetupStateConsumed)?,
         );
         self.network = Some(network.clone());
 
@@ -258,11 +271,13 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
     ///
     /// This establishes outgoing connections to all peers and spawns
     /// receive loops for each connection.
-    pub async fn connect_to_peers(&self) -> Result<(), HoneyBadgerError> {
+    pub async fn connect_to_peers(&self) -> Result<(), HoneyBadgerQuicServerError> {
         let network = self
             .network
             .as_ref()
-            .expect("connect_to_peers() called before start()");
+            .ok_or(HoneyBadgerQuicServerError::NotStarted {
+                operation: "connect_to_peers()",
+            })?;
 
         let peers: Vec<(PartyId, SocketAddr)> = network
             .parties()
@@ -590,33 +605,27 @@ pub async fn spawn_receive_loops_split(
                 );
 
                 tokio::spawn(async move {
-                    loop {
-                        match connection.receive().await {
-                            Ok(data) => {
-                                match open_message_router.try_handle_wire_message(sender_id, &data)
-                                {
-                                    Ok(true) => continue,
-                                    Err(_) => continue,
-                                    Ok(false) => {}
-                                }
-                                match open_message_router
-                                    .try_handle_hb_open_exp_wire_message(sender_id, &data)
-                                {
-                                    Ok(true) => continue,
-                                    Err(_) => continue,
-                                    Ok(false) => {}
-                                }
-                                if let Err(e) = txx.send((sender_id, data)).await {
-                                    tracing::warn!(
-                                        party_id = local_party_id,
-                                        sender_id,
-                                        error = ?e,
-                                        "Failed to forward server message"
-                                    );
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
+                    while let Ok(data) = connection.receive().await {
+                        match open_message_router.try_handle_wire_message(sender_id, &data) {
+                            Ok(true) => continue,
+                            Err(_) => continue,
+                            Ok(false) => {}
+                        }
+                        match open_message_router
+                            .try_handle_hb_open_exp_wire_message(sender_id, &data)
+                        {
+                            Ok(true) => continue,
+                            Err(_) => continue,
+                            Ok(false) => {}
+                        }
+                        if let Err(e) = txx.send((sender_id, data)).await {
+                            tracing::warn!(
+                                party_id = local_party_id,
+                                sender_id,
+                                error = ?e,
+                                "Failed to forward server message"
+                            );
+                            break;
                         }
                     }
                 });
@@ -677,4 +686,55 @@ pub async fn spawn_receive_loops_split(
     });
 
     (server_rx, client_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::mpc::honeybadger_node_opts;
+
+    async fn test_server() -> HoneyBadgerQuicServer<Fr> {
+        let (tx, _rx) = mpsc::channel(8);
+        let bind_address = "127.0.0.1:0".parse().expect("valid local bind address");
+        let opts = honeybadger_node_opts(4, 1, 0, 0, 0).expect("valid HB options");
+        HoneyBadgerQuicServer::new(
+            0,
+            bind_address,
+            opts,
+            HoneyBadgerQuicConfig::default(),
+            tx,
+            Vec::new(),
+        )
+        .await
+        .expect("server should bind")
+    }
+
+    #[tokio::test]
+    async fn connect_to_peers_before_start_returns_lifecycle_error() {
+        let server = test_server().await;
+        let err = server
+            .connect_to_peers()
+            .await
+            .expect_err("connect before start should be fallible");
+        assert_eq!(
+            err,
+            HoneyBadgerQuicServerError::NotStarted {
+                operation: "connect_to_peers()"
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_after_start_returns_lifecycle_error() {
+        let mut server = test_server().await;
+        server.start().await.expect("server should start");
+
+        let err = server
+            .add_peer(1, "127.0.0.1:1".parse().expect("valid peer address"))
+            .await
+            .expect_err("add_peer after start should be fallible");
+        assert_eq!(err, HoneyBadgerQuicServerError::AlreadyStarted);
+
+        server.stop().await;
+    }
 }

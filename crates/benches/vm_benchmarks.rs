@@ -1,746 +1,1300 @@
-// VM Benchmarks
-// This file contains benchmarks for the StoffelVM virtual machine.
-//
-// The benchmarks are designed to measure the performance of different aspects of the VM:
-//
-// 1. Basic Operations (bench_basic_operations):
-//    - Original benchmarks that measure arithmetic and register operations
-//    - Each benchmark creates a new VM instance, which includes initialization overhead
-//
-// 2. Optimized Operations (bench_optimized_operations):
-//    - Improved benchmarks that separate setup from measurement
-//    - VM is initialized once outside the benchmark, reducing initialization overhead
-//    - Includes warmup runs to ensure instructions are cached and resolved
-//
-// 3. Individual Instructions (bench_individual_instructions):
-//    - Microbenchmarks for individual instructions (ADD, MUL, MOV)
-//    - Measures the performance of specific instructions in isolation
-//
-// 4. VM Components (bench_vm_components):
-//    - Benchmarks that isolate different VM components
-//    - Measures instruction dispatch overhead
-//
-// 5. Hook System (bench_hook_system, bench_optimized_hook_system):
-//    - Measures the overhead of the hook system
-//    - Compares execution with and without hooks
-//    - The optimized version uses the same VM instance and enables/disables hooks
-//
-// 6. Parameterized Benchmarks (bench_parameterized):
-//    - Measures how performance scales with different parameters
-//    - Tests with different numbers of instructions
-//
-// 7. Memory Overhead (bench_memory_overhead):
-//    - Measures memory allocation overhead
-//    - Tests with different array sizes
-//
-// 8. Core Execution (bench_core_execution):
-//    - Uses a custom VM execution method that bypasses certain overhead
-//    - Compares regular execution with optimized execution
-//    - Provides a more accurate measurement of the core execution loop
-
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::Throughput;
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Duration;
-use stoffel_vm::core_types::Value;
+use stoffel_vm::core_types::{ClearShareInput, ClearShareValue, ShareData, ShareType, Value};
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::functions::VMFunction;
 use stoffel_vm::instructions::Instruction;
+use stoffel_vm::net::mpc_engine::{
+    AsyncMpcEngine, MpcCapabilities, MpcEngine, MpcEngineResult, MpcSessionTopology,
+};
 use stoffel_vm::runtime_hooks::HookEvent;
+use stoffel_vm_types::activations::ActivationRecord;
+use stoffel_vm_types::registers::{RegisterFile, RegisterIndex, RegisterLayout};
 
-fn bench_basic_operations(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Basic Operations");
+const INSTRUCTION_COUNTS: [usize; 3] = [100, 1_000, 10_000];
+const CALL_COUNTS: [usize; 3] = [100, 1_000, 5_000];
+const TABLE_OPERATION_COUNTS: [usize; 3] = [10, 100, 1_000];
+const REGISTER_BANK_COUNTS: [usize; 3] = [10, 100, 1_000];
+const ASYNC_ENTRY_COUNTS: [usize; 3] = [1, 4, 16];
+const LONG_DIAGNOSTIC_COUNT: usize = 10_000_000;
+const STRAIGHT_LINE_COUNT: usize = 10_000_000;
+const STACK_DIAGNOSTIC_COUNT: usize = 100_000;
+const FRAME_DIAGNOSTIC_COUNT: usize = 100_000;
 
-    // Benchmark arithmetic operations
-    {
-        let mut vm = VirtualMachine::new();
-        let arithmetic = VMFunction::new(
-            "arithmetic_test".to_string(),
-            vec![],
-            vec![],
-            None,
-            4,
-            vec![
-                Instruction::LDI(0, Value::I64(10)),
-                Instruction::LDI(1, Value::I64(20)),
-                Instruction::ADD(2, 0, 1),
-                Instruction::MUL(3, 2, 1),
-                Instruction::RET(3),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(arithmetic);
+struct ImmediateAsyncEngine;
 
-        group.bench_function("arithmetic", |b| {
-            b.iter(|| black_box(vm.execute("arithmetic_test").unwrap()));
-        });
+impl ImmediateAsyncEngine {
+    fn share_data_for_clear(clear: &ClearShareInput) -> ShareData {
+        let byte = match clear.value() {
+            ClearShareValue::Integer(value) => value.to_le_bytes()[0],
+            ClearShareValue::FixedPoint(value) => (value.0 as i64).to_le_bytes()[0],
+            ClearShareValue::Boolean(value) => u8::from(value),
+        };
+        ShareData::Opaque(vec![byte])
     }
 
-    // Benchmark register operations
-    {
-        let mut vm = VirtualMachine::new();
-        let registers = VMFunction::new(
-            "register_test".to_string(),
-            vec![],
-            vec![],
-            None,
-            3,
-            vec![
-                Instruction::LDI(0, Value::I64(42)),
-                Instruction::MOV(1, 0),
-                Instruction::MOV(2, 1),
-                Instruction::RET(2),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(registers);
-
-        group.bench_function("registers", |b| {
-            b.iter(|| black_box(vm.execute("register_test").unwrap()));
-        });
+    fn open_share_bytes(share_bytes: &[u8]) -> ClearShareValue {
+        ClearShareValue::Integer(share_bytes.first().copied().unwrap_or_default() as i64)
     }
-
-    group.finish();
 }
 
-fn bench_function_calls(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Function Calls");
-
-    // Benchmark regular function calls
-    {
-        let mut vm = VirtualMachine::new();
-        let simple_func = VMFunction::new(
-            "simple_function".to_string(),
-            vec!["x".to_string()],
-            vec![],
-            None,
-            2,
-            vec![
-                Instruction::ADD(1, 0, 0), // Double the input
-                Instruction::RET(1),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(simple_func);
-
-        let caller = VMFunction::new(
-            "caller".to_string(),
-            vec![],
-            vec![],
-            None,
-            2,
-            vec![
-                Instruction::LDI(0, Value::I64(42)),
-                Instruction::PUSHARG(0),
-                Instruction::CALL("simple_function".to_string()),
-                Instruction::RET(0),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(caller);
-
-        group.bench_function("regular_call", |b| {
-            b.iter(|| black_box(vm.execute("caller").unwrap()));
-        });
+impl MpcEngine for ImmediateAsyncEngine {
+    fn protocol_name(&self) -> &'static str {
+        "bench-immediate-async"
     }
 
-    // Benchmark closure creation and calls
-    {
-        let mut vm = VirtualMachine::new();
-        let create_adder = VMFunction::new(
-            "create_adder".to_string(),
-            vec!["x".to_string()],
-            vec![],
-            None,
-            3,
-            vec![
-                Instruction::LDI(1, Value::String("add".to_string())),
-                Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::String("x".to_string())),
-                Instruction::PUSHARG(2),
-                Instruction::CALL("create_closure".to_string()),
-                Instruction::RET(0),
-            ],
-            HashMap::new(),
-        );
-
-        let add = VMFunction::new(
-            "add".to_string(),
-            vec!["y".to_string()],
-            vec!["x".to_string()],
-            Some("create_adder".to_string()),
-            3,
-            vec![
-                Instruction::LDI(1, Value::String("x".to_string())),
-                Instruction::PUSHARG(1),
-                Instruction::CALL("get_upvalue".to_string()),
-                Instruction::ADD(2, 0, 1),
-                Instruction::RET(2),
-            ],
-            HashMap::new(),
-        );
-
-        vm.register_function(create_adder);
-        vm.register_function(add);
-
-        group.bench_function("closure", |b| {
-            b.iter(|| {
-                let args = vec![Value::I64(5)];
-                black_box(vm.execute_with_args("create_adder", &args).unwrap())
-            });
-        });
+    fn topology(&self) -> MpcSessionTopology {
+        MpcSessionTopology::try_new(1, 0, 1, 0).expect("benchmark topology should be valid")
     }
 
-    group.finish();
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn start(&self) -> MpcEngineResult<()> {
+        Ok(())
+    }
+
+    fn input_share(&self, clear: ClearShareInput) -> MpcEngineResult<ShareData> {
+        Ok(Self::share_data_for_clear(&clear))
+    }
+
+    fn open_share(&self, _ty: ShareType, share_bytes: &[u8]) -> MpcEngineResult<ClearShareValue> {
+        Ok(Self::open_share_bytes(share_bytes))
+    }
+
+    fn capabilities(&self) -> MpcCapabilities {
+        MpcCapabilities::empty()
+    }
 }
 
-fn bench_object_operations(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Object Operations");
-
-    // Benchmark object creation and field access
-    {
-        let mut vm = VirtualMachine::new();
-        let object_ops = VMFunction::new(
-            "object_ops".to_string(),
-            vec![],
-            vec![],
-            None,
-            4,
-            vec![
-                // Create object
-                Instruction::CALL("create_object".to_string()),
-                Instruction::MOV(1, 0),
-                // Set field
-                Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::String("field".to_string())),
-                Instruction::PUSHARG(2),
-                Instruction::LDI(3, Value::I64(42)),
-                Instruction::PUSHARG(3),
-                Instruction::CALL("set_field".to_string()),
-                // Get field
-                Instruction::PUSHARG(1),
-                Instruction::PUSHARG(2),
-                Instruction::CALL("get_field".to_string()),
-                Instruction::RET(0),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(object_ops);
-
-        group.bench_function("object_access", |b| {
-            b.iter(|| black_box(vm.execute("object_ops").unwrap()));
-        });
+#[async_trait::async_trait]
+impl AsyncMpcEngine for ImmediateAsyncEngine {
+    async fn input_share_async(&self, clear: ClearShareInput) -> MpcEngineResult<ShareData> {
+        Ok(Self::share_data_for_clear(&clear))
     }
 
-    group.finish();
-}
-
-fn bench_array_operations(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Array Operations");
-
-    // Benchmark array creation and element access
-    {
-        let mut vm = VirtualMachine::new();
-        let array_ops = VMFunction::new(
-            "array_ops".to_string(),
-            vec![],
-            vec![],
-            None,
-            4,
-            vec![
-                // Create array
-                Instruction::CALL("create_array".to_string()),
-                Instruction::MOV(1, 0),
-                // Push elements
-                Instruction::PUSHARG(1),
-                Instruction::LDI(2, Value::I64(42)),
-                Instruction::PUSHARG(2),
-                Instruction::CALL("array_push".to_string()),
-                // Get element
-                Instruction::PUSHARG(1),
-                Instruction::LDI(3, Value::I64(1)),
-                Instruction::PUSHARG(3),
-                Instruction::CALL("get_field".to_string()),
-                Instruction::RET(0),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(array_ops);
-
-        group.bench_function("array_access", |b| {
-            b.iter(|| black_box(vm.execute("array_ops").unwrap()));
-        });
+    async fn open_share_async(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+    ) -> MpcEngineResult<ClearShareValue> {
+        Ok(Self::open_share_bytes(share_bytes))
     }
-
-    group.finish();
 }
 
-fn bench_hook_system(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Hook System");
-
-    // Benchmark execution with and without hooks
-    {
-        let mut vm = VirtualMachine::new();
-        let simple_prog = VMFunction::new(
-            "simple_prog".to_string(),
-            vec![],
-            vec![],
-            None,
-            3,
-            vec![
-                Instruction::LDI(0, Value::I64(1)),
-                Instruction::LDI(1, Value::I64(2)),
-                Instruction::ADD(2, 0, 1),
-                Instruction::RET(2),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(simple_prog);
-
-        // Benchmark without hooks
-        group.bench_function("no_hooks", |b| {
-            b.iter(|| black_box(vm.execute("simple_prog").unwrap()));
-        });
-
-        // Add a simple instruction hook
-        vm.register_hook(|_| true, |_, _| Ok(()), 100);
-
-        // Benchmark with hooks
-        group.bench_function("with_hooks", |b| {
-            b.iter(|| black_box(vm.execute("simple_prog").unwrap()));
-        });
-    }
-
-    group.finish();
+fn function(
+    name: &str,
+    register_count: usize,
+    instructions: Vec<Instruction>,
+    labels: HashMap<String, usize>,
+) -> VMFunction {
+    VMFunction::new(
+        name.to_owned(),
+        vec![],
+        vec![],
+        None,
+        register_count,
+        instructions,
+        labels,
+    )
 }
 
-#[allow(dead_code)]
-fn bench_optimized_hook_system(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Optimized Hook System");
-
-    // Configure the benchmark group
-    group.measurement_time(Duration::from_secs(5));
-    group.sample_size(100);
-
-    // Setup VM once outside the benchmark
+fn vm_with(functions: impl IntoIterator<Item = VMFunction>) -> VirtualMachine {
     let mut vm = VirtualMachine::new();
-
-    // Create a test program with different instruction types
-    let test_prog = VMFunction::new(
-        "test_prog".to_string(),
-        vec![],
-        vec![],
-        None,
-        5,
-        vec![
-            // Mix of different instruction types
-            Instruction::LDI(0, Value::I64(10)),
-            Instruction::LDI(1, Value::I64(20)),
-            Instruction::ADD(2, 0, 1),
-            Instruction::MUL(3, 2, 1),
-            Instruction::MOV(4, 3),
-            Instruction::RET(4),
-        ],
-        HashMap::new(),
-    );
-    vm.register_function(test_prog);
-
-    // Warmup run
-    vm.execute("test_prog").unwrap();
-
-    // Benchmark without hooks
-    group.bench_function("baseline_no_hooks", |b| {
-        b.iter(|| black_box(vm.execute("test_prog").unwrap()));
-    });
-
-    // Register different types of hooks to measure their overhead
-
-    // 1. Simple instruction hook that does nothing
-    let hook_id1 = vm.register_hook(
-        |_| true,      // Match all instructions
-        |_, _| Ok(()), // Do nothing
-        100,
-    );
-
-    // Warmup with hook
-    vm.execute("test_prog").unwrap();
-
-    // Benchmark with simple hook
-    group.bench_function("simple_hook", |b| {
-        b.iter(|| black_box(vm.execute("test_prog").unwrap()));
-    });
-
-    // Unregister the simple hook instead of just disabling it
-    vm.unregister_hook(hook_id1);
-
-    // 2. Register hook that only matches specific instructions
-    let hook_id2 = vm.register_hook(
-        |event| {
-            if let HookEvent::BeforeInstructionExecute(instruction) = event {
-                matches!(instruction, Instruction::ADD(_, _, _))
-            } else {
-                false
-            }
-        },
-        |_, _| Ok(()),
-        100,
-    );
-
-    // Warmup with selective hook
-    vm.execute("test_prog").unwrap();
-
-    // Benchmark with selective hook
-    group.bench_function("selective_hook", |b| {
-        b.iter(|| black_box(vm.execute("test_prog").unwrap()));
-    });
-
-    // Unregister the selective hook instead of just disabling it
-    vm.unregister_hook(hook_id2);
-
-    // 3. Register multiple hooks with different priorities
-    let hook_id3 = vm.register_hook(|_| true, |_, _| Ok(()), 100);
-
-    let hook_id4 = vm.register_hook(|_| true, |_, _| Ok(()), 200);
-
-    let hook_id5 = vm.register_hook(|_| true, |_, _| Ok(()), 300);
-
-    // Warmup with multiple hooks
-    vm.execute("test_prog").unwrap();
-
-    // Benchmark with multiple hooks
-    group.bench_function("multiple_hooks", |b| {
-        b.iter(|| black_box(vm.execute("test_prog").unwrap()));
-    });
-
-    // Unregister all hooks instead of just disabling them
-    vm.unregister_hook(hook_id3);
-    vm.unregister_hook(hook_id4);
-    vm.unregister_hook(hook_id5);
-
-    group.finish();
+    for function in functions {
+        vm.register_function(function);
+    }
+    vm
 }
 
-fn bench_optimized_operations(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Optimized Operations");
-
-    // Configure the benchmark group
-    group.measurement_time(Duration::from_secs(5));
-    group.sample_size(100);
-
-    // Setup VM once outside the benchmark
-    let mut vm = VirtualMachine::new();
-
-    // Register arithmetic function
-    let arithmetic = VMFunction::new(
-        "arithmetic_test".to_string(),
-        vec![],
-        vec![],
-        None,
-        4,
-        vec![
-            Instruction::LDI(0, Value::I64(10)),
-            Instruction::LDI(1, Value::I64(20)),
-            Instruction::ADD(2, 0, 1),
-            Instruction::MUL(3, 2, 1),
-            Instruction::RET(3),
-        ],
-        HashMap::new(),
-    );
-    vm.register_function(arithmetic);
-
-    // Ensure instructions are cached and resolved before benchmarking
-    vm.execute("arithmetic_test").unwrap(); // Warmup run
-
-    // Only measure the execution
-    group.bench_function("arithmetic_optimized", |b| {
-        b.iter(|| black_box(vm.execute("arithmetic_test").unwrap()));
-    });
-
-    // Register register operations function
-    let registers = VMFunction::new(
-        "register_test".to_string(),
-        vec![],
-        vec![],
-        None,
-        3,
-        vec![
-            Instruction::LDI(0, Value::I64(42)),
-            Instruction::MOV(1, 0),
-            Instruction::MOV(2, 1),
-            Instruction::RET(2),
-        ],
-        HashMap::new(),
-    );
-    vm.register_function(registers);
-
-    // Warmup
-    vm.execute("register_test").unwrap();
-
-    // Benchmark
-    group.bench_function("registers_optimized", |b| {
-        b.iter(|| black_box(vm.execute("register_test").unwrap()));
-    });
-
-    group.finish();
+fn vm_with_register_layout(
+    functions: impl IntoIterator<Item = VMFunction>,
+    layout: RegisterLayout,
+    engine: Arc<dyn MpcEngine>,
+) -> VirtualMachine {
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_builtins(false)
+        .with_register_layout(layout)
+        .with_mpc_engine(engine)
+        .build();
+    for function in functions {
+        vm.register_function(function);
+    }
+    vm
 }
 
-fn bench_core_execution(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Core Execution");
+fn warm(mut vm: VirtualMachine, entry: &str) -> VirtualMachine {
+    vm.execute(entry).unwrap();
+    vm
+}
 
-    // Configure the benchmark group
-    group.measurement_time(Duration::from_secs(5));
-    group.sample_size(100);
+fn add_chain(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 3);
+    instructions.push(Instruction::LDI(0, Value::I64(0)));
+    instructions.push(Instruction::LDI(1, Value::I64(1)));
+    instructions.extend((0..operation_count).map(|_| Instruction::ADD(0, 0, 1)));
+    instructions.push(Instruction::RET(0));
 
-    // Setup VM once outside the benchmark
-    let mut vm = VirtualMachine::new();
+    function("add_chain", 2, instructions, HashMap::new())
+}
 
-    // Register a variety of functions to benchmark
+fn mov_chain(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(0, Value::I64(1)));
+    instructions.extend((0..operation_count).map(|i| {
+        if i % 2 == 0 {
+            Instruction::MOV(1, 0)
+        } else {
+            Instruction::MOV(0, 1)
+        }
+    }));
+    instructions.push(Instruction::RET(0));
 
-    // 1. Simple arithmetic
-    let arithmetic = VMFunction::new(
-        "arithmetic_bench".to_string(),
-        vec![],
-        vec![],
-        None,
-        4,
-        vec![
-            Instruction::LDI(0, Value::I64(10)),
-            Instruction::LDI(1, Value::I64(20)),
-            Instruction::ADD(2, 0, 1),
-            Instruction::MUL(3, 2, 1),
-            Instruction::RET(3),
-        ],
-        HashMap::new(),
-    );
-    vm.register_function(arithmetic);
+    function("mov_chain", 2, instructions, HashMap::new())
+}
 
-    // 2. Register operations
-    let registers = VMFunction::new(
-        "registers_bench".to_string(),
-        vec![],
-        vec![],
-        None,
-        3,
-        vec![
-            Instruction::LDI(0, Value::I64(42)),
-            Instruction::MOV(1, 0),
-            Instruction::MOV(2, 1),
-            Instruction::RET(2),
-        ],
-        HashMap::new(),
-    );
-    vm.register_function(registers);
-
-    // 3. Control flow
+fn branch_loop(iterations: usize) -> VMFunction {
     let mut labels = HashMap::new();
-    labels.insert("loop_start".to_string(), 2);
-    labels.insert("loop_end".to_string(), 6);
+    labels.insert("loop".to_owned(), 3);
 
-    let control_flow = VMFunction::new(
-        "control_flow_bench".to_string(),
-        vec![],
-        vec![],
-        None,
+    function(
+        "branch_loop",
         3,
         vec![
-            Instruction::LDI(0, Value::I64(1)),  // Counter
-            Instruction::LDI(1, Value::I64(10)), // Limit
-            // loop_start:
-            Instruction::CMP(0, 1),
-            Instruction::JMPGT("loop_end".to_string()),
-            Instruction::ADD(0, 0, 0), // Double the counter
-            Instruction::JMP("loop_start".to_string()),
-            // loop_end:
+            Instruction::LDI(0, Value::I64(0)),
+            Instruction::LDI(1, Value::I64(1)),
+            Instruction::LDI(2, Value::I64(iterations as i64)),
+            Instruction::ADD(0, 0, 1),
+            Instruction::CMP(0, 2),
+            Instruction::JMPLT("loop".to_owned()),
             Instruction::RET(0),
         ],
         labels,
-    );
-    vm.register_function(control_flow);
-
-    // Ensure all functions are executed once to cache and resolve instructions
-    vm.execute("arithmetic_bench").unwrap();
-    vm.execute("registers_bench").unwrap();
-    vm.execute("control_flow_bench").unwrap();
-
-    // Benchmark using regular execute method
-    group.bench_function("arithmetic_regular", |b| {
-        b.iter(|| black_box(vm.execute("arithmetic_bench").unwrap()));
-    });
-
-    // Benchmark using execute_for_benchmark method
-    group.bench_function("arithmetic_benchmark", |b| {
-        b.iter(|| black_box(vm.execute_for_benchmark("arithmetic_bench").unwrap()));
-    });
-
-    // Benchmark register operations
-    group.bench_function("registers_regular", |b| {
-        b.iter(|| black_box(vm.execute("registers_bench").unwrap()));
-    });
-
-    group.bench_function("registers_benchmark", |b| {
-        b.iter(|| black_box(vm.execute_for_benchmark("registers_bench").unwrap()));
-    });
-
-    // Benchmark control flow
-    group.bench_function("control_flow_regular", |b| {
-        b.iter(|| black_box(vm.execute("control_flow_bench").unwrap()));
-    });
-
-    group.bench_function("control_flow_benchmark", |b| {
-        b.iter(|| black_box(vm.execute_for_benchmark("control_flow_bench").unwrap()));
-    });
-
-    group.finish();
+    )
 }
 
-fn bench_individual_instructions(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Individual Instructions");
+fn nop_loop(iterations: usize) -> VMFunction {
+    let mut labels = HashMap::new();
+    labels.insert("loop".to_owned(), 3);
 
-    // Benchmark ADD instruction
-    {
-        let mut vm = VirtualMachine::new();
-        let add_test = VMFunction::new(
-            "add_test".to_string(),
-            vec![],
-            vec![],
-            None,
-            3,
-            vec![
-                Instruction::LDI(0, Value::I64(10)),
-                Instruction::LDI(1, Value::I64(20)),
-                // Only benchmark this instruction
-                Instruction::ADD(2, 0, 1),
-                Instruction::RET(2),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(add_test);
-        vm.execute("add_test").unwrap(); // Warmup
-
-        group.bench_function("add_instruction", |b| {
-            b.iter(|| black_box(vm.execute("add_test").unwrap()));
-        });
-    }
-
-    // Benchmark MUL instruction
-    {
-        let mut vm = VirtualMachine::new();
-        let mul_test = VMFunction::new(
-            "mul_test".to_string(),
-            vec![],
-            vec![],
-            None,
-            3,
-            vec![
-                Instruction::LDI(0, Value::I64(10)),
-                Instruction::LDI(1, Value::I64(20)),
-                // Only benchmark this instruction
-                Instruction::MUL(2, 0, 1),
-                Instruction::RET(2),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(mul_test);
-        vm.execute("mul_test").unwrap(); // Warmup
-
-        group.bench_function("mul_instruction", |b| {
-            b.iter(|| black_box(vm.execute("mul_test").unwrap()));
-        });
-    }
-
-    // Benchmark MOV instruction
-    {
-        let mut vm = VirtualMachine::new();
-        let mov_test = VMFunction::new(
-            "mov_test".to_string(),
-            vec![],
-            vec![],
-            None,
-            3,
-            vec![
-                Instruction::LDI(0, Value::I64(42)),
-                // Only benchmark this instruction
-                Instruction::MOV(1, 0),
-                Instruction::RET(1),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(mov_test);
-        vm.execute("mov_test").unwrap(); // Warmup
-
-        group.bench_function("mov_instruction", |b| {
-            b.iter(|| black_box(vm.execute("mov_test").unwrap()));
-        });
-    }
-
-    group.finish();
+    function(
+        "nop_loop",
+        3,
+        vec![
+            Instruction::LDI(0, Value::I64(0)),
+            Instruction::LDI(1, Value::I64(1)),
+            Instruction::LDI(2, Value::I64(iterations as i64)),
+            Instruction::NOP,
+            Instruction::ADD(0, 0, 1),
+            Instruction::CMP(0, 2),
+            Instruction::JMPLT("loop".to_owned()),
+            Instruction::RET(0),
+        ],
+        labels,
+    )
 }
 
-fn bench_vm_components(c: &mut Criterion) {
-    let mut group = c.benchmark_group("VM Components");
+fn cmp_read_loop(iterations: usize) -> VMFunction {
+    let mut labels = HashMap::new();
+    labels.insert("loop".to_owned(), 5);
 
-    // Benchmark instruction dispatch overhead
-    {
-        let mut vm = VirtualMachine::new();
-        let noop_test = VMFunction::new(
-            "noop_test".to_string(),
-            vec![],
-            vec![],
-            None,
-            1,
-            vec![
-                // Just a sequence of MOVs to measure dispatch overhead
-                Instruction::MOV(0, 0),
-                Instruction::MOV(0, 0),
-                Instruction::MOV(0, 0),
-                Instruction::MOV(0, 0),
-                Instruction::MOV(0, 0),
-                Instruction::RET(0),
-            ],
-            HashMap::new(),
-        );
-        vm.register_function(noop_test);
-        vm.execute("noop_test").unwrap(); // Warmup
-
-        group.bench_function("instruction_dispatch", |b| {
-            b.iter(|| black_box(vm.execute("noop_test").unwrap()));
-        });
-    }
-
-    group.finish();
+    function(
+        "cmp_read_loop",
+        5,
+        vec![
+            Instruction::LDI(0, Value::I64(0)),
+            Instruction::LDI(1, Value::I64(1)),
+            Instruction::LDI(2, Value::I64(iterations as i64)),
+            Instruction::LDI(3, Value::I64(7)),
+            Instruction::LDI(4, Value::I64(11)),
+            Instruction::CMP(3, 4),
+            Instruction::ADD(0, 0, 1),
+            Instruction::CMP(0, 2),
+            Instruction::JMPLT("loop".to_owned()),
+            Instruction::RET(0),
+        ],
+        labels,
+    )
 }
 
-fn bench_parameterized(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Scaling");
+fn branch_always_taken_loop(iterations: usize) -> VMFunction {
+    let mut labels = HashMap::new();
+    labels.insert("loop".to_owned(), 5);
+    labels.insert("taken".to_owned(), 8);
 
-    // Test with different numbers of instructions
-    for size in [10, 100, 1000].iter() {
-        let mut vm = VirtualMachine::new();
+    function(
+        "branch_always_taken_loop",
+        5,
+        vec![
+            Instruction::LDI(0, Value::I64(0)),
+            Instruction::LDI(1, Value::I64(1)),
+            Instruction::LDI(2, Value::I64(iterations as i64)),
+            Instruction::LDI(3, Value::I64(7)),
+            Instruction::LDI(4, Value::I64(7)),
+            Instruction::CMP(3, 4),
+            Instruction::JMPEQ("taken".to_owned()),
+            Instruction::RET(0),
+            Instruction::ADD(0, 0, 1),
+            Instruction::CMP(0, 2),
+            Instruction::JMPLT("loop".to_owned()),
+            Instruction::RET(0),
+        ],
+        labels,
+    )
+}
 
-        // Create a function with *size* instructions
-        let mut instructions = Vec::new();
-        for i in 0..*size {
-            instructions.push(Instruction::LDI(0, Value::I64(i as i64)));
-        }
-        instructions.push(Instruction::RET(0));
+fn branch_never_taken_loop(iterations: usize) -> VMFunction {
+    let mut labels = HashMap::new();
+    labels.insert("loop".to_owned(), 5);
+    labels.insert("taken".to_owned(), 11);
 
-        let test_func = VMFunction::new(
-            format!("test_func_{}", size),
-            vec![],
-            vec![],
-            None,
-            1,
-            instructions,
-            HashMap::new(),
-        );
-        vm.register_function(test_func);
-        vm.execute(&format!("test_func_{}", size)).unwrap(); // Warmup
+    function(
+        "branch_never_taken_loop",
+        5,
+        vec![
+            Instruction::LDI(0, Value::I64(0)),
+            Instruction::LDI(1, Value::I64(1)),
+            Instruction::LDI(2, Value::I64(iterations as i64)),
+            Instruction::LDI(3, Value::I64(7)),
+            Instruction::LDI(4, Value::I64(11)),
+            Instruction::CMP(3, 4),
+            Instruction::JMPEQ("taken".to_owned()),
+            Instruction::ADD(0, 0, 1),
+            Instruction::CMP(0, 2),
+            Instruction::JMPLT("loop".to_owned()),
+            Instruction::RET(0),
+            Instruction::RET(0),
+        ],
+        labels,
+    )
+}
 
+fn branch_alternating_loop(iterations: usize) -> VMFunction {
+    let mut labels = HashMap::new();
+    labels.insert("loop".to_owned(), 5);
+    labels.insert("taken".to_owned(), 10);
+    labels.insert("join".to_owned(), 11);
+
+    function(
+        "branch_alternating_loop",
+        5,
+        vec![
+            Instruction::LDI(0, Value::I64(0)),
+            Instruction::LDI(1, Value::I64(1)),
+            Instruction::LDI(2, Value::I64(iterations as i64)),
+            Instruction::LDI(3, Value::I64(0)),
+            Instruction::LDI(4, Value::I64(0)),
+            Instruction::CMP(3, 4),
+            Instruction::JMPEQ("taken".to_owned()),
+            Instruction::LDI(3, Value::I64(0)),
+            Instruction::JMP("join".to_owned()),
+            Instruction::RET(0),
+            Instruction::LDI(3, Value::I64(1)),
+            Instruction::ADD(0, 0, 1),
+            Instruction::CMP(0, 2),
+            Instruction::JMPLT("loop".to_owned()),
+            Instruction::RET(0),
+        ],
+        labels,
+    )
+}
+
+fn straight_nop(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 1);
+    instructions.extend(std::iter::repeat_n(Instruction::NOP, operation_count));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_nop", 1, instructions, HashMap::new())
+}
+
+fn straight_mov(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(0, Value::I64(1)));
+    instructions.extend(std::iter::repeat_n(Instruction::MOV(0, 0), operation_count));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_mov", 1, instructions, HashMap::new())
+}
+
+fn straight_add(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 3);
+    instructions.push(Instruction::LDI(0, Value::I64(0)));
+    instructions.push(Instruction::LDI(1, Value::I64(1)));
+    instructions.extend(std::iter::repeat_n(
+        Instruction::ADD(0, 0, 1),
+        operation_count,
+    ));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_add", 2, instructions, HashMap::new())
+}
+
+fn straight_binary_instruction(
+    name: &str,
+    operation_count: usize,
+    lhs: Value,
+    rhs: Value,
+    instruction: fn(usize, usize, usize) -> Instruction,
+) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 4);
+    instructions.push(Instruction::LDI(1, lhs));
+    instructions.push(Instruction::LDI(2, rhs));
+    instructions.extend(std::iter::repeat_n(instruction(0, 1, 2), operation_count));
+    instructions.push(Instruction::RET(0));
+
+    function(name, 3, instructions, HashMap::new())
+}
+
+fn straight_unary_instruction(
+    name: &str,
+    operation_count: usize,
+    src: Value,
+    instruction: fn(usize, usize) -> Instruction,
+) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 3);
+    instructions.push(Instruction::LDI(1, src));
+    instructions.extend(std::iter::repeat_n(instruction(0, 1), operation_count));
+    instructions.push(Instruction::RET(0));
+
+    function(name, 2, instructions, HashMap::new())
+}
+
+fn straight_sub(operation_count: usize) -> VMFunction {
+    straight_binary_instruction(
+        "straight_sub",
+        operation_count,
+        Value::I64(9),
+        Value::I64(4),
+        Instruction::SUB,
+    )
+}
+
+fn straight_mul(operation_count: usize) -> VMFunction {
+    straight_binary_instruction(
+        "straight_mul",
+        operation_count,
+        Value::I64(6),
+        Value::I64(7),
+        Instruction::MUL,
+    )
+}
+
+fn straight_div(operation_count: usize) -> VMFunction {
+    straight_binary_instruction(
+        "straight_div",
+        operation_count,
+        Value::I64(42),
+        Value::I64(3),
+        Instruction::DIV,
+    )
+}
+
+fn straight_mod(operation_count: usize) -> VMFunction {
+    straight_binary_instruction(
+        "straight_mod",
+        operation_count,
+        Value::I64(43),
+        Value::I64(5),
+        Instruction::MOD,
+    )
+}
+
+fn straight_and(operation_count: usize) -> VMFunction {
+    straight_binary_instruction(
+        "straight_and",
+        operation_count,
+        Value::I64(0b1010),
+        Value::I64(0b1100),
+        Instruction::AND,
+    )
+}
+
+fn straight_or(operation_count: usize) -> VMFunction {
+    straight_binary_instruction(
+        "straight_or",
+        operation_count,
+        Value::I64(0b1010),
+        Value::I64(0b0101),
+        Instruction::OR,
+    )
+}
+
+fn straight_xor(operation_count: usize) -> VMFunction {
+    straight_binary_instruction(
+        "straight_xor",
+        operation_count,
+        Value::I64(0b1010),
+        Value::I64(0b1100),
+        Instruction::XOR,
+    )
+}
+
+fn straight_not(operation_count: usize) -> VMFunction {
+    straight_unary_instruction(
+        "straight_not",
+        operation_count,
+        Value::I64(0b1010),
+        Instruction::NOT,
+    )
+}
+
+fn straight_shl(operation_count: usize) -> VMFunction {
+    straight_binary_instruction(
+        "straight_shl",
+        operation_count,
+        Value::I64(1),
+        Value::I64(3),
+        Instruction::SHL,
+    )
+}
+
+fn straight_shr(operation_count: usize) -> VMFunction {
+    straight_binary_instruction(
+        "straight_shr",
+        operation_count,
+        Value::I64(64),
+        Value::I64(2),
+        Instruction::SHR,
+    )
+}
+
+fn straight_load_stack(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 3);
+    instructions.push(Instruction::LDI(0, Value::I64(7)));
+    instructions.push(Instruction::PUSHARG(0));
+    instructions.extend(std::iter::repeat_n(Instruction::LD(1, 0), operation_count));
+    instructions.push(Instruction::RET(1));
+
+    function("straight_load_stack", 2, instructions, HashMap::new())
+}
+
+fn straight_pusharg(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(0, Value::I64(7)));
+    instructions.extend(std::iter::repeat_n(
+        Instruction::PUSHARG(0),
+        operation_count,
+    ));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_pusharg", 1, instructions, HashMap::new())
+}
+
+fn straight_write_const(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 1);
+    instructions.extend(std::iter::repeat_n(
+        Instruction::LDI(0, Value::I64(1)),
+        operation_count,
+    ));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_write_const", 1, instructions, HashMap::new())
+}
+
+fn straight_cmp_read_only_proxy(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 3);
+    instructions.push(Instruction::LDI(0, Value::I64(7)));
+    instructions.push(Instruction::LDI(1, Value::I64(7)));
+    instructions.extend(std::iter::repeat_n(Instruction::CMP(0, 1), operation_count));
+    instructions.push(Instruction::RET(0));
+
+    function(
+        "straight_cmp_read_only_proxy",
+        2,
+        instructions,
+        HashMap::new(),
+    )
+}
+
+fn straight_mov_distinct(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 3);
+    instructions.push(Instruction::LDI(0, Value::I64(0)));
+    instructions.push(Instruction::LDI(1, Value::I64(1)));
+    instructions.extend(std::iter::repeat_n(Instruction::MOV(0, 1), operation_count));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_mov_distinct", 2, instructions, HashMap::new())
+}
+
+fn straight_mov_self_alias(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(0, Value::I64(1)));
+    instructions.extend(std::iter::repeat_n(Instruction::MOV(0, 0), operation_count));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_mov_self_alias", 1, instructions, HashMap::new())
+}
+
+fn straight_mov_reverse_adjacent(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 3);
+    instructions.push(Instruction::LDI(0, Value::I64(1)));
+    instructions.push(Instruction::LDI(1, Value::I64(0)));
+    instructions.extend(std::iter::repeat_n(Instruction::MOV(1, 0), operation_count));
+    instructions.push(Instruction::RET(1));
+
+    function(
+        "straight_mov_reverse_adjacent",
+        2,
+        instructions,
+        HashMap::new(),
+    )
+}
+
+fn straight_mov_far_to_low(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(15, Value::I64(1)));
+    instructions.extend(std::iter::repeat_n(
+        Instruction::MOV(0, 15),
+        operation_count,
+    ));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_mov_far_to_low", 16, instructions, HashMap::new())
+}
+
+fn straight_mov_low_to_far(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(0, Value::I64(1)));
+    instructions.extend(std::iter::repeat_n(
+        Instruction::MOV(15, 0),
+        operation_count,
+    ));
+    instructions.push(Instruction::RET(15));
+
+    function("straight_mov_low_to_far", 16, instructions, HashMap::new())
+}
+
+fn straight_mov_zero_source(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 3);
+    instructions.push(Instruction::LDI(0, Value::I64(1)));
+    instructions.push(Instruction::LDI(1, Value::I64(0)));
+    instructions.extend(std::iter::repeat_n(Instruction::MOV(0, 1), operation_count));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_mov_zero_source", 2, instructions, HashMap::new())
+}
+
+fn straight_mov_unit_source(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(0, Value::I64(1)));
+    instructions.extend(std::iter::repeat_n(Instruction::MOV(0, 1), operation_count));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_mov_unit_source", 2, instructions, HashMap::new())
+}
+
+fn straight_add_distinct(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 4);
+    instructions.push(Instruction::LDI(0, Value::I64(0)));
+    instructions.push(Instruction::LDI(1, Value::I64(1)));
+    instructions.push(Instruction::LDI(2, Value::I64(2)));
+    instructions.extend(std::iter::repeat_n(
+        Instruction::ADD(0, 1, 2),
+        operation_count,
+    ));
+    instructions.push(Instruction::RET(0));
+
+    function("straight_add_distinct", 3, instructions, HashMap::new())
+}
+
+fn vm_noop_target() -> VMFunction {
+    function(
+        "vm_noop",
+        1,
+        vec![Instruction::LDI(0, Value::I64(1)), Instruction::RET(0)],
+        HashMap::new(),
+    )
+}
+
+fn vm_add_target() -> VMFunction {
+    VMFunction::new(
+        "vm_add".to_owned(),
+        vec!["lhs".to_owned(), "rhs".to_owned()],
+        Vec::new(),
+        None,
+        2,
+        vec![Instruction::ADD(0, 0, 1), Instruction::RET(0)],
+        HashMap::new(),
+    )
+}
+
+fn call_loop(entry: &str, callee: &str, call_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(call_count + 1);
+    instructions.extend((0..call_count).map(|_| Instruction::CALL(callee.to_owned())));
+    instructions.push(Instruction::RET(0));
+
+    function(entry, 1, instructions, HashMap::new())
+}
+
+fn call_loop_with_two_args(entry: &str, callee: &str, call_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(call_count * 5 + 1);
+    for _ in 0..call_count {
+        instructions.push(Instruction::LDI(0, Value::I64(1)));
+        instructions.push(Instruction::PUSHARG(0));
+        instructions.push(Instruction::LDI(1, Value::I64(2)));
+        instructions.push(Instruction::PUSHARG(1));
+        instructions.push(Instruction::CALL(callee.to_owned()));
+    }
+    instructions.push(Instruction::RET(0));
+
+    function(entry, 2, instructions, HashMap::new())
+}
+
+fn array_push_program(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(2 + operation_count * 4 + 1);
+    instructions.push(Instruction::CALL("create_array".to_owned()));
+    instructions.push(Instruction::MOV(1, 0));
+
+    for value in 0..operation_count {
+        instructions.push(Instruction::PUSHARG(1));
+        instructions.push(Instruction::LDI(2, Value::I64(value as i64)));
+        instructions.push(Instruction::PUSHARG(2));
+        instructions.push(Instruction::CALL("array_push".to_owned()));
+    }
+
+    instructions.push(Instruction::RET(1));
+    function("array_push_loop", 3, instructions, HashMap::new())
+}
+
+fn object_set_program(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(2 + operation_count * 6 + 1);
+    instructions.push(Instruction::CALL("create_object".to_owned()));
+    instructions.push(Instruction::MOV(1, 0));
+
+    for value in 0..operation_count {
+        instructions.push(Instruction::PUSHARG(1));
+        instructions.push(Instruction::LDI(2, Value::String(format!("field_{value}"))));
+        instructions.push(Instruction::PUSHARG(2));
+        instructions.push(Instruction::LDI(3, Value::I64(value as i64)));
+        instructions.push(Instruction::PUSHARG(3));
+        instructions.push(Instruction::CALL("set_field".to_owned()));
+    }
+
+    instructions.push(Instruction::RET(1));
+    function("object_set_loop", 4, instructions, HashMap::new())
+}
+
+fn clear_register_copy_many(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(0, Value::I64(7)));
+    instructions.extend((1..=operation_count).map(|dest| Instruction::MOV(dest, 0)));
+    instructions.push(Instruction::RET(0));
+
+    function(
+        "clear_register_copy_many",
+        operation_count + 1,
+        instructions,
+        HashMap::new(),
+    )
+}
+
+fn clear_to_secret_many(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(0, Value::I64(7)));
+    instructions.extend((1..=operation_count).map(|dest| Instruction::MOV(dest, 0)));
+    instructions.push(Instruction::RET(0));
+
+    function(
+        "clear_to_secret_many",
+        operation_count + 1,
+        instructions,
+        HashMap::new(),
+    )
+}
+
+fn secret_register_copy_many(operation_count: usize) -> VMFunction {
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(1, Value::I64(7)));
+    instructions.extend((0..operation_count).map(|index| Instruction::MOV(index + 2, 1)));
+    instructions.push(Instruction::RET(0));
+
+    function(
+        "secret_register_copy_many",
+        operation_count + 2,
+        instructions,
+        HashMap::new(),
+    )
+}
+
+fn secret_to_clear_many(operation_count: usize) -> VMFunction {
+    let secret_register = operation_count;
+    let mut instructions = Vec::with_capacity(operation_count + 2);
+    instructions.push(Instruction::LDI(secret_register, Value::I64(7)));
+    instructions.extend((0..operation_count).map(|dest| Instruction::MOV(dest, secret_register)));
+    instructions.push(Instruction::RET(0));
+
+    function(
+        "secret_to_clear_many",
+        operation_count + 1,
+        instructions,
+        HashMap::new(),
+    )
+}
+
+fn async_share_roundtrip_program(name: &str, clear_value: i64) -> VMFunction {
+    function(
+        name,
+        1,
+        vec![
+            Instruction::LDI(0, Value::I64(clear_value)),
+            Instruction::PUSHARG(0),
+            Instruction::CALL("Share.from_clear".to_owned()),
+            Instruction::PUSHARG(0),
+            Instruction::CALL("Share.open".to_owned()),
+            Instruction::RET(0),
+        ],
+        HashMap::new(),
+    )
+}
+
+fn async_roundtrip_vm(
+    entry_count: usize,
+    engine: Arc<dyn MpcEngine>,
+) -> (VirtualMachine, Vec<String>) {
+    let names = (0..entry_count)
+        .map(|index| format!("async_roundtrip_{index}"))
+        .collect::<Vec<_>>();
+    let functions = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| async_share_roundtrip_program(name, index as i64));
+
+    let mut vm = vm_with(functions);
+    vm.set_mpc_engine(engine);
+    (vm, names)
+}
+
+fn configure(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(50);
+}
+
+fn configure_long_diagnostic(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+) {
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(10);
+}
+
+fn bench_instruction_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("instruction_throughput");
+    configure(&mut group);
+
+    for operation_count in INSTRUCTION_COUNTS {
+        group.throughput(Throughput::Elements(operation_count as u64));
+
+        let mut vm = warm(vm_with([add_chain(operation_count)]), "add_chain");
         group.bench_with_input(
-            BenchmarkId::new("instruction_count", size),
-            size,
-            |b, &size| {
-                b.iter(|| black_box(vm.execute(&format!("test_func_{}", size)).unwrap()));
+            BenchmarkId::new("clear_add_chain", operation_count),
+            &operation_count,
+            |b, _| b.iter(|| black_box(vm.execute("add_chain").unwrap())),
+        );
+
+        let mut vm = warm(vm_with([mov_chain(operation_count)]), "mov_chain");
+        group.bench_with_input(
+            BenchmarkId::new("register_mov_chain", operation_count),
+            &operation_count,
+            |b, _| b.iter(|| black_box(vm.execute("mov_chain").unwrap())),
+        );
+
+        let mut vm = warm(vm_with([branch_loop(operation_count)]), "branch_loop");
+        group.bench_with_input(
+            BenchmarkId::new("compare_branch_loop", operation_count),
+            &operation_count,
+            |b, _| b.iter(|| black_box(vm.execute("branch_loop").unwrap())),
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_dispatch_diagnostics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dispatch_diagnostics");
+    configure_long_diagnostic(&mut group);
+    group.throughput(Throughput::Elements(LONG_DIAGNOSTIC_COUNT as u64));
+
+    let mut vm = warm(vm_with([nop_loop(LONG_DIAGNOSTIC_COUNT)]), "nop_loop");
+    group.bench_function("nop_loop_controlled/10000000", |b| {
+        b.iter(|| black_box(vm.execute("nop_loop").unwrap()))
+    });
+
+    let mut vm = warm(
+        vm_with([cmp_read_loop(LONG_DIAGNOSTIC_COUNT)]),
+        "cmp_read_loop",
+    );
+    group.bench_function("cmp_read_loop_controlled/10000000", |b| {
+        b.iter(|| black_box(vm.execute("cmp_read_loop").unwrap()))
+    });
+
+    group.finish();
+}
+
+fn bench_straight_line_diagnostics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("straight_line_diagnostics");
+    configure_long_diagnostic(&mut group);
+    group.throughput(Throughput::Elements(STRAIGHT_LINE_COUNT as u64));
+
+    {
+        let mut vm = warm(vm_with([straight_nop(STRAIGHT_LINE_COUNT)]), "straight_nop");
+        group.bench_function("straight_nop_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_nop").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(vm_with([straight_mov(STRAIGHT_LINE_COUNT)]), "straight_mov");
+        group.bench_function("straight_mov_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_mov").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(vm_with([straight_add(STRAIGHT_LINE_COUNT)]), "straight_add");
+        group.bench_function("straight_add_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_add").unwrap()))
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_register_path_diagnostics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("register_path_diagnostics");
+    configure_long_diagnostic(&mut group);
+    group.throughput(Throughput::Elements(STRAIGHT_LINE_COUNT as u64));
+
+    {
+        let mut vm = warm(
+            vm_with([straight_write_const(STRAIGHT_LINE_COUNT)]),
+            "straight_write_const",
+        );
+        group.bench_function("write_const_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_write_const").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(
+            vm_with([straight_cmp_read_only_proxy(STRAIGHT_LINE_COUNT)]),
+            "straight_cmp_read_only_proxy",
+        );
+        group.bench_function("cmp_read_only_proxy_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_cmp_read_only_proxy").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(
+            vm_with([straight_mov_distinct(STRAIGHT_LINE_COUNT)]),
+            "straight_mov_distinct",
+        );
+        group.bench_function("mov_r0_r1_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_mov_distinct").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(
+            vm_with([straight_add_distinct(STRAIGHT_LINE_COUNT)]),
+            "straight_add_distinct",
+        );
+        group.bench_function("add_r0_r1_r2_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_add_distinct").unwrap()))
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_register_file_diagnostics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("register_file_diagnostics");
+    configure_long_diagnostic(&mut group);
+    group.throughput(Throughput::Elements(LONG_DIAGNOSTIC_COUNT as u64));
+
+    group.bench_function("copy_clear_i64_10M", |b| {
+        b.iter_batched(
+            || {
+                let mut registers = RegisterFile::with_default_layout(2);
+                *registers
+                    .get_mut(RegisterIndex::new(0))
+                    .expect("destination register should exist") = Value::I64(0);
+                *registers
+                    .get_mut(RegisterIndex::new(1))
+                    .expect("source register should exist") = Value::I64(1);
+                registers
+            },
+            |mut registers| {
+                let dest = RegisterIndex::new(0);
+                let src = RegisterIndex::new(1);
+                for _ in 0..LONG_DIAGNOSTIC_COUNT {
+                    black_box(registers.copy_clear_value(dest, src));
+                }
+                black_box(registers)
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.finish();
+}
+
+fn bench_local_instruction_matrix(c: &mut Criterion) {
+    let mut group = c.benchmark_group("local_instruction_matrix");
+    configure_long_diagnostic(&mut group);
+    group.throughput(Throughput::Elements(STRAIGHT_LINE_COUNT as u64));
+
+    macro_rules! bench_straight {
+        ($id:literal, $builder:ident, $entry:literal) => {{
+            let mut vm = warm(vm_with([$builder(STRAIGHT_LINE_COUNT)]), $entry);
+            group.bench_function($id, |b| b.iter(|| black_box(vm.execute($entry).unwrap())));
+        }};
+    }
+
+    bench_straight!("ldi_i64_10M", straight_write_const, "straight_write_const");
+    bench_straight!("ld_stack_10M", straight_load_stack, "straight_load_stack");
+    bench_straight!("sub_i64_10M", straight_sub, "straight_sub");
+    bench_straight!("mul_i64_10M", straight_mul, "straight_mul");
+    bench_straight!("div_i64_10M", straight_div, "straight_div");
+    bench_straight!("mod_i64_10M", straight_mod, "straight_mod");
+    bench_straight!("and_i64_10M", straight_and, "straight_and");
+    bench_straight!("or_i64_10M", straight_or, "straight_or");
+    bench_straight!("xor_i64_10M", straight_xor, "straight_xor");
+    bench_straight!("not_i64_10M", straight_not, "straight_not");
+    bench_straight!("shl_i64_10M", straight_shl, "straight_shl");
+    bench_straight!("shr_i64_10M", straight_shr, "straight_shr");
+
+    group.finish();
+}
+
+fn bench_stack_instruction_diagnostics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("stack_instruction_diagnostics");
+    configure(&mut group);
+    group.throughput(Throughput::Elements(STACK_DIAGNOSTIC_COUNT as u64));
+
+    {
+        let mut vm = warm(
+            vm_with([straight_pusharg(STACK_DIAGNOSTIC_COUNT)]),
+            "straight_pusharg",
+        );
+        group.bench_function("pusharg_100k", |b| {
+            b.iter(|| black_box(vm.execute("straight_pusharg").unwrap()))
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_mov_path_diagnostics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mov_path_diagnostics");
+    configure_long_diagnostic(&mut group);
+    group.throughput(Throughput::Elements(STRAIGHT_LINE_COUNT as u64));
+
+    {
+        let mut vm = warm(
+            vm_with([straight_mov_self_alias(STRAIGHT_LINE_COUNT)]),
+            "straight_mov_self_alias",
+        );
+        group.bench_function("mov_r0_r0_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_mov_self_alias").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(
+            vm_with([straight_mov_distinct(STRAIGHT_LINE_COUNT)]),
+            "straight_mov_distinct",
+        );
+        group.bench_function("mov_r0_r1_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_mov_distinct").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(
+            vm_with([straight_mov_reverse_adjacent(STRAIGHT_LINE_COUNT)]),
+            "straight_mov_reverse_adjacent",
+        );
+        group.bench_function("mov_r1_r0_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_mov_reverse_adjacent").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(
+            vm_with([straight_mov_far_to_low(STRAIGHT_LINE_COUNT)]),
+            "straight_mov_far_to_low",
+        );
+        group.bench_function("mov_r0_r15_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_mov_far_to_low").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(
+            vm_with([straight_mov_low_to_far(STRAIGHT_LINE_COUNT)]),
+            "straight_mov_low_to_far",
+        );
+        group.bench_function("mov_r15_r0_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_mov_low_to_far").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(
+            vm_with([straight_mov_zero_source(STRAIGHT_LINE_COUNT)]),
+            "straight_mov_zero_source",
+        );
+        group.bench_function("mov_zero_source_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_mov_zero_source").unwrap()))
+        });
+    }
+
+    {
+        let mut vm = warm(
+            vm_with([straight_mov_unit_source(STRAIGHT_LINE_COUNT)]),
+            "straight_mov_unit_source",
+        );
+        group.bench_function("mov_unit_source_10M", |b| {
+            b.iter(|| black_box(vm.execute("straight_mov_unit_source").unwrap()))
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_branch_prediction_diagnostics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("branch_prediction_diagnostics");
+    configure_long_diagnostic(&mut group);
+    group.throughput(Throughput::Elements(LONG_DIAGNOSTIC_COUNT as u64));
+
+    let mut vm = warm(
+        vm_with([branch_always_taken_loop(LONG_DIAGNOSTIC_COUNT)]),
+        "branch_always_taken_loop",
+    );
+    group.bench_function("always_taken/10000000", |b| {
+        b.iter(|| black_box(vm.execute("branch_always_taken_loop").unwrap()))
+    });
+
+    let mut vm = warm(
+        vm_with([branch_never_taken_loop(LONG_DIAGNOSTIC_COUNT)]),
+        "branch_never_taken_loop",
+    );
+    group.bench_function("never_taken/10000000", |b| {
+        b.iter(|| black_box(vm.execute("branch_never_taken_loop").unwrap()))
+    });
+
+    let mut vm = warm(
+        vm_with([branch_alternating_loop(LONG_DIAGNOSTIC_COUNT)]),
+        "branch_alternating_loop",
+    );
+    group.bench_function("alternating/10000000", |b| {
+        b.iter(|| black_box(vm.execute("branch_alternating_loop").unwrap()))
+    });
+
+    group.finish();
+}
+
+fn bench_function_call_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("function_call_throughput");
+    configure(&mut group);
+
+    for call_count in CALL_COUNTS {
+        group.throughput(Throughput::Elements(call_count as u64));
+
+        let mut vm = warm(
+            vm_with([
+                vm_noop_target(),
+                call_loop("vm_call_loop", "vm_noop", call_count),
+            ]),
+            "vm_call_loop",
+        );
+        group.bench_with_input(
+            BenchmarkId::new("vm_function_call", call_count),
+            &call_count,
+            |b, _| b.iter(|| black_box(vm.execute("vm_call_loop").unwrap())),
+        );
+
+        let mut vm = warm(
+            vm_with([
+                vm_add_target(),
+                call_loop_with_two_args("vm_call_with_args_loop", "vm_add", call_count),
+            ]),
+            "vm_call_with_args_loop",
+        );
+        group.bench_with_input(
+            BenchmarkId::new("vm_function_call_with_args", call_count),
+            &call_count,
+            |b, _| b.iter(|| black_box(vm.execute("vm_call_with_args_loop").unwrap())),
+        );
+
+        let mut vm = vm_with([call_loop("foreign_call_loop", "native.noop", call_count)]);
+        vm.register_foreign_function("native.noop", |_| Ok(Value::I64(1)));
+        let mut vm = warm(vm, "foreign_call_loop");
+        group.bench_with_input(
+            BenchmarkId::new("foreign_function_call", call_count),
+            &call_count,
+            |b, _| b.iter(|| black_box(vm.execute("foreign_call_loop").unwrap())),
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_activation_frame_diagnostics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("activation_frame_diagnostics");
+    configure(&mut group);
+    group.throughput(Throughput::Elements(FRAME_DIAGNOSTIC_COUNT as u64));
+
+    let function_name: Arc<str> = Arc::from("callee");
+    let layout = RegisterLayout::default();
+    let parameters = vec!["x".to_owned(), "y".to_owned()];
+    let borrowed_args = vec![Value::I64(1), Value::I64(2)];
+
+    group.bench_function("empty_frame_100k", |b| {
+        b.iter(|| {
+            for _ in 0..FRAME_DIAGNOSTIC_COUNT {
+                black_box(ActivationRecord::for_function(
+                    Arc::clone(&function_name),
+                    layout,
+                    3,
+                    Vec::new(),
+                    None,
+                ));
+            }
+        })
+    });
+
+    group.bench_function("preallocated_empty_frame_100k", |b| {
+        b.iter(|| {
+            for _ in 0..FRAME_DIAGNOSTIC_COUNT {
+                black_box(ActivationRecord::for_function_with_local_capacity(
+                    Arc::clone(&function_name),
+                    layout,
+                    3,
+                    Vec::new(),
+                    None,
+                    parameters.len(),
+                ));
+            }
+        })
+    });
+
+    group.bench_function("bind_borrowed_two_args_100k", |b| {
+        b.iter(|| {
+            for _ in 0..FRAME_DIAGNOSTIC_COUNT {
+                let mut record = ActivationRecord::for_function(
+                    Arc::clone(&function_name),
+                    layout,
+                    3,
+                    Vec::new(),
+                    None,
+                );
+                record
+                    .bind_parameters(&parameters, &borrowed_args)
+                    .expect("benchmark arguments should match parameters");
+                black_box(record);
+            }
+        })
+    });
+
+    group.bench_function("bind_owned_two_args_100k", |b| {
+        b.iter(|| {
+            for _ in 0..FRAME_DIAGNOSTIC_COUNT {
+                let mut record = ActivationRecord::for_function(
+                    Arc::clone(&function_name),
+                    layout,
+                    3,
+                    Vec::new(),
+                    None,
+                );
+                record
+                    .bind_owned_parameters(&parameters, vec![Value::I64(1), Value::I64(2)])
+                    .expect("benchmark arguments should match parameters");
+                black_box(record);
+            }
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_hook_overhead(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hook_overhead");
+    configure(&mut group);
+
+    for operation_count in INSTRUCTION_COUNTS {
+        group.throughput(Throughput::Elements(operation_count as u64));
+
+        let mut vm = warm(vm_with([add_chain(operation_count)]), "add_chain");
+        group.bench_with_input(
+            BenchmarkId::new("no_hooks", operation_count),
+            &operation_count,
+            |b, _| b.iter(|| black_box(vm.execute("add_chain").unwrap())),
+        );
+
+        let mut vm = vm_with([add_chain(operation_count)]);
+        let hook_id = vm.register_hook(|_| true, |_, _| Ok(()), 0);
+        assert!(vm.disable_hook(hook_id));
+        let mut vm = warm(vm, "add_chain");
+        group.bench_with_input(
+            BenchmarkId::new("disabled_hook_registered", operation_count),
+            &operation_count,
+            |b, _| b.iter(|| black_box(vm.execute("add_chain").unwrap())),
+        );
+
+        let mut vm = vm_with([add_chain(operation_count)]);
+        vm.register_hook(
+            |event| matches!(event, HookEvent::BeforeInstructionExecute(_)),
+            |_, _| Ok(()),
+            0,
+        );
+        let mut vm = warm(vm, "add_chain");
+        group.bench_with_input(
+            BenchmarkId::new("enabled_instruction_hook", operation_count),
+            &operation_count,
+            |b, _| b.iter(|| black_box(vm.execute("add_chain").unwrap())),
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_table_memory_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("table_memory_throughput");
+    configure(&mut group);
+
+    for operation_count in TABLE_OPERATION_COUNTS {
+        group.throughput(Throughput::Elements(operation_count as u64));
+
+        let template = vm_with([array_push_program(operation_count)]);
+        group.bench_with_input(
+            BenchmarkId::new("array_push", operation_count),
+            &operation_count,
+            |b, _| {
+                b.iter_batched(
+                    || template.try_clone_with_independent_state().unwrap(),
+                    |mut vm| black_box(vm.execute("array_push_loop").unwrap()),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        let template = vm_with([object_set_program(operation_count)]);
+        group.bench_with_input(
+            BenchmarkId::new("object_set_field", operation_count),
+            &operation_count,
+            |b, _| {
+                b.iter_batched(
+                    || template.try_clone_with_independent_state().unwrap(),
+                    |mut vm| black_box(vm.execute("object_set_loop").unwrap()),
+                    BatchSize::SmallInput,
+                );
             },
         );
     }
@@ -748,45 +1302,107 @@ fn bench_parameterized(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_memory_overhead(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Memory Overhead");
+fn bench_register_bank_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("register_bank_throughput");
+    configure(&mut group);
 
-    // Benchmark with different array sizes
-    for size in [10, 100, 1000].iter() {
-        let mut vm = VirtualMachine::new();
+    for operation_count in REGISTER_BANK_COUNTS {
+        group.throughput(Throughput::Elements(operation_count as u64));
 
-        // Create a function that creates an array of size *size*
-        let mut instructions = Vec::new();
-
-        // Create array
-        instructions.push(Instruction::CALL("create_array".to_string()));
-        instructions.push(Instruction::MOV(1, 0));
-
-        // Push elements
-        for i in 0..*size {
-            instructions.push(Instruction::PUSHARG(1));
-            instructions.push(Instruction::LDI(2, Value::I64(i as i64)));
-            instructions.push(Instruction::PUSHARG(2));
-            instructions.push(Instruction::CALL("array_push".to_string()));
-        }
-
-        instructions.push(Instruction::RET(1));
-
-        let test_func = VMFunction::new(
-            format!("array_test_{}", size),
-            vec![],
-            vec![],
-            None,
-            3,
-            instructions,
-            HashMap::new(),
+        let engine: Arc<dyn MpcEngine> = Arc::new(ImmediateAsyncEngine);
+        let mut vm = warm(
+            vm_with_register_layout(
+                [clear_register_copy_many(operation_count)],
+                RegisterLayout::new(operation_count + 1),
+                Arc::clone(&engine),
+            ),
+            "clear_register_copy_many",
         );
-        vm.register_function(test_func);
-        vm.execute(&format!("array_test_{}", size)).unwrap(); // Warmup
+        group.bench_with_input(
+            BenchmarkId::new("clear_to_clear_many", operation_count),
+            &operation_count,
+            |b, _| b.iter(|| black_box(vm.execute("clear_register_copy_many").unwrap())),
+        );
 
-        group.bench_with_input(BenchmarkId::new("array_size", size), size, |b, &size| {
-            b.iter(|| black_box(vm.execute(&format!("array_test_{}", size)).unwrap()));
-        });
+        let engine: Arc<dyn MpcEngine> = Arc::new(ImmediateAsyncEngine);
+        let mut vm = warm(
+            vm_with_register_layout(
+                [clear_to_secret_many(operation_count)],
+                RegisterLayout::new(1),
+                Arc::clone(&engine),
+            ),
+            "clear_to_secret_many",
+        );
+        group.bench_with_input(
+            BenchmarkId::new("clear_to_secret_many", operation_count),
+            &operation_count,
+            |b, _| b.iter(|| black_box(vm.execute("clear_to_secret_many").unwrap())),
+        );
+
+        let engine: Arc<dyn MpcEngine> = Arc::new(ImmediateAsyncEngine);
+        let mut vm = warm(
+            vm_with_register_layout(
+                [secret_register_copy_many(operation_count)],
+                RegisterLayout::new(1),
+                Arc::clone(&engine),
+            ),
+            "secret_register_copy_many",
+        );
+        group.bench_with_input(
+            BenchmarkId::new("secret_to_secret_many", operation_count),
+            &operation_count,
+            |b, _| b.iter(|| black_box(vm.execute("secret_register_copy_many").unwrap())),
+        );
+
+        let engine: Arc<dyn MpcEngine> = Arc::new(ImmediateAsyncEngine);
+        let mut vm = warm(
+            vm_with_register_layout(
+                [secret_to_clear_many(operation_count)],
+                RegisterLayout::new(operation_count),
+                Arc::clone(&engine),
+            ),
+            "secret_to_clear_many",
+        );
+        group.bench_with_input(
+            BenchmarkId::new("secret_to_clear_many", operation_count),
+            &operation_count,
+            |b, _| b.iter(|| black_box(vm.execute("secret_to_clear_many").unwrap())),
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_async_effect_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("async_effect_throughput");
+    configure(&mut group);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("benchmark runtime should build");
+    let async_engine = Arc::new(ImmediateAsyncEngine);
+    let runtime_engine: Arc<dyn MpcEngine> = async_engine.clone();
+
+    for entry_count in ASYNC_ENTRY_COUNTS {
+        group.throughput(Throughput::Elements(entry_count as u64));
+        let (vm, names) = async_roundtrip_vm(entry_count, Arc::clone(&runtime_engine));
+        group.bench_with_input(
+            BenchmarkId::new("share_from_clear_open_many", entry_count),
+            &entry_count,
+            |b, _| {
+                b.iter(|| {
+                    black_box(
+                        runtime
+                            .block_on(vm.execute_many_async(
+                                names.iter().map(String::as_str),
+                                async_engine.as_ref(),
+                            ))
+                            .unwrap(),
+                    )
+                });
+            },
+        );
     }
 
     group.finish();
@@ -794,18 +1410,20 @@ fn bench_memory_overhead(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_basic_operations,
-    bench_function_calls,
-    bench_object_operations,
-    bench_array_operations,
-    bench_hook_system,
-    bench_optimized_operations,
-    bench_individual_instructions,
-    bench_vm_components,
-    bench_parameterized,
-    bench_memory_overhead,
-    // Temporarily remove bench_optimized_hook_system to avoid hanging
-    // bench_optimized_hook_system,
-    bench_core_execution
+    bench_instruction_throughput,
+    bench_dispatch_diagnostics,
+    bench_straight_line_diagnostics,
+    bench_register_path_diagnostics,
+    bench_register_file_diagnostics,
+    bench_local_instruction_matrix,
+    bench_stack_instruction_diagnostics,
+    bench_mov_path_diagnostics,
+    bench_branch_prediction_diagnostics,
+    bench_function_call_throughput,
+    bench_activation_frame_diagnostics,
+    bench_hook_overhead,
+    bench_table_memory_throughput,
+    bench_register_bank_throughput,
+    bench_async_effect_throughput,
 );
 criterion_main!(benches);

@@ -117,7 +117,7 @@ async fn test_open_share_in_exp_known_value() {
             let party_id = servers[i]
                 .party_id
                 .expect("party_id should be set after finalize_network()");
-            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::try_from_existing_node_with_router(
                 servers[i].open_message_router.clone(),
                 instance_id,
                 party_id,
@@ -129,6 +129,7 @@ async fn test_open_share_in_exp_known_value() {
                     .expect("network should be set"),
                 servers[i].node.clone(),
             )
+            .expect("test topology should be valid")
         })
         .collect();
 
@@ -174,7 +175,11 @@ async fn test_open_share_in_exp_known_value() {
                 .expect("party_id should be set after finalize_network()")]
             .clone();
             let gen = gen_bytes.clone();
-            tokio::spawn(async move { engine.open_share_in_exp(ty, &share, &gen) })
+            tokio::spawn(async move {
+                engine
+                    .open_in_exp_ops()?
+                    .open_share_in_exp(ty, &share, &gen)
+            })
         })
         .collect();
 
@@ -305,7 +310,7 @@ async fn test_simulated_dkg_flow() {
             let party_id = servers[i]
                 .party_id
                 .expect("party_id should be set after finalize_network()");
-            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::from_existing_node_with_router(
+            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::try_from_existing_node_with_router(
                 servers[i].open_message_router.clone(),
                 instance_id,
                 party_id,
@@ -317,6 +322,7 @@ async fn test_simulated_dkg_flow() {
                     .expect("network should be set"),
                 servers[i].node.clone(),
             )
+            .expect("test topology should be valid")
         })
         .collect();
 
@@ -369,7 +375,11 @@ async fn test_simulated_dkg_flow() {
                 .expect("party_id should be set after finalize_network()")]
             .clone();
             let gen = gen_bytes.clone();
-            tokio::spawn(async move { engine.open_share_in_exp(ty, &share, &gen) })
+            tokio::spawn(async move {
+                engine
+                    .open_in_exp_ops()?
+                    .open_share_in_exp(ty, &share, &gen)
+            })
         })
         .collect();
 

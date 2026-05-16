@@ -7,6 +7,9 @@
 # Usage:
 #   STOFFEL_AUTH_TOKEN=<token> docker-compose -f docker-compose.avss.yml up
 #
+# To run a different compiled Stoffel program:
+#   STOFFEL_AUTH_TOKEN=<token> STOFFEL_PROGRAM=/app/programs/threshold_bls_bls12381.stflb docker-compose -f docker-compose.avss.yml up
+#
 # To use a different elliptic curve (default: bls12-381):
 #   STOFFEL_AUTH_TOKEN=<token> STOFFEL_MPC_CURVE=bn254 docker-compose -f docker-compose.avss.yml up
 #
@@ -30,7 +33,7 @@ services:
       - STOFFEL_BIND_ADDR=172.29.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
-      - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
+      - STOFFEL_PROGRAM=${STOFFEL_PROGRAM:-/app/programs/avss_keygen.stflb}
       - STOFFEL_ENTRY=main
       - STOFFEL_MPC_BACKEND=avss
       - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
@@ -64,7 +67,7 @@ services:
       - STOFFEL_BOOTSTRAP_ADDR=172.29.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
-      - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
+      - STOFFEL_PROGRAM=${STOFFEL_PROGRAM:-/app/programs/avss_keygen.stflb}
       - STOFFEL_ENTRY=main
       - STOFFEL_MPC_BACKEND=avss
       - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
@@ -95,7 +98,7 @@ services:
       - STOFFEL_BOOTSTRAP_ADDR=172.29.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
-      - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
+      - STOFFEL_PROGRAM=${STOFFEL_PROGRAM:-/app/programs/avss_keygen.stflb}
       - STOFFEL_ENTRY=main
       - STOFFEL_MPC_BACKEND=avss
       - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
@@ -126,7 +129,7 @@ services:
       - STOFFEL_BOOTSTRAP_ADDR=172.29.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
-      - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
+      - STOFFEL_PROGRAM=${STOFFEL_PROGRAM:-/app/programs/avss_keygen.stflb}
       - STOFFEL_ENTRY=main
       - STOFFEL_MPC_BACKEND=avss
       - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}
@@ -157,7 +160,7 @@ services:
       - STOFFEL_BOOTSTRAP_ADDR=172.29.0.10:9000
       - STOFFEL_N_PARTIES=5
       - STOFFEL_THRESHOLD=1
-      - STOFFEL_PROGRAM=/app/programs/avss_keygen.stflb
+      - STOFFEL_PROGRAM=${STOFFEL_PROGRAM:-/app/programs/avss_keygen.stflb}
       - STOFFEL_ENTRY=main
       - STOFFEL_MPC_BACKEND=avss
       - STOFFEL_MPC_CURVE=${STOFFEL_MPC_CURVE:-}

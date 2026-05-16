@@ -12,11 +12,13 @@ use ark_std::UniformRand;
 use std::collections::HashMap;
 
 use crate::core_vm::VirtualMachine;
-use crate::mpc_builtins::avss_object;
-use crate::tests::test_utils::setup_test_tracing;
-use stoffel_vm_types::core_types::Value;
+use crate::tests::test_utils::{read_vm_table_byte_array, setup_test_tracing};
+use stoffel_vm_types::core_types::{ObjectRef, Value};
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
+
+type AvssPartyMaterial = (Vec<u8>, Vec<Vec<u8>>);
+type SimulatedAvssShares = Vec<AvssPartyMaterial>;
 
 /// Create a mock AVSS share for testing
 /// This simulates what the AVSS protocol would produce
@@ -62,6 +64,22 @@ fn create_mock_avss_share(party_id: usize, threshold: usize) -> (Vec<u8>, Vec<Ve
     (share_bytes, commitment_bytes, public_key)
 }
 
+fn create_vm_avss_share(
+    vm: &mut VirtualMachine,
+    key_name: &str,
+    share_bytes: Vec<u8>,
+    commitment_bytes: Vec<Vec<u8>>,
+    party_id: usize,
+) -> usize {
+    match vm
+        .create_avss_share_object(key_name, share_bytes, commitment_bytes, party_id)
+        .expect("create AVSS share object")
+    {
+        Value::Object(object_ref) => object_ref.id(),
+        other => panic!("Expected AVSS share object, got: {:?}", other),
+    }
+}
+
 /// Test that AVSS share objects can be created and queried
 #[test]
 fn test_avss_share_object_creation() {
@@ -75,31 +93,27 @@ fn test_avss_share_object_creation() {
     let (share_bytes, commitment_bytes, expected_public_key) =
         create_mock_avss_share(party_id, threshold);
 
-    let obj_id = avss_object::create_avss_share_object(
-        &mut vm.state.object_store,
+    let obj_id = create_vm_avss_share(
+        &mut vm,
         key_name,
         share_bytes,
         commitment_bytes.clone(),
         party_id,
-    )
-    .unwrap();
+    );
 
-    let obj = Value::Object(obj_id);
-    assert!(avss_object::is_avss_share_object(
-        &vm.state.object_store,
-        &obj
-    ));
+    let obj = Value::from(ObjectRef::new(obj_id));
+    assert!(vm.is_avss_share_object(&obj));
 
     // Verify key name
-    let retrieved_key_name = avss_object::get_key_name(&vm.state.object_store, &obj).unwrap();
+    let retrieved_key_name = vm.avss_key_name(&obj).unwrap();
     assert_eq!(retrieved_key_name, key_name);
 
     // Verify commitment count
-    let count = avss_object::get_commitment_count(&vm.state.object_store, &obj).unwrap();
+    let count = vm.avss_commitment_count(&obj).unwrap();
     assert_eq!(count, commitment_bytes.len());
 
     // Verify public key (commitment[0])
-    let public_key_bytes = avss_object::get_commitment(&vm.state.object_store, &obj, 0).unwrap();
+    let public_key_bytes = vm.avss_commitment(&obj, 0).unwrap();
     assert_eq!(public_key_bytes, commitment_bytes[0]);
 
     // Deserialize and verify it matches the expected public key
@@ -120,14 +134,13 @@ fn test_avss_builtins_via_vm() {
     let (share_bytes, commitment_bytes, _expected_public_key) =
         create_mock_avss_share(party_id, threshold);
 
-    let obj_id = avss_object::create_avss_share_object(
-        &mut vm.state.object_store,
+    let obj_id = create_vm_avss_share(
+        &mut vm,
         "vm_test_key",
         share_bytes,
         commitment_bytes.clone(),
         party_id,
-    )
-    .unwrap();
+    );
 
     let test_is_avss_share_fn = VMFunction::new(
         "test_is_avss_share".to_string(),
@@ -136,7 +149,7 @@ fn test_avss_builtins_via_vm() {
         None,
         4,
         vec![
-            Instruction::LDI(0, Value::Object(obj_id)),
+            Instruction::LDI(0, Value::from(ObjectRef::new(obj_id))),
             Instruction::PUSHARG(0),
             Instruction::CALL("Avss.is_avss_share".to_string()),
             Instruction::RET(0),
@@ -166,14 +179,13 @@ fn test_avss_get_public_key_via_commitment_zero() {
     let (share_bytes, commitment_bytes, expected_public_key) =
         create_mock_avss_share(party_id, threshold);
 
-    let obj_id = avss_object::create_avss_share_object(
-        &mut vm.state.object_store,
+    let obj_id = create_vm_avss_share(
+        &mut vm,
         "pk_test_key",
         share_bytes,
         commitment_bytes.clone(),
         party_id,
-    )
-    .unwrap();
+    );
 
     let get_public_key_fn = VMFunction::new(
         "get_public_key".to_string(),
@@ -182,7 +194,7 @@ fn test_avss_get_public_key_via_commitment_zero() {
         None,
         4,
         vec![
-            Instruction::LDI(0, Value::Object(obj_id)),
+            Instruction::LDI(0, Value::from(ObjectRef::new(obj_id))),
             Instruction::LDI(1, Value::I64(0)), // commitment index 0 = public key
             Instruction::PUSHARG(0),
             Instruction::PUSHARG(1),
@@ -198,16 +210,9 @@ fn test_avss_get_public_key_via_commitment_zero() {
 
     match result {
         Value::Array(arr_id) => {
-            let arr = vm.state.object_store.get_array(arr_id).unwrap();
-            let len = arr.length();
+            let pk_bytes = read_vm_table_byte_array(&mut vm, arr_id.id()).unwrap();
+            let len = pk_bytes.len();
             assert!(len > 0, "Public key should have non-zero length");
-
-            let mut pk_bytes = Vec::with_capacity(len);
-            for i in 0..len {
-                if let Some(Value::U8(b)) = arr.get(&Value::I64(i as i64)) {
-                    pk_bytes.push(*b);
-                }
-            }
 
             let retrieved_pk = G1::deserialize_compressed(&pk_bytes[..])
                 .expect("Failed to deserialize public key");
@@ -231,14 +236,13 @@ fn test_avss_get_commitment_builtin() {
 
     let (share_bytes, commitment_bytes, _) = create_mock_avss_share(party_id, threshold);
 
-    let obj_id = avss_object::create_avss_share_object(
-        &mut vm.state.object_store,
+    let obj_id = create_vm_avss_share(
+        &mut vm,
         "commitment_test_key",
         share_bytes,
         commitment_bytes.clone(),
         party_id,
-    )
-    .unwrap();
+    );
 
     let get_commitment_fn = VMFunction::new(
         "get_commitment_1".to_string(),
@@ -247,7 +251,7 @@ fn test_avss_get_commitment_builtin() {
         None,
         4,
         vec![
-            Instruction::LDI(0, Value::Object(obj_id)),
+            Instruction::LDI(0, Value::from(ObjectRef::new(obj_id))),
             Instruction::LDI(1, Value::I64(1)),
             Instruction::PUSHARG(0),
             Instruction::PUSHARG(1),
@@ -263,13 +267,7 @@ fn test_avss_get_commitment_builtin() {
 
     match result {
         Value::Array(arr_id) => {
-            let arr = vm.state.object_store.get_array(arr_id).unwrap();
-            let mut bytes = Vec::with_capacity(arr.length());
-            for i in 0..arr.length() {
-                if let Some(Value::U8(b)) = arr.get(&Value::I64(i as i64)) {
-                    bytes.push(*b);
-                }
-            }
+            let bytes = read_vm_table_byte_array(&mut vm, arr_id.id()).unwrap();
             assert_eq!(
                 bytes, commitment_bytes[1],
                 "Commitment at index 1 should match"
@@ -292,14 +290,13 @@ fn test_avss_commitment_count_builtin() {
 
     let expected_count = commitment_bytes.len();
 
-    let obj_id = avss_object::create_avss_share_object(
-        &mut vm.state.object_store,
+    let obj_id = create_vm_avss_share(
+        &mut vm,
         "count_test_key",
         share_bytes,
         commitment_bytes,
         party_id,
-    )
-    .unwrap();
+    );
 
     let get_count_fn = VMFunction::new(
         "get_commitment_count".to_string(),
@@ -308,7 +305,7 @@ fn test_avss_commitment_count_builtin() {
         None,
         4,
         vec![
-            Instruction::LDI(0, Value::Object(obj_id)),
+            Instruction::LDI(0, Value::from(ObjectRef::new(obj_id))),
             Instruction::PUSHARG(0),
             Instruction::CALL("Avss.commitment_count".to_string()),
             Instruction::RET(0),
@@ -341,14 +338,7 @@ fn test_avss_get_key_name_builtin() {
 
     let (share_bytes, commitment_bytes, _) = create_mock_avss_share(party_id, threshold);
 
-    let obj_id = avss_object::create_avss_share_object(
-        &mut vm.state.object_store,
-        key_name,
-        share_bytes,
-        commitment_bytes,
-        party_id,
-    )
-    .unwrap();
+    let obj_id = create_vm_avss_share(&mut vm, key_name, share_bytes, commitment_bytes, party_id);
 
     let get_key_name_fn = VMFunction::new(
         "get_key_name".to_string(),
@@ -357,7 +347,7 @@ fn test_avss_get_key_name_builtin() {
         None,
         4,
         vec![
-            Instruction::LDI(0, Value::Object(obj_id)),
+            Instruction::LDI(0, Value::from(ObjectRef::new(obj_id))),
             Instruction::PUSHARG(0),
             Instruction::CALL("Avss.get_key_name".to_string()),
             Instruction::RET(0),
@@ -404,14 +394,8 @@ fn test_example_avss_public_key_program() {
         commitment_bytes[0].len()
     );
 
-    let avss_share_obj_id = avss_object::create_avss_share_object(
-        &mut vm.state.object_store,
-        key_name,
-        share_bytes,
-        commitment_bytes,
-        party_id,
-    )
-    .unwrap();
+    let avss_share_obj_id =
+        create_vm_avss_share(&mut vm, key_name, share_bytes, commitment_bytes, party_id);
 
     tracing::info!("Created AVSS share object with ID: {}", avss_share_obj_id);
 
@@ -422,7 +406,7 @@ fn test_example_avss_public_key_program() {
         None,
         4,
         vec![
-            Instruction::LDI(0, Value::Object(avss_share_obj_id)),
+            Instruction::LDI(0, Value::from(ObjectRef::new(avss_share_obj_id))),
             Instruction::LDI(1, Value::I64(0)), // commitment index 0 = public key
             Instruction::PUSHARG(0),
             Instruction::PUSHARG(1),
@@ -439,16 +423,9 @@ fn test_example_avss_public_key_program() {
 
     match result {
         Value::Array(arr_id) => {
-            let arr = vm.state.object_store.get_array(arr_id).unwrap();
-            let len = arr.length();
+            let pk_bytes = read_vm_table_byte_array(&mut vm, arr_id.id()).unwrap();
+            let len = pk_bytes.len();
             tracing::info!("Got public key as byte array with {} bytes", len);
-
-            let mut pk_bytes = Vec::with_capacity(len);
-            for i in 0..len {
-                if let Some(Value::U8(b)) = arr.get(&Value::I64(i as i64)) {
-                    pk_bytes.push(*b);
-                }
-            }
 
             let retrieved_pk = G1::deserialize_compressed(&pk_bytes[..])
                 .expect("Failed to deserialize public key");
@@ -474,7 +451,7 @@ fn test_avss_builtin_rejects_non_avss_objects() {
     let mut vm = VirtualMachine::new();
 
     // Create a regular object (not an AVSS share)
-    let regular_obj_id = vm.state.object_store.create_object();
+    let regular_obj_id = vm.create_object_ref().expect("create regular object").id();
 
     let test_fn = VMFunction::new(
         "test_reject".to_string(),
@@ -483,7 +460,7 @@ fn test_avss_builtin_rejects_non_avss_objects() {
         None,
         4,
         vec![
-            Instruction::LDI(0, Value::Object(regular_obj_id)),
+            Instruction::LDI(0, Value::from(ObjectRef::new(regular_obj_id))),
             Instruction::PUSHARG(0),
             Instruction::CALL("Avss.is_avss_share".to_string()),
             Instruction::RET(0),
@@ -506,10 +483,7 @@ fn test_avss_builtin_rejects_non_avss_objects() {
 // ============================================================================
 
 /// Simulate 5 parties running AVSS and producing consistent shares
-fn simulate_avss_for_n_parties(
-    n_parties: usize,
-    threshold: usize,
-) -> (Vec<(Vec<u8>, Vec<Vec<u8>>)>, G1) {
+fn simulate_avss_for_n_parties(n_parties: usize, threshold: usize) -> (SimulatedAvssShares, G1) {
     use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
     use ark_std::test_rng;
 
@@ -577,14 +551,13 @@ fn test_e2e_5_parties_avss_public_key() {
     for (party_id, (share_bytes, commitment_bytes)) in party_data.into_iter().enumerate() {
         let mut vm = VirtualMachine::new();
 
-        let avss_share_id = avss_object::create_avss_share_object(
-            &mut vm.state.object_store,
+        let avss_share_id = create_vm_avss_share(
+            &mut vm,
             "shared_key",
             share_bytes,
             commitment_bytes,
             party_id,
-        )
-        .unwrap();
+        );
 
         let extract_pk_fn = VMFunction::new(
             "get_avss_public_key".to_string(),
@@ -593,7 +566,7 @@ fn test_e2e_5_parties_avss_public_key() {
             None,
             4,
             vec![
-                Instruction::LDI(0, Value::Object(avss_share_id)),
+                Instruction::LDI(0, Value::from(ObjectRef::new(avss_share_id))),
                 Instruction::LDI(1, Value::I64(0)), // commitment index 0 = public key
                 Instruction::PUSHARG(0),
                 Instruction::PUSHARG(1),
@@ -616,16 +589,7 @@ fn test_e2e_5_parties_avss_public_key() {
         let result = vm.execute("get_avss_public_key").expect("Execution failed");
 
         let pk_bytes = match result {
-            Value::Array(arr_id) => {
-                let arr = vm.state.object_store.get_array(arr_id).unwrap();
-                let mut bytes = Vec::with_capacity(arr.length());
-                for i in 0..arr.length() {
-                    if let Some(Value::U8(b)) = arr.get(&Value::I64(i as i64)) {
-                        bytes.push(*b);
-                    }
-                }
-                bytes
-            }
+            Value::Array(arr_ref) => read_vm_table_byte_array(vm, arr_ref.id()).unwrap(),
             other => panic!("Party {} got unexpected result: {:?}", party_id, other),
         };
 
@@ -710,14 +674,13 @@ fn test_e2e_avss_with_input_output_clients() {
     for (party_id, (share_bytes, commitment_bytes)) in party_data.into_iter().enumerate() {
         let mut vm = VirtualMachine::new();
 
-        let avss_share_id = avss_object::create_avss_share_object(
-            &mut vm.state.object_store,
+        let avss_share_id = create_vm_avss_share(
+            &mut vm,
             "client_key",
             share_bytes,
             commitment_bytes,
             party_id,
-        )
-        .unwrap();
+        );
 
         let main_fn = VMFunction::new(
             "main".to_string(),
@@ -726,7 +689,7 @@ fn test_e2e_avss_with_input_output_clients() {
             None,
             8,
             vec![
-                Instruction::LDI(0, Value::Object(avss_share_id)),
+                Instruction::LDI(0, Value::from(ObjectRef::new(avss_share_id))),
                 Instruction::LDI(1, Value::I64(0)), // commitment index 0 = public key
                 Instruction::PUSHARG(0),
                 Instruction::PUSHARG(1),
@@ -745,16 +708,7 @@ fn test_e2e_avss_with_input_output_clients() {
         let result = vm.execute("main").expect("Execution failed");
 
         let pk_bytes = match result {
-            Value::Array(arr_id) => {
-                let arr = vm.state.object_store.get_array(arr_id).unwrap();
-                let mut bytes = Vec::with_capacity(arr.length());
-                for i in 0..arr.length() {
-                    if let Some(Value::U8(b)) = arr.get(&Value::I64(i as i64)) {
-                        bytes.push(*b);
-                    }
-                }
-                bytes
-            }
+            Value::Array(arr_ref) => read_vm_table_byte_array(vm, arr_ref.id()).unwrap(),
             other => panic!("Unexpected result: {:?}", other),
         };
 

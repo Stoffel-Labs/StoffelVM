@@ -1,0 +1,9 @@
+# AVSS/ADKG distributed key generation.
+#
+# Share.random() runs the cooperative AVSS random-share protocol. The first
+# commitment is the public key for the jointly-generated secret.
+
+main main() -> bytes:
+  var secret_key = Share.random()
+  var public_key = Share.get_commitment(secret_key, 0)
+  return public_key

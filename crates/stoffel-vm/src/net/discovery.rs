@@ -1,10 +1,12 @@
 //! Bootnode-based discovery for StoffelVM over QUIC.
 //! Supports both direct connections and NAT traversal via ICE hole punching.
-use super::program_sync::{send_ctrl as send_prog_ctrl, send_program_bytes, ProgramSyncMessage};
-use super::session::{derive_instance_id, SessionInfo, SessionMessage};
+mod bootnode;
+
+use super::session::{SessionInfo, SessionMessage};
 use bincode;
+use bootnode::{spawn_connection_handler, BootnodeState};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
 use stoffelnet::network_utils::{Network, PartyId};
 use stoffelnet::transports::quic::{
     NetworkManager, PeerConnection, QuicNetworkConfig, QuicNetworkManager,
@@ -12,7 +14,7 @@ use stoffelnet::transports::quic::{
 
 // NAT traversal types - use real types when feature is enabled, stubs otherwise
 #[cfg(feature = "nat")]
-use stoffelnet::transports::ice::{CandidateType, IceCandidate, LocalCandidates};
+use stoffelnet::transports::ice::{CandidateType, IceCandidate};
 
 #[cfg(not(feature = "nat"))]
 #[allow(dead_code)]
@@ -53,10 +55,7 @@ mod nat_stubs {
 
 #[cfg(not(feature = "nat"))]
 use nat_stubs::IceCandidate;
-use tokio::{
-    sync::{broadcast, watch, Mutex},
-    time::sleep,
-};
+use tokio::time::sleep;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DiscoveryMessage {
@@ -116,21 +115,6 @@ pub enum DiscoveryMessage {
         from_party_id: PartyId,
         to_party_id: PartyId,
     },
-}
-
-/// Pending session state at bootnode
-#[derive(Debug, Clone)]
-struct PendingSession {
-    program_id: [u8; 32],
-    entry: String,
-    n_parties: usize,
-    threshold: usize,
-    /// Parties that have registered for this session
-    parties: HashMap<PartyId, SocketAddr>,
-    /// TLS-derived IDs for each party (bootnode-party-id → tls-derived-id)
-    tls_ids: HashMap<PartyId, PartyId>,
-    /// Session nonce (timestamp-based for uniqueness)
-    nonce: u64,
 }
 
 fn discovery_auth_token_from_env() -> Option<String> {
@@ -199,401 +183,13 @@ async fn run_bootnode_with_config_and_auth(
         ..Default::default()
     });
     net.listen(bind).await?;
-    let state: Arc<Mutex<HashMap<PartyId, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Program/Session agreement state: single active session for simplicity
-    let session_state: Arc<Mutex<Option<SessionInfo>>> = Arc::new(Mutex::new(None));
-    let uploader_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>> = Arc::new(Mutex::new(None));
-    // Pending session: parties waiting for session to start
-    let pending_session: Arc<Mutex<Option<PendingSession>>> = Arc::new(Mutex::new(None));
-    let expected_parties = Arc::new(Mutex::new(expected_parties));
-    // Watch channel for session ready notification
-    let (session_tx, _session_rx) = watch::channel::<Option<SessionInfo>>(None);
-    let session_tx = Arc::new(session_tx);
-    // Broadcast channel for ICE candidate relay (NAT traversal)
-    // Each connection task subscribes and forwards ICE messages to their party
-    let (ice_tx, _ice_rx) = broadcast::channel::<DiscoveryMessage>(256);
-    let ice_tx = Arc::new(ice_tx);
+    let state = BootnodeState::new(expected_parties);
 
     eprintln!("[bootnode] Listening on {}", bind);
 
     loop {
         let conn = net.accept().await?;
-        let state = state.clone();
-        let session_state = session_state.clone();
-        let uploader_bytes = uploader_bytes.clone();
-        let pending_session = pending_session.clone();
-        let expected_parties = expected_parties.clone();
-        let session_tx = session_tx.clone();
-        let session_rx = session_tx.subscribe();
-        let ice_tx = ice_tx.clone();
-        let mut ice_rx = ice_tx.subscribe();
-        let required_auth_token = required_auth_token.clone();
-
-        tokio::spawn(async move {
-            // Track if this connection registered for a session
-            let mut waiting_for_session = false;
-            // Track this connection's party_id for ICE relay
-            let mut my_party_id: Option<PartyId> = None;
-
-            loop {
-                // If waiting for session, check if it's ready
-                if waiting_for_session {
-                    // Check if session is already available - clone to avoid holding borrow across await
-                    let session_info = session_rx.borrow().clone();
-                    if let Some(info) = session_info {
-                        // Send session announce
-                        let announce = SessionMessage::SessionAnnounce(info);
-                        let announce_bytes = bincode::serialize(&announce).unwrap();
-                        let _ = conn.send(&announce_bytes).await;
-                        waiting_for_session = false;
-                    }
-                }
-
-                // Check for ICE messages to relay to this party
-                if let Some(pid) = my_party_id {
-                    // Non-blocking check for ICE messages
-                    while let Ok(ice_msg) = ice_rx.try_recv() {
-                        match &ice_msg {
-                            DiscoveryMessage::IceCandidates { to_party_id, .. } => {
-                                if *to_party_id == pid {
-                                    // Forward this ICE message to our party
-                                    let _ = send_ctrl(&*conn, &ice_msg).await;
-                                }
-                            }
-                            DiscoveryMessage::IceExchangeRequest { to_party_id, .. } => {
-                                if *to_party_id == pid {
-                                    // Forward this ICE exchange request to our party
-                                    let _ = send_ctrl(&*conn, &ice_msg).await;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                // Use a short timeout to allow checking session state
-                match tokio::time::timeout(Duration::from_millis(50), conn.receive()).await {
-                    Ok(Ok(buf)) => {
-                        if let Ok(msg) = bincode::deserialize::<DiscoveryMessage>(&buf) {
-                            match msg {
-                                DiscoveryMessage::Register {
-                                    party_id,
-                                    listen_addr,
-                                    auth_token: message_auth_token,
-                                } => {
-                                    if !registration_token_is_valid(
-                                        required_auth_token.as_deref(),
-                                        message_auth_token.as_deref(),
-                                    ) {
-                                        eprintln!(
-                                            "[bootnode] Rejected Register from party {} (invalid auth token)",
-                                            party_id
-                                        );
-                                        continue;
-                                    }
-
-                                    // Track this connection's party_id for ICE relay
-                                    my_party_id = Some(party_id);
-
-                                    let mut st = state.lock().await;
-                                    let is_new = !st.contains_key(&party_id);
-                                    st.insert(party_id, listen_addr);
-
-                                    // reply with full peer list (excluding self)
-                                    let peers: Vec<(PartyId, SocketAddr)> = st
-                                        .iter()
-                                        .filter(|(pid, _)| **pid != party_id)
-                                        .map(|(pid, addr)| (*pid, *addr))
-                                        .collect();
-                                    let reply = DiscoveryMessage::PeerList { peers };
-                                    let _ = send_ctrl(&*conn, &reply).await;
-
-                                    // notify others if new
-                                    if is_new {
-                                        let joined = DiscoveryMessage::PeerJoined {
-                                            party_id,
-                                            listen_addr,
-                                        };
-                                        let _ = send_ctrl(&*conn, &joined).await;
-                                    }
-                                }
-                                DiscoveryMessage::RegisterWithSession {
-                                    party_id,
-                                    listen_addr,
-                                    program_id,
-                                    entry,
-                                    n_parties,
-                                    threshold,
-                                    program_bytes,
-                                    auth_token: message_auth_token,
-                                    tls_derived_id,
-                                } => {
-                                    if !registration_token_is_valid(
-                                        required_auth_token.as_deref(),
-                                        message_auth_token.as_deref(),
-                                    ) {
-                                        eprintln!(
-                                            "[bootnode] Rejected RegisterWithSession from party {} (invalid auth token)",
-                                            party_id
-                                        );
-                                        waiting_for_session = false;
-                                        continue;
-                                    }
-
-                                    // Track this connection's party_id for ICE relay
-                                    my_party_id = Some(party_id);
-
-                                    eprintln!(
-                                        "[bootnode] Party {} registering for session (program: {}, n={}, t={}, has_bytes={})",
-                                        party_id,
-                                        hex::encode(&program_id[..8]),
-                                        n_parties,
-                                        threshold,
-                                        program_bytes.is_some()
-                                    );
-
-                                    // Store program bytes if provided and we don't have them yet
-                                    if let Some(bytes) = program_bytes {
-                                        let mut ub = uploader_bytes.lock().await;
-                                        if ub.is_none() {
-                                            eprintln!(
-                                                "[bootnode] Storing program bytes from party {} ({} bytes)",
-                                                party_id,
-                                                bytes.len()
-                                            );
-                                            *ub = Some(Arc::new(bytes));
-                                        }
-                                    }
-
-                                    // Update peer state
-                                    {
-                                        let mut st = state.lock().await;
-                                        st.insert(party_id, listen_addr);
-                                    }
-
-                                    // Mark this connection as waiting for session
-                                    waiting_for_session = true;
-
-                                    // Check/create pending session
-                                    let mut pending = pending_session.lock().await;
-                                    let expected = expected_parties.lock().await;
-                                    let target_n = expected.unwrap_or(n_parties);
-
-                                    if pending.is_none() {
-                                        // Create new pending session
-                                        let nonce = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_nanos() as u64)
-                                            .unwrap_or(0);
-                                        let mut parties = HashMap::new();
-                                        parties.insert(party_id, listen_addr);
-                                        let mut tls_ids = HashMap::new();
-                                        if let Some(tid) = tls_derived_id {
-                                            tls_ids.insert(party_id, tid);
-                                        }
-                                        *pending = Some(PendingSession {
-                                            program_id,
-                                            entry,
-                                            n_parties: target_n,
-                                            threshold,
-                                            parties,
-                                            tls_ids,
-                                            nonce,
-                                        });
-                                        eprintln!(
-                                            "[bootnode] Created pending session, waiting for {} parties (have 1)",
-                                            target_n
-                                        );
-                                    } else {
-                                        // Add to existing pending session
-                                        let ps = pending.as_mut().unwrap();
-                                        if ps.program_id != program_id {
-                                            eprintln!(
-                                                "[bootnode] Warning: party {} has different program_id",
-                                                party_id
-                                            );
-                                            // For now, reject mismatched programs
-                                            let _ = send_ctrl(
-                                                &*conn,
-                                                &DiscoveryMessage::PeerLeft { party_id },
-                                            )
-                                            .await;
-                                            waiting_for_session = false;
-                                            continue;
-                                        }
-                                        ps.parties.insert(party_id, listen_addr);
-                                        if let Some(tid) = tls_derived_id {
-                                            ps.tls_ids.insert(party_id, tid);
-                                        }
-                                        eprintln!(
-                                            "[bootnode] Party {} joined, have {}/{} parties",
-                                            party_id,
-                                            ps.parties.len(),
-                                            ps.n_parties
-                                        );
-                                    }
-
-                                    // Check if session is ready
-                                    let session_ready = {
-                                        let ps = pending.as_ref().unwrap();
-                                        ps.parties.len() >= ps.n_parties
-                                    };
-
-                                    if session_ready {
-                                        let ps = pending.take().unwrap();
-                                        let instance_id =
-                                            derive_instance_id(&ps.program_id, ps.nonce);
-                                        let parties: Vec<(PartyId, SocketAddr)> =
-                                            ps.parties.into_iter().collect();
-                                        let tls_ids: Vec<(PartyId, PartyId)> =
-                                            ps.tls_ids.into_iter().collect();
-
-                                        let session_info = SessionInfo {
-                                            program_id: ps.program_id,
-                                            instance_id,
-                                            entry: ps.entry,
-                                            parties: parties.clone(),
-                                            n_parties: ps.n_parties,
-                                            threshold: ps.threshold,
-                                            tls_ids,
-                                        };
-
-                                        eprintln!(
-                                            "[bootnode] Session ready! instance_id={}, n_parties={}",
-                                            instance_id,
-                                            session_info.n_parties
-                                        );
-
-                                        // Store active session and notify all waiting connections
-                                        {
-                                            let mut ss = session_state.lock().await;
-                                            *ss = Some(session_info.clone());
-                                        }
-
-                                        // Broadcast via watch channel - all waiting handlers will see this
-                                        let _ = session_tx.send(Some(session_info));
-                                    }
-                                }
-                                DiscoveryMessage::RequestPeers => {
-                                    let st = state.lock().await;
-                                    let peers: Vec<(PartyId, SocketAddr)> =
-                                        st.iter().map(|(pid, addr)| (*pid, *addr)).collect();
-                                    let _ =
-                                        send_ctrl(&*conn, &DiscoveryMessage::PeerList { peers })
-                                            .await;
-                                }
-                                DiscoveryMessage::Heartbeat => {
-                                    // Ignored in this minimal version
-                                }
-                                DiscoveryMessage::ProgramFetchRequest { program_id } => {
-                                    // Send cached program bytes if available
-                                    let bytes_opt = uploader_bytes.lock().await.clone();
-                                    if let Some(bytes) = bytes_opt {
-                                        eprintln!(
-                                            "[bootnode] Sending program bytes ({} bytes) for {}",
-                                            bytes.len(),
-                                            hex::encode(&program_id[..8])
-                                        );
-                                        let resp = DiscoveryMessage::ProgramFetchResponse {
-                                            program_id,
-                                            bytes: bytes.to_vec(),
-                                        };
-                                        let _ = send_ctrl(&*conn, &resp).await;
-                                    } else {
-                                        eprintln!(
-                                            "[bootnode] Program fetch request for {} but no bytes cached",
-                                            hex::encode(&program_id[..8])
-                                        );
-                                    }
-                                }
-                                DiscoveryMessage::IceCandidates {
-                                    from_party_id,
-                                    to_party_id,
-                                    ref ufrag,
-                                    ref pwd,
-                                    ref candidates,
-                                } => {
-                                    // Relay ICE candidates to the target party via broadcast
-                                    eprintln!(
-                                        "[bootnode] Relaying {} ICE candidates from party {} to party {}",
-                                        candidates.len(),
-                                        from_party_id,
-                                        to_party_id
-                                    );
-                                    // Broadcast - the target party's task will pick it up
-                                    let ice_msg = DiscoveryMessage::IceCandidates {
-                                        from_party_id,
-                                        to_party_id,
-                                        ufrag: ufrag.clone(),
-                                        pwd: pwd.clone(),
-                                        candidates: candidates.clone(),
-                                    };
-                                    let _ = ice_tx.send(ice_msg);
-                                }
-                                DiscoveryMessage::IceExchangeRequest {
-                                    from_party_id,
-                                    to_party_id,
-                                } => {
-                                    // Log and relay the exchange request
-                                    eprintln!(
-                                        "[bootnode] ICE exchange request from party {} to party {}",
-                                        from_party_id, to_party_id
-                                    );
-                                    // Broadcast - the target party's task will handle it
-                                    let req_msg = DiscoveryMessage::IceExchangeRequest {
-                                        from_party_id,
-                                        to_party_id,
-                                    };
-                                    let _ = ice_tx.send(req_msg);
-                                }
-                                _ => {}
-                            }
-                        } else if let Ok(ps) = bincode::deserialize::<ProgramSyncMessage>(&buf) {
-                            // Handle program sync messages
-                            match ps {
-                                ProgramSyncMessage::ProgramAnnounce { .. } => {
-                                    // Respond with program sync logic if needed
-                                    // For now, just echo back
-                                    let _ = send_prog_ctrl(&*conn, &ps).await;
-                                }
-                                ProgramSyncMessage::ProgramFetchRequest { program_id } => {
-                                    // Send cached program bytes if available
-                                    let bytes_opt = uploader_bytes.lock().await.clone();
-                                    if let Some(bytes) = bytes_opt {
-                                        let _ = send_program_bytes(&*conn, program_id, bytes).await;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        } else if let Ok(sess) = bincode::deserialize::<SessionMessage>(&buf) {
-                            match sess {
-                                SessionMessage::SessionAnnounce(_) => { /* not expected from clients */
-                                }
-                                SessionMessage::SessionAck {
-                                    party_id,
-                                    instance_id,
-                                    ..
-                                } => {
-                                    eprintln!(
-                                        "[bootnode] Received SessionAck from party {} for instance {}",
-                                        party_id, instance_id
-                                    );
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Ok(Err(_)) => {
-                        // Connection error, exit loop
-                        break;
-                    }
-                    Err(_) => {
-                        // Timeout, continue loop to check session state
-                        continue;
-                    }
-                }
-            }
-        });
+        spawn_connection_handler(conn, state.clone(), required_auth_token.clone());
     }
 }
 
@@ -787,8 +383,8 @@ async fn add_node_and_connect_nat(
                 if let Ok(DiscoveryMessage::IceCandidates {
                     from_party_id,
                     to_party_id: _,
-                    ufrag: remote_ufrag,
-                    pwd: remote_pwd,
+                    ufrag: _,
+                    pwd: _,
                     candidates: remote_candidates,
                 }) = bincode::deserialize::<DiscoveryMessage>(&buf)
                 {
@@ -945,6 +541,15 @@ async fn send_ctrl(conn: &dyn PeerConnection, msg: &DiscoveryMessage) -> Result<
     conn.send(bytes.as_slice()).await.map_err(|e| e.to_string())
 }
 
+async fn send_session_announce(
+    conn: &dyn PeerConnection,
+    info: &SessionInfo,
+) -> Result<(), String> {
+    let announce = SessionMessage::SessionAnnounce(info.clone());
+    let bytes = bincode::serialize(&announce).map_err(|e| e.to_string())?;
+    conn.send(&bytes).await.map_err(|e| e.to_string())
+}
+
 /// Wait until at least n parties are in the QuicNetworkManager.parties() view (including self).
 pub async fn wait_until_min_parties(
     net: &QuicNetworkManager,
@@ -974,12 +579,35 @@ pub async fn agree_and_sync_program(
     entry: &str,
     maybe_program_bytes: Option<Vec<u8>>,
 ) -> Result<([u8; 32], usize, String), String> {
-    super::program_sync::agree_and_sync_program(bn_conn, my_party, entry, maybe_program_bytes).await
+    super::program_sync::agree_and_sync_program(bn_conn, my_party, entry, maybe_program_bytes)
+        .await
+        .map_err(String::from)
 }
 
 /// Re-export program ID computation
 pub fn program_id_from_bytes(bytes: &[u8]) -> [u8; 32] {
     super::program_sync::program_id_from_bytes(bytes)
+}
+
+/// Configuration for joining a bootnode-announced MPC session.
+#[derive(Debug, Clone)]
+pub struct SessionRegistrationConfig {
+    pub bootnode: SocketAddr,
+    pub my_party_id: PartyId,
+    pub my_listen: SocketAddr,
+    pub program_id: [u8; 32],
+    pub entry: String,
+    pub n_parties: usize,
+    pub threshold: usize,
+    pub timeout: Duration,
+    pub program_bytes: Option<Vec<u8>>,
+}
+
+impl SessionRegistrationConfig {
+    pub fn with_program_bytes(mut self, program_bytes: Vec<u8>) -> Self {
+        self.program_bytes = Some(program_bytes);
+        self
+    }
 }
 
 /// Register with bootnode for a specific session and wait for session to be announced.
@@ -992,21 +620,13 @@ pub fn program_id_from_bytes(bytes: &[u8]) -> [u8; 32] {
 /// All parties will receive the same instance_id, which is derived deterministically
 /// from the program_id and a session nonce.
 ///
-/// If `program_bytes` is Some, this party will upload the program to the bootnode.
+/// If `config.program_bytes` is Some, this party will upload the program to the bootnode.
 /// Parties that don't have the program locally can pass None and later fetch it.
 pub async fn register_and_wait_for_session(
     net: &mut QuicNetworkManager,
-    bootnode: SocketAddr,
-    my_party_id: PartyId,
-    my_listen: SocketAddr,
-    program_id: [u8; 32],
-    entry: &str,
-    n_parties: usize,
-    threshold: usize,
-    timeout: Duration,
+    config: SessionRegistrationConfig,
 ) -> Result<SessionInfo, String> {
-    register_and_wait_for_session_with_program(
-        net,
+    let SessionRegistrationConfig {
         bootnode,
         my_party_id,
         my_listen,
@@ -1015,25 +635,10 @@ pub async fn register_and_wait_for_session(
         n_parties,
         threshold,
         timeout,
-        None,
-    )
-    .await
-}
+        program_bytes,
+    } = config;
+    let uploading_program = program_bytes.is_some();
 
-/// Same as `register_and_wait_for_session` but allows passing program bytes.
-/// If `program_bytes` is Some, the bytes will be uploaded to the bootnode for other parties to fetch.
-pub async fn register_and_wait_for_session_with_program(
-    net: &mut QuicNetworkManager,
-    bootnode: SocketAddr,
-    my_party_id: PartyId,
-    my_listen: SocketAddr,
-    program_id: [u8; 32],
-    entry: &str,
-    n_parties: usize,
-    threshold: usize,
-    timeout: Duration,
-    program_bytes: Option<Vec<u8>>,
-) -> Result<SessionInfo, String> {
     // Use a separate temporary manager for the bootnode discovery connection
     // so that the bootnode's TLS public key doesn't pollute the party mesh
     // manager's peer_public_keys (which would give N+1 sorted party IDs).
@@ -1050,7 +655,7 @@ pub async fn register_and_wait_for_session_with_program(
         hex::encode(&program_id[..8]),
         n_parties,
         threshold,
-        program_bytes.is_some()
+        uploading_program
     );
 
     // Send session-aware registration with optional program bytes.
@@ -1061,7 +666,7 @@ pub async fn register_and_wait_for_session_with_program(
         party_id: my_party_id,
         listen_addr: my_listen,
         program_id,
-        entry: entry.to_string(),
+        entry,
         n_parties,
         threshold,
         program_bytes,
