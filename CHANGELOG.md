@@ -2,6 +2,13 @@
 
 All notable changes to the Stoffel crates are tracked here.
 
+## [Unreleased]
+
+### Changed
+
+- Bumped `stoffelcrypto` (mpc-protocols) to `0.1.1` and `stoffelnet` to `0.1.1` across the workspace and coordinator wrapper. `stoffelmpc-network` follows to `0.1.1` via the lockfile. `stoffel-mpc-coordinator-shared` and `stoffel-mpc-coordinator-off-chain` remain on `0.1.0`.
+- Adapted the AVSS engine to the `stoffelcrypto` 0.1.1 API: `verify_feldman` now takes an `expected_id`, and the AVSS share store values carry a receive timestamp alongside the shares. Existing verification semantics are preserved by binding shares to their own embedded evaluation id.
+
 ## [0.1.2] - 2026-09-03
 
 ### Added

@@ -21,6 +21,6 @@ jsonrpsee = { version = "=0.26.0", features = ["full"] }
 rustls = "=0.23.41"
 stoffel-mpc-coordinator-off-chain = "=0.1.0"
 stoffel-mpc-coordinator-shared = "=0.1.0"
-stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.0" }
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.1" }
 tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "time"] }
 x509-parser = "=0.18.1"

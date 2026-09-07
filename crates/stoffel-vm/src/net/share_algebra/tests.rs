@@ -98,7 +98,7 @@ fn feldman_linear_local_ops_preserve_verifiable_commitments() {
         &add_share_for_curve(MpcCurveConfig::Bls12_381, ty, &lhs_bytes, &rhs_bytes)
             .expect("add Feldman shares"),
     );
-    assert!(verify_feldman(added.clone()));
+    assert!(verify_feldman(added.clone(), added.feldmanshare.id));
     assert_eq!(
         added.commitments[0],
         lhs.commitments[0] + rhs.commitments[0]
@@ -112,7 +112,10 @@ fn feldman_linear_local_ops_preserve_verifiable_commitments() {
         &sub_share_for_curve(MpcCurveConfig::Bls12_381, ty, &lhs_bytes, &rhs_bytes)
             .expect("subtract Feldman shares"),
     );
-    assert!(verify_feldman(subtracted.clone()));
+    assert!(verify_feldman(
+        subtracted.clone(),
+        subtracted.feldmanshare.id
+    ));
     assert_eq!(
         subtracted.commitments[0],
         lhs.commitments[0] - rhs.commitments[0]
@@ -126,7 +129,7 @@ fn feldman_linear_local_ops_preserve_verifiable_commitments() {
         &mul_share_scalar_for_curve(MpcCurveConfig::Bls12_381, ty, &lhs_bytes, 4)
             .expect("scale Feldman share"),
     );
-    assert!(verify_feldman(scaled.clone()));
+    assert!(verify_feldman(scaled.clone(), scaled.feldmanshare.id));
     assert_eq!(scaled.commitments[0], lhs.commitments[0] * Fr::from(4u64));
     assert_eq!(scaled.commitments[1], lhs.commitments[1] * Fr::from(4u64));
 
@@ -134,7 +137,7 @@ fn feldman_linear_local_ops_preserve_verifiable_commitments() {
         &add_share_scalar_for_curve(MpcCurveConfig::Bls12_381, ty, &lhs_bytes, 9)
             .expect("add scalar to Feldman share"),
     );
-    assert!(verify_feldman(shifted.clone()));
+    assert!(verify_feldman(shifted.clone(), shifted.feldmanshare.id));
     assert_eq!(
         shifted.commitments[0],
         lhs.commitments[0] + G1Projective::generator() * Fr::from(9u64)
@@ -160,14 +163,14 @@ fn ed25519_feldman_local_ops_preserve_ed25519_commitments() {
         mul_share_field_for_curve(MpcCurveConfig::Ed25519, ty, &sk_bytes, &scalar_bytes)
             .expect("multiply Ed25519 Feldman share by field element");
     let scaled = decode_ed25519_feldman_share(&scaled_bytes);
-    assert!(verify_feldman(scaled.clone()));
+    assert!(verify_feldman(scaled.clone(), scaled.feldmanshare.id));
     assert_eq!(scaled.commitments[0], sk.commitments[0] * scalar);
     assert_eq!(scaled.commitments[1], sk.commitments[1] * scalar);
 
     let added_bytes = add_share_for_curve(MpcCurveConfig::Ed25519, ty, &nonce_bytes, &scaled_bytes)
         .expect("add Ed25519 Feldman shares");
     let added = decode_ed25519_feldman_share(&added_bytes);
-    assert!(verify_feldman(added.clone()));
+    assert!(verify_feldman(added.clone(), added.feldmanshare.id));
     assert_eq!(
         added.commitments[0],
         nonce.commitments[0] + scaled.commitments[0]
