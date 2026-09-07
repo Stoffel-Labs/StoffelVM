@@ -17,8 +17,8 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 libc = "=0.2.186"
-stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.0" }
-stoffelnet = "=0.1.0"
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.1" }
+stoffelnet = "=0.1.1"
 stoffel-vm-types = { version = "=0.1.2", path = "../stoffel-vm-types" }
 alloy = "=1.8.3"
 alloy-primitives = "=1.6.0"

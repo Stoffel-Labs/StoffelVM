@@ -714,7 +714,7 @@ impl AvssTurmoilVmEngine {
         t: usize,
     ) -> Result<Fr, String> {
         let expected_share = Self::decode_share(expected_share_bytes)?;
-        if !verify_feldman(expected_share.clone()) {
+        if !verify_feldman(expected_share.clone(), expected_share.feldmanshare.id) {
             return Err("local AVSS share failed Feldman verification".to_string());
         }
 
@@ -727,7 +727,7 @@ impl AvssTurmoilVmEngine {
             if share.commitments != expected_share.commitments {
                 continue;
             }
-            if verify_feldman(share.clone()) {
+            if verify_feldman(share.clone(), share.feldmanshare.id) {
                 verified.push(share);
                 if verified.len() == required_valid {
                     break;

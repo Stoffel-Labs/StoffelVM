@@ -30,6 +30,21 @@ pub(super) struct AvssG2ExpContribution {
     pub(super) partial_point: Vec<u8>,
 }
 
+/// Verify a Feldman share against its own embedded evaluation id.
+///
+/// `stoffelcrypto` 0.1.1 added an `expected_id` argument to
+/// [`verify_feldman`] so protocol code can bind a share to the party that
+/// is supposed to hold it. The helpers in this module operate on shares whose
+/// origin is already fixed by the caller (the local share, or peer shares whose
+/// commitments must match the local ones), so we bind to the id carried in the
+/// share itself, preserving the pre-0.1.1 semantics.
+pub(super) fn verify_feldman_self<F: FftField, G: CurveGroup<ScalarField = F>>(
+    share: &FeldmanShamirShare<F, G>,
+) -> bool {
+    let expected_id = share.feldmanshare.id;
+    verify_feldman(share.clone(), expected_id)
+}
+
 impl<F, G> AvssMpcEngine<F, G>
 where
     F: FftField + PrimeField + UniformRand + Send + Sync + 'static,
@@ -147,7 +162,7 @@ where
                     tracing::warn!("wait_for_share: drain_rbc_output failed: {e:?}");
                 }
                 let shares = node.share_gen_avss.avss.shares.lock().await;
-                if let Some(Some(share_vec)) = shares.get(&session_id) {
+                if let Some((_, Some(share_vec))) = shares.get(&session_id) {
                     if let Some(share) = share_vec.first() {
                         return Ok(share.clone());
                     }
@@ -186,7 +201,7 @@ where
                 let shares = node.share_gen_avss.avss.shares.lock().await;
                 let stored = self.stored_shares.lock().await;
 
-                for share_vec in shares.values().flatten() {
+                for share_vec in shares.values().filter_map(|(_, v)| v.as_ref()) {
                     if let Some(share) = share_vec.first() {
                         let already_stored = stored
                             .values()
@@ -368,7 +383,7 @@ where
         generator: G,
         partial_point: G,
     ) -> Result<Vec<u8>, String> {
-        if !verify_feldman(share.clone()) {
+        if !verify_feldman_self(share) {
             return Err(
                 "AVSS open-in-exponent local Feldman share failed commitment verification"
                     .to_string(),
@@ -471,7 +486,7 @@ where
         context: &str,
     ) -> Result<Vec<(usize, Vec<u8>)>, String> {
         let expected_share = Self::decode_feldman_share(expected_share_bytes)?;
-        if !verify_feldman(expected_share.clone()) {
+        if !verify_feldman_self(&expected_share) {
             return Err(format!(
                 "{context}: local Feldman share failed commitment verification"
             ));
@@ -563,7 +578,7 @@ where
         use ark_ec::{pairing::Pairing, PrimeGroup};
 
         let expected_share = Self::decode_feldman_share(expected_share_bytes)?;
-        if !verify_feldman(expected_share.clone()) {
+        if !verify_feldman_self(&expected_share) {
             return Err(format!(
                 "{context}: local Feldman share failed commitment verification"
             ));
@@ -708,7 +723,7 @@ where
             .checked_add(1)
             .ok_or_else(|| format!("{context}: valid contribution count overflowed"))?;
 
-        if !verify_feldman(expected_share.clone()) {
+        if !verify_feldman_self(&expected_share) {
             return Err(format!(
                 "{context}: local Feldman share failed commitment verification"
             ));
@@ -724,7 +739,7 @@ where
                 continue;
             }
 
-            if verify_feldman(share.clone()) {
+            if verify_feldman_self(&share) {
                 verified.push(share);
                 if verified.len() == required_valid {
                     break;

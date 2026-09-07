@@ -19,8 +19,8 @@ stoffel-vm = { version = "=0.1.2", path = "../stoffel-vm" }
 stoffel-vm-types = { version = "=0.1.2", path = "../stoffel-vm-types" }
 stoffel-mpc-coordinator-shared = "=0.1.0"
 stoffel-mpc-coordinator-off-chain = "=0.1.0"
-stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.0" }
-stoffelnet = "=0.1.0"
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.1" }
+stoffelnet = "=0.1.1"
 ark-bls12-381 = "=0.5.0"
 ark-bn254 = "=0.5.0"
 ark-curve25519 = "=0.5.0"

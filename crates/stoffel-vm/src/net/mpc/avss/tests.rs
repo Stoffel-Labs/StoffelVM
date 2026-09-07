@@ -1,3 +1,4 @@
+use super::shares::verify_feldman_self;
 use super::*;
 use crate::net::curve::SupportedMpcField;
 use crate::net::mpc_engine::{DurableIdentityDigest, MpcEngine};
@@ -9,7 +10,6 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::test_rng;
 use std::sync::Arc;
 use stoffel_vm_types::core_types::{ClearShareValue, ShareType, F64};
-use stoffelmpc_mpc::common::share::avss::verify_feldman;
 use stoffelnet::transports::quic::QuicNetworkManager;
 
 #[test]
@@ -65,7 +65,7 @@ fn upstream_ransha_commitment_transform_produces_verifiable_ed25519_shares() {
     }
 
     for share in &computed[2 * t..] {
-        assert!(verify_feldman(share.clone()));
+        assert!(verify_feldman_self(share));
     }
 }
 
@@ -164,7 +164,7 @@ fn test_feldman_verification() {
             FeldmanShamirShare::new(y, i, t, commitments.clone()).expect("Failed to create share");
 
         assert!(
-            verify_feldman(share.clone()),
+            verify_feldman_self(&share),
             "Feldman verification failed for party {}",
             i
         );
@@ -485,7 +485,7 @@ where
         assert_eq!(share.feldmanshare.id, decoded.feldmanshare.id);
         assert_eq!(share.feldmanshare.degree, decoded.feldmanshare.degree);
         assert_eq!(share.feldmanshare.share, decoded.feldmanshare.share);
-        assert!(verify_feldman(decoded));
+        assert!(verify_feldman_self(&decoded));
     }
 
     let required = t + 1;
@@ -709,7 +709,7 @@ fn avss_open_reconstruction_rejects_non_verifiable_local_feldman_share() {
     corrupted_local.commitments = vec![G1::generator(); t + 1];
 
     assert!(
-        !verify_feldman(corrupted_local.clone()),
+        !verify_feldman_self(&corrupted_local),
         "test setup should model a local Feldman share with invalid commitments"
     );
 
@@ -1087,11 +1087,11 @@ async fn test_avss_input_share_is_local_constant_sharing() {
         "parties evaluate at distinct share ids"
     );
     assert!(
-        stoffelmpc_mpc::common::share::avss::verify_feldman(s0.clone()),
+        verify_feldman_self(&s0),
         "constant share must pass Feldman verification"
     );
     assert!(
-        stoffelmpc_mpc::common::share::avss::verify_feldman(s1.clone()),
+        verify_feldman_self(&s1),
         "constant share must pass Feldman verification"
     );
 
