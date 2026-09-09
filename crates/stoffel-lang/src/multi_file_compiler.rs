@@ -32,6 +32,8 @@ pub struct ModuleExports {
     pub functions: HashMap<String, (Vec<SymbolType>, SymbolType)>,
     /// Exported variable/constant symbols: name -> type
     pub variables: HashMap<String, SymbolType>,
+    /// Call-site binding information (names, defaults and variadic packing).
+    pub parameters: HashMap<String, Vec<crate::ast::Parameter>>,
 }
 
 impl ModuleExports {
@@ -40,6 +42,7 @@ impl ModuleExports {
             module_path,
             functions: HashMap::new(),
             variables: HashMap::new(),
+            parameters: HashMap::new(),
         }
     }
 }
@@ -50,6 +53,7 @@ pub struct CompiledModule {
     pub module_path: ModulePath,
     pub program: CompiledProgram,
     pub exports: ModuleExports,
+    analyzed_ast: AstNode,
 }
 
 /// The multi-file compiler orchestrates compilation across multiple modules.
@@ -83,20 +87,113 @@ impl MultiFileCompiler {
 
         // Phase 3: Compile each module in order
         for module_key in &compilation_order {
-            self.compile_module(module_key)?;
+            if module_key != &entry_module {
+                if let Some(resolved) = self.resolver.resolved_modules.get(module_key) {
+                    if let AstNode::Block(statements) = &resolved.ast {
+                        if let Some(stmt) = statements
+                            .iter()
+                            .find(|stmt| semantic::SemanticAnalyzer::is_top_level_execution(stmt))
+                        {
+                            return Err(vec![CompilerError::semantic_error(
+                                "Imported modules cannot contain executable top-level code or variables", stmt.location())
+                                .with_hint("Move initialization into a function and call it explicitly; pass values as parameters")]);
+                        }
+                    }
+                }
+            }
+            self.compile_module(module_key, &entry_module)?;
         }
 
         // Phase 4: Link all modules into a single program, then remove any
         // functions that are not reachable from the entry chunk.
         let mut program = self.link_modules(&entry_module)?;
-        program.prune_unreachable_functions_with_roots(
-            self.options.entry_points.iter().map(String::as_str),
-        );
+        let mut nodes = Vec::new();
+        let mut roots = self.options.entry_points.clone();
+        let mut keys = self.compiled_modules.keys().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            let names = self.function_bindings(key, &entry_module);
+            crate::compiler::collect_literal_closure_targets(
+                &self.compiled_modules[key].analyzed_ast,
+                &mut roots,
+            );
+            nodes.push(qualify_analysis(
+                self.compiled_modules[key].analyzed_ast.clone(),
+                &names,
+                key == &entry_module,
+            ));
+        }
+        let outputs = crate::client_io_planner::infer_output_domains(
+            &AstNode::Block(nodes),
+            &self.options.entry_points,
+        )?;
+        crate::client_io_planner::apply_output_domains(outputs, &mut program.client_io_manifest);
+        program.prune_unreachable_functions_with_roots(roots.iter().map(String::as_str));
         Ok(program)
     }
 
+    fn function_bindings(&self, module_key: &str, entry: &str) -> HashMap<String, String> {
+        self.bindings_for_names(
+            module_key,
+            entry,
+            self.compiled_modules[module_key]
+                .program
+                .function_chunks
+                .keys(),
+        )
+    }
+
+    fn bindings_for_names<'a>(
+        &self,
+        module_key: &str,
+        entry: &str,
+        local_names: impl IntoIterator<Item = &'a String>,
+    ) -> HashMap<String, String> {
+        let mut names = HashMap::new();
+        for name in local_names {
+            names.insert(
+                name.clone(),
+                if module_key == entry {
+                    name.clone()
+                } else {
+                    format!("{module_key}.{name}")
+                },
+            );
+        }
+        let mut simple_imports: HashMap<String, Vec<String>> = HashMap::new();
+        for import in &self.resolver.resolved_modules[module_key].imports {
+            if is_std_module_path(&import.module_path) {
+                continue;
+            }
+            let key = import
+                .resolved_module_key
+                .clone()
+                .unwrap_or_else(|| import.module_path.as_string());
+            if let Some(dependency) = self.compiled_modules.get(&key) {
+                for name in dependency.exports.functions.keys() {
+                    let Some(binding) = import.binding_for_export(name) else {
+                        continue;
+                    };
+                    names.insert(binding, format!("{key}.{name}"));
+                    if import.imported_item.is_none() {
+                        simple_imports
+                            .entry(name.clone())
+                            .or_default()
+                            .push(format!("{key}.{name}"));
+                    }
+                }
+            }
+        }
+        for (name, targets) in simple_imports {
+            if targets.len() == 1 {
+                names.entry(name).or_insert_with(|| targets[0].clone());
+            }
+        }
+        names
+    }
+
     /// Compiles a single module, using exports from already-compiled dependencies.
-    fn compile_module(&mut self, module_key: &str) -> Result<(), Vec<CompilerError>> {
+    fn compile_module(&mut self, module_key: &str, entry: &str) -> Result<(), Vec<CompilerError>> {
         let resolved = self
             .resolver
             .resolved_modules
@@ -115,7 +212,8 @@ impl MultiFileCompiler {
         let imported_symbols = self.collect_imported_symbols(&resolved.imports)?;
 
         // Compile the module with imported symbols
-        let (program, exports) = self.compile_single_module(resolved, &imported_symbols)?;
+        let (program, exports, analyzed_ast) =
+            self.compile_single_module(resolved, &imported_symbols, module_key, entry)?;
 
         // Store the compiled module
         self.compiled_modules.insert(
@@ -124,6 +222,7 @@ impl MultiFileCompiler {
                 module_path: resolved.module_path.clone(),
                 program,
                 exports,
+                analyzed_ast,
             },
         );
 
@@ -136,6 +235,7 @@ impl MultiFileCompiler {
         imports: &[ImportInfo],
     ) -> Result<HashMap<String, SymbolInfo>, Vec<CompilerError>> {
         let mut symbols = HashMap::new();
+        let mut bindings = HashMap::new();
 
         for import in imports {
             if is_std_module_path(&import.module_path) {
@@ -155,13 +255,38 @@ impl MultiFileCompiler {
                 )]
             })?;
 
-            // Determine the prefix for imported symbols
-            let import_prefix = import.module_path.as_string();
-            let prefix = import.alias.as_ref().unwrap_or(&import_prefix);
+            let binding = import.alias.clone().unwrap_or_else(|| {
+                import
+                    .imported_item
+                    .clone()
+                    .unwrap_or_else(|| import.module_path.as_string())
+            });
+            let target = (module_key.clone(), import.imported_item.clone());
+            if let Some(previous) = bindings.insert(binding.clone(), target.clone()) {
+                if previous != target {
+                    return Err(vec![CompilerError::semantic_error(
+                        format!("Import binding '{binding}' refers to more than one target"),
+                        import.location.clone(),
+                    )
+                    .with_hint("Give the imports distinct aliases")]);
+                }
+            }
+            if let Some(item) = &import.imported_item {
+                if !compiled.exports.functions.contains_key(item)
+                    && !compiled.exports.variables.contains_key(item)
+                {
+                    return Err(vec![CompilerError::semantic_error(
+                        format!("Module '{module_key}' has no exported function or value named '{item}'"),
+                        import.location.clone(),
+                    ).with_hint("Check the exported name in the imported .stfl file")]);
+                }
+            }
 
             // Add function exports
             for (name, (params, ret_type)) in &compiled.exports.functions {
-                let qualified_name = format!("{}.{}", prefix, name);
+                let Some(qualified_name) = import.binding_for_export(name) else {
+                    continue;
+                };
                 symbols.insert(
                     qualified_name.clone(),
                     SymbolInfo {
@@ -179,7 +304,9 @@ impl MultiFileCompiler {
 
             // Add variable exports
             for (name, var_type) in &compiled.exports.variables {
-                let qualified_name = format!("{}.{}", prefix, name);
+                let Some(qualified_name) = import.binding_for_export(name) else {
+                    continue;
+                };
                 symbols.insert(
                     qualified_name.clone(),
                     SymbolInfo {
@@ -201,10 +328,39 @@ impl MultiFileCompiler {
         &self,
         resolved: &ResolvedModule,
         imported_symbols: &HashMap<String, SymbolInfo>,
-    ) -> Result<(CompiledProgram, ModuleExports), Vec<CompilerError>> {
+        module_key: &str,
+        entry: &str,
+    ) -> Result<(CompiledProgram, ModuleExports, AstNode), Vec<CompilerError>> {
         let mut error_reporter = ErrorReporter::new();
 
-        // Clone the AST for transformation
+        // An explicit member alias cannot silently replace a local declaration.
+        if let AstNode::Block(nodes) = &resolved.ast {
+            for import in &resolved.imports {
+                if let Some(item) = &import.imported_item {
+                    let binding = import.alias.as_ref().unwrap_or(item);
+                    if nodes.iter().any(|node| match node {
+                        AstNode::FunctionDefinition {
+                            name: Some(name), ..
+                        }
+                        | AstNode::VariableDeclaration { name, .. }
+                        | AstNode::ObjectDefinition { name, .. }
+                        | AstNode::TypeAlias { name, .. }
+                        | AstNode::EnumDefinition { name, .. } => name == binding,
+                        _ => false,
+                    }) {
+                        return Err(vec![CompilerError::semantic_error(
+                            format!(
+                                "Import binding '{binding}' conflicts with a local declaration"
+                            ),
+                            import.location.clone(),
+                        )
+                        .with_hint(
+                            "Choose a distinct import alias or rename the local declaration",
+                        )]);
+                    }
+                }
+            }
+        }
         let ast = resolved.ast.clone();
 
         // Apply UFCS transformation, preserving known module-qualified calls.
@@ -215,6 +371,7 @@ impl MultiFileCompiler {
         let analyzed_ast = self.analyze_with_imports(
             transformed_ast,
             imported_symbols,
+            &resolved.imports,
             &mut error_reporter,
             &resolved.file_path.to_string_lossy(),
         )?;
@@ -223,6 +380,11 @@ impl MultiFileCompiler {
             return Err(error_reporter.get_all().into_iter().cloned().collect());
         }
 
+        let mut local_names = Vec::new();
+        collect_function_names(&analyzed_ast, &mut local_names);
+        let bindings = self.bindings_for_names(module_key, entry, local_names.iter());
+        let analyzed_ast = qualify_closure_targets(analyzed_ast, &bindings);
+        let source_ast = analyzed_ast.clone();
         let analyzed_ast = optimizations::lower_semantic_client_reductions(analyzed_ast);
 
         // Apply optimizations
@@ -254,7 +416,7 @@ impl MultiFileCompiler {
         program.client_io_manifest.mpc_backend = self.options.mpc_backend;
         program.client_io_manifest.mpc_curve = self.options.mpc_curve;
 
-        Ok((program, exports))
+        Ok((program, exports, source_ast))
     }
 
     /// Performs semantic analysis with imported symbols pre-populated.
@@ -262,18 +424,39 @@ impl MultiFileCompiler {
         &self,
         ast: AstNode,
         imported_symbols: &HashMap<String, SymbolInfo>,
+        imports: &[ImportInfo],
         error_reporter: &mut ErrorReporter,
         filename: &str,
     ) -> Result<AstNode, Vec<CompilerError>> {
-        // Use the semantic analyzer with imported symbols
-        semantic::analyze_with_imports(ast, error_reporter, filename, imported_symbols.clone())
+        let mut analyzer = semantic::SemanticAnalyzer::with_imports(
+            error_reporter,
+            filename,
+            imported_symbols.clone(),
+        );
+        for import in imports {
+            if let Some(compiled) = import
+                .resolved_module_key
+                .as_ref()
+                .and_then(|key| self.compiled_modules.get(key))
+            {
+                for (name, parameters) in &compiled.exports.parameters {
+                    if let Some(binding) = import.binding_for_export(name) {
+                        analyzer.import_function_signature(binding, parameters);
+                    }
+                }
+            }
+        }
+        analyzer
+            .analyze(ast)
             .map_err(|_| error_reporter.get_all().into_iter().cloned().collect())
     }
 
     fn module_prefixes_for_imports(imports: &[ImportInfo]) -> HashSet<String> {
         imports
             .iter()
-            .filter(|import| !is_std_module_path(&import.module_path))
+            .filter(|import| {
+                !is_std_module_path(&import.module_path) && import.imported_item.is_none()
+            })
             .map(|import| {
                 import
                     .alias
@@ -308,10 +491,16 @@ impl MultiFileCompiler {
                 let param_types: Vec<SymbolType> = parameters
                     .iter()
                     .map(|p| {
-                        p.type_annotation
+                        let ty = p
+                            .type_annotation
                             .as_ref()
                             .map(|t| SymbolType::from_ast_with_type_params(t, type_params))
-                            .unwrap_or(SymbolType::Unknown)
+                            .unwrap_or(SymbolType::Unknown);
+                        if p.is_variadic {
+                            SymbolType::List(Box::new(ty))
+                        } else {
+                            ty
+                        }
                     })
                     .collect();
 
@@ -323,6 +512,7 @@ impl MultiFileCompiler {
                 exports
                     .functions
                     .insert(name.clone(), (param_types, ret_type));
+                exports.parameters.insert(name.clone(), parameters.clone());
             }
             AstNode::VariableDeclaration {
                 name,
@@ -361,29 +551,112 @@ impl MultiFileCompiler {
         // Start with the entry module's program
         let mut linked = entry.program.clone();
 
-        // Add all other modules' function chunks
-        for (module_key, compiled) in &self.compiled_modules {
-            if module_key != entry_module {
-                // Prefix function names with module path to avoid collisions,
-                // and also provide unqualified aliases for CALL instructions.
-                for (func_name, chunk) in &compiled.program.function_chunks {
-                    let qualified_name = format!("{}.{}", module_key, func_name);
-                    // Always insert the qualified name
-                    linked.function_chunks.insert(qualified_name, chunk.clone());
-
-                    // Insert an unqualified alias only if it does not already exist.
-                    // This preserves entry-module definitions and avoids silent overwrites.
-                    if !linked.function_chunks.contains_key(func_name) {
-                        linked
-                            .function_chunks
-                            .insert(func_name.clone(), chunk.clone());
-                    }
-                }
+        // Resolve CALL names in their defining module. The same bindings drive
+        // domain inference, so aliases and identically named private helpers
+        // cannot make metadata describe a different function from the VM call.
+        let names = self.function_bindings(entry_module, entry_module);
+        qualify_chunk(&mut linked.main_chunk, &names);
+        for chunk in linked.function_chunks.values_mut() {
+            qualify_chunk(chunk, &names);
+        }
+        let mut keys = self.compiled_modules.keys().collect::<Vec<_>>();
+        keys.sort();
+        for module_key in keys {
+            if module_key == entry_module {
+                continue;
+            }
+            let compiled = &self.compiled_modules[module_key];
+            let names = self.function_bindings(module_key, entry_module);
+            for (func_name, chunk) in &compiled.program.function_chunks {
+                let mut chunk = chunk.clone();
+                qualify_chunk(&mut chunk, &names);
+                linked
+                    .function_chunks
+                    .insert(format!("{module_key}.{func_name}"), chunk);
             }
         }
 
         Ok(linked)
     }
+}
+
+fn collect_function_names(node: &AstNode, names: &mut Vec<String>) {
+    if let AstNode::FunctionDefinition { name, body, .. } = node {
+        if let Some(name) = name {
+            names.push(name.clone());
+        }
+        collect_function_names(body, names);
+    }
+    optimizations::for_each_child(node, &mut |child| collect_function_names(child, names));
+}
+
+fn qualify_closure_targets(mut node: AstNode, names: &HashMap<String, String>) -> AstNode {
+    if let AstNode::FunctionDefinition { body, .. } = &mut node {
+        **body = qualify_closure_targets(*body.clone(), names);
+        return node;
+    }
+    if let AstNode::FunctionCall {
+        function,
+        arguments,
+        ..
+    } = &mut node
+    {
+        if matches!(function.as_ref(), AstNode::Identifier(name, _) if name == "create_closure" || name == "create_closure_with_upvalue")
+        {
+            if let Some(AstNode::Literal {
+                value: crate::ast::Value::String(target),
+                ..
+            }) = arguments.first_mut()
+            {
+                if let Some(qualified) = names.get(target) {
+                    *target = qualified.clone();
+                }
+            }
+        }
+    }
+    optimizations::map_children(node, &mut |child| qualify_closure_targets(child, names))
+}
+
+fn qualify_chunk(chunk: &mut crate::bytecode::BytecodeChunk, names: &HashMap<String, String>) {
+    for instruction in &mut chunk.instructions {
+        if let crate::bytecode::Instruction::CALL(name) = instruction {
+            if let Some(qualified) = names.get(name) {
+                *name = qualified.clone();
+            }
+        }
+    }
+}
+
+fn qualify_analysis(mut node: AstNode, names: &HashMap<String, String>, entry: bool) -> AstNode {
+    match &mut node {
+        AstNode::FunctionDefinition {
+            name,
+            body,
+            pragmas,
+            ..
+        } => {
+            if let Some(qualified) = name.as_ref().and_then(|name| names.get(name)) {
+                *name = Some(qualified.clone());
+            }
+            if !entry {
+                pragmas.retain(|p| !matches!(p, crate::ast::Pragma::Simple(n, _) if n == "entry"));
+            }
+            **body = qualify_analysis(*body.clone(), names, entry);
+            return node;
+        }
+        AstNode::FunctionCall { function, .. }
+        | AstNode::CommandCall {
+            command: function, ..
+        } => {
+            if let AstNode::Identifier(name, _) = function.as_mut() {
+                if let Some(qualified) = names.get(name) {
+                    *name = qualified.clone();
+                }
+            }
+        }
+        _ => {}
+    }
+    optimizations::map_children(node, &mut |child| qualify_analysis(child, names, entry))
 }
 
 /// Checks if a source string contains import statements.

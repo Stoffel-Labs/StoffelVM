@@ -133,7 +133,8 @@ where
         }
 
         match ty {
-            ShareType::SecretInt { .. }
+            ShareType::SecretField
+            | ShareType::SecretInt { .. }
             | ShareType::SecretUInt { .. }
             | ShareType::SecretFixedPoint { .. } => {
                 let left_share = Self::decode_share(left)?;
@@ -290,7 +291,8 @@ where
         }
 
         match ty {
-            ShareType::SecretInt { .. }
+            ShareType::SecretField
+            | ShareType::SecretInt { .. }
             | ShareType::SecretUInt { .. }
             | ShareType::SecretFixedPoint { .. } => {
                 let max_pairs_per_session =
@@ -404,6 +406,9 @@ where
         share_bytes: &[u8],
     ) -> Result<ClearShareValue, String> {
         let type_key = match ty {
+            ShareType::SecretField => {
+                return Err("SecretField requires Share.open_field".to_owned())
+            }
             ShareType::SecretInt { bit_length } => format!("hb-int-{bit_length}"),
             ShareType::SecretUInt { bit_length } => format!("hb-uint-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
@@ -465,6 +470,7 @@ where
         share_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
         let type_key = match ty {
+            ShareType::SecretField => "hb-field-field".to_owned(),
             ShareType::SecretInt { bit_length } => format!("hb-field-int-{bit_length}"),
             ShareType::SecretUInt { bit_length } => format!("hb-field-uint-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
@@ -525,6 +531,9 @@ where
         }
 
         let type_key = match ty {
+            ShareType::SecretField => {
+                return Err("SecretField requires Share.open_field".to_owned())
+            }
             ShareType::SecretInt { bit_length } => format!("hb-batch-int-{bit_length}"),
             ShareType::SecretUInt { bit_length } => format!("hb-batch-uint-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
@@ -582,6 +591,7 @@ where
         }
 
         let type_key = match ty {
+            ShareType::SecretField => "hb-batch-field-field".to_owned(),
             ShareType::SecretInt { bit_length } => format!("hb-batch-field-int-{bit_length}"),
             ShareType::SecretUInt { bit_length } => format!("hb-batch-field-uint-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {
@@ -684,6 +694,7 @@ where
         }
 
         let share_type = match ty {
+            ShareType::SecretField => "field".to_owned(),
             ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
             ShareType::SecretUInt { bit_length } => format!("uint-{bit_length}"),
             ShareType::SecretFixedPoint { precision } => {

@@ -13,11 +13,9 @@ use stoffel_vm_types::core_types::{
 pub type PersistentValueResult<T> = Result<T, PersistentValueError>;
 
 const MAGIC: &[u8; 8] = b"STFLVAL1";
-#[cfg(test)]
-const LEGACY_SHARE_ENVELOPE_VERSION_WITH_SESSION: u8 = 1;
-#[cfg(test)]
-const LEGACY_SHARE_ENVELOPE_VERSION_WITH_PARTY_ID: u8 = 2;
-const SHARE_ENVELOPE_VERSION: u8 = 3;
+// v4 distinguishes field shares from integer shares. Previous envelopes cannot
+// identify field values that were persisted with integer tags.
+const SHARE_ENVELOPE_VERSION: u8 = 4;
 pub const MAX_PERSISTENT_VALUE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PERSISTENT_BLOB_BYTES: usize = MAX_PERSISTENT_VALUE_BYTES;
 const MAX_PERSISTENT_TABLE_ENTRIES: usize = 65_536;
@@ -39,6 +37,7 @@ const TAG_SHARE: u8 = 12;
 const TAG_OBJECT: u8 = 13;
 const TAG_ARRAY: u8 = 14;
 
+const SHARE_TYPE_SECRET_FIELD: u8 = 3;
 const SHARE_TYPE_SECRET_INT: u8 = 0;
 const SHARE_TYPE_SECRET_FIXED_POINT: u8 = 1;
 const SHARE_TYPE_SECRET_UINT: u8 = 2;
@@ -342,6 +341,7 @@ impl Encoder<'_> {
 
     fn write_share_type(&mut self, share_type: ShareType) -> PersistentValueResult<()> {
         match share_type {
+            ShareType::SecretField => self.write_u8(SHARE_TYPE_SECRET_FIELD),
             ShareType::SecretInt { bit_length } => {
                 self.write_u8(SHARE_TYPE_SECRET_INT);
                 self.write_len(bit_length, "secret integer bit")?;
@@ -572,6 +572,7 @@ impl Reader<'_> {
 
     fn read_share_type(&mut self) -> PersistentValueResult<ShareType> {
         match self.read_u8()? {
+            SHARE_TYPE_SECRET_FIELD => Ok(ShareType::SecretField),
             SHARE_TYPE_SECRET_INT => {
                 let bit_length = self.read_len("secret integer bit")?;
                 ShareType::try_secret_int(bit_length)
@@ -845,10 +846,9 @@ fn share_commitment_digest(share_data: &ShareData) -> PersistentValueResult<Opti
 mod tests {
     use super::{
         decode_value, decode_value_with_context, encode_value, encode_value_with_context,
-        PersistentShareContext, PersistentValueContext, PersistentValueError,
-        LEGACY_SHARE_ENVELOPE_VERSION_WITH_PARTY_ID, LEGACY_SHARE_ENVELOPE_VERSION_WITH_SESSION,
-        MAGIC, MAX_PERSISTENT_COMMITMENTS, MAX_PERSISTENT_TABLE_ENTRIES, SHARE_DATA_FELDMAN,
-        SHARE_DATA_OPAQUE, SHARE_ENVELOPE_VERSION, SHARE_TYPE_SECRET_INT, TAG_ARRAY, TAG_SHARE,
+        PersistentShareContext, PersistentValueContext, PersistentValueError, MAGIC,
+        MAX_PERSISTENT_COMMITMENTS, MAX_PERSISTENT_TABLE_ENTRIES, SHARE_DATA_FELDMAN,
+        SHARE_ENVELOPE_VERSION, SHARE_TYPE_SECRET_INT, TAG_ARRAY, TAG_SHARE,
     };
     use crate::net::mpc_engine::DurableIdentityDigest;
     use std::sync::Arc;
@@ -874,6 +874,10 @@ mod tests {
         let mut memory = ObjectStore::new();
         let context = test_context(b"value");
         let values = [
+            Value::Share(
+                ShareType::SecretField,
+                ShareData::Opaque(vec![1, 2, 3].into()),
+            ),
             Value::Unit,
             Value::I64(-42),
             Value::I32(-32),
@@ -1030,51 +1034,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_share_envelopes_are_rejected() {
+    fn noncurrent_share_envelopes_are_rejected_before_decoding_payload() {
         let mut memory = ObjectStore::new();
         let context = test_context(b"share-key");
-        let share_payload = [1u8, 2, 3];
-        let mut bytes = Vec::from(MAGIC.as_slice());
-        bytes.push(TAG_SHARE);
-        bytes.push(LEGACY_SHARE_ENVELOPE_VERSION_WITH_SESSION);
-        write_test_string(&mut bytes, "avss-mpc");
-        write_test_string(&mut bytes, "bls12-381");
-        write_test_string(&mut bytes, "bls12-381-fr");
-        bytes.extend_from_slice(&123_456_789u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&5u64.to_le_bytes());
-        bytes.extend_from_slice(&1u64.to_le_bytes());
-        bytes.extend_from_slice(blake3::hash(b"share-key").as_bytes());
-        bytes.extend_from_slice(blake3::hash(&share_payload).as_bytes());
-        bytes.push(0);
-        bytes.push(SHARE_TYPE_SECRET_INT);
-        bytes.extend_from_slice(&64u64.to_le_bytes());
-        bytes.push(SHARE_DATA_OPAQUE);
-        bytes.extend_from_slice(&(share_payload.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&share_payload);
-
-        assert_eq!(
-            decode_value_with_context(&bytes, &mut memory, Some(&context))
-                .expect_err("legacy envelope should be rejected"),
-            PersistentValueError::InvalidData {
-                reason: format!(
-                    "unsupported persistent share envelope version {}",
-                    LEGACY_SHARE_ENVELOPE_VERSION_WITH_SESSION
-                )
-            }
-        );
-
-        bytes[MAGIC.len() + 1] = LEGACY_SHARE_ENVELOPE_VERSION_WITH_PARTY_ID;
-        assert_eq!(
-            decode_value_with_context(&bytes, &mut memory, Some(&context))
-                .expect_err("legacy party-id envelope should be rejected"),
-            PersistentValueError::InvalidData {
-                reason: format!(
-                    "unsupported persistent share envelope version {}",
-                    LEGACY_SHARE_ENVELOPE_VERSION_WITH_PARTY_ID
-                )
-            }
-        );
+        for version in (0..SHARE_ENVELOPE_VERSION).chain([SHARE_ENVELOPE_VERSION + 1, u8::MAX]) {
+            let mut bytes = Vec::from(MAGIC.as_slice());
+            bytes.extend_from_slice(&[TAG_SHARE, version]);
+            assert_eq!(
+                decode_value_with_context(&bytes, &mut memory, Some(&context)),
+                Err(PersistentValueError::InvalidData {
+                    reason: format!("unsupported persistent share envelope version {version}")
+                })
+            );
+        }
     }
 
     #[test]

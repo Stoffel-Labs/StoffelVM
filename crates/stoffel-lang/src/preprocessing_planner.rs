@@ -1157,7 +1157,8 @@ impl<'a> Planner<'a> {
             // --- Free MPC builtins (secrecy effects only, no demand) ---------
             "Share.add" | "Share.sub" | "Share.mul_scalar" | "Share.add_constant"
             | "Share.add_scalar" => AbstractValue::secret(),
-            "Share.from_clear"
+            "Share.from_field"
+            | "Share.from_clear"
             | "Share.from_clear_int"
             | "Share.from_clear_uint"
             | "Share.from_clear_fixed" => AbstractValue::secret(),

@@ -475,6 +475,7 @@ where
     fn open_share_as_field(&self, ty: ShareType, share_bytes: &[u8]) -> MpcEngineResult<Vec<u8>> {
         (|| -> Result<Vec<u8>, String> {
             let type_key = match ty {
+                ShareType::SecretField => "avss-field-field".to_owned(),
                 ShareType::SecretInt { bit_length } => format!("avss-field-int-{bit_length}"),
                 ShareType::SecretUInt { bit_length } => format!("avss-field-uint-{bit_length}"),
                 ShareType::SecretFixedPoint { precision } => {
@@ -779,6 +780,9 @@ where
     ) -> MpcEngineResult<ClearShareValue> {
         async {
             let type_key = match ty {
+                ShareType::SecretField => {
+                    return Err("SecretField requires Share.open_field".to_owned())
+                }
                 ShareType::SecretInt { bit_length } => format!("avss-int-{bit_length}"),
                 ShareType::SecretUInt { bit_length } => format!("avss-uint-{bit_length}"),
                 ShareType::SecretFixedPoint { precision } => {
@@ -835,6 +839,9 @@ where
     ) -> MpcEngineResult<Vec<ClearShareValue>> {
         async {
             let type_key = match ty {
+                ShareType::SecretField => {
+                    return Err("SecretField requires Share.open_field".to_owned())
+                }
                 ShareType::SecretInt { bit_length } => format!("avss-batch-int-{bit_length}"),
                 ShareType::SecretUInt { bit_length } => format!("avss-batch-uint-{bit_length}"),
                 ShareType::SecretFixedPoint { precision } => {
@@ -918,6 +925,7 @@ where
     ) -> MpcEngineResult<Vec<u8>> {
         async {
             let type_key = match ty {
+                ShareType::SecretField => "avss-field-field".to_owned(),
                 ShareType::SecretInt { bit_length } => format!("avss-field-int-{bit_length}"),
                 ShareType::SecretUInt { bit_length } => format!("avss-field-uint-{bit_length}"),
                 ShareType::SecretFixedPoint { precision } => {

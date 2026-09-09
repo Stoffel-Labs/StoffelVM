@@ -40,7 +40,10 @@ pub(super) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
         share_open_exp,
     )?;
     vm.try_register_mpc_online_foreign_function(MpcOnlineBuiltin::Random, share_random)?;
-    vm.try_register_mpc_online_foreign_function(MpcOnlineBuiltin::RandomField, share_random)?;
+    vm.try_register_mpc_online_foreign_function(MpcOnlineBuiltin::RandomField, |mut ctx| {
+        let data = ctx.random_share_data(ShareType::SecretField)?;
+        create_result_share_object(&mut ctx, ShareType::SecretField, data)
+    })?;
     vm.try_register_mpc_online_foreign_function(MpcOnlineBuiltin::RandomInt, share_random_int)?;
     vm.try_register_mpc_online_foreign_method(
         "Share",

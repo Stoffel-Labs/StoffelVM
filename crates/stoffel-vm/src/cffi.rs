@@ -222,11 +222,13 @@ pub enum HBEngineErrorCode {
 /// The `kind` field indicates the type:
 /// - 0 = Int (width is the value)
 /// - 1 = Bool (width is 1 for true, 0 for false)
-/// - 2 = Float (width is the value)
+/// - 2 = Fixed point (width is total bits)
+/// - 3 = Unsigned integer (width is bit length)
+/// - 4 = Field element (width must be zero)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CShareType {
-    /// Type kind: 0=Int, 1=Bool, 2=Float
+    /// Type kind: 0=Int, 1=Bool, 2=FixedPoint, 3=UInt, 4=Field
     pub kind: u8,
     /// Width/value depending on kind
     pub width: i64,
@@ -259,6 +261,8 @@ impl TryFrom<CShareType> for ShareType {
                 let bit_length = positive_ffi_width(c.width, "secret unsigned integer bit length")?;
                 ShareType::try_secret_uint(bit_length).map_err(String::from)
             }
+            4 if c.width == 0 => Ok(ShareType::SecretField),
+            4 => Err("field shares have no bit width; use width 0".to_owned()),
             _ => Err(format!("unknown share type kind {}", c.kind)),
         }
     }
@@ -269,6 +273,7 @@ impl TryFrom<ShareType> for CShareType {
 
     fn try_from(st: ShareType) -> Result<Self, Self::Error> {
         match st {
+            ShareType::SecretField => Ok(CShareType { kind: 4, width: 0 }),
             ShareType::SecretInt { bit_length } => Ok(CShareType {
                 kind: if bit_length == 1 { 1 } else { 0 },
                 width: i64::try_from(bit_length)
@@ -1421,6 +1426,16 @@ mod tests {
 #[cfg(test)]
 mod hb_engine_tests {
     use super::*;
+
+    #[test]
+    fn field_share_type_c_roundtrip_and_width_validation() {
+        let field = CShareType::try_from(ShareType::SecretField).unwrap();
+        assert_eq!((field.kind, field.width), (4, 0));
+        assert_eq!(ShareType::try_from(field).unwrap(), ShareType::SecretField);
+        for width in [-1, 1, 64, i64::MAX] {
+            assert!(ShareType::try_from(CShareType { kind: 4, width }).is_err());
+        }
+    }
 
     #[test]
     fn test_share_type_conversion_int() {

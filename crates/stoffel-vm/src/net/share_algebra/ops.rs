@@ -343,11 +343,17 @@ where
     G: CurveGroup<ScalarField = F>,
 {
     let share = decode_share_bytes_typed::<F, G>(share_bytes)?;
-    let scalar_f = F::deserialize_compressed(scalar_bytes).map_err(|e| {
+    let mut input = scalar_bytes;
+    let scalar_f = F::deserialize_compressed(&mut input).map_err(|e| {
         ShareAlgebraError::FieldElementDecode {
             source: e.to_string(),
         }
     })?;
+    if !input.is_empty() {
+        return Err(ShareAlgebraError::FieldElementDecode {
+            source: "trailing bytes in field element".to_owned(),
+        });
+    }
     match share {
         DecodedShare::Robust(share) => {
             let new_share = RobustShare::new(share.share[0] * scalar_f, share.id, share.degree);
@@ -371,11 +377,17 @@ where
     G: CurveGroup<ScalarField = F>,
 {
     let share = decode_share_bytes_typed::<F, G>(share_bytes)?;
-    let field = F::deserialize_compressed(field_bytes).map_err(|e| {
+    let mut input = field_bytes;
+    let field = F::deserialize_compressed(&mut input).map_err(|e| {
         ShareAlgebraError::FieldElementDecode {
             source: e.to_string(),
         }
     })?;
+    if !input.is_empty() {
+        return Err(ShareAlgebraError::FieldElementDecode {
+            source: "trailing bytes in field element".to_owned(),
+        });
+    }
     match share {
         DecodedShare::Robust(share) => {
             let new_share = RobustShare::new(share.share[0] + field, share.id, share.degree);

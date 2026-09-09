@@ -15,6 +15,8 @@ builtin object MpcOutput:
   def send_to_client[T](client_id: int64, value: T) -> bool {.builtin.}:
 
 builtin object Share:
+  # Locally share the same public field constant on every party.
+  def from_field(field_bytes: bytes) -> Share {.builtin.}:
   def from_clear(value: int64) -> Share {.builtin.}:
   def from_clear_int(value: int64, bit_length: int64) -> Share {.builtin.}:
   def from_clear_uint(value: uint64, bit_length: int64) -> Share {.builtin.}:

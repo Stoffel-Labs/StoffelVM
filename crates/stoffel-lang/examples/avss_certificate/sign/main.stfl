@@ -6,7 +6,7 @@
 # party ordering from a previous keygen run.
 
 def main() -> bytes:
-  var secret_key: secret int64 = Share.random()
+  var secret_key: Share = Share.random_field()
   var public_key = secret_key.get_commitment(0)
   var curve = Mpc.curve()
 
@@ -18,8 +18,8 @@ def main() -> bytes:
     var message_share = ClientStore.take_share(0, 0)
     message_field = message_share.open_field()
 
-  var gamma: secret int64 = Share.random()
-  var nonce: secret int64 = Share.random()
+  var gamma: Share = Share.random_field()
+  var nonce: Share = Share.random_field()
   var delta_share = gamma.mul(nonce)
   var delta = delta_share.open_field()
   var delta_inverse = Crypto.field_inv(delta, curve)
@@ -34,8 +34,7 @@ def main() -> bytes:
   var response_share = message_over_nonce.add(scaled_secret)
 
   if client_count > 0 and Mpc.has_capability("client-output"):
-    var one_share = Share.from_clear(1)
-    var r_share = one_share.mul_field(r)
+    var r_share = Share.from_field(r)
     var output_shares: list[Share] = []
     output_shares.append(r_share)
     output_shares.append(response_share)

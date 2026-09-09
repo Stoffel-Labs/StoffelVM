@@ -131,6 +131,9 @@ fn share_add_constant(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbac
     // - integer share + fixed constant: scale the integer share into the
     //   fixed-point domain (multiply its value by `2^f`) before adding.
     if let Value::Float(F64(constant)) = constant_value {
+        if ty == ShareType::SecretField {
+            return Err("SecretField requires an integer scalar or field arithmetic".into());
+        }
         let (total_bits, target_f) = match ty {
             ShareType::SecretFixedPoint { precision } => {
                 (precision.total_bits(), precision.fractional_bits())
@@ -180,6 +183,9 @@ fn share_mul_scalar(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackR
     //   so secret-share the public scalar and run the truncating secret*secret
     //   fixed-point multiply.
     if let Value::Float(F64(scalar)) = scalar_value {
+        if ty == ShareType::SecretField {
+            return Err("SecretField requires an integer scalar or field arithmetic".into());
+        }
         let (total_bits, target_f) = match ty {
             ShareType::SecretFixedPoint { precision } => {
                 (precision.total_bits(), precision.fractional_bits())
@@ -236,12 +242,15 @@ fn share_mul_field(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackRe
         };
 
         let (ty, data) = ctx.extract_share_data(&share_value)?;
+        if matches!(ty, ShareType::SecretFixedPoint { .. }) {
+            return Err("Field arithmetic requires an integer or field share; use scalar arithmetic for fixed-point shares".into());
+        }
         let field_bytes = ctx.read_byte_array(&field_value)?;
         (ty, data, field_bytes)
     };
 
     let result_data = ctx.secret_share_mul_field_data(ty, &data, &field_bytes)?;
-    create_result_share_value(ty, result_data)
+    create_result_share_value(ShareType::SecretField, result_data)
 }
 
 fn share_add_field(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackResult<Value> {
@@ -253,12 +262,15 @@ fn share_add_field(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackRe
         };
 
         let (ty, data) = ctx.extract_share_data(&share_value)?;
+        if matches!(ty, ShareType::SecretFixedPoint { .. }) {
+            return Err("Field arithmetic requires an integer or field share; use scalar arithmetic for fixed-point shares".into());
+        }
         let field_bytes = ctx.read_byte_array(&field_value)?;
         (ty, data, field_bytes)
     };
 
     let result_data = ctx.secret_share_add_field_data(ty, &data, &field_bytes)?;
-    create_result_share_value(ty, result_data)
+    create_result_share_value(ShareType::SecretField, result_data)
 }
 
 fn share_interpolate_local(

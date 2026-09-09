@@ -103,6 +103,9 @@ where
     ) -> crate::net::mpc_engine::MpcEngineResult<ClearShareValue> {
         (|| -> Result<ClearShareValue, String> {
             let type_key = match ty {
+                ShareType::SecretField => {
+                    return Err("SecretField requires Share.open_field".to_owned())
+                }
                 ShareType::SecretInt { bit_length } => format!("hb-int-{bit_length}"),
                 ShareType::SecretUInt { bit_length } => format!("hb-uint-{bit_length}"),
                 ShareType::SecretFixedPoint { precision } => {
@@ -163,6 +166,9 @@ where
     ) -> crate::net::mpc_engine::MpcEngineResult<Vec<ClearShareValue>> {
         (|| -> Result<Vec<ClearShareValue>, String> {
             let type_key = match ty {
+                ShareType::SecretField => {
+                    return Err("SecretField requires Share.open_field".to_owned())
+                }
                 ShareType::SecretInt { bit_length } => format!("hb-batch-int-{bit_length}"),
                 ShareType::SecretUInt { bit_length } => format!("hb-batch-uint-{bit_length}"),
                 ShareType::SecretFixedPoint { precision } => {

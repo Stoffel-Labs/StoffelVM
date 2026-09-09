@@ -592,6 +592,9 @@ fn field_to_typed_value(
     share_type: ClientScalarType,
 ) -> Result<ClientScalarValue, ClientError> {
     match scalar_share_type(share_type)? {
+        ShareType::SecretField => Err(ClientError::InvalidScalarValue(
+            "field shares require raw field output".to_owned(),
+        )),
         ShareType::SecretInt { bit_length: 1 } => Ok(ClientScalarValue::Boolean(!value.is_zero())),
         ShareType::SecretInt { .. } => field_to_i64(value).map(ClientScalarValue::SignedInteger),
         ShareType::SecretUInt { bit_length } => {

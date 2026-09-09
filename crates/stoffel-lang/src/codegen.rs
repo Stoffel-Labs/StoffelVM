@@ -30,6 +30,19 @@ fn int_literal_u64(node: Option<&AstNode>) -> Option<u64> {
 fn infer_single_share_type(node: &AstNode) -> Option<ShareType> {
     match node {
         AstNode::FunctionCall { function, .. } => match function.as_ref() {
+            AstNode::Identifier(name, _)
+                if matches!(
+                    name.as_str(),
+                    "Share.from_field"
+                        | "Share.random_field"
+                        | "Share.add_field"
+                        | "Share.mul_field"
+                        | "add_field"
+                        | "mul_field"
+                ) =>
+            {
+                Some(ShareType::SecretField)
+            }
             AstNode::Identifier(name, _) if name == "ClientStore.take_share_fixed" => {
                 Some(ShareType::default_secret_fixed_point())
             }
@@ -1639,6 +1652,7 @@ impl CodeGenerator {
 
         let (clear_vr, _clear_is_secret) = self.compile_node(expr)?;
         match share_type {
+            ShareType::SecretField => return Ok(None),
             ShareType::SecretInt { bit_length } => {
                 let bit_length_vr = self.emit_i64_literal(bit_length as i64);
                 self.emit(Instruction::PUSHARG(clear_vr.0));
@@ -2108,6 +2122,9 @@ impl CodeGenerator {
                     right_type_hint.as_ref().map(SymbolType::underlying_type),
                     Some(SymbolType::List(_))
                 );
+                // Semantic analysis guarantees a clear integer count. Hints are
+                // intentionally partial (e.g. conditional expressions), so do not
+                // require a count hint to lower an already checked repetition.
                 let is_list_repeat = op == "*" && (is_left_list || is_right_list);
                 let is_list_equality =
                     matches!(op.as_str(), "==" | "!=") && is_left_list && is_right_list;
@@ -2383,7 +2400,9 @@ impl CodeGenerator {
                             let bit_length = match share_type {
                                 ShareType::SecretInt { bit_length }
                                 | ShareType::SecretUInt { bit_length } => bit_length,
-                                ShareType::SecretFixedPoint { .. } => unreachable!(),
+                                ShareType::SecretFixedPoint { .. } | ShareType::SecretField => {
+                                    unreachable!()
+                                }
                             };
                             let bit_length_vr = self.allocate_virtual_register(false);
                             self.identified_constants
@@ -2729,6 +2748,9 @@ impl CodeGenerator {
                 body,
                 location,
             } => {
+                let outer_bindings = self.symbol_table.clone();
+                let outer_types = self.symbol_types.clone();
+                let outer_objects = self.object_field_types.clone();
                 // Support: single var over range a .. b (exclusive) or over a list/array
                 if variables.len() != 1 {
                     return Err(CompilerError::semantic_error(
@@ -2925,6 +2947,11 @@ impl CodeGenerator {
                 }
 
                 // For-loops evaluate to Unit
+                // For-loop declarations have lexical scope, while writes to
+                // existing outer registers retain their runtime effects.
+                self.symbol_table = outer_bindings;
+                self.symbol_types = outer_types;
+                self.object_field_types = outer_objects;
                 let nil_vr = self.allocate_virtual_register(false);
                 self.identified_constants.push(Constant::Unit);
                 self.emit(Instruction::LDI(nil_vr.0, crate::core_types::Value::Unit));

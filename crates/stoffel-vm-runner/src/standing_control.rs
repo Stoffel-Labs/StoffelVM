@@ -18,10 +18,7 @@ use stoffel_vm::net::{
     program_id_from_bytes, ExecutionSpecV1, MpcBackendKind, MpcCurveConfig, NodeEvent,
     NodeEventKind, NodeExecutionContext, NodeSupervisor, PreparedNodeExecution,
 };
-use stoffel_vm_types::compiled_binary::{
-    ClientIoManifest, CompiledBinary, PreprocessingDemand,
-    PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
-};
+use stoffel_vm_types::compiled_binary::{ClientIoManifest, CompiledBinary, PreprocessingDemand};
 use stoffelnet::network_utils::{CertificateIdentity, NodePublicKey};
 use tokio_util::sync::CancellationToken;
 use x509_parser::prelude::FromDer;
@@ -595,7 +592,7 @@ fn inspect_standing_program_with_policy(
 > {
     let mut reader = BufReader::new(bytes);
     let mut entries = HashSet::new();
-    let (functions, version, manifest) =
+    let (functions, _, manifest) =
         CompiledBinary::try_for_each_vm_function_from_reader(&mut reader, |function| {
             entries.insert(function.name().to_owned());
             Ok(())
@@ -609,7 +606,6 @@ fn inspect_standing_program_with_policy(
         ));
     }
     validate_standing_preprocessing_manifest(
-        version,
         &manifest.preprocessing_demand,
         allow_dynamic_preprocessing,
     )
@@ -623,15 +619,9 @@ fn inspect_standing_program_with_policy(
 }
 
 fn validate_standing_preprocessing_manifest(
-    artifact_version: u16,
     demand: &PreprocessingDemand,
     allow_dynamic_preprocessing: bool,
 ) -> Result<(), String> {
-    if artifact_version < PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION {
-        return Err(format!(
-            "standing execution requires artifact format version {PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION} or newer; version {artifact_version} has no complete preprocessing manifest"
-        ));
-    }
     if demand.dynamic && !allow_dynamic_preprocessing {
         return Err(
             "standing execution requires statically bounded preprocessing demand".to_owned(),
@@ -907,33 +897,15 @@ mod tests {
 
     #[test]
     fn standing_preprocessing_requires_a_current_bounded_manifest() {
-        let fixed = PreprocessingDemand::default();
-        let old_version = validate_standing_preprocessing_manifest(
-            PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION - 1,
-            &fixed,
-            false,
-        )
-        .unwrap_err();
-        assert!(old_version.contains("no complete preprocessing manifest"));
-
         let dynamic = PreprocessingDemand {
             dynamic: true,
             ..PreprocessingDemand::default()
         };
-        let unbounded = validate_standing_preprocessing_manifest(
-            PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
-            &dynamic,
-            false,
-        )
-        .unwrap_err();
+        let unbounded = validate_standing_preprocessing_manifest(&dynamic, false).unwrap_err();
         assert!(unbounded.contains("statically bounded"));
 
-        validate_standing_preprocessing_manifest(
-            PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
-            &dynamic,
-            true,
-        )
-        .expect("explicit example/test policy admits a dynamic demand floor");
+        validate_standing_preprocessing_manifest(&dynamic, true)
+            .expect("explicit example/test policy admits a dynamic demand floor");
     }
 
     #[test]

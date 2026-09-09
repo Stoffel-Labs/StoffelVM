@@ -4,7 +4,7 @@
 
 def main() -> bytes:
   var client_count = ClientStore.get_number_clients()
-  var secret_key: secret int64 = Share.random()
+  var secret_key: Share = Share.random_field()
   var public_key = secret_key.open_exp("bls12-381-g2")
 
   var message = Bytes.from_string("test message for bls")

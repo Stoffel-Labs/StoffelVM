@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{AstNode, Pragma, Value};
 use crate::builtin_registry::BuiltinParameterInfo;
@@ -19,6 +19,7 @@ pub struct SemanticAnalyzer<'a> {
     imported_symbols: HashMap<String, SymbolInfo>,
     /// Number of enclosing loops at the current analysis point (for break/continue)
     loop_depth: usize,
+    function_scope: Option<usize>,
     /// Parameter names, default-value expressions, and variadic flags of
     /// user-defined functions, used to resolve named arguments, inject
     /// defaults, and pack *args at call sites.
@@ -59,6 +60,7 @@ impl<'a> SemanticAnalyzer<'a> {
             current_function_return_type: None,
             imported_symbols: HashMap::new(),
             loop_depth: 0,
+            function_scope: None,
             function_signatures: HashMap::new(),
             enum_members: HashMap::new(),
         }
@@ -76,24 +78,73 @@ impl<'a> SemanticAnalyzer<'a> {
             current_function_return_type: None,
             imported_symbols,
             loop_depth: 0,
+            function_scope: None,
             function_signatures: HashMap::new(),
             enum_members: HashMap::new(),
         }
     }
 
+    pub(crate) fn import_function_signature(
+        &mut self,
+        name: String,
+        parameters: &[crate::ast::Parameter],
+    ) {
+        self.function_signatures.insert(
+            name,
+            parameters
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        p.default_value.as_deref().cloned(),
+                        p.is_variadic,
+                    )
+                })
+                .collect(),
+        );
+    }
+
     /// Adds imported symbols to the global scope.
-    fn register_imported_symbols(&mut self) {
+    fn register_imported_symbols(&mut self, node: &AstNode) {
+        let mut counts = HashMap::new();
+        for name in self.imported_symbols.keys() {
+            *counts
+                .entry(name.rsplit('.').next().unwrap_or(name))
+                .or_insert(0usize) += 1;
+        }
+        let local_names: HashSet<_> = if let AstNode::Block(nodes) = node {
+            nodes
+                .iter()
+                .filter_map(|n| match n {
+                    AstNode::FunctionDefinition {
+                        name: Some(name), ..
+                    } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
         for (name, info) in &self.imported_symbols {
             // Add the simple name (without module prefix) for convenience
             // This allows calling `add(a, b)` instead of `utils.math.add(a, b)`
             let simple_name = name.rsplit('.').next().unwrap_or(name);
-            self.symbol_table.declare_symbol(SymbolInfo {
-                name: simple_name.to_string(),
-                kind: info.kind.clone(),
-                symbol_type: info.symbol_type.clone(),
-                is_secret: info.is_secret,
-                defined_at: info.defined_at.clone(),
-            });
+            if name != simple_name
+                && counts.get(simple_name) == Some(&1)
+                && !local_names.contains(simple_name)
+            {
+                if let Some(signature) = self.function_signatures.get(name).cloned() {
+                    self.function_signatures
+                        .insert(simple_name.to_owned(), signature);
+                }
+                self.symbol_table.declare_symbol(SymbolInfo {
+                    name: simple_name.to_string(),
+                    kind: info.kind.clone(),
+                    symbol_type: info.symbol_type.clone(),
+                    is_secret: info.is_secret,
+                    defined_at: info.defined_at.clone(),
+                });
+            }
             // Also add the qualified name for explicit module.func() calls
             self.symbol_table.declare_symbol(info.clone());
         }
@@ -750,7 +801,10 @@ impl<'a> SemanticAnalyzer<'a> {
     ) -> Option<(String, Vec<CallParameterInfo>, SymbolType)> {
         let (function_name, params, return_type, is_builtin) = match function {
             AstNode::Identifier(name, _) => {
-                if let Some((object_name, method_name)) = name.split_once('.') {
+                if let Some((object_name, method_name)) = name
+                    .split_once('.')
+                    .filter(|_| !self.imported_symbols.contains_key(name))
+                {
                     let method = self
                         .symbol_table
                         .lookup_builtin_method(object_name, method_name)?;
@@ -2400,6 +2454,14 @@ impl<'a> SemanticAnalyzer<'a> {
                 Value::Bool(_) => SymbolType::Bool,
                 Value::Nil => SymbolType::Nil,
             },
+            AstNode::Identifier(name, _)
+                if self
+                    .symbol_table
+                    .lookup_symbol(name)
+                    .is_some_and(|info| matches!(info.kind, SymbolKind::BuiltinObject { .. })) =>
+            {
+                SymbolType::Unknown
+            }
             AstNode::Identifier(name, _) => env
                 .get(name)
                 .cloned()
@@ -2442,6 +2504,26 @@ impl<'a> SemanticAnalyzer<'a> {
                 let right_type = self.inference_expr_type(right, env);
                 if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=" | "in") {
                     return SymbolType::Bool;
+                }
+                if op == "*"
+                    && (matches!(left_type.underlying_type(), SymbolType::List(_))
+                        || matches!(right_type.underlying_type(), SymbolType::List(_)))
+                {
+                    let clear_int = |ty: &SymbolType, node: &AstNode| {
+                        !ty.is_secret()
+                            && (ty.is_integer() || Self::untyped_int_literal_value(node).is_some())
+                    };
+                    return if matches!(left_type.underlying_type(), SymbolType::List(_))
+                        && clear_int(&right_type, right)
+                    {
+                        left_type
+                    } else if matches!(right_type.underlying_type(), SymbolType::List(_))
+                        && clear_int(&left_type, left)
+                    {
+                        right_type
+                    } else {
+                        SymbolType::Unknown
+                    };
                 }
                 if op == "+" && left_type == SymbolType::String && right_type == SymbolType::String
                 {
@@ -2541,7 +2623,10 @@ impl<'a> SemanticAnalyzer<'a> {
     ) -> Option<(String, Vec<SymbolType>, bool)> {
         match function {
             AstNode::Identifier(name, _) => {
-                if let Some((object_name, method_name)) = name.split_once('.') {
+                if let Some((object_name, method_name)) = name
+                    .split_once('.')
+                    .filter(|_| !self.imported_symbols.contains_key(name))
+                {
                     let method = self
                         .symbol_table
                         .lookup_builtin_method(object_name, method_name)?;
@@ -2606,7 +2691,10 @@ impl<'a> SemanticAnalyzer<'a> {
     ) -> SymbolType {
         match function {
             AstNode::Identifier(name, _) => {
-                if let Some((object_name, method_name)) = name.split_once('.') {
+                if let Some((object_name, method_name)) = name
+                    .split_once('.')
+                    .filter(|_| !self.imported_symbols.contains_key(name))
+                {
                     return self
                         .symbol_table
                         .lookup_builtin_method(object_name, method_name)
@@ -3184,7 +3272,25 @@ impl<'a> SemanticAnalyzer<'a> {
     /// Returns the potentially annotated AST or errors.
     pub fn analyze(&mut self, node: AstNode) -> Result<AstNode, SemanticError> {
         // Register any imported symbols before analysis
-        self.register_imported_symbols();
+        self.register_imported_symbols(&node);
+
+        if let AstNode::Block(statements) = &node {
+            let has_main = statements.iter().any(|stmt| {
+                matches!(stmt,
+                AstNode::FunctionDefinition { name: Some(name), .. } if name == "main")
+            });
+            if has_main {
+                if let Some(stmt) = statements
+                    .iter()
+                    .find(|stmt| Self::is_top_level_execution(stmt))
+                {
+                    self.error_reporter.add_error(CompilerError::semantic_error(
+                        "Cannot mix top-level code with 'def main' entry", stmt.location())
+                        .with_hint("Move executable statements and variables into 'def main', or use script-style top-level code without 'def main'"));
+                    return Err(SemanticError);
+                }
+            }
+        }
 
         // Perform the combined analysis traversal
         let (analyzed_node, _node_type) = self.analyze_node(node).map_err(|_| SemanticError)?;
@@ -3211,11 +3317,47 @@ impl<'a> SemanticAnalyzer<'a> {
             return Err(SemanticError); // Stop if declaration errors occurred
         }
 
+        if !self.error_reporter.has_errors() {
+            for error in crate::definite_assignment::check(&analyzed_node) {
+                self.error_reporter.add_error(error);
+            }
+        }
         if self.error_reporter.has_errors() {
             Err(SemanticError)
         } else {
             Ok(analyzed_node) // Return the analyzed node
         }
+    }
+
+    pub(crate) fn is_top_level_execution(node: &AstNode) -> bool {
+        !matches!(
+            node,
+            AstNode::FunctionDefinition { .. }
+                | AstNode::ObjectDefinition { .. }
+                | AstNode::EnumDefinition { .. }
+                | AstNode::TypeAlias { .. }
+                | AstNode::BuiltinTypeDefinition { .. }
+                | AstNode::BuiltinObjectDefinition { .. }
+                | AstNode::Import { .. }
+        )
+    }
+
+    fn validate_variable_scope(&mut self, name: &str, location: SourceLocation) -> Result<(), ()> {
+        if let Some((scope, info)) = self.symbol_table.lookup_symbol_with_scope(name) {
+            let imported = scope == 0
+                && self.imported_symbols.values().any(|symbol| {
+                    symbol.name == info.name || symbol.name.rsplit('.').next() == Some(name)
+                });
+            if matches!(info.kind, SymbolKind::Variable { .. })
+                && (imported || self.function_scope.is_some_and(|boundary| scope < boundary))
+            {
+                self.error_reporter.add_error(CompilerError::semantic_error(
+                    format!("Variable '{}' is outside this function's storage scope; globals and implicit captures are not supported", name), location)
+                    .with_hint("Pass the value as a function parameter, or use explicit closure upvalues"));
+                return Err(());
+            }
+        }
+        Ok(())
     }
 
     /// Recursively analyzes a node, handling symbol declaration, resolution, and type checking.
@@ -3253,7 +3395,10 @@ impl<'a> SemanticAnalyzer<'a> {
             AstNode::Identifier(name, location) => {
                 // First check for qualified builtin method names (e.g., "ClientStore.take_share")
                 // These are valid when used as function identifiers in FunctionCall
-                if let Some(dot_pos) = name.find('.') {
+                if let Some(dot_pos) = name
+                    .find('.')
+                    .filter(|_| !self.imported_symbols.contains_key(&name))
+                {
                     let obj_name = &name[..dot_pos];
                     let method_name = &name[dot_pos + 1..];
 
@@ -3269,6 +3414,21 @@ impl<'a> SemanticAnalyzer<'a> {
                     }
                 }
 
+                self.validate_variable_scope(&name, location.clone())?;
+                if self
+                    .symbol_table
+                    .lookup_symbol(&name)
+                    .is_some_and(|info| matches!(info.kind, SymbolKind::BuiltinObject { .. }))
+                {
+                    self.error_reporter.add_error(
+                        CompilerError::type_error(
+                            format!("'{}' is a builtin namespace, not a value", name),
+                            location,
+                        )
+                        .with_hint(format!("Call a method such as '{}.method(...)'", name)),
+                    );
+                    return Err(());
+                }
                 // Regular symbol lookup
                 if let Some(info) = self.symbol_table.lookup_symbol(name.as_str()) {
                     // TODO: Mark symbol as used (for warnings)
@@ -3496,6 +3656,13 @@ impl<'a> SemanticAnalyzer<'a> {
                 is_secret,
                 location,
             } => {
+                if let Some(annotation) = type_annotation.as_ref() {
+                    self.validate_namespace_annotation(annotation)?;
+                    self.validate_type_annotation(
+                        &SymbolType::from_ast(annotation),
+                        annotation.location(),
+                    )?;
+                }
                 // 1. Analyze the value expression first (if it exists)
                 let mut checked_value_node = None;
                 let mut value_type = if let Some(val_expr) = value {
@@ -3593,6 +3760,17 @@ impl<'a> SemanticAnalyzer<'a> {
                 };
                 let calculated_is_secret = final_type.is_secret();
 
+                // Preserve the resolved type for default initialization and
+                // downstream analyses; source spans still identify the annotation.
+                let type_annotation = Self::type_annotation_for_inferred_type(
+                    &final_type,
+                    type_annotation
+                        .as_deref()
+                        .map(AstNode::location)
+                        .unwrap_or_else(|| location.clone()),
+                )
+                .map(Box::new)
+                .or(type_annotation);
                 // 5. Declare the symbol in the current scope
                 let info = SymbolInfo {
                     name: name.clone(),
@@ -3664,6 +3842,9 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 // Validate parameter types - ensure they refer to actual types, not functions
                 for (param, param_type) in parameters.iter().zip(param_types.iter()) {
+                    if let Some(annotation) = &param.type_annotation {
+                        self.validate_namespace_annotation(annotation)?;
+                    }
                     let param_loc = param
                         .type_annotation
                         .as_ref()
@@ -3673,6 +3854,7 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 // Validate return type
                 if let Some(rt_node) = &return_type {
+                    self.validate_namespace_annotation(rt_node)?;
                     self.validate_type_annotation(&final_return_type, rt_node.location())?;
                 }
 
@@ -3775,42 +3957,49 @@ impl<'a> SemanticAnalyzer<'a> {
                 // 3. Analyze function body in a new scope (if not builtin)
                 let checked_body = if !is_builtin {
                     self.symbol_table.enter_scope();
+                    let previous_function_scope = self
+                        .function_scope
+                        .replace(self.symbol_table.current_scope_id());
+                    let previous_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
                     let previous_return_type = self
                         .current_function_return_type
                         .replace(final_return_type.clone());
 
-                    // Declare parameters within the function's scope
-                    for (param, param_type) in parameters.iter().zip(param_types.iter()) {
-                        let param_info = SymbolInfo {
-                            name: param.name.clone(),
-                            kind: SymbolKind::Variable { is_mutable: false }, // Params are immutable
-                            symbol_type: param_type.clone(),
-                            is_secret: param_type.is_secret(),
-                            defined_at: param
-                                .type_annotation
-                                .as_ref()
-                                .map_or_else(|| location.clone(), |n| n.location()),
-                        };
-                        self.symbol_table.declare_symbol(param_info);
-                    }
+                    let body_result: Result<AstNode, ()> = (|| {
+                        // Declare parameters within the function's scope
+                        for (param, param_type) in parameters.iter().zip(param_types.iter()) {
+                            let param_info = SymbolInfo {
+                                name: param.name.clone(),
+                                kind: SymbolKind::Variable { is_mutable: false }, // Params are immutable
+                                symbol_type: param_type.clone(),
+                                is_secret: param_type.is_secret(),
+                                defined_at: param
+                                    .type_annotation
+                                    .as_ref()
+                                    .map_or_else(|| location.clone(), |n| n.location()),
+                            };
+                            self.symbol_table.declare_symbol(param_info);
+                        }
 
-                    let body = Box::new(self.infer_function_body_types(*body, &final_return_type)?);
+                        let body =
+                            Box::new(self.infer_function_body_types(*body, &final_return_type)?);
 
-                    // Recursively analyze the body
-                    let errors_before_body = self.error_reporter.error_count();
-                    let (checked_body_node, _body_type) = self.analyze_node(*body)?;
-                    let body_has_errors = self.error_reporter.error_count() > errors_before_body;
+                        // Recursively analyze the body
+                        let errors_before_body = self.error_reporter.error_count();
+                        let (checked_body_node, _body_type) = self.analyze_node(*body)?;
+                        let body_has_errors =
+                            self.error_reporter.error_count() > errors_before_body;
 
-                    // Every path through a value-returning function must return.
-                    let needs_return = !matches!(
-                        final_return_type.underlying_type(),
-                        SymbolType::Void | SymbolType::Nil | SymbolType::Unknown
-                    );
-                    if !body_has_errors
-                        && needs_return
-                        && !Self::node_always_returns(&checked_body_node)
-                    {
-                        self.error_reporter.add_error(
+                        // Every path through a value-returning function must return.
+                        let needs_return = !matches!(
+                            final_return_type.underlying_type(),
+                            SymbolType::Void | SymbolType::Nil | SymbolType::Unknown
+                        );
+                        if !body_has_errors
+                            && needs_return
+                            && !Self::node_always_returns(&checked_body_node)
+                        {
+                            self.error_reporter.add_error(
                             CompilerError::semantic_error(
                                 format!(
                                     "Function '{}' declares return type '{}' but not all paths return a value",
@@ -3821,16 +4010,42 @@ impl<'a> SemanticAnalyzer<'a> {
                             )
                             .with_hint("Add a return statement at the end of the function or to every branch"),
                         );
-                        return Err(());
-                    }
+                            return Err(());
+                        }
 
+                        Ok(checked_body_node)
+                    })();
                     self.current_function_return_type = previous_return_type;
+                    self.function_scope = previous_function_scope;
+                    self.loop_depth = previous_loop_depth;
                     self.symbol_table.exit_scope();
-                    Box::new(checked_body_node)
+                    Box::new(body_result?)
                 } else {
                     body // Keep original body for builtins (it's not analyzed)
                 };
 
+                // Keep aliases resolved at function boundaries as well as in
+                // locals, so downstream domain analysis sees the same types.
+                let mut parameters = parameters;
+                for parameter in &mut parameters {
+                    if let Some(annotation) = parameter.type_annotation.as_deref() {
+                        let mut ty = self.resolve_type_aliases(&SymbolType::from_ast(annotation));
+                        if parameter.is_secret && !ty.is_secret() {
+                            ty = ty.with_secret_modifier();
+                        }
+                        if let Some(resolved) =
+                            Self::type_annotation_for_inferred_type(&ty, annotation.location())
+                        {
+                            parameter.type_annotation = Some(Box::new(resolved));
+                        }
+                    }
+                }
+                let return_type = return_type.map(|annotation| {
+                    let ty = self.resolve_type_aliases(&SymbolType::from_ast(&annotation));
+                    Self::type_annotation_for_inferred_type(&ty, annotation.location())
+                        .map(Box::new)
+                        .unwrap_or(annotation)
+                });
                 // 4. Reconstruct the node
                 let reconstructed_node = AstNode::FunctionDefinition {
                     name,
@@ -3862,6 +4077,7 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 if let Some(base_node) = &base_type {
                     let base_type_symbol = SymbolType::from_ast(base_node);
+                    self.validate_namespace_annotation(base_node)?;
                     self.validate_type_annotation(&base_type_symbol, base_node.location())?;
                     let base_type_symbol = self.resolve_type_aliases(&base_type_symbol);
 
@@ -3884,6 +4100,7 @@ impl<'a> SemanticAnalyzer<'a> {
                         field_type = field_type.with_secret_modifier();
                     }
                     // Validate field type refers to a valid type
+                    self.validate_namespace_annotation(&field.type_annotation)?;
                     self.validate_type_annotation(&field_type, field.type_annotation.location())?;
                     field_type = self.resolve_type_aliases(&field_type);
                     field_types.insert(field.name.clone(), field_type);
@@ -3891,7 +4108,7 @@ impl<'a> SemanticAnalyzer<'a> {
 
                 self.symbol_table.register_user_object(UserObjectInfo {
                     name: name.clone(),
-                    fields: field_types,
+                    fields: field_types.clone(),
                 });
 
                 // Declare the object type as a type symbol
@@ -3904,7 +4121,27 @@ impl<'a> SemanticAnalyzer<'a> {
                 };
                 self.symbol_table.declare_symbol(info);
 
-                // Return the node as-is (no transformation needed)
+                // Materialize inherited fields and resolved aliases for defaults
+                // and the initialization checker, using the same object layout.
+                let mut resolved_fields = Vec::new();
+                for (field_name, ty) in &field_types {
+                    let field_location = fields
+                        .iter()
+                        .find(|f| &f.name == field_name)
+                        .map(|f| f.type_annotation.location())
+                        .unwrap_or_else(|| location.clone());
+                    if let Some(annotation) =
+                        Self::type_annotation_for_inferred_type(ty, field_location)
+                    {
+                        resolved_fields.push(crate::ast::FieldDefinition {
+                            name: field_name.clone(),
+                            type_annotation: Box::new(annotation),
+                            is_secret: ty.is_secret(),
+                        });
+                    }
+                }
+                resolved_fields.sort_by(|a, b| a.name.cmp(&b.name));
+                let fields = resolved_fields;
                 Ok((
                     AstNode::ObjectDefinition {
                         name,
@@ -3928,6 +4165,7 @@ impl<'a> SemanticAnalyzer<'a> {
                     alias_type = alias_type.with_secret_modifier();
                 }
 
+                self.validate_namespace_annotation(&target_type)?;
                 self.validate_type_annotation(&alias_type, target_type.location())?;
                 alias_type = self.resolve_type_aliases(&alias_type);
 
@@ -4243,6 +4481,8 @@ impl<'a> SemanticAnalyzer<'a> {
                 // Exit loop scope
                 self.symbol_table.exit_scope();
 
+                let (var_name, checked_body) =
+                    crate::scope_bindings::for_scope(var_name, checked_body, &location);
                 Ok((
                     AstNode::ForLoop {
                         variables: vec![var_name],
@@ -4501,7 +4741,10 @@ impl<'a> SemanticAnalyzer<'a> {
                     match &checked_function_node {
                         AstNode::Identifier(name, loc) => {
                             // Check if this is a qualified builtin object method call (e.g., "ClientStore.take_share")
-                            if let Some(dot_pos) = name.find('.') {
+                            if let Some(dot_pos) = name
+                                .find('.')
+                                .filter(|_| !self.imported_symbols.contains_key(name))
+                            {
                                 let obj_name = &name[..dot_pos];
                                 let method_name = &name[dot_pos + 1..];
 
@@ -4719,6 +4962,30 @@ impl<'a> SemanticAnalyzer<'a> {
                         }
                     };
 
+                if is_builtin_call
+                    && matches!(
+                        function_name.as_str(),
+                        "mul_scalar"
+                            | "add_constant"
+                            | "add_scalar"
+                            | "Share.mul_scalar"
+                            | "Share.add_constant"
+                            | "Share.add_scalar"
+                    )
+                {
+                    if let Some(ty) = argument_types.get(1) {
+                        if ty.is_secret() || !Self::is_clear_numeric_type(ty) {
+                            self.error_reporter.add_error(CompilerError::type_error(
+                                format!(
+                                    "'{}' requires a clear numeric scalar, found '{}'",
+                                    function_name, ty
+                                ),
+                                checked_arguments[1].location(),
+                            ));
+                            return Err(());
+                        }
+                    }
+                }
                 // 4. Validate argument count
                 let mut call_parameters = self.builtin_call_parameters(
                     &function_name,
@@ -5238,8 +5505,16 @@ impl<'a> SemanticAnalyzer<'a> {
                 if op == "*" {
                     let left_is_list = matches!(left_ty.underlying_type(), SymbolType::List(_));
                     let right_is_list = matches!(right_ty.underlying_type(), SymbolType::List(_));
-                    let left_is_int = left_ty.underlying_type().is_integer();
-                    let right_is_int = right_ty.underlying_type().is_integer();
+                    let left_is_int = left_ty.is_integer() && !left_ty.is_secret();
+                    let right_is_int = right_ty.is_integer() && !right_ty.is_secret();
+                    if (left_is_list || right_is_list)
+                        && !(left_is_list && right_is_int || left_is_int && right_is_list)
+                    {
+                        self.error_reporter.add_error(CompilerError::type_error(
+                            format!("List repetition requires a clear integer count, found '{}' and '{}'", left_ty, right_ty), location.clone())
+                            .with_hint("Use list * clear_integer; for a field element and a Share, use Share.mul_field(share, field_bytes)"));
+                        return Err(());
+                    }
 
                     if left_is_list && right_is_int {
                         return Ok((
@@ -5404,6 +5679,33 @@ impl<'a> SemanticAnalyzer<'a> {
                     let l_share = Self::is_share_alias_type(&left_ty);
                     let r_share = Self::is_share_alias_type(&right_ty);
                     if l_share || r_share {
+                        let left_share = l_share || left_ty.is_secret();
+                        let right_share = r_share || right_ty.is_secret();
+                        let clear_int = |ty: &SymbolType| ty.is_integer() && !ty.is_secret();
+                        let clear_real =
+                            |ty: &SymbolType| Self::is_clear_real_type(ty) && !ty.is_secret();
+                        let supported = match op.as_str() {
+                            "+" | "-" => {
+                                (left_share && right_share)
+                                    || (left_share && clear_int(&right_ty))
+                                    || (clear_int(&left_ty) && right_share)
+                            }
+                            "*" => {
+                                (left_share && right_share)
+                                    || (left_share
+                                        && (clear_int(&right_ty) || clear_real(&right_ty)))
+                                    || ((clear_int(&left_ty) || clear_real(&left_ty))
+                                        && right_share)
+                            }
+                            "/" => left_share && (clear_int(&right_ty) || clear_real(&right_ty)),
+                            _ => false,
+                        };
+                        if !supported {
+                            self.error_reporter.add_error(CompilerError::type_error(
+                                format!("Unsupported Share arithmetic: '{}' {} '{}'", left_ty, op, right_ty), location.clone())
+                                .with_hint("Use supported Share/scalar arithmetic; use Share.add_field or Share.mul_field for field bytes"));
+                            return Err(());
+                        }
                         let result_ty = if l_share {
                             left_ty.clone()
                         } else {
@@ -5722,6 +6024,7 @@ impl<'a> SemanticAnalyzer<'a> {
             } => {
                 if let AstNode::Identifier(object_name, _) = object.as_ref() {
                     let qualified_name = format!("{}.{}", object_name, field_name);
+                    self.validate_variable_scope(&qualified_name, location.clone())?;
                     if let Some(info) = self.symbol_table.lookup_symbol(&qualified_name) {
                         return Ok((
                             AstNode::FieldAccess {
@@ -5850,6 +6153,66 @@ impl<'a> SemanticAnalyzer<'a> {
 
     // --- Helper Functions ---
 
+    /// Walk the annotation before type conversion loses nested source spans.
+    fn validate_namespace_annotation(&mut self, node: &AstNode) -> Result<(), ()> {
+        match node {
+            AstNode::SecretType(inner) | AstNode::ListType(inner) => {
+                self.validate_namespace_annotation(inner)
+            }
+            AstNode::TupleType(items) => {
+                for item in items {
+                    self.validate_namespace_annotation(item)?;
+                }
+                Ok(())
+            }
+            AstNode::DictType {
+                key_type,
+                value_type,
+                ..
+            } => {
+                self.validate_namespace_annotation(key_type)?;
+                self.validate_namespace_annotation(value_type)
+            }
+            AstNode::FunctionType {
+                parameter_types,
+                return_type,
+                ..
+            } => {
+                for parameter in parameter_types {
+                    self.validate_namespace_annotation(parameter)?;
+                }
+                self.validate_namespace_annotation(return_type)
+            }
+            AstNode::GenericType {
+                base_name,
+                type_params,
+                location,
+            } => {
+                if crate::builtin_registry::builtin_registry()
+                    .objects
+                    .contains_key(base_name)
+                {
+                    self.validate_type_annotation(
+                        &SymbolType::TypeName(base_name.clone()),
+                        location.clone(),
+                    )?;
+                }
+                for parameter in type_params {
+                    self.validate_namespace_annotation(parameter)?;
+                }
+                Ok(())
+            }
+            AstNode::Identifier(name, location)
+                if crate::builtin_registry::builtin_registry()
+                    .objects
+                    .contains_key(name) =>
+            {
+                self.validate_type_annotation(&SymbolType::TypeName(name.clone()), location.clone())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Validates that a SymbolType doesn't contain invalid type references.
     /// Returns an error if a TypeName refers to a function or undeclared identifier.
     fn validate_type_annotation(
@@ -5857,6 +6220,24 @@ impl<'a> SemanticAnalyzer<'a> {
         sym_type: &SymbolType,
         location: SourceLocation,
     ) -> Result<(), ()> {
+        if let SymbolType::TypeName(name) | SymbolType::Object(name) = sym_type {
+            let registry = crate::builtin_registry::builtin_registry();
+            if registry.objects.contains_key(name) && !registry.object_type_names.contains(name) {
+                let hint = match name.as_str() {
+                    "Field" => "Field elements are represented as 'bytes'",
+                    "Bytes" => "Use 'bytes' (list[uint8]) for byte values",
+                    _ => "Use this namespace only to call its builtin methods",
+                };
+                self.error_reporter.add_error(
+                    CompilerError::type_error(
+                        format!("'{}' is a builtin namespace, not a type", name),
+                        location,
+                    )
+                    .with_hint(hint),
+                );
+                return Err(());
+            }
+        }
         match sym_type {
             SymbolType::TypeName(name) => {
                 // Check if the name refers to something in the symbol table
@@ -5883,7 +6264,7 @@ impl<'a> SemanticAnalyzer<'a> {
                             Err(())
                         }
                         SymbolKind::BuiltinObject { .. } => {
-                            // Builtin objects are valid types (e.g., Share, ClientStore)
+                            // Namespace-only names were rejected above; Share remains a value type.
                             Ok(())
                         }
                         SymbolKind::Module => {

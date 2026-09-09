@@ -1403,6 +1403,9 @@ fn field_to_u64<F: PrimeField>(value: F, bit_length: usize) -> Result<u64> {
 
 fn field_to_value<F: PrimeField>(value: F, share_type: ShareType) -> Result<Value> {
     match share_type {
+        ShareType::SecretField => Err(Error::InvalidInput(
+            "SecretField requires raw field output, not scalar decoding".to_owned(),
+        )),
         ShareType::SecretInt { bit_length: 1 } => Ok(Value::Bool(!value.is_zero())),
         ShareType::SecretInt { .. } => Ok(Value::I64(field_to_i64(value)?)),
         ShareType::SecretUInt { bit_length } => Ok(Value::U64(field_to_u64(value, bit_length)?)),

@@ -5,7 +5,7 @@ use crate::foreign_functions::{
 };
 use crate::mpc_values::clear_share_input;
 use crate::VirtualMachineResult;
-use stoffel_vm_types::core_types::{ShareType, Value};
+use stoffel_vm_types::core_types::{ClearShareInput, ClearShareValue, ShareType, Value};
 
 pub(super) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
     vm.try_register_mpc_online_foreign_function(MpcOnlineBuiltin::FromClear, |ctx| {
@@ -42,6 +42,22 @@ pub(super) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
         )
     })?;
 
+    vm.try_register_typed_foreign_function("Share.from_field", |mut ctx| {
+        let bytes_value = {
+            let args = ctx.named_args("Share.from_field");
+            args.require_exact(1, "1 argument: field_bytes")?;
+            args.cloned(0)?
+        };
+        let bytes = ctx.read_byte_array(&bytes_value)?;
+        // Both engines construct public constants locally. Adding the field to
+        // zero reuses their share encoding and commitment-preserving algebra.
+        let zero = ctx.input_share_data(ClearShareInput::new(
+            ShareType::default_secret_int(),
+            ClearShareValue::Integer(0),
+        ))?;
+        let data = ctx.secret_share_add_field_data(ShareType::SecretField, &zero, &bytes)?;
+        create_result_share_object(&mut ctx, ShareType::SecretField, data)
+    })?;
     Ok(())
 }
 

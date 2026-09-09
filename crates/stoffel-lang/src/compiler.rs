@@ -127,6 +127,9 @@ pub fn compile(
         println!("-------------------------------------");
     }
 
+    let output_domains =
+        crate::client_io_planner::infer_output_domains(&analyzed_ast, &options.entry_points)?;
+
     // Lower semantically proven VM-native reductions even when general
     // optimization is disabled. This is a backend-aware lowering, not an
     // optional source-level performance tweak developers must remember.
@@ -167,6 +170,10 @@ pub fn compile(
             return Err(error_reporter.get_all().into_iter().cloned().collect());
         }
     };
+    crate::client_io_planner::apply_output_domains(
+        output_domains,
+        &mut compiled_program.client_io_manifest,
+    );
     let mut executable_roots = options.entry_points.clone();
     collect_literal_closure_targets(&optimized_ast, &mut executable_roots);
     executable_roots.sort();
@@ -186,7 +193,7 @@ pub fn compile(
 /// A closure target is a dynamic VM call edge even though the source names it
 /// with a string literal. Preserve those functions when pruning ordinary
 /// instruction-level call graph dead code.
-fn collect_literal_closure_targets(node: &AstNode, roots: &mut Vec<String>) {
+pub(crate) fn collect_literal_closure_targets(node: &AstNode, roots: &mut Vec<String>) {
     if let AstNode::FunctionDefinition { body, .. } = node {
         collect_literal_closure_targets(body, roots);
         return;

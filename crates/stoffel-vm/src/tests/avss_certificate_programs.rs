@@ -53,8 +53,8 @@ pub fn build_avss_certificate_keygen_program_for_key(
         Instruction::LDI(3, Value::Bool(true)),
         Instruction::CMP(2, 3),
         Instruction::JMPEQ("load_existing_key".to_owned()),
-        // r4 = Share.random() -- cooperative DKG for the CA signing key
-        Instruction::CALL("Share.random".to_owned()),
+        // r4 = Share.random_field() -- cooperative DKG for the CA signing key
+        Instruction::CALL("Share.random_field".to_owned()),
         Instruction::MOV(4, 0),
         // LocalStorage.store(key, sk)
         Instruction::PUSHARG(1),
@@ -129,9 +129,9 @@ pub fn build_avss_certificate_sign_program_for_key(
         Instruction::CALL("Share.open_field".to_owned()),
         Instruction::MOV(6, 0),
         // r7 = [gamma], r8 = [k].
-        Instruction::CALL("Share.random".to_owned()),
+        Instruction::CALL("Share.random_field".to_owned()),
         Instruction::MOV(7, 0),
-        Instruction::CALL("Share.random".to_owned()),
+        Instruction::CALL("Share.random_field".to_owned()),
         Instruction::MOV(8, 0),
         // r9 = [delta] = [gamma] * [k].
         Instruction::PUSHARG(7),
@@ -233,7 +233,7 @@ pub fn build_threshold_ecdsa_program(
 ) -> (Vec<Instruction>, HashMap<String, usize>) {
     let instructions = vec![
         // r1 = [sk] from cooperative DKG, r3 = pk = commitment[0](sk).
-        Instruction::CALL("Share.random".to_owned()),
+        Instruction::CALL("Share.random_field".to_owned()),
         Instruction::MOV(1, 0),
         Instruction::LDI(2, Value::I64(0)),
         Instruction::PUSHARG(1),
@@ -256,9 +256,9 @@ pub fn build_threshold_ecdsa_program(
         Instruction::CALL("Crypto.hash_to_field".to_owned()),
         Instruction::MOV(5, 0),
         // r6 = [gamma], r7 = [k].
-        Instruction::CALL("Share.random".to_owned()),
+        Instruction::CALL("Share.random_field".to_owned()),
         Instruction::MOV(6, 0),
-        Instruction::CALL("Share.random".to_owned()),
+        Instruction::CALL("Share.random_field".to_owned()),
         Instruction::MOV(7, 0),
         // r8 = [delta] = [gamma] * [k].
         Instruction::PUSHARG(6),
@@ -384,7 +384,7 @@ fn avss_certificate_keygen_loads_existing_key_before_generating() {
     ));
     assert!(matches!(
         &instructions[7],
-        Instruction::CALL(name) if name == "Share.random"
+        Instruction::CALL(name) if name == "Share.random_field"
     ));
 }
 

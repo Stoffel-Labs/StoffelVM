@@ -47,9 +47,13 @@ fn callback_error(error: &VirtualMachineError) -> &ForeignFunctionCallbackError 
 }
 
 fn compile_vm_source(source: &str) -> VirtualMachine {
+    compile_vm_source_at_level(source, 0)
+}
+
+fn compile_vm_source_at_level(source: &str, level: u8) -> VirtualMachine {
     let options = stoffellang::CompilerOptions {
-        optimize: false,
-        optimization_level: 0,
+        optimize: level > 0,
+        optimization_level: level,
         print_ir: false,
         mpc_backend: MpcBackend::HoneyBadger,
         mpc_curve: MpcCurve::default(),
@@ -6985,4 +6989,168 @@ fn test_complex_program() {
 
     let result = vm.execute("test_complex").unwrap();
     assert_eq!(result, Value::I64(55)); // 1 + 4 + 9 + 16 + 25 = 55
+}
+
+#[test]
+fn compiled_list_repetition_preserves_expression_counts_and_operand_order() {
+    for (expr, expected) in [
+        ("xs * n", vec![1, 2, 1, 2]),
+        ("n * xs", vec![1, 2, 1, 2]),
+        ("xs * -n", vec![]),
+        ("xs * (n - 1)", vec![1, 2]),
+        ("(n - 1) * xs", vec![1, 2]),
+        ("xs * 0", vec![]),
+    ] {
+        let source = format!("def main() -> list[int64]:\n  var xs: list[int64] = [1, 2]\n  var n: int64 = 2\n  return {expr}\n");
+        let mut vm = compile_vm_source(&source);
+        let result = vm.execute("main").unwrap();
+        assert_eq!(
+            read_vm_array(&mut vm, result),
+            expected.into_iter().map(Value::I64).collect::<Vec<_>>(),
+            "{expr}"
+        );
+    }
+}
+
+#[test]
+fn compiled_definite_assignment_accepts_branch_and_loop_initialization() {
+    for flag in [false, true] {
+        let mut vm = compile_vm_source(
+            "def main(flag: bool) -> int64:\n  var x: int64\n  if flag:\n    return 7\n  else:\n    while True:\n      x = 9\n      break\n  return x\n",
+        );
+        assert_eq!(
+            vm.execute_with_args("main", &[Value::Bool(flag)]).unwrap(),
+            Value::I64(if flag { 7 } else { 9 })
+        );
+    }
+}
+
+#[test]
+fn compiled_definite_assignment_preserves_object_alias_initialization() {
+    let mut vm = compile_vm_source(
+        "object Pair:\n  x: int64\n  y: int64\ndef init(p: Pair):\n  p.x = 11\n  p.y = 13\ndef main() -> int64:\n  var p: Pair\n  var alias = p\n  init(alias)\n  return p.x + p.y\n",
+    );
+    assert_eq!(vm.execute_with_args("main", &[]).unwrap(), Value::I64(24));
+}
+
+#[test]
+fn compiled_definite_assignment_alias_and_inherited_list_defaults_execute() {
+    let mut vm = compile_vm_source(
+        "type Numbers = list[int64]\nobject Base:\n  values: Numbers\nobject Child(Base):\n  count: int64\ndef main() -> int64:\n  var c: Child\n  c.values.append(17)\n  c.count = 1\n  var values: Numbers\n  values.append(c.values[0])\n  return values[0] + c.count\n",
+    );
+    assert_eq!(vm.execute_with_args("main", &[]).unwrap(), Value::I64(18));
+}
+
+#[test]
+fn compiled_definite_assignment_keeps_loop_local_shadowing_local() {
+    let mut vm = compile_vm_source(
+        "def main() -> int64:\n  var x: int64 = 17\n  for i in 0..2:\n    var x: int64 = 5\n  return x\n",
+    );
+    assert_eq!(vm.execute_with_args("main", &[]).unwrap(), Value::I64(17));
+}
+
+#[test]
+fn compiled_definite_assignment_optimizer_runtime_matrix() {
+    let cases = [
+        ("def main() -> int64:\n  var x: int64\n  while True:\n    x = 19\n    break\n  return x\n", 19),
+        ("object P:\n  x: int64\ndef init(p: P):\n  p.x = 23\ndef main() -> int64:\n  var p: P\n  var alias = p\n  init(alias)\n  return p.x\n", 23),
+        ("def main() -> int64:\n  var x = 17\n  for i in 0..2:\n    var x = 5\n  return x\n", 17),
+        ("type Numbers = list[int64]\nobject Base:\n  values: Numbers\nobject Child(Base):\n  count: int64\ndef main() -> int64:\n  var c: Child\n  c.values.append(17)\n  c.count = 1\n  return c.values[0] + c.count\n", 18),
+    ];
+    for level in 0..=3 {
+        for (source, expected) in cases {
+            let mut vm = compile_vm_source_at_level(source, level);
+            assert_eq!(
+                vm.execute_with_args("main", &[]).unwrap(),
+                Value::I64(expected),
+                "O{level}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compiled_definite_assignment_eager_boolean_initializer_effects_survive() {
+    let source = "object P:\n  x: int64\ndef init(p: P) -> bool:\n  p.x = 29\n  return True\ndef main() -> int64:\n  var p: P\n  if False and init(p):\n    return 0\n  return p.x\n";
+    for level in 0..=3 {
+        let mut vm = compile_vm_source_at_level(source, level);
+        assert_eq!(
+            vm.execute_with_args("main", &[]).unwrap(),
+            Value::I64(29),
+            "O{level}"
+        );
+    }
+}
+
+#[test]
+fn compiled_definite_assignment_loop_transfers_survive_optimization() {
+    let cases = [
+        ("def main(flag: bool) -> int64:\n  var x = 0\n  for i in 0..3:\n    if flag:\n      x += 7\n      break\n    x += 2\n  return x\n", 6, 7),
+        ("def main(flag: bool) -> int64:\n  var x = 0\n  for i in 0..3:\n    if flag:\n      x += 7\n      continue\n    x += 2\n  return x\n", 6, 21),
+    ];
+    for level in 0..=3 {
+        for (source, when_false, when_true) in cases {
+            for flag in [false, true] {
+                let mut vm = compile_vm_source_at_level(source, level);
+                assert_eq!(
+                    vm.execute_with_args("main", &[Value::Bool(flag)]).unwrap(),
+                    Value::I64(if flag { when_true } else { when_false }),
+                    "O{level}, flag={flag}: {source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn compiled_multifile_member_aliases_execute_the_correct_functions() {
+    let cases: &[(&[(&str, &str)], i64)] = &[
+        (&[
+            ("math.stfl", "def helper(x: int64) -> int64:\n  return x + 2\ndef value(x: int64 = 5) -> int64:\n  return helper(x)\n"),
+            ("main.stfl", "import math.value as answer\nimport math.value as alternate\ndef main() -> int64:\n  var c = create_closure(\"alternate\")\n  var x: int64 = call_closure_with_arg(c, 3)\n  return answer() + answer(x: 9) + x\n"),
+        ], 23),
+        (&[
+            ("left/service.stfl", "import helpers.value as selected\ndef run() -> int64:\n  return selected()\n"),
+            ("left/helpers.stfl", "def value() -> int64:\n  return 3\n"),
+            ("right/service.stfl", "import helpers.value as selected\ndef run() -> int64:\n  return selected()\n"),
+            ("right/helpers.stfl", "def value() -> int64:\n  return 8\n"),
+            ("main.stfl", "import left.service as l\nimport right.service as r\ndef main() -> int64:\n  return l.run() + r.run()\n"),
+        ], 11),
+        (&[
+            ("pkg/tools.stfl", "def sum(*xs: int64) -> int64:\n  var result = 0\n  for x in xs:\n    result += x\n  return result\n"),
+            ("main.stfl", "import pkg.tools.sum as total\ndef main() -> int64:\n  return total(2, 3, 7) + total()\n"),
+        ], 12),
+    ];
+    for (files, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, source) in *files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        let path = dir.path().join("main.stfl");
+        let source = std::fs::read_to_string(&path).unwrap();
+        for level in 0..=3 {
+            let program = stoffellang::compile_file(
+                &path,
+                &source,
+                &stoffellang::CompilerOptions {
+                    optimize: level > 0,
+                    optimization_level: level,
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("O{level}: {e:?}"));
+            let binary = stoffellang::convert_to_binary(&program);
+            let mut vm = VirtualMachine::try_new().unwrap();
+            for function in binary.try_to_vm_functions().unwrap() {
+                vm.try_register_function(function).unwrap();
+            }
+            assert_eq!(
+                vm.execute("main").unwrap(),
+                Value::I64(*expected),
+                "O{level}: {source}"
+            );
+        }
+    }
 }

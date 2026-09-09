@@ -4,10 +4,10 @@
 
 def main() -> bytes:
   var client_count = ClientStore.get_number_clients()
-  var secret_key: secret int64 = Share.random()
+  var secret_key: Share = Share.random_field()
   var public_key = secret_key.get_commitment(0)
 
-  var nonce: secret int64 = Share.random()
+  var nonce: Share = Share.random_field()
   var nonce_commitment = nonce.get_commitment(0)
 
   var prefix = Bytes.concat(nonce_commitment, public_key)

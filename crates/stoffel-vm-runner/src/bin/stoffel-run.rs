@@ -59,7 +59,6 @@ use stoffel_vm_runner::{
 };
 use stoffel_vm_types::compiled_binary::{
     BinaryError, ClientIoManifest, ClientIoSchema, CompiledBinary,
-    MPC_BACKEND_MANIFEST_FORMAT_VERSION, MPC_CURVE_MANIFEST_FORMAT_VERSION,
 };
 use stoffel_vm_types::core_types::{ClearShareValue, ShareType, TableRef, Value};
 use stoffel_vm_types::fixed_point_codec::{encode_fixed_point_float, encode_fixed_point_integer};
@@ -1487,6 +1486,7 @@ fn encode_manifest_client_inputs(
 
 fn encode_manifest_client_input(value: &str, share_type: ShareType) -> Result<String, String> {
     match share_type {
+        ShareType::SecretField => Err("field inputs require --raw-client-io".to_owned()),
         ShareType::SecretFixedPoint { precision } => {
             if value.starts_with("0x") || value.starts_with("0X") {
                 return Err(
@@ -8569,7 +8569,7 @@ async fn main() {
             );
             exit(2);
         });
-        let (_, bytecode_version, client_io_manifest) =
+        let (_, _, client_io_manifest) =
             CompiledBinary::try_for_each_vm_function_from_reader(&mut BufReader::new(file), |_| {
                 Ok(())
             })
@@ -8580,17 +8580,15 @@ async fn main() {
                 );
                 exit(2);
             });
-        let backend = (bytecode_version >= MPC_BACKEND_MANIFEST_FORMAT_VERSION)
-            .then_some(MpcBackendKind::from(client_io_manifest.mpc_backend));
-        let curve = (bytecode_version >= MPC_CURVE_MANIFEST_FORMAT_VERSION)
-            .then_some(MpcCurveConfig::from(client_io_manifest.mpc_curve));
-        (backend, curve)
+        (
+            MpcBackendKind::from(client_io_manifest.mpc_backend),
+            MpcCurveConfig::from(client_io_manifest.mpc_curve),
+        )
     });
-    let manifest_backend = manifest_config.and_then(|(backend, _)| backend);
-    let manifest_curve = manifest_config.and_then(|(_, curve)| curve);
+    let manifest_backend = manifest_config.map(|(backend, _)| backend);
+    let manifest_curve = manifest_config.map(|(_, curve)| curve);
 
-    // Resolve MPC backend kind. v3+ binaries are authoritative; --mpc-backend
-    // remains for client mode and legacy v1/v2 binaries without backend metadata.
+    // Program manifests are authoritative; --mpc-backend also serves client mode.
     let backend_kind = if let Some(ref name) = mpc_backend {
         let cli_backend = match MpcBackendKind::from_str(name) {
             Ok(k) => k,

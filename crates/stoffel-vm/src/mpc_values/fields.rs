@@ -9,6 +9,7 @@ pub mod share_fields {
     pub const PRECISION_F: &str = "__precision_f";
 
     pub const TYPE_VALUE: &str = "Share";
+    pub const SECRET_FIELD: &str = "SecretField";
     pub const SECRET_INT: &str = "SecretInt";
     pub const SECRET_UINT: &str = "SecretUInt";
     pub const SECRET_FIXED_POINT: &str = "SecretFixedPoint";

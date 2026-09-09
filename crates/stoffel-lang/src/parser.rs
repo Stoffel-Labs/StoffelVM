@@ -2135,13 +2135,14 @@ impl<'a> Parser<'a> {
     // IMPORTANT: This function *only* parses the type name/structure itself.
     // It handles the optional 'secret' keyword internally.
     fn parse_type_annotation(&mut self) -> CompilerResult<AstNode> {
-        let type_location = self.get_location(); // Location of 'secret' or the type identifier
         let mut is_secret = false;
         if self.check_keyword("secret") {
             self.advance(); // Consume 'secret'
             is_secret = true;
         }
 
+        // Preserve the actual type name location even after a secret modifier.
+        let type_location = self.get_location();
         // Now parse the actual type
         let base_type = match &self.current_token_info {
             Some(TokenInfo {

@@ -73,6 +73,22 @@ pub struct ImportInfo {
     pub alias: Option<String>,
     pub location: SourceLocation,
     pub resolved_module_key: Option<String>,
+    /// An exported member selected by `import module.member [as alias]`.
+    pub imported_item: Option<String>,
+}
+
+impl ImportInfo {
+    pub(crate) fn binding_for_export(&self, name: &str) -> Option<String> {
+        if let Some(item) = &self.imported_item {
+            (item == name).then(|| self.alias.clone().unwrap_or_else(|| item.clone()))
+        } else {
+            let prefix = self
+                .alias
+                .clone()
+                .unwrap_or_else(|| self.module_path.as_string());
+            Some(format!("{prefix}.{name}"))
+        }
+    }
 }
 
 /// A resolved module with its source, AST, and dependencies.
@@ -276,6 +292,8 @@ pub struct ModuleResolver {
     pub errors: Vec<CompilerError>,
     /// Modules currently being resolved (for cycle detection)
     resolving_modules: HashSet<String>,
+    /// File identity is independent of the spelling/alias at each import site.
+    file_keys: HashMap<PathBuf, String>,
 }
 
 impl ModuleResolver {
@@ -285,7 +303,22 @@ impl ModuleResolver {
             dependency_graph: DependencyGraph::new(),
             errors: Vec::new(),
             resolving_modules: HashSet::new(),
+            file_keys: HashMap::new(),
         }
+    }
+
+    fn key_for_file(&mut self, file: &Path, preferred: String) -> String {
+        let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+        if let Some(key) = self.file_keys.get(&canonical) {
+            return key.clone();
+        }
+        let key = if self.file_keys.values().any(|key| key == &preferred) {
+            canonical.to_string_lossy().into_owned()
+        } else {
+            preferred
+        };
+        self.file_keys.insert(canonical, key.clone());
+        key
     }
 
     /// Resolves all modules starting from an entry file.
@@ -305,6 +338,7 @@ impl ModuleResolver {
             .unwrap_or("main")
             .to_string();
 
+        let entry_module_name = self.key_for_file(&entry_file, entry_module_name);
         // Start resolving from the entry file
         let _ = self.resolve_module_from_file(
             &entry_file,
@@ -407,11 +441,28 @@ impl ModuleResolver {
                 continue;
             }
 
-            let imported_file_path = if let Some(raw_path) = &import_info.raw_path {
+            let mut imported_module_path = import_info.module_path.clone();
+            let mut imported_file_path = if let Some(raw_path) = &import_info.raw_path {
                 base_dir.join(raw_path)
             } else {
                 import_info.module_path.to_file_path(base_dir)
             };
+
+            // A real nested module takes precedence. Otherwise the final
+            // component may name an export of the parent .stfl file.
+            if !imported_file_path.exists()
+                && import_info.raw_path.is_none()
+                && imported_module_path.components.len() > 1
+            {
+                let item = imported_module_path.components.pop().unwrap();
+                let parent_file = imported_module_path.to_file_path(base_dir);
+                if parent_file.is_file() {
+                    imported_file_path = parent_file;
+                    import_info.imported_item = Some(item);
+                } else {
+                    imported_module_path = import_info.module_path.clone();
+                }
+            }
 
             let imported_module_key =
                 if import_info.raw_path.is_some() && imported_file_path.exists() {
@@ -420,8 +471,9 @@ impl ModuleResolver {
                         .map(|path| path.to_string_lossy().into_owned())
                         .unwrap_or_else(|_| imported_file_path.to_string_lossy().into_owned())
                 } else {
-                    import_info.module_path.as_string()
+                    imported_module_path.as_string()
                 };
+            let imported_module_key = self.key_for_file(&imported_file_path, imported_module_key);
             import_info.resolved_module_key = Some(imported_module_key.clone());
 
             // Add edge in dependency graph
@@ -447,7 +499,7 @@ impl ModuleResolver {
             // Recursively resolve the imported module
             let _ = self.resolve_module_from_file(
                 &imported_file_path,
-                import_info.module_path.clone(),
+                imported_module_path,
                 imported_module_key,
             );
         }
@@ -492,6 +544,7 @@ impl ModuleResolver {
                     alias: alias.clone(),
                     location: location.clone(),
                     resolved_module_key: None,
+                    imported_item: None,
                 });
             }
             AstNode::Block(statements) => {
@@ -773,6 +826,7 @@ mod tests {
             alias: Some("u".to_string()),
             location: SourceLocation::default(),
             resolved_module_key: None,
+            imported_item: None,
         };
         assert_eq!(info.module_path.as_string(), "utils");
         assert_eq!(info.alias, Some("u".to_string()));

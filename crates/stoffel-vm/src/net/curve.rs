@@ -25,6 +25,7 @@ pub enum MpcCurveError {
         curve: MpcCurveConfig,
         backend: MpcBackendKind,
     },
+    FieldRequiresRawOpening,
     FieldElementBelowI64Min,
     FieldElementExceedsI64Max,
     FixedPointFractionalBitsTooLarge {
@@ -63,6 +64,7 @@ impl fmt::Display for MpcCurveError {
                 curve.name(),
                 backend.name()
             ),
+            MpcCurveError::FieldRequiresRawOpening => write!(f, "SecretField requires Share.open_field; it has no bounded scalar interpretation"),
             MpcCurveError::FieldElementBelowI64Min => {
                 write!(f, "Field element is below i64::MIN")
             }
@@ -466,6 +468,7 @@ pub fn field_to_clear_share_value<F: ark_ff::PrimeField>(
     secret: F,
 ) -> MpcCurveResult<ClearShareValue> {
     match ty {
+        ShareType::SecretField => Err(MpcCurveError::FieldRequiresRawOpening),
         ShareType::SecretInt { bit_length } if bit_length == BOOLEAN_SECRET_INT_BITS => {
             Ok(ClearShareValue::Boolean(!secret.is_zero()))
         }

@@ -219,11 +219,11 @@ typedef enum {
 /**
  * C-compatible representation of ShareType
  *
- * kind: 0=Int, 1=Bool, 2=Float
- * width: value/width depending on kind
+ * kind: 0=Int, 1=Bool, 2=FixedPoint, 3=UInt, 4=Field
+ * width: value/width depending on kind; must be 0 for Field
  */
 typedef struct {
-    uint8_t kind;   /**< Type kind: 0=Int, 1=Bool, 2=Float */
+    uint8_t kind;   /**< Type kind: 0=Int, 1=Bool, 2=FixedPoint, 3=UInt, 4=Field */
     int64_t width;  /**< Width/value depending on kind */
 } CShareType;
 

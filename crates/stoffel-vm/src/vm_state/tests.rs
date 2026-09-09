@@ -297,6 +297,9 @@ impl MpcEngine for MockBatchEngine {
         let values = shares
             .iter()
             .map(|bytes| match ty {
+                ShareType::SecretField => {
+                    panic!("scalar opening mock must not receive a field share")
+                }
                 ShareType::SecretInt { .. } => {
                     ClearShareValue::Integer(bytes.first().copied().unwrap_or(0) as i64)
                 }

@@ -120,6 +120,7 @@ impl ShareObjectRef {
             .ok_or_else(|| MpcValueError::message("Share object missing __share_type field"))?;
 
         match share_type_field {
+            Value::String(s) if s == share_fields::SECRET_FIELD => Ok(ShareType::SecretField),
             Value::String(s) if s == share_fields::SECRET_INT => {
                 let bit_length = match store
                     .read_table_field(self.table_ref(), &field(share_fields::BIT_LENGTH))
@@ -210,6 +211,15 @@ pub fn create_share_object_ref<M: TableMemory + ?Sized>(
         .map_err(|e| MpcValueError::table_memory_context("failed to set Share type tag", e))?;
 
     match share_type {
+        ShareType::SecretField => {
+            store
+                .set_table_field(
+                    obj,
+                    field(share_fields::SHARE_TYPE),
+                    Value::String(share_fields::SECRET_FIELD.to_owned()),
+                )
+                .map_err(|e| MpcValueError::table_memory_context("failed to set Share type", e))?;
+        }
         ShareType::SecretInt { bit_length } => {
             store
                 .set_table_field(

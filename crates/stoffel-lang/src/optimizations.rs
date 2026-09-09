@@ -6825,19 +6825,17 @@ fn const_eval_bool(node: &AstNode) -> Option<bool> {
                 };
             }
             match op.as_str() {
-                // Short-circuiting constant truth: a constant-false `and` operand or
-                // constant-true `or` operand fixes the result regardless of the
-                // other (possibly non-constant) side.
-                "and" => match (const_eval_bool(left), const_eval_bool(right)) {
-                    (Some(false), _) | (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                },
-                "or" => match (const_eval_bool(left), const_eval_bool(right)) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                },
+                // The VM evaluates both operands. Folding a constant truth
+                // with an unknown operand could discard an initializer call.
+                "and" | "or" => {
+                    let left = const_eval_bool(left)?;
+                    let right = const_eval_bool(right)?;
+                    Some(if op == "and" {
+                        left && right
+                    } else {
+                        left || right
+                    })
+                }
                 _ => None,
             }
         }
@@ -6874,22 +6872,15 @@ fn const_eval_bool_env(node: &AstNode, env: &LenEnv) -> Option<bool> {
                 };
             }
             match op.as_str() {
-                "and" => match (
-                    const_eval_bool_env(left, env),
-                    const_eval_bool_env(right, env),
-                ) {
-                    (Some(false), _) | (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                },
-                "or" => match (
-                    const_eval_bool_env(left, env),
-                    const_eval_bool_env(right, env),
-                ) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                },
+                "and" | "or" => {
+                    let left = const_eval_bool_env(left, env)?;
+                    let right = const_eval_bool_env(right, env)?;
+                    Some(if op == "and" {
+                        left && right
+                    } else {
+                        left || right
+                    })
+                }
                 _ => None,
             }
         }
@@ -8429,6 +8420,7 @@ fn estimate_stmt_size(stmt: &AstNode, env: &mut LenEnv, limit: usize) -> usize {
             let inner = estimate_unrolled_size(body_stmts, &benv, limit).max(1);
             // Would this loop itself unroll? (Same predicate as `try_unroll_for`.)
             let unrolls = matches!(variables.as_slice(), [v] if !body_assigns_var(body, v))
+                && !has_loop_transfer(body)
                 && range_bounds(iterable, env)
                     .is_some_and(|(lo, hi)| hi > lo && (hi - lo) <= UNROLL_MAX_ITERATIONS);
             let size = if unrolls {
@@ -8490,6 +8482,21 @@ fn estimate_stmt_size(stmt: &AstNode, env: &mut LenEnv, limit: usize) -> usize {
 /// Attempt to flatten a single statement if it is a `for` loop whose trip count
 /// resolves to a constant in `env`. Returns the flattened iterations, or the
 /// original node unchanged.
+fn has_loop_transfer(node: &AstNode) -> bool {
+    match node {
+        AstNode::Break | AstNode::Continue => true,
+        // Transfers in nested loops belong to those loops.
+        AstNode::ForLoop { .. }
+        | AstNode::WhileLoop { .. }
+        | AstNode::FunctionDefinition { .. } => false,
+        _ => {
+            let mut found = false;
+            for_each_child(node, &mut |child| found |= has_loop_transfer(child));
+            found
+        }
+    }
+}
+
 fn try_unroll_for(stmt: AstNode, env: &LenEnv, budget: &mut usize) -> UnrollOutcome {
     let AstNode::ForLoop {
         variables,
@@ -8540,8 +8547,9 @@ fn try_unroll_for(stmt: AstNode, env: &LenEnv, budget: &mut usize) -> UnrollOutc
     }
 
     // Bail if the body reassigns the loop variable: substituting a literal for
-    // the variable would change observable behavior.
-    if body_assigns_var(&body, loop_var) {
+    // the variable would change observable behavior. Keep loops whose break
+    // or continue would lose its target when the body is flattened too.
+    if body_assigns_var(&body, loop_var) || has_loop_transfer(&body) {
         return UnrollOutcome::Kept(AstNode::ForLoop {
             variables,
             iterable,
@@ -9496,7 +9504,7 @@ pub(crate) fn for_each_child(node: &AstNode, f: &mut dyn FnMut(&AstNode)) {
 /// Like `for_each_child` this is exhaustive and visits the SAME children; it
 /// does NOT descend into `FunctionDefinition` bodies (a scope boundary) and
 /// returns childless / type / definition nodes unchanged.
-fn map_children(node: AstNode, f: &mut dyn FnMut(AstNode) -> AstNode) -> AstNode {
+pub(crate) fn map_children(node: AstNode, f: &mut dyn FnMut(AstNode) -> AstNode) -> AstNode {
     // Apply `f` through an owned `Box` child, re-boxing the result.
     let fb = |b: Box<AstNode>, f: &mut dyn FnMut(AstNode) -> AstNode| Box::new(f(*b));
     match node {

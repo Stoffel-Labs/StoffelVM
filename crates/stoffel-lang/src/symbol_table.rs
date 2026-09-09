@@ -633,6 +633,14 @@ impl SymbolTable {
 
     /// Looks up a symbol starting from the current scope and walking up the chain.
     pub fn lookup_symbol(&self, name: &str) -> Option<&SymbolInfo> {
+        self.lookup_symbol_with_scope(name).map(|(_, info)| info)
+    }
+
+    pub fn current_scope_id(&self) -> usize {
+        self.current_scope_id
+    }
+
+    pub fn lookup_symbol_with_scope(&self, name: &str) -> Option<(usize, &SymbolInfo)> {
         let mut scope_id_to_check = Some(self.current_scope_id);
         while let Some(id) = scope_id_to_check {
             let scope = self
@@ -640,7 +648,7 @@ impl SymbolTable {
                 .get(id)
                 .expect("Internal error: Invalid scope ID during lookup");
             if let Some(info) = scope.lookup_local(name) {
-                return Some(info);
+                return Some((id, info));
             }
             scope_id_to_check = scope.parent_scope_id;
         }

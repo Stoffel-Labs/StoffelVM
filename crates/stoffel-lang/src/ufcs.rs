@@ -1,6 +1,16 @@
 use crate::ast::AstNode;
 use std::collections::HashSet;
 
+fn dotted_name(node: &AstNode) -> Option<String> {
+    match node {
+        AstNode::Identifier(name, _) => Some(name.clone()),
+        AstNode::FieldAccess {
+            object, field_name, ..
+        } => dotted_name(object).map(|prefix| format!("{prefix}.{field_name}")),
+        _ => None,
+    }
+}
+
 /// Checks if a name is a builtin object that uses qualified method names
 fn is_builtin_object(name: &str) -> bool {
     crate::builtin_registry::builtin_registry()
@@ -34,6 +44,24 @@ pub fn transform_ufcs_with_module_prefixes(
             location,
             resolved_return_type,
         } => {
+            // A namespace can itself contain dots (`pkg.tools`). Resolve the
+            // entire module prefix before considering receiver-style UFCS.
+            if let Some(name) = dotted_name(&function) {
+                if name
+                    .rsplit_once('.')
+                    .is_some_and(|(prefix, _)| module_prefixes.contains(prefix))
+                {
+                    return AstNode::FunctionCall {
+                        function: Box::new(AstNode::Identifier(name, function.location())),
+                        arguments: arguments
+                            .into_iter()
+                            .map(|arg| transform_ufcs_with_module_prefixes(arg, module_prefixes))
+                            .collect(),
+                        location,
+                        resolved_return_type,
+                    };
+                }
+            }
             // Style 1: Transform obj.method(arg1, arg2)
             if let AstNode::FieldAccess {
                 object,
@@ -51,29 +79,13 @@ pub fn transform_ufcs_with_module_prefixes(
                                 qualified_name,
                                 fa_location.clone(),
                             )),
-                            arguments: arguments.into_iter().map(transform_ufcs).collect(),
-                            location: fa_location,
-                            resolved_return_type,
-                        };
-                    }
-
-                    if module_prefixes.contains(obj_name) {
-                        return AstNode::FunctionCall {
-                            function: Box::new(AstNode::FieldAccess {
-                                object: Box::new(AstNode::Identifier(
-                                    obj_name.clone(),
-                                    fa_location.clone(),
-                                )),
-                                field_name,
-                                location: fa_location.clone(),
-                            }),
                             arguments: arguments
                                 .into_iter()
                                 .map(|arg| {
                                     transform_ufcs_with_module_prefixes(arg, module_prefixes)
                                 })
                                 .collect(),
-                            location,
+                            location: fa_location,
                             resolved_return_type,
                         };
                     }

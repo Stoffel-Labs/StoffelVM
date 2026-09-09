@@ -15,3 +15,6 @@ pub(crate) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
     metadata::register(vm)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

@@ -118,6 +118,7 @@ struct DisplayShareType(ShareType);
 impl fmt::Display for DisplayShareType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
+            ShareType::SecretField => write!(formatter, "secret-field"),
             ShareType::SecretInt { bit_length } => write!(formatter, "secret-int:{bit_length}"),
             ShareType::SecretUInt { bit_length } => write!(formatter, "secret-uint:{bit_length}"),
             ShareType::SecretFixedPoint { precision } => write!(
@@ -131,6 +132,9 @@ impl fmt::Display for DisplayShareType {
 }
 
 fn parse_share_type(value: &str) -> Result<ShareType, ReturnedShareParseError> {
+    if value == "secret-field" {
+        return Ok(ShareType::SecretField);
+    }
     let mut parts = value.split(':');
     let kind = parts
         .next()
@@ -182,6 +186,19 @@ pub enum ReturnedShareParseError {
 mod tests {
     use super::{ReturnedShare, ReturnedShareParseError};
     use stoffel_vm_types::core_types::{ShareData, ShareDataFormat, ShareType, Value};
+
+    #[test]
+    fn returned_field_share_roundtrips_without_an_integer_width() {
+        for format in [ShareDataFormat::Opaque, ShareDataFormat::Feldman] {
+            let share = ReturnedShare::new(ShareType::SecretField, format, vec![0, 255, 2]);
+            let encoded = share.to_string();
+            assert!(encoded.contains("secret-field;"));
+            assert_eq!(encoded.parse::<ReturnedShare>().unwrap(), share);
+        }
+        assert!("share:v1[secret-field:64;opaque;1] 0x00"
+            .parse::<ReturnedShare>()
+            .is_err());
+    }
 
     #[test]
     fn returned_share_round_trips_exact_opaque_bytes() {

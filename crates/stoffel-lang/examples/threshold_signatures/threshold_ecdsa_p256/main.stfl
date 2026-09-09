@@ -5,7 +5,7 @@
 
 def main() -> bytes:
   var client_count = ClientStore.get_number_clients()
-  var secret_key: secret int64 = Share.random()
+  var secret_key: Share = Share.random_field()
   var public_key = secret_key.get_commitment(0)
 
   var message = Bytes.from_string("stoffel-avss-threshold-ecdsa-demo-message-v1")
@@ -15,8 +15,8 @@ def main() -> bytes:
     var message_share = ClientStore.take_share(0, 0)
     message_field = message_share.open_field()
 
-  var gamma: secret int64 = Share.random()
-  var nonce: secret int64 = Share.random()
+  var gamma: Share = Share.random_field()
+  var nonce: Share = Share.random_field()
   var delta_share = gamma.mul(nonce)
   var delta = delta_share.open_field()
   var delta_inverse = Crypto.field_inv(delta, "p-256")
@@ -32,7 +32,7 @@ def main() -> bytes:
   var response = response_share.open_field()
 
   if client_count > 0 and Mpc.has_capability("client-output"):
-    var r_share = Share.from_clear(1).mul_field(r)
+    var r_share = Share.from_field(r)
     var output_shares: list[Share] = [r_share, response_share]
     MpcOutput.send_to_client(0, output_shares)
 

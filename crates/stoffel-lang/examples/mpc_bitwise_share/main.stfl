@@ -17,6 +17,7 @@ def NOT(b: bitwise_share) -> bitwise_share:
 
 def AND(a: bitwise_share, b: bitwise_share) -> bitwise_share:
   var tmp: bitwise_share
+  tmp.length = 0
 
   if a.length == b.length:
     tmp.length = a.length
@@ -27,6 +28,7 @@ def AND(a: bitwise_share, b: bitwise_share) -> bitwise_share:
 
 def OR(a: bitwise_share, b: bitwise_share) -> bitwise_share:
   var tmp: bitwise_share
+  tmp.length = 0
 
   if a.length == b.length:
     tmp.length = a.length
@@ -37,6 +39,7 @@ def OR(a: bitwise_share, b: bitwise_share) -> bitwise_share:
 
 def XOR(a: bitwise_share, b: bitwise_share) -> bitwise_share:
   var tmp: bitwise_share
+  tmp.length = 0
 
   if a.length == b.length:
     tmp.length = a.length

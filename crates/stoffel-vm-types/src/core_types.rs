@@ -701,6 +701,8 @@ pub enum ShareType {
     SecretUInt { bit_length: usize },
     /// Secure fixed-point shares (mirrors `SecretFixedPoint` in mpc-protocols)
     SecretFixedPoint { precision: FixedPointPrecision },
+    /// A value in the active MPC field, with no bounded integer interpretation.
+    SecretField,
 }
 
 impl ShareType {
@@ -790,6 +792,7 @@ impl Eq for ShareType {}
 impl Hash for ShareType {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
+            ShareType::SecretField => 3u8.hash(state),
             ShareType::SecretInt { bit_length } => {
                 0u8.hash(state);
                 bit_length.hash(state);

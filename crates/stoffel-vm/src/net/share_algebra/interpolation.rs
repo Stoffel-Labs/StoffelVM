@@ -91,6 +91,9 @@ where
     };
 
     match ty {
+        ShareType::SecretField => {
+            Err(crate::net::curve::MpcCurveError::FieldRequiresRawOpening.into())
+        }
         ShareType::SecretInt { bit_length: 1 } => Ok(Value::Bool(!secret.is_zero())),
         ty @ ShareType::SecretInt { bit_length } => Ok(clear_share_value_to_vm_value(
             ty,

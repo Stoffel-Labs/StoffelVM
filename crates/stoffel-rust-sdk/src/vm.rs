@@ -275,6 +275,11 @@ fn value_is_set(value: &Value) -> bool {
 /// share type the manifest declared for that output position.
 fn decode_client_output_value(raw: u64, share_type: ShareType) -> Result<Value> {
     Ok(match share_type {
+        ShareType::SecretField => {
+            return Err(Error::InvalidInput(
+                "SecretField requires raw field output, not scalar decoding".to_owned(),
+            ))
+        }
         ShareType::SecretInt { bit_length: 1 } => Value::Bool(raw != 0),
         ShareType::SecretInt { .. } => Value::I64(raw as i64),
         ShareType::SecretUInt { .. } => Value::U64(raw),

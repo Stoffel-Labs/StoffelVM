@@ -1241,6 +1241,10 @@ fn emit_entrypoint_method(
 
 fn rust_type(share_type: ShareType) -> Result<&'static str> {
     match share_type {
+        ShareType::SecretField => Err(Error::Unsupported(
+            "field shares require raw field output; bounded scalar bindings are not supported"
+                .to_owned(),
+        )),
         ShareType::SecretInt { bit_length: 1 } => Ok("bool"),
         ShareType::SecretInt { bit_length: 2..=8 } => Ok("i8"),
         ShareType::SecretInt { bit_length: 9..=16 } => Ok("i16"),
@@ -1270,6 +1274,10 @@ fn rust_type(share_type: ShareType) -> Result<&'static str> {
 
 fn client_value_type_variant(share_type: ShareType) -> Result<&'static str> {
     match share_type {
+        ShareType::SecretField => Err(Error::Unsupported(
+            "field shares require raw field output; bounded scalar bindings are not supported"
+                .to_owned(),
+        )),
         ShareType::SecretInt { bit_length: 1 } => Ok("Boolean"),
         ShareType::SecretInt { bit_length } if bit_length > 1 => Ok("Integer"),
         ShareType::SecretUInt { .. } => Ok("Integer"),

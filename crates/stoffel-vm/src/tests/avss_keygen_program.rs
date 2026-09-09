@@ -2,7 +2,7 @@
 //!
 //! Generates a `.stflb` bytecode program that performs distributed key generation
 //! using the AVSS backend. The program:
-//! 1. Calls `Share.random()` to run cooperative DKG (no party knows the secret)
+//! 1. Calls `Share.random_field()` to run cooperative DKG (no party knows the secret)
 //! 2. Calls `Share.get_commitment(share, 0)` to extract the public key
 //! 3. Returns the public key bytes (all parties produce the same result)
 
@@ -18,8 +18,8 @@ use stoffel_vm_types::{
 /// Build the AVSS keygen program as bytecode instructions.
 pub fn build_avss_keygen_program() -> Vec<Instruction> {
     vec![
-        // r0 = Share.random()  → jointly-random share (DKG)
-        Instruction::CALL("Share.random".to_string()),
+        // r0 = Share.random_field()  → jointly-random share (DKG)
+        Instruction::CALL("Share.random_field".to_string()),
         // r1 = share object
         Instruction::MOV(1, 0),
         // r2 = 0 (commitment index 0 = public key)

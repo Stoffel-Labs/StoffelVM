@@ -286,6 +286,8 @@ impl AstNode {
     pub fn location(&self) -> SourceLocation {
         match self {
             AstNode::Identifier(_, loc) => loc.clone(),
+            AstNode::SecretType(inner) | AstNode::ListType(inner) => inner.location(),
+            AstNode::TupleType(nodes) => nodes.first().map(AstNode::location).unwrap_or_default(),
             AstNode::Assignment { location: loc, .. } => loc.clone(),
             AstNode::VariableDeclaration { location: loc, .. } => loc.clone(),
             AstNode::BinaryOperation { location: loc, .. } => loc.clone(),

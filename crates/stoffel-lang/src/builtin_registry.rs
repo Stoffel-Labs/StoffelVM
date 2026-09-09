@@ -125,7 +125,8 @@ fn build_builtin_registry() -> BuiltinRegistry {
                     registry.object_type_names.insert(name.clone());
                 }
             }
-            AstNode::BuiltinObjectDefinition { name, .. } => {
+            AstNode::BuiltinObjectDefinition { name, .. } if name == "Share" => {
+                // Most builtin objects are namespaces, not runtime values.
                 registry.type_names.insert(name.clone());
                 registry.object_type_names.insert(name.clone());
             }

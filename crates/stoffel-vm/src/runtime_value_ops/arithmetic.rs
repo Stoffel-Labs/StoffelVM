@@ -159,6 +159,9 @@ fn mul_share_by_fixed_scalar(
     let Value::Float(F64(scalar)) = scalar_value else {
         return Ok(None);
     };
+    if *share_type == ShareType::SecretField {
+        return unsupported("SecretField requires an integer scalar or field arithmetic");
+    }
     let scalar = *scalar;
 
     // The product keeps the share's precision when the share is already

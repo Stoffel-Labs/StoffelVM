@@ -28,10 +28,12 @@ pub(crate) fn add_share_scalar_for_curve(
     scalar: i64,
 ) -> ShareAlgebraResult<Vec<u8>> {
     match ty {
-        ShareType::SecretInt { .. } | ShareType::SecretUInt { .. } => dispatch_share_curve_config!(
-            curve_config,
-            share_scalar_op_typed(share_bytes, scalar, ShareScalarOp::Add)
-        ),
+        ShareType::SecretField | ShareType::SecretInt { .. } | ShareType::SecretUInt { .. } => {
+            dispatch_share_curve_config!(
+                curve_config,
+                share_scalar_op_typed(share_bytes, scalar, ShareScalarOp::Add)
+            )
+        }
         ShareType::SecretFixedPoint { precision } => {
             let scaled_scalar = scale_fixed_point_scalar(precision.f(), scalar)?;
             dispatch_share_curve_config!(
@@ -49,10 +51,12 @@ pub(crate) fn sub_share_scalar_for_curve(
     scalar: i64,
 ) -> ShareAlgebraResult<Vec<u8>> {
     match ty {
-        ShareType::SecretInt { .. } | ShareType::SecretUInt { .. } => dispatch_share_curve_config!(
-            curve_config,
-            share_scalar_op_typed(share_bytes, scalar, ShareScalarOp::Sub)
-        ),
+        ShareType::SecretField | ShareType::SecretInt { .. } | ShareType::SecretUInt { .. } => {
+            dispatch_share_curve_config!(
+                curve_config,
+                share_scalar_op_typed(share_bytes, scalar, ShareScalarOp::Sub)
+            )
+        }
         ShareType::SecretFixedPoint { precision } => {
             let scaled_scalar = scale_fixed_point_scalar(precision.f(), scalar)?;
             dispatch_share_curve_config!(
@@ -70,7 +74,7 @@ pub(crate) fn scalar_sub_share_for_curve(
     share_bytes: &[u8],
 ) -> ShareAlgebraResult<Vec<u8>> {
     match ty {
-        ShareType::SecretInt { .. } | ShareType::SecretUInt { .. } => {
+        ShareType::SecretField | ShareType::SecretInt { .. } | ShareType::SecretUInt { .. } => {
             dispatch_share_curve_config!(curve_config, scalar_sub_share_typed(scalar, share_bytes))
         }
         ShareType::SecretFixedPoint { precision } => {
@@ -90,7 +94,8 @@ pub(crate) fn mul_share_scalar_for_curve(
     scalar: i64,
 ) -> ShareAlgebraResult<Vec<u8>> {
     match ty {
-        ShareType::SecretInt { .. }
+        ShareType::SecretField
+        | ShareType::SecretInt { .. }
         | ShareType::SecretUInt { .. }
         | ShareType::SecretFixedPoint { .. } => {
             dispatch_share_curve_config!(
@@ -108,7 +113,8 @@ pub(crate) fn div_share_scalar_for_curve(
     scalar: i64,
 ) -> ShareAlgebraResult<Vec<u8>> {
     match ty {
-        ShareType::SecretInt { .. }
+        ShareType::SecretField
+        | ShareType::SecretInt { .. }
         | ShareType::SecretUInt { .. }
         | ShareType::SecretFixedPoint { .. } => {
             dispatch_share_curve_config!(curve_config, share_div_scalar_typed(share_bytes, scalar))
