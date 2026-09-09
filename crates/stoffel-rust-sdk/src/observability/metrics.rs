@@ -219,7 +219,12 @@ fn duration_to_millis(duration: Duration) -> u64 {
 }
 
 fn saturating_fetch_add(value: &AtomicU64, increment: u64) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(increment))
-    });
+    let mut current = value.load(Ordering::Relaxed);
+    loop {
+        let updated = current.saturating_add(increment);
+        match value.compare_exchange_weak(current, updated, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }

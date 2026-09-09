@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -16,6 +16,7 @@ use crate::net::mpc_engine::{
     AsyncMpcEngine, AsyncMpcEngineClientOps, MpcCapabilities, MpcEngine, MpcEngineResult,
     MpcSessionTopology, MpcSessionTopologyError,
 };
+use crate::storage::RedbLocalStorage;
 use crate::VirtualMachineErrorKind;
 
 use super::guard::RunnerVmGuard;
@@ -81,12 +82,16 @@ impl AsyncMpcEngine for SyncOnlyEngine {
 
 struct AsyncHydratingEngine {
     hydrate_calls: AtomicUsize,
+    reset_calls: AtomicUsize,
+    instance_id: AtomicU64,
 }
 
 impl Default for AsyncHydratingEngine {
     fn default() -> Self {
         Self {
             hydrate_calls: AtomicUsize::new(0),
+            reset_calls: AtomicUsize::new(0),
+            instance_id: AtomicU64::new(8),
         }
     }
 }
@@ -97,7 +102,8 @@ impl MpcEngine for AsyncHydratingEngine {
     }
 
     fn topology(&self) -> MpcSessionTopology {
-        MpcSessionTopology::try_new(8, 2, 3, 1).expect("test topology should be valid")
+        MpcSessionTopology::try_new(self.instance_id.load(Ordering::SeqCst), 2, 3, 1)
+            .expect("test topology should be valid")
     }
 
     fn is_ready(&self) -> bool {
@@ -146,6 +152,12 @@ impl AsyncMpcEngine for AsyncHydratingEngine {
             "async_open_share",
             "not used",
         ))
+    }
+
+    async fn reset_for_next_run(&self, new_instance_id: u64) -> MpcEngineResult<()> {
+        self.reset_calls.fetch_add(1, Ordering::SeqCst);
+        self.instance_id.store(new_instance_id, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -432,4 +444,46 @@ async fn async_execute_function_uses_async_client_input_hydration() {
         .expect("inspect hydrated VM input")
         .expect("client input should be hydrated");
     assert_eq!(hydrated_share.data(), &ShareData::Opaque(vec![9].into()));
+}
+
+#[tokio::test]
+async fn reset_for_next_run_rotates_engine_and_clears_local_storage() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("local.redb");
+    let storage = RedbLocalStorage::new(&path).expect("open local storage");
+    let mut vm = VirtualMachine::builder()
+        .with_local_storage(storage)
+        .try_build()
+        .expect("build VM");
+    vm.execute_with_args(
+        "LocalStorage.store",
+        &[Value::String("key".to_owned()), Value::I64(7)],
+    )
+    .expect("store local value");
+    assert_eq!(
+        vm.execute_with_args("LocalStorage.exists", &[Value::String("key".to_owned())])
+            .expect("local value exists"),
+        Value::Bool(true)
+    );
+
+    let engine = Arc::new(AsyncHydratingEngine::default());
+    let runner = MpcRunner::with_config(
+        vm,
+        engine.clone(),
+        MpcRunnerConfig {
+            execution_timeout: std::time::Duration::from_secs(1),
+            auto_hydrate: false,
+        },
+    );
+
+    runner.reset_for_next_run(99).await.expect("reset runner");
+
+    assert_eq!(engine.reset_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runner.instance().id(), 99);
+    let exists = runner
+        .try_with_vm_mut_result(|vm| {
+            vm.execute_with_args("LocalStorage.exists", &[Value::String("key".to_owned())])
+        })
+        .expect("inspect cleared local storage");
+    assert_eq!(exists, Value::Bool(false));
 }

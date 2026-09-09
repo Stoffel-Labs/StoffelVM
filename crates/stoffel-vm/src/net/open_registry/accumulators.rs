@@ -88,8 +88,44 @@ pub enum ExpOpenProgress {
 
 #[derive(Default)]
 pub struct RbcState {
-    /// Maps (session_id, from_party) → message bytes
-    pub messages: HashMap<(u64, usize), Vec<u8>>,
+    /// Monotonic local session allocator per broadcaster.
+    pub next_sessions: HashMap<usize, u64>,
+    /// Maps broadcaster VAL sessions to the digest already accepted for that session.
+    pub messages: HashMap<(u64, usize), [u8; 32]>,
+    /// Candidate payloads learned from VAL or ECHO, keyed by their digest.
+    pub candidates: HashMap<(u64, usize, [u8; 32]), Vec<u8>>,
+    /// Authenticated peer whose quota was charged when each candidate was first retained.
+    pub candidate_sources: HashMap<(u64, usize, [u8; 32]), usize>,
     /// Tracks deliveries: (receiver_party, from_party, session_id)
     pub delivered: HashSet<(usize, usize, u64)>,
+    /// Local receiver identities that share this registry (normally exactly one in production).
+    pub receivers: HashSet<usize>,
+    /// Authenticated ECHO relays keyed by (session, broadcaster, digest).
+    pub echoes: HashMap<(u64, usize, [u8; 32]), HashSet<usize>>,
+    /// Authenticated READY relays keyed by (session, broadcaster, digest).
+    pub readies: HashMap<(u64, usize, [u8; 32]), HashSet<usize>>,
+    /// Per-local-party protocol messages already emitted.
+    pub sent_echoes: HashSet<(usize, usize, u64)>,
+    pub sent_readies: HashSet<(usize, usize, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RbcRelayPhase {
+    Echo,
+    Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RbcRelay {
+    pub phase: RbcRelayPhase,
+    pub session_id: u64,
+    pub broadcaster_party_id: usize,
+    pub digest: [u8; 32],
+    pub message: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RbcProgress {
+    pub relays: Vec<RbcRelay>,
+    pub delivery: Option<(usize, Vec<u8>)>,
 }

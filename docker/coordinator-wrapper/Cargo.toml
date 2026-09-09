@@ -3,6 +3,10 @@ name = "stoffel-coordinator-docker"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "stoffel-coordinator-docker"
+path = "src/main.rs"
+
 [workspace]
 
 [dependencies]
@@ -14,13 +18,13 @@ ark-ed25519 = "=0.5.0"
 ark-ff = "=0.5.0"
 ark-secp256k1 = "=0.5.0"
 ark-secp256r1 = "=0.5.0"
-async-trait = "=0.1.89"
+async-trait = "=0.1.92"
 clap = { version = "=4.6.1", features = ["derive"] }
 hex = "=0.4.3"
 jsonrpsee = { version = "=0.26.0", features = ["full"] }
 rustls = "=0.23.41"
-stoffel-mpc-coordinator-off-chain = "=0.1.0"
-stoffel-mpc-coordinator-shared = "=0.1.0"
+stoffel-mpc-coordinator-off-chain = "=0.2.0"
+stoffel-mpc-coordinator-shared = "=0.2.0"
 stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.1" }
-tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "signal", "time"] }
 x509-parser = "=0.18.1"

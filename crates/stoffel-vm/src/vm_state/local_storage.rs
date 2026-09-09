@@ -58,6 +58,19 @@ impl VMState {
             .exists(key)
             .map_err(local_storage_error("exists"))
     }
+
+    pub(crate) fn clear_local_storage(&mut self) -> VmResult<()> {
+        let Some(storage) = &self.local_storage else {
+            return Ok(());
+        };
+        let storage = Arc::clone(storage);
+        let mut storage = storage.lock();
+        storage
+            .as_mut()
+            .clear()
+            .map_err(local_storage_error("clear"))?;
+        Ok(())
+    }
 }
 
 impl VMState {

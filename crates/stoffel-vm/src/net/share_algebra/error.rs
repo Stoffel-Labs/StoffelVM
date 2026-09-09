@@ -41,6 +41,7 @@ pub enum ShareAlgebraError {
     },
     InterpolationFormatMismatch,
     InterpolationEmpty,
+    ShareSumEmpty,
     RecoverSecret {
         source: String,
     },
@@ -107,6 +108,7 @@ impl fmt::Display for ShareAlgebraError {
             ShareAlgebraError::InterpolationEmpty => {
                 write!(f, "Cannot interpolate from empty shares array")
             }
+            ShareAlgebraError::ShareSumEmpty => write!(f, "Cannot sum an empty share array"),
             ShareAlgebraError::RecoverSecret { source } => {
                 write!(f, "Failed to recover secret: {source}")
             }

@@ -75,6 +75,7 @@ async fn main() -> stoffel::Result<()> {
     println!("(client 0 = ciphertext, client 1 = key; plaintext never revealed to nodes)");
 
     let (_returned, client_outputs) = Stoffel::compile_file(PROGRAM)?
+        .optimization_level(3)
         .parties(5)
         .threshold(1)
         // Declaring output clients enables the client-output capability so the

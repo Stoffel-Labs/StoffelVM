@@ -13,7 +13,9 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use stoffel::prelude::*;
 
-use crate::project::{init_library_project, BuildConfig, Project, Template};
+use crate::project::{
+    init_library_project, validate_project_controlled_path, BuildConfig, Project, Template,
+};
 
 macro_rules! print {
     ($($arg:tt)*) => {{
@@ -290,7 +292,8 @@ struct RunArgs {
     /// Load named function inputs from a .json, .csv, or .txt file.
     #[arg(long = "input-file", value_name = "FILE")]
     input_files: Vec<PathBuf>,
-    /// Local simulation input for a numeric client slot, written as SLOT=VALUE.
+    /// Semantic input for a numeric client slot, written as SLOT=VALUE.
+    /// Fixed-point values are scaled automatically from ordinary integers or decimals.
     #[arg(
         long = "client-input",
         visible_alias = "client-inputs",
@@ -430,7 +433,8 @@ struct DevArgs {
     /// Load named function inputs from a .json, .csv, or .txt file.
     #[arg(long = "input-file", value_name = "FILE")]
     input_files: Vec<PathBuf>,
-    /// Local simulation input for a numeric client slot, written as SLOT=VALUE.
+    /// Semantic input for a numeric client slot, written as SLOT=VALUE.
+    /// Fixed-point values are scaled automatically from ordinary integers or decimals.
     #[arg(
         long = "client-input",
         visible_alias = "client-inputs",
@@ -631,7 +635,7 @@ impl std::str::FromStr for ClientInputArg {
         }
         if value.contains('=') {
             anyhow::bail!(
-                "client input '{raw}' has more than one '='. Write one client input per flag as --client-input {client_slot}=<value>; values must be integers, booleans, or 0x-prefixed hex bytes."
+                "client input '{raw}' has more than one '='. Write one client input per flag as --client-input {client_slot}=<value>; values may be integers, fixed-point decimals, booleans, or 0x-prefixed hex bytes."
             );
         }
         Ok(Self {
@@ -1559,6 +1563,7 @@ fn clean(args: CleanArgs) -> Result<()> {
     let mut removed = Vec::new();
     let mut skipped = Vec::new();
     remove_dir_if_exists(
+        project.root(),
         &project.target_dir(),
         args.dry_run,
         &mut removed,
@@ -1566,10 +1571,17 @@ fn clean(args: CleanArgs) -> Result<()> {
     )?;
     if args.all {
         for path in deep_clean_paths(&project) {
-            remove_dir_if_exists(&path, args.dry_run, &mut removed, &mut skipped)?;
+            remove_dir_if_exists(
+                project.root(),
+                &path,
+                args.dry_run,
+                &mut removed,
+                &mut skipped,
+            )?;
         }
     } else {
         remove_dir_if_exists(
+            project.root(),
             &project.cache_dir(),
             args.dry_run,
             &mut removed,
@@ -2054,6 +2066,7 @@ fn validate_bytecode_output_path(project: &Project, output: &Path) -> Result<()>
                 "--output must not write bytecode under src/; use a path under target/ instead"
             );
         }
+        validate_project_controlled_path(project.root(), output, false)?;
     }
     Ok(())
 }
@@ -3460,11 +3473,13 @@ fn print_build_stats(
 }
 
 fn remove_dir_if_exists(
+    root: &Path,
     path: &Path,
     dry_run: bool,
     removed: &mut Vec<PathBuf>,
     skipped: &mut Vec<PathBuf>,
 ) -> Result<()> {
+    validate_project_controlled_path(root, path, true)?;
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         skipped.push(path.to_path_buf());
         return Ok(());

@@ -1,6 +1,6 @@
 [package]
 name = "stoffel-vm-runner"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Local runner and CLI binary for executing Stoffel VM programs"
 license = "Apache-2.0"
@@ -15,11 +15,11 @@ name = "stoffel-run"
 path = "src/bin/stoffel-run.rs"
 
 [dependencies]
-stoffel-vm = { version = "=0.1.2", path = "../stoffel-vm" }
-stoffel-vm-types = { version = "=0.1.2", path = "../stoffel-vm-types" }
-stoffel-mpc-coordinator-shared = "=0.1.0"
-stoffel-mpc-coordinator-off-chain = "=0.1.0"
-stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.1" }
+stoffel-vm = { version = "=0.2.0", path = "../stoffel-vm" }
+stoffel-vm-types = { version = "=0.2.0", path = "../stoffel-vm-types" }
+stoffel-mpc-coordinator-shared = "=0.2.0"
+stoffel-mpc-coordinator-off-chain = "=0.2.0"
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.1", features = ["statistics"] }
 stoffelnet = "=0.1.1"
 ark-bls12-381 = "=0.5.0"
 ark-bn254 = "=0.5.0"
@@ -31,20 +31,29 @@ ark-ec = "=0.5.0"
 ark-ff = "=0.5.0"
 ark-serialize = "=0.5.0"
 ark-std = { version = "=0.5.0", features = ["getrandom"] }
-async-trait = "=0.1.89"
+async-trait = "=0.1.92"
 bincode = { version = "=1.3.3", default-features = true }
+blake3 = "=1.8.5"
 futures = "=0.3.32"
 hex = "=0.4.3"
 libc = "=0.2.186"
 rustls = "=0.23.41"
 serde = { version = "=1.0.228", features = ["derive", "default"] }
+serde_json = "=1.0.150"
 thiserror = "=2.0.18"
 tokio = { version = "=1.52.3", features = ["full"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
 tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 uuid = { version = "=1.23.4", features = ["v4"] }
 x509-parser = "=0.18.1"
 
+[features]
+statistics = ["stoffelmpc-mpc/statistics"]
+
 [dev-dependencies]
-stoffel-vm-types = { version = "=0.1.2", path = "../stoffel-vm-types" }
-stoffellang = { version = "=0.1.2", path = "../stoffel-lang" }
+rcgen = "=0.14.8"
+stoffel-vm-types = { version = "=0.2.0", path = "../stoffel-vm-types" }
+stoffellang = { version = "=0.2.0", path = "../stoffel-lang" }
 tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread"] }
+tempfile = "=3.27.0"

@@ -4,7 +4,7 @@ use crate::net::client_store::{
     ClientInputHydrationCount, ClientInputStore, ClientOutputShareCount,
 };
 use crate::net::reservation::ReservationGrant;
-use crate::storage::preproc::PreprocStore;
+use crate::storage::preproc::{PoolAvailability, PreprocStore};
 use std::sync::Arc;
 use stoffel_vm_types::core_types::{ShareData, ShareType};
 use stoffelnet::network_utils::ClientId;
@@ -22,6 +22,22 @@ pub trait MpcEngineMultiplication: MpcEngine {
         left: &[u8],
         right: &[u8],
     ) -> MpcEngineResult<ShareData>;
+
+    /// Perform secure multiplication for a batch of share pairs.
+    ///
+    /// Backends with a native vectorized protocol should override this method.
+    /// The default preserves compatibility by executing scalar multiplications
+    /// in order.
+    fn batch_multiply_shares(
+        &self,
+        ty: ShareType,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+    ) -> MpcEngineResult<Vec<ShareData>> {
+        pairs
+            .iter()
+            .map(|(left, right)| self.multiply_share(ty, left, right))
+            .collect()
+    }
 
     /// Divide a secret fixed-point share by a public positive constant.
     ///
@@ -117,6 +133,46 @@ pub trait MpcEngineOpenInExponent: MpcEngine {
 
         self.open_share_in_exp(ty, share_bytes, generator_bytes)
     }
+
+    /// Reveal several shares in an exponent group. Backends can override this
+    /// to exchange all partial points in one transport batch.
+    fn batch_open_shares_in_exp_group(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+        generator_bytes: &[u8],
+    ) -> MpcEngineResult<Vec<Vec<u8>>> {
+        shares
+            .iter()
+            .map(|share| self.open_share_in_exp_group(group, ty, share, generator_bytes))
+            .collect()
+    }
+
+    /// Reveal several shares against per-item public generators.
+    fn batch_open_shares_in_exp_group_custom(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+        generators: &[Vec<u8>],
+    ) -> MpcEngineResult<Vec<Vec<u8>>> {
+        if shares.len() != generators.len() {
+            return Err(MpcEngineError::operation_failed(
+                "batch_open_shares_in_exp_group_custom",
+                format!(
+                    "share/generator length mismatch: {} != {}",
+                    shares.len(),
+                    generators.len()
+                ),
+            ));
+        }
+        shares
+            .iter()
+            .zip(generators)
+            .map(|(share, generator)| self.open_share_in_exp_group(group, ty, share, generator))
+            .collect()
+    }
 }
 
 /// Extended MPC engine trait for jointly-random share generation.
@@ -141,6 +197,18 @@ pub trait MpcEngineRandomness: MpcEngine {
 pub trait MpcEngineFieldOpen: MpcEngine {
     /// Reconstruct a secret from shares and return the raw field element bytes.
     fn open_share_as_field(&self, ty: ShareType, share_bytes: &[u8]) -> MpcEngineResult<Vec<u8>>;
+
+    /// Batch-reconstruct secrets as canonical raw field-element bytes.
+    fn batch_open_shares_as_fields(
+        &self,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> MpcEngineResult<Vec<Vec<u8>>> {
+        shares
+            .iter()
+            .map(|share| self.open_share_as_field(ty, share))
+            .collect()
+    }
 }
 
 /// Extended MPC engine trait for persistent preprocessing material.
@@ -194,12 +262,33 @@ pub trait MpcEngineReservation: MpcEngine {
     async fn init_reservations(&self, program_hash: [u8; 32], capacity: u64)
         -> MpcEngineResult<()>;
 
+    /// Initialize or restore reservation state for one isolated execution.
+    async fn init_reservations_for_run(
+        &self,
+        program_hash: [u8; 32],
+        capacity: u64,
+        run_id: u64,
+        preproc_offset: PoolAvailability,
+    ) -> MpcEngineResult<()>;
+
     /// Reserve `n` consecutive mask indices for a client.
     async fn reserve_masks(&self, client_id: ClientId, n: u64)
         -> MpcEngineResult<ReservationGrant>;
 
     /// Get this node's mask share at a given index as serialized bytes.
     async fn get_mask_share(&self, index: u64) -> MpcEngineResult<Vec<u8>>;
+
+    /// Get several mask shares in caller-specified order.
+    ///
+    /// Engines with persistent preprocessing should override this to amortize
+    /// store reads and cursor updates. The default preserves compatibility.
+    async fn get_mask_shares(&self, indices: &[u64]) -> MpcEngineResult<Vec<Vec<u8>>> {
+        let mut shares = Vec::with_capacity(indices.len());
+        for &index in indices {
+            shares.push(self.get_mask_share(index).await?);
+        }
+        Ok(shares)
+    }
 
     /// Accept a masked input at a reserved index.
     async fn submit_masked_input(
@@ -213,6 +302,11 @@ pub trait MpcEngineReservation: MpcEngine {
     ///
     /// Marks the indices as consumed.
     async fn consume_masked_inputs(&self, indices: &[u64]) -> MpcEngineResult<Vec<(u64, Vec<u8>)>>;
+
+    /// Retire mask material after an external coordinator has completed the
+    /// unmasking protocol. This marks the logical reservations consumed and
+    /// erases any process-local copies of destructively allocated shares.
+    async fn retire_masks(&self, indices: &[u64]) -> MpcEngineResult<()>;
 
     /// Number of unreserved mask slots.
     async fn available_masks(&self) -> u64;

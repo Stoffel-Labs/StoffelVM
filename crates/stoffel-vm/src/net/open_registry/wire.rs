@@ -1,7 +1,13 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 
 /// Maximum wire message payload size accepted from the network (1 MB).
 pub(super) const MAX_WIRE_MESSAGE_LEN: usize = 1_048_576;
+/// Maximum number of independently allocated positions in one batch frame.
+pub(super) const MAX_BATCH_ELEMENTS: usize = 4_096;
+/// Maximum UTF-8 bytes accepted for a registry type discriminator.
+pub(super) const MAX_TYPE_KEY_LEN: usize = 256;
 
 pub(super) const OPEN_REGISTRY_WIRE_PREFIX: &[u8; 4] = b"OPN1";
 
@@ -37,6 +43,7 @@ pub(super) enum OpenRegistryWireMessage {
         seq: u64,
         type_key: String,
         sender_party_id: usize,
+        #[serde(deserialize_with = "deserialize_bounded_batch")]
         shares: Vec<Vec<u8>>,
     },
     Rbc {
@@ -44,6 +51,108 @@ pub(super) enum OpenRegistryWireMessage {
         session_id: u64,
         sender_party_id: usize,
         message: Vec<u8>,
+    },
+    RbcEcho {
+        instance_id: u64,
+        session_id: u64,
+        broadcaster_party_id: usize,
+        sender_party_id: usize,
+        digest: [u8; 32],
+        message: Vec<u8>,
+    },
+    RbcReady {
+        instance_id: u64,
+        session_id: u64,
+        broadcaster_party_id: usize,
+        sender_party_id: usize,
+        digest: [u8; 32],
+    },
+}
+
+fn deserialize_bounded_batch<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedBatchVisitor;
+
+    impl<'de> Visitor<'de> for BoundedBatchVisitor {
+        type Value = Vec<Vec<u8>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "a batch with at most {MAX_BATCH_ELEMENTS} elements"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence
+                .size_hint()
+                .is_some_and(|length| length > MAX_BATCH_ELEMENTS)
+            {
+                return Err(A::Error::custom(format!(
+                    "batch element count exceeds maximum of {MAX_BATCH_ELEMENTS}"
+                )));
+            }
+            let mut shares = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+            while let Some(share) = sequence.next_element()? {
+                if shares.len() == MAX_BATCH_ELEMENTS {
+                    return Err(A::Error::custom(format!(
+                        "batch element count exceeds maximum of {MAX_BATCH_ELEMENTS}"
+                    )));
+                }
+                shares.push(share);
+            }
+            Ok(shares)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedBatchVisitor)
+}
+
+/// Serialization-only borrowed mirror of `OpenRegistryWireMessage`.
+///
+/// Variant order and fields intentionally match the owned wire enum, so bincode
+/// produces the same payload without cloning an entire batch first.
+#[derive(Serialize)]
+enum BorrowedOpenRegistryWireMessage<'a> {
+    Single {
+        instance_id: u64,
+        seq: u64,
+        type_key: &'a str,
+        sender_party_id: usize,
+        share: &'a [u8],
+    },
+    Batch {
+        instance_id: u64,
+        seq: u64,
+        type_key: &'a str,
+        sender_party_id: usize,
+        shares: &'a [Vec<u8>],
+    },
+    Rbc {
+        instance_id: u64,
+        session_id: u64,
+        sender_party_id: usize,
+        message: &'a [u8],
+    },
+    RbcEcho {
+        instance_id: u64,
+        session_id: u64,
+        broadcaster_party_id: usize,
+        sender_party_id: usize,
+        digest: [u8; 32],
+        message: &'a [u8],
+    },
+    RbcReady {
+        instance_id: u64,
+        session_id: u64,
+        broadcaster_party_id: usize,
+        sender_party_id: usize,
+        digest: [u8; 32],
     },
 }
 
@@ -54,12 +163,12 @@ pub fn encode_single_share_wire_message(
     sender_party_id: usize,
     share_bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let payload = OpenRegistryWireMessage::Single {
+    let payload = BorrowedOpenRegistryWireMessage::Single {
         instance_id,
         seq: seq as u64,
-        type_key: type_key.to_string(),
+        type_key,
         sender_party_id,
-        share: share_bytes.to_vec(),
+        share: share_bytes,
     };
     let encoded =
         bincode::serialize(&payload).map_err(|e| format!("serialize open wire payload: {}", e))?;
@@ -76,12 +185,12 @@ pub fn encode_batch_share_wire_message(
     sender_party_id: usize,
     shares: &[Vec<u8>],
 ) -> Result<Vec<u8>, String> {
-    let payload = OpenRegistryWireMessage::Batch {
+    let payload = BorrowedOpenRegistryWireMessage::Batch {
         instance_id,
         seq: seq as u64,
-        type_key: type_key.to_string(),
+        type_key,
         sender_party_id,
-        shares: shares.to_vec(),
+        shares,
     };
     let encoded =
         bincode::serialize(&payload).map_err(|e| format!("serialize open wire payload: {}", e))?;
@@ -97,14 +206,50 @@ pub fn encode_rbc_wire_message(
     sender_party_id: usize,
     message: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let payload = OpenRegistryWireMessage::Rbc {
+    let payload = BorrowedOpenRegistryWireMessage::Rbc {
         instance_id,
         session_id,
         sender_party_id,
-        message: message.to_vec(),
+        message,
     };
     let encoded =
         bincode::serialize(&payload).map_err(|e| format!("serialize RBC payload: {}", e))?;
+    let mut out = Vec::with_capacity(OPEN_REGISTRY_WIRE_PREFIX.len() + encoded.len());
+    out.extend_from_slice(OPEN_REGISTRY_WIRE_PREFIX);
+    out.extend_from_slice(&encoded);
+    Ok(out)
+}
+
+pub fn encode_rbc_relay_wire_message(
+    instance_id: u64,
+    session_id: u64,
+    broadcaster_party_id: usize,
+    sender_party_id: usize,
+    digest: [u8; 32],
+    message: Option<&[u8]>,
+    ready: bool,
+) -> Result<Vec<u8>, String> {
+    let payload = if ready {
+        BorrowedOpenRegistryWireMessage::RbcReady {
+            instance_id,
+            session_id,
+            broadcaster_party_id,
+            sender_party_id,
+            digest,
+        }
+    } else {
+        let message = message.ok_or_else(|| "RBC ECHO relay is missing its payload".to_string())?;
+        BorrowedOpenRegistryWireMessage::RbcEcho {
+            instance_id,
+            session_id,
+            broadcaster_party_id,
+            sender_party_id,
+            digest,
+            message,
+        }
+    };
+    let encoded =
+        bincode::serialize(&payload).map_err(|e| format!("serialize RBC relay payload: {e}"))?;
     let mut out = Vec::with_capacity(OPEN_REGISTRY_WIRE_PREFIX.len() + encoded.len());
     out.extend_from_slice(OPEN_REGISTRY_WIRE_PREFIX);
     out.extend_from_slice(&encoded);

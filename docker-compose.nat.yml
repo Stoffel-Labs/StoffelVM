@@ -9,10 +9,10 @@
 #
 # Usage:
 #   Person A (Leader - with public IP or port forwarding):
-#     docker-compose -f docker-compose.nat.yml up leader
+#     STOFFEL_EXECUTION_ID=<shared-64-hex-id> docker-compose -f docker-compose.nat.yml up leader
 #
 #   Person B (Remote party - behind NAT):
-#     LEADER_PUBLIC_IP=<person_a_ip> docker-compose -f docker-compose.nat.yml up party
+#     STOFFEL_EXECUTION_ID=<same-id> LEADER_PUBLIC_IP=<person_a_ip> docker-compose -f docker-compose.nat.yml up party
 #
 # Google STUN servers (pre-resolved IPs for DNS-free operation):
 #   74.125.250.129:19302 (stun.l.google.com)
@@ -25,12 +25,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      additional_contexts:
+        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}"
+        networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1}"
       args:
         ENABLE_NAT: "true"
     container_name: stoffel-leader
     hostname: leader
     environment:
       - STOFFEL_ROLE=leader
+      - STOFFEL_EXECUTION_ID=${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}
       - STOFFEL_PARTY_ID=0
       - STOFFEL_BIND_ADDR=0.0.0.0:9000
       - STOFFEL_N_PARTIES=${N_PARTIES:-2}
@@ -50,12 +54,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      additional_contexts:
+        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}"
+        networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1}"
       args:
         ENABLE_NAT: "true"
     container_name: stoffel-party
     hostname: party
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_EXECUTION_ID=${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}
       - STOFFEL_PARTY_ID=${PARTY_ID:-1}
       - STOFFEL_BIND_ADDR=0.0.0.0:9001
       - STOFFEL_BOOTSTRAP_ADDR=${LEADER_PUBLIC_IP:?Set LEADER_PUBLIC_IP environment variable}:9000

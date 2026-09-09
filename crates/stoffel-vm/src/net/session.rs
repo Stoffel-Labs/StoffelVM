@@ -1,17 +1,103 @@
-use crate::net::discovery::DiscoveryMessage;
 use crate::net::p2p::PeerConnection;
 use bincode;
 use blake3::Hasher;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::time::Duration;
 use stoffelnet::network_utils::PartyId;
 
 pub const CONTROL_STREAM_ID: u64 = 1;
-pub const PROGRAM_STREAM_ID: u64 = 2;
 
 pub type SessionResult<T> = Result<T, SessionError>;
+
+/// Coordinator-issued identity for one execution of a program.
+///
+/// A program may be executed more than once at the same time, so `program_id`
+/// is not a session key.  The full 256-bit execution ID is carried through
+/// discovery and retained in [`SessionInfo`]; the shorter `instance_id` exists
+/// only for protocols that still require a `u64` routing value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExecutionId(pub [u8; 32]);
+
+impl ExecutionId {
+    pub fn new() -> Self {
+        loop {
+            let mut bytes = [0u8; 32];
+            rand::rng().fill_bytes(&mut bytes);
+            let id = Self(bytes);
+            if !id.is_zero() {
+                return id;
+            }
+        }
+    }
+
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.0 == [0; 32]
+    }
+}
+
+impl Default for ExecutionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<[u8; 32]> for ExecutionId {
+    fn from(value: [u8; 32]) -> Self {
+        Self::from_bytes(value)
+    }
+}
+
+impl From<ExecutionId> for [u8; 32] {
+    fn from(value: ExecutionId) -> Self {
+        value.into_bytes()
+    }
+}
+
+impl fmt::Debug for ExecutionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ExecutionId({})", hex::encode(self.0))
+    }
+}
+
+impl fmt::Display for ExecutionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl FromStr for ExecutionId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 {
+            return Err(format!(
+                "execution ID must contain exactly 64 hexadecimal characters, got {}",
+                value.len()
+            ));
+        }
+        let bytes = hex::decode(value).map_err(|error| format!("invalid execution ID: {error}"))?;
+        Ok(Self(
+            bytes.try_into().expect("validated execution ID length"),
+        ))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -30,13 +116,6 @@ pub enum SessionError {
         "timed out waiting for session control message on stream {stream_id} after {timeout:?}"
     )]
     Timeout { stream_id: u64, timeout: Duration },
-    #[error("unexpected session message: expected {expected}, got {actual}")]
-    UnexpectedMessage {
-        expected: &'static str,
-        actual: &'static str,
-    },
-    #[error("program mismatch between local and session: expected {expected}, got {actual}")]
-    ProgramMismatch { expected: String, actual: String },
 }
 
 impl From<SessionError> for String {
@@ -47,6 +126,7 @@ impl From<SessionError> for String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
+    pub execution_id: ExecutionId,
     pub program_id: [u8; 32],
     pub instance_id: u64,
     pub entry: String,
@@ -58,12 +138,32 @@ pub struct SessionInfo {
     /// `accept()` succeeds with `use_tls: true`.
     #[serde(default)]
     pub tls_ids: Vec<(PartyId, PartyId)>,
+    /// Full DER-encoded SPKIs for all logical parties. These identities, not
+    /// the compact `tls_ids`, authorize mesh admission and reconnects.
+    #[serde(default)]
+    pub tls_public_keys: Vec<(PartyId, Vec<u8>)>,
+}
+
+/// Immutable description of the one physical party mesh owned by a standing
+/// node. Execution and program identity deliberately do not appear here:
+/// concurrent programs share this exact, certificate-pinned mesh and carry
+/// their own execution IDs inside transport envelopes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshInfo {
+    pub parties: Vec<(PartyId, SocketAddr)>,
+    pub n_parties: usize,
+    pub threshold: usize,
+    /// Complete DER-encoded SPKIs, indexed by logical party ID. These are the
+    /// admission authority; compact transport IDs are an implementation detail
+    /// of the networking layer and are intentionally absent here.
+    pub tls_public_keys: Vec<(PartyId, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionMessage {
     /// Sent by parties to request joining a session
     SessionRequest {
+        execution_id: ExecutionId,
         party_id: PartyId,
         program_id: [u8; 32],
         entry: String,
@@ -73,25 +173,16 @@ pub enum SessionMessage {
     SessionAnnounce(SessionInfo),
     /// Sent by parties to acknowledge session
     SessionAck {
+        execution_id: ExecutionId,
         party_id: PartyId,
         program_id: [u8; 32],
         instance_id: u64,
     },
     /// Sent by bootnode to indicate session is fully confirmed and ready to start
-    SessionStart { instance_id: u64 },
-}
-
-fn session_message_kind(message: &SessionMessage) -> &'static str {
-    match message {
-        SessionMessage::SessionRequest { .. } => "SessionRequest",
-        SessionMessage::SessionAnnounce(_) => "SessionAnnounce",
-        SessionMessage::SessionAck { .. } => "SessionAck",
-        SessionMessage::SessionStart { .. } => "SessionStart",
-    }
-}
-
-fn program_id_hex(program_id: &[u8; 32]) -> String {
-    hex::encode(program_id)
+    SessionStart {
+        execution_id: ExecutionId,
+        instance_id: u64,
+    },
 }
 
 pub fn random_instance_id() -> u64 {
@@ -111,6 +202,33 @@ pub fn derive_instance_id(program_id: &[u8; 32], session_nonce: u64) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&hash.as_bytes()[..8]);
     u64::from_le_bytes(bytes)
+}
+
+/// Derive the compact `u64` protocol routing ID for an execution.
+///
+/// The bootnode and node supervisor must continue to treat `execution_id` as
+/// the authoritative identity and reject a live collision in this shortened
+/// value.
+pub fn derive_instance_id_for_execution(execution_id: &ExecutionId) -> u64 {
+    let mut hasher = Hasher::new();
+    hasher.update(b"stoffel-execution-instance-v1");
+    hasher.update(execution_id.as_bytes());
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+/// Derive the transport identity for a coordinator-free one-shot session.
+///
+/// One-shot callers already coordinate on a unique protocol instance ID. Keep
+/// that compact API while ensuring their traffic uses the same mandatory wire
+/// envelope as coordinator-issued executions.
+pub fn derive_execution_id_for_instance(instance_id: u64) -> ExecutionId {
+    let mut hasher = Hasher::new();
+    hasher.update(b"stoffel-one-shot-execution-v1");
+    hasher.update(&instance_id.to_le_bytes());
+    ExecutionId::from_bytes(*hasher.finalize().as_bytes())
 }
 
 pub async fn send_ctrl(conn: &mut dyn PeerConnection, msg: &impl Serialize) -> SessionResult<()> {
@@ -155,46 +273,6 @@ pub async fn recv_ctrl<T: for<'a> serde::Deserialize<'a>>(
         reason: error.to_string(),
     })?;
     Ok(val)
-}
-
-/// Parties learn agreed session info over an existing control connection (e.g., to bootnode).
-/// The leader/bootnode is responsible for generating instance_id and announcing it.
-pub async fn agree_session_with_bootnode(
-    bn_conn: &mut dyn PeerConnection,
-    my_party: PartyId,
-    my_program_id: [u8; 32],
-    _entry: &str,
-) -> SessionResult<SessionInfo> {
-    // Request peers and implicit session announce via discovery RequestPeers
-    // Then wait for SessionAnnounce
-    // For compatibility with existing discovery, we send a Heartbeat first.
-    send_ctrl(bn_conn, &DiscoveryMessage::Heartbeat).await?;
-
-    // SessionAnnounce expected next
-    let message: SessionMessage = recv_ctrl(bn_conn, None).await?;
-    let info = match message {
-        SessionMessage::SessionAnnounce(info) => info,
-        other => {
-            return Err(SessionError::UnexpectedMessage {
-                expected: "SessionAnnounce",
-                actual: session_message_kind(&other),
-            });
-        }
-    };
-    if info.program_id != my_program_id {
-        return Err(SessionError::ProgramMismatch {
-            expected: program_id_hex(&my_program_id),
-            actual: program_id_hex(&info.program_id),
-        });
-    }
-    // Ack
-    let ack = SessionMessage::SessionAck {
-        party_id: my_party,
-        program_id: my_program_id,
-        instance_id: info.instance_id,
-    };
-    send_ctrl(bn_conn, &ack).await?;
-    Ok(info)
 }
 
 #[cfg(test)]
@@ -261,7 +339,10 @@ mod tests {
 
     #[tokio::test]
     async fn recv_ctrl_respects_timeout() {
-        let msg = SessionMessage::SessionStart { instance_id: 42 };
+        let msg = SessionMessage::SessionStart {
+            execution_id: ExecutionId::from([3u8; 32]),
+            instance_id: 42,
+        };
         let bytes = bincode::serialize(&msg).expect("serialize session message");
         let mut conn = DelayedMockConnection {
             response: bytes,
@@ -279,86 +360,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn agree_session_accepts_announced_matching_program() {
-        let program_id = [7u8; 32];
-        let info = SessionInfo {
-            program_id,
-            instance_id: 42,
-            entry: "main".to_owned(),
-            parties: Vec::new(),
-            n_parties: 1,
-            threshold: 0,
-            tls_ids: Vec::new(),
-        };
-        let bytes = bincode::serialize(&SessionMessage::SessionAnnounce(info.clone()))
-            .expect("serialize session announce");
-        let mut conn = DelayedMockConnection {
-            response: bytes,
-            delay: Duration::ZERO,
-        };
-
-        let agreed = agree_session_with_bootnode(&mut conn, 0, program_id, "main")
-            .await
-            .expect("matching session should be accepted");
-
-        assert_eq!(agreed.instance_id, info.instance_id);
-        assert_eq!(agreed.program_id, program_id);
-    }
-
-    #[tokio::test]
-    async fn agree_session_rejects_unexpected_session_message() {
-        let bytes = bincode::serialize(&SessionMessage::SessionStart { instance_id: 42 })
-            .expect("serialize session start");
-        let mut conn = DelayedMockConnection {
-            response: bytes,
-            delay: Duration::ZERO,
-        };
-
-        let err = agree_session_with_bootnode(&mut conn, 0, [7u8; 32], "main")
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            err,
-            SessionError::UnexpectedMessage {
-                expected: "SessionAnnounce",
-                actual: "SessionStart",
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn agree_session_rejects_program_mismatch_with_typed_error() {
-        let info = SessionInfo {
-            program_id: [8u8; 32],
-            instance_id: 42,
-            entry: "main".to_owned(),
-            parties: Vec::new(),
-            n_parties: 1,
-            threshold: 0,
-            tls_ids: Vec::new(),
-        };
-        let bytes = bincode::serialize(&SessionMessage::SessionAnnounce(info))
-            .expect("serialize session announce");
-        let mut conn = DelayedMockConnection {
-            response: bytes,
-            delay: Duration::ZERO,
-        };
-
-        let err = agree_session_with_bootnode(&mut conn, 0, [7u8; 32], "main")
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            err,
-            SessionError::ProgramMismatch {
-                expected: hex::encode([7u8; 32]),
-                actual: hex::encode([8u8; 32]),
-            }
-        );
-    }
-
     #[test]
     fn derive_instance_id_is_deterministic_and_domain_separated() {
         let program_id = [7u8; 32];
@@ -369,5 +370,33 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first, different_nonce);
+    }
+
+    #[test]
+    fn execution_instance_id_is_deterministic_and_execution_scoped() {
+        let first_execution = ExecutionId::from([1u8; 32]);
+        let second_execution = ExecutionId::from([2u8; 32]);
+
+        assert_eq!(
+            derive_instance_id_for_execution(&first_execution),
+            derive_instance_id_for_execution(&first_execution)
+        );
+        assert_ne!(
+            derive_instance_id_for_execution(&first_execution),
+            derive_instance_id_for_execution(&second_execution)
+        );
+    }
+
+    #[test]
+    fn execution_id_hex_round_trip_matches_coordinator_contract() {
+        let id = ExecutionId::from_bytes([0xab; 32]);
+        let encoded = id.to_string();
+
+        assert_eq!(encoded.len(), 64);
+        assert_eq!(encoded.parse::<ExecutionId>().unwrap(), id);
+        assert!("ab".parse::<ExecutionId>().is_err());
+        assert!(format!("{}z", &encoded[..63])
+            .parse::<ExecutionId>()
+            .is_err());
     }
 }

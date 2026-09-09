@@ -10,7 +10,7 @@
 # HoneyBadger/BLS12-381 coordinator flow.
 #
 # Usage:
-#   STOFFEL_AUTH_TOKEN=<token> docker-compose -f docker-compose.avss.yml up
+#   STOFFEL_AUTH_TOKEN=<token> STOFFEL_EXECUTION_ID=<64-hex-chars> docker-compose -f docker-compose.avss.yml up
 #
 # To run a different compiled Stoffel program:
 #   STOFFEL_AUTH_TOKEN=<token> STOFFEL_PROGRAM=/app/programs/threshold_bls_bls12381.stflb docker-compose -f docker-compose.avss.yml up
@@ -32,17 +32,25 @@
 #
 # To view logs from a specific party:
 #   docker-compose -f docker-compose.avss.yml logs -f party0
+# The default execution ID is example-only; override STOFFEL_EXECUTION_ID with one fresh nonzero
+# 64-hex-character value shared by every party for each real/overlapping invocation.
+
+x-stoffel-build: &stoffel-build
+  context: .
+  dockerfile: Dockerfile
+  additional_contexts:
+    coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}"
+    networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1}"
 
 services:
   # Party 0 - Leader node (runs bootnode + party 0)
   party0:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: *stoffel-build
     container_name: stoffel-avss-party0
     hostname: party0
     environment:
       - STOFFEL_ROLE=leader
+      - STOFFEL_EXECUTION_ID=${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}
       - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=0
       - STOFFEL_BIND_ADDR=172.29.0.10:9000
@@ -72,13 +80,12 @@ services:
 
   # Party 1
   party1:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: *stoffel-build
     container_name: stoffel-avss-party1
     hostname: party1
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_EXECUTION_ID=${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}
       - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=1
       - STOFFEL_BIND_ADDR=172.29.0.11:9001
@@ -106,13 +113,12 @@ services:
 
   # Party 2
   party2:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: *stoffel-build
     container_name: stoffel-avss-party2
     hostname: party2
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_EXECUTION_ID=${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}
       - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=2
       - STOFFEL_BIND_ADDR=172.29.0.12:9002
@@ -140,13 +146,12 @@ services:
 
   # Party 3
   party3:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: *stoffel-build
     container_name: stoffel-avss-party3
     hostname: party3
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_EXECUTION_ID=${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}
       - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=3
       - STOFFEL_BIND_ADDR=172.29.0.13:9003
@@ -174,13 +179,12 @@ services:
 
   # Party 4
   party4:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: *stoffel-build
     container_name: stoffel-avss-party4
     hostname: party4
     environment:
       - STOFFEL_ROLE=party
+      - STOFFEL_EXECUTION_ID=${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}
       - STOFFEL_AUTH_TOKEN=${STOFFEL_AUTH_TOKEN:?Set STOFFEL_AUTH_TOKEN}
       - STOFFEL_PARTY_ID=4
       - STOFFEL_BIND_ADDR=172.29.0.14:9004

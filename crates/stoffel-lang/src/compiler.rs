@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::ast::{AstNode, Value};
 use crate::bytecode::CompiledProgram;
 use crate::codegen;
 use crate::errors::{CompilerError, ErrorReporter};
@@ -126,6 +127,11 @@ pub fn compile(
         println!("-------------------------------------");
     }
 
+    // Lower semantically proven VM-native reductions even when general
+    // optimization is disabled. This is a backend-aware lowering, not an
+    // optional source-level performance tweak developers must remember.
+    let analyzed_ast = optimizations::lower_semantic_client_reductions(analyzed_ast);
+
     // 5. Optimization Passes
     let optimized_ast = if options.optimize {
         let ast = optimizations::optimize_all_with_budgets(
@@ -149,17 +155,24 @@ pub fn compile(
     } else {
         0
     };
-    let mut compiled_program =
-        match codegen::generate_bytecode_with_opt_level(&optimized_ast, codegen_opt_level) {
-            Ok(program) => program,
-            Err(e) => {
-                error_reporter.add_error(e);
-                // Stop if codegen fails
-                return Err(error_reporter.get_all().into_iter().cloned().collect());
-            }
-        };
+    let mut compiled_program = match codegen::generate_bytecode_with_opt_level_and_backend(
+        &optimized_ast,
+        codegen_opt_level,
+        options.mpc_backend,
+    ) {
+        Ok(program) => program,
+        Err(e) => {
+            error_reporter.add_error(e);
+            // Stop if codegen fails
+            return Err(error_reporter.get_all().into_iter().cloned().collect());
+        }
+    };
+    let mut executable_roots = options.entry_points.clone();
+    collect_literal_closure_targets(&optimized_ast, &mut executable_roots);
+    executable_roots.sort();
+    executable_roots.dedup();
     compiled_program
-        .prune_unreachable_functions_with_roots(options.entry_points.iter().map(String::as_str));
+        .prune_unreachable_functions_with_roots(executable_roots.iter().map(String::as_str));
     compiled_program.client_io_manifest.mpc_backend = options.mpc_backend;
     compiled_program.client_io_manifest.mpc_curve = options.mpc_curve;
 
@@ -168,6 +181,40 @@ pub fn compile(
     } else {
         Ok(compiled_program)
     }
+}
+
+/// A closure target is a dynamic VM call edge even though the source names it
+/// with a string literal. Preserve those functions when pruning ordinary
+/// instruction-level call graph dead code.
+fn collect_literal_closure_targets(node: &AstNode, roots: &mut Vec<String>) {
+    if let AstNode::FunctionDefinition { body, .. } = node {
+        collect_literal_closure_targets(body, roots);
+        return;
+    }
+    if let AstNode::FunctionCall {
+        function,
+        arguments,
+        ..
+    } = node
+    {
+        let is_closure_constructor = matches!(
+            function.as_ref(),
+            AstNode::Identifier(name, _)
+                if name == "create_closure" || name == "create_closure_with_upvalue"
+        );
+        if is_closure_constructor {
+            if let Some(AstNode::Literal {
+                value: Value::String(target),
+                ..
+            }) = arguments.first()
+            {
+                roots.push(target.clone());
+            }
+        }
+    }
+    optimizations::for_each_child(node, &mut |child| {
+        collect_literal_closure_targets(child, roots)
+    });
 }
 
 /// Compiles a project from a file path.

@@ -1,0 +1,18 @@
+# Deliberately round-heavy online workload for mesh fault injection.
+#
+# Multiplication by a secret sharing of one preserves the client value while
+# forcing a sequence of online MPC rounds. This gives the Compose campaign a
+# deterministic window in which to freeze one party after all-party setup has
+# completed.
+
+def main() -> int64:
+  var value: secret int64 = ClientStore.take_share(0, 0)
+  var one = Share.from_clear_int(1, 64)
+
+  for round in 0..1800:
+    value = Share.mul(value, one)
+
+  if Mpc.has_capability("client-output"):
+    value.send_to_client(0)
+
+  return Share.open(value)

@@ -1,0 +1,492 @@
+type B = secret bool
+type W = list[B]
+type V = list[W]
+type Q = list[V]
+type I = secret int64
+
+def pb(v: int64) -> B:
+  return Share.from_clear_int(v, 1)
+
+def pw(n: int64) -> W:
+  var o: W = []
+  var v: int64 = n
+  for i in 0..32:
+    o.append(pb(v % 2))
+    v = v / 2
+  return o
+
+def rr(a: W, n: int64) -> W:
+  var o: W = []
+  for i in 0..32:
+    o.append(a[(i + n) % 32])
+  return o
+
+def sr(a: W, n: int64) -> W:
+  var o: W = []
+  for i in 0..32:
+    if i + n < 32:
+      o.append(a[i + n])
+    else:
+      o.append(pb(0))
+  return o
+
+def c1s(a: W, b: W, e: W, f: W, g: W, h: W, m: W, k: int64, sw: V) -> V:
+  var x = rr(e, 6)
+  var y = rr(e, 11)
+  var u = rr(a, 2)
+  var v = rr(a, 13)
+  var l: W = []
+  var r: W = []
+  for i in 0..32:
+    l.append(x[i])
+    r.append(y[i])
+    l.append(u[i])
+    r.append(v[i])
+    l.append(e[i])
+    r.append(Share.sub(f[i], g[i]))
+    l.append(a[i])
+    r.append(b[i])
+    l.append(h[i])
+    r.append(m[i])
+  for j in 0..2:
+    for i in 0..32:
+      l.append(sw[j][(i + 17) % 32])
+      r.append(sw[j][(i + 19) % 32])
+  for j in 2..4:
+    for i in 0..32:
+      l.append(sw[j][(i + 7) % 32])
+      r.append(sw[j][(i + 18) % 32])
+  var q = Share.batch_mul(l, r)
+  var i1: W = []
+  var i0: W = []
+  var ch: W = []
+  var mp: W = []
+  var ab: W = []
+  var hs: W = []
+  var hc: W = [pb(0)]
+  var kv = k
+  for i in 0..32:
+    i1.append(Share.sub(Share.add(x[i], y[i]), Share.mul_scalar(q[i * 5], 2)))
+    i0.append(Share.sub(Share.add(u[i], v[i]), Share.mul_scalar(q[i * 5 + 1], 2)))
+    ch.append(Share.add(g[i], q[i * 5 + 2]))
+    mp.append(Share.sub(Share.add(a[i], b[i]), Share.mul_scalar(q[i * 5 + 3], 2)))
+    ab.append(q[i * 5 + 3])
+    var bit = kv % 2
+    var hm = Share.sub(Share.add(h[i], m[i]), Share.mul_scalar(q[i * 5 + 4], 2))
+    hs.append(Share.sub(Share.add_scalar(hm, bit), Share.mul_scalar(hm, 2 * bit)))
+    if i < 31:
+      hc.append(Share.add(q[i * 5 + 4], Share.mul_scalar(hm, bit)))
+    kv = kv / 2
+  var o: V = [i1, i0, ch, mp, ab, hs, hc]
+  for j in 0..2:
+    var z: W = []
+    for i in 0..32:
+      var n = 160 + j * 32 + i
+      z.append(Share.sub(Share.add(sw[j][(i + 17) % 32], sw[j][(i + 19) % 32]), Share.mul_scalar(q[n], 2)))
+    o.append(z)
+  for j in 2..4:
+    var z: W = []
+    for i in 0..32:
+      var n = 160 + j * 32 + i
+      z.append(Share.sub(Share.add(sw[j][(i + 7) % 32], sw[j][(i + 18) % 32]), Share.mul_scalar(q[n], 2)))
+    o.append(z)
+  return o
+
+def cfs(p: W, g: W, x: W) -> V:
+  var q = Share.batch_mul(p, x)
+  var s: W = []
+  var c: W = [pb(0)]
+  for i in 0..32:
+    s.append(Share.sub(Share.add(p[i], x[i]), Share.mul_scalar(q[i], 2)))
+    if i < 31:
+      c.append(Share.add(g[i], q[i]))
+  return [s, c]
+
+def c2s(a: W, c: W, e: W, x: V, sw: V) -> V:
+  var l: W = []
+  var r: W = []
+  var re = rr(e, 25)
+  var ra = rr(a, 22)
+  for i in 0..32:
+    l.append(x[0][i])
+    r.append(re[i])
+    l.append(x[1][i])
+    r.append(ra[i])
+    l.append(c[i])
+    r.append(x[3][i])
+    l.append(x[5][i])
+    r.append(x[6][i])
+  for j in 0..2:
+    for i in 0..22:
+      l.append(x[7 + j][i])
+      r.append(sw[j][i + 10])
+    for i in 22..32:
+      l.append(x[7 + j][i])
+      r.append(pb(0))
+  for j in 2..4:
+    for i in 0..29:
+      l.append(x[7 + j][i])
+      r.append(sw[j][i + 3])
+    for i in 29..32:
+      l.append(x[7 + j][i])
+      r.append(pb(0))
+  var q = Share.batch_mul(l, r)
+  var s1: W = []
+  var s0: W = []
+  var ma: W = []
+  var tp: W = []
+  var tg: W = []
+  for i in 0..32:
+    s1.append(Share.sub(Share.add(x[0][i], re[i]), Share.mul_scalar(q[i * 4], 2)))
+    s0.append(Share.sub(Share.add(x[1][i], ra[i]), Share.mul_scalar(q[i * 4 + 1], 2)))
+    ma.append(Share.add(x[4][i], q[i * 4 + 2]))
+    tp.append(Share.sub(Share.add(x[5][i], x[6][i]), Share.mul_scalar(q[i * 4 + 3], 2)))
+    tg.append(q[i * 4 + 3])
+  var y = cfs(tp, tg, x[2])
+  var o: V = [y[0], y[1], s1, s0, ma]
+  for j in 0..4:
+    var z: W = []
+    for i in 0..32:
+      var n = 128 + j * 32 + i
+      z.append(Share.sub(Share.add(l[n], r[n]), Share.mul_scalar(q[n], 2)))
+    o.append(z)
+  return o
+
+def cl(a: W, b: W, c: W, e: W, f: W, g: W, h: W, m: W, k: int64) -> V:
+  var x = rr(e, 6)
+  var y = rr(e, 11)
+  var u = rr(a, 2)
+  var v = rr(a, 13)
+  var l: W = []
+  var r: W = []
+  for i in 0..32:
+    l.append(x[i])
+    r.append(y[i])
+    l.append(u[i])
+    r.append(v[i])
+    l.append(e[i])
+    r.append(Share.sub(f[i], g[i]))
+    l.append(a[i])
+    r.append(b[i])
+    l.append(h[i])
+    r.append(m[i])
+  var p = Share.batch_mul(l, r)
+  var i1: W = []
+  var i0: W = []
+  var ch: W = []
+  var mp: W = []
+  var ab: W = []
+  var hs: W = []
+  var hc: W = [pb(0)]
+  var kv = k
+  for i in 0..32:
+    i1.append(Share.sub(Share.add(x[i], y[i]), Share.mul_scalar(p[i * 5], 2)))
+    i0.append(Share.sub(Share.add(u[i], v[i]), Share.mul_scalar(p[i * 5 + 1], 2)))
+    ch.append(Share.add(g[i], p[i * 5 + 2]))
+    mp.append(Share.sub(Share.add(a[i], b[i]), Share.mul_scalar(p[i * 5 + 3], 2)))
+    ab.append(p[i * 5 + 3])
+    var bit = kv % 2
+    var hm = Share.sub(Share.add(h[i], m[i]), Share.mul_scalar(p[i * 5 + 4], 2))
+    hs.append(Share.sub(Share.add_scalar(hm, bit), Share.mul_scalar(hm, 2 * bit)))
+    if i < 31:
+      hc.append(Share.add(p[i * 5 + 4], Share.mul_scalar(hm, bit)))
+    kv = kv / 2
+  x = rr(e, 25)
+  y = rr(a, 22)
+  l = []
+  r = []
+  for i in 0..32:
+    l.append(i1[i])
+    r.append(x[i])
+    l.append(i0[i])
+    r.append(y[i])
+    l.append(c[i])
+    r.append(mp[i])
+    l.append(hs[i])
+    r.append(hc[i])
+  var q = Share.batch_mul(l, r)
+  var s1: W = []
+  var s0: W = []
+  var ma: W = []
+  var tp: W = []
+  var tg: W = []
+  for i in 0..32:
+    s1.append(Share.sub(Share.add(i1[i], x[i]), Share.mul_scalar(q[i * 4], 2)))
+    s0.append(Share.sub(Share.add(i0[i], y[i]), Share.mul_scalar(q[i * 4 + 1], 2)))
+    ma.append(Share.add(ab[i], q[i * 4 + 2]))
+    tp.append(Share.sub(Share.add(hs[i], hc[i]), Share.mul_scalar(q[i * 4 + 3], 2)))
+    tg.append(q[i * 4 + 3])
+  var z = Share.batch_mul(tp, ch)
+  var ts: W = []
+  var tc: W = [pb(0)]
+  for i in 0..32:
+    ts.append(Share.sub(Share.add(tp[i], ch[i]), Share.mul_scalar(z[i], 2)))
+    if i < 31:
+      tc.append(Share.add(tg[i], z[i]))
+  return [ts, tc, s1, s0, ma]
+
+def ps(p: V, g: V, d: int64, c: int64, n: int64) -> Q:
+  var l: W = []
+  var r: W = []
+  for i in 0..n:
+    for h in 0..c:
+      var b = h * 2 * d
+      for j in 0..d:
+        l.append(p[i][b + d + j])
+        r.append(g[i][b + d - 1])
+  for i in 0..n:
+    for h in 1..c:
+      var b = h * 2 * d
+      for j in 0..d:
+        l.append(p[i][b + d + j])
+        r.append(p[i][b + d - 1])
+  var x = Share.batch_mul(l, r)
+  var z: int64 = 0
+  for i in 0..n:
+    for h in 0..c:
+      var b = h * 2 * d
+      for j in 0..d:
+        g[i][b + d + j] = Share.add(g[i][b + d + j], x[z])
+        z += 1
+  for i in 0..n:
+    for h in 1..c:
+      var b = h * 2 * d
+      for j in 0..d:
+        p[i][b + d + j] = x[z]
+        z += 1
+  return [p, g]
+
+def av(a: V, b: V, n: int64) -> V:
+  var l: W = []
+  var r: W = []
+  for i in 0..n:
+    for j in 0..32:
+      l.append(a[i][j])
+      r.append(b[i][j])
+  var ab = Share.batch_mul(l, r)
+
+  var p: V = []
+  var g: V = []
+  var z: int64 = 0
+  for i in 0..n:
+    var x: W = []
+    var y: W = []
+    for j in 0..32:
+      x.append(Share.sub(Share.add(l[z], r[z]), Share.mul_scalar(ab[z], 2)))
+      y.append(ab[z])
+      z += 1
+    p.append(x)
+    g.append(y)
+
+  var stage = ps(p, g, 1, 16, n)
+  stage = ps(stage[0], stage[1], 2, 8, n)
+  stage = ps(stage[0], stage[1], 4, 4, n)
+  stage = ps(stage[0], stage[1], 8, 2, n)
+  stage = ps(stage[0], stage[1], 16, 1, n)
+  g = stage[1]
+
+  var o: V = []
+  for i in 0..n:
+    var w: W = [Share.sub(Share.add(a[i][0], b[i][0]), Share.mul_scalar(g[i][0], 2))]
+    for j in 1..32:
+      w.append(Share.sub(Share.add(Share.add(a[i][j], b[i][j]), g[i][j - 1]), Share.mul_scalar(g[i][j], 2)))
+    o.append(w)
+  return o
+
+def a2(a: W, b: W) -> W:
+  return av([a], [b], 1)[0]
+
+def ac(a: V, k: list[int64], n: int64) -> V:
+  var p: V = []
+  var g: V = []
+  for i in 0..n:
+    var x: W = []
+    var y: W = []
+    var v = k[i]
+    for j in 0..32:
+      var b = v % 2
+      x.append(Share.sub(Share.add_scalar(a[i][j], b), Share.mul_scalar(a[i][j], 2 * b)))
+      y.append(Share.mul_scalar(a[i][j], b))
+      v = v / 2
+    p.append(x)
+    g.append(y)
+  var s = ps(p, g, 1, 16, n)
+  s = ps(s[0], s[1], 2, 8, n)
+  s = ps(s[0], s[1], 4, 4, n)
+  s = ps(s[0], s[1], 8, 2, n)
+  s = ps(s[0], s[1], 16, 1, n)
+  g = s[1]
+  var o: V = []
+  for i in 0..n:
+    var v = k[i]
+    var w: W = []
+    for j in 0..32:
+      var c = pb(0)
+      if j > 0:
+        c = g[i][j - 1]
+      w.append(Share.sub(Share.add(Share.add_scalar(a[i][j], v % 2), c), Share.mul_scalar(g[i][j], 2)))
+      v = v / 2
+    o.append(w)
+  return o
+
+def cv(a: V, b: V, c: V, n: int64) -> Q:
+  var l: W = []
+  var r: W = []
+  for i in 0..n:
+    for j in 0..32:
+      l.append(a[i][j])
+      r.append(b[i][j])
+  var ab = Share.batch_mul(l, r)
+  var p: V = []
+  var z: int64 = 0
+  for i in 0..n:
+    var w: W = []
+    for j in 0..32:
+      w.append(Share.sub(Share.add(l[z], r[z]), Share.mul_scalar(ab[z], 2)))
+      z += 1
+    p.append(w)
+  l = []
+  r = []
+  for i in 0..n:
+    for j in 0..32:
+      l.append(p[i][j])
+      r.append(c[i][j])
+  var pc = Share.batch_mul(l, r)
+  var s: V = []
+  var k: V = []
+  z = 0
+  for i in 0..n:
+    var x: W = []
+    var y: W = [pb(0)]
+    for j in 0..32:
+      x.append(Share.sub(Share.add(l[z], r[z]), Share.mul_scalar(pc[z], 2)))
+      if j < 31:
+        y.append(Share.add(ab[z], pc[z]))
+      z += 1
+    s.append(x)
+    k.append(y)
+  return [s, k]
+
+def c3(a: W, b: W, c: W) -> V:
+  var x = cv([a], [b], [c], 1)
+  return [x[0][0], x[1][0]]
+
+def mw(x: W, i: int64) -> W:
+  var w: W = []
+  for j in 0..32:
+    var b: int64 = 3 - (j / 8)
+    w.append(x[(i * 4 + b) * 8 + j % 8])
+  return w
+
+def ks() -> list[int64]:
+  return [
+    1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221,
+    3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580,
+    3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+    2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895,
+    666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037,
+    2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+    430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779,
+    1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298
+  ]
+
+def sha(x: W) -> V:
+  var w: V = []
+  for i in 0..8:
+    w.append(mw(x, i))
+  w.append(pw(2147483648))
+  for i in 9..15:
+    w.append(pw(0))
+  w.append(pw(256))
+
+  var z: V = [
+    pw(1779033703), pw(3144134277), pw(1013904242), pw(2773480762),
+    pw(1359893119), pw(2600822924), pw(528734635), pw(1541459225)
+  ]
+  var a = z[0]
+  var b = z[1]
+  var c = z[2]
+  var d = z[3]
+  var e = z[4]
+  var f = z[5]
+  var g = z[6]
+  var h = z[7]
+  var k = ks()
+  var t: int64 = 16
+
+  for i in 0..24:
+    var sw: V = [w[t - 2], w[t - 1], w[t - 15], w[t - 14]]
+    var l = c1s(a, b, e, f, g, h, w[i], k[i], sw)
+    l = c2s(a, c, e, l, sw)
+    var u = cv(
+      [l[0], l[5], l[6]],
+      [l[1], w[t - 7], w[t - 6]],
+      [l[2], l[7], l[8]],
+      3
+    )
+    var p = cv(
+      [u[0][0], u[0][0], u[0][1], u[0][2]],
+      [u[1][0], u[1][0], u[1][1], u[1][2]],
+      [l[3], d, w[t - 16], w[t - 15]],
+      4
+    )
+    var q = c3(p[0][0], p[1][0], l[4])
+    var n = av(
+      [q[0], p[0][1], p[0][2], p[0][3]],
+      [q[1], p[1][1], p[1][2], p[1][3]],
+      4
+    )
+    w.append(n[2])
+    w.append(n[3])
+    t += 2
+    h = g
+    g = f
+    f = e
+    e = n[1]
+    d = c
+    c = b
+    b = a
+    a = n[0]
+
+  for i in 24..64:
+    var l = cl(a, b, c, e, f, g, h, w[i], k[i])
+    var t1 = c3(l[0], l[1], l[2])
+    var p = cv([t1[0], t1[0]], [t1[1], t1[1]], [l[3], d], 2)
+    var q = c3(p[0][0], p[1][0], l[4])
+    var n = av([q[0], p[0][1]], [q[1], p[1][1]], 2)
+    h = g
+    g = f
+    f = e
+    e = n[1]
+    d = c
+    c = b
+    b = a
+    a = n[0]
+
+  return ac(
+    [a, b, c, d, e, f, g, h],
+    [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225],
+    8
+  )
+
+def pk(a: W) -> I:
+  var x: I = Share.from_clear_int(0, 64)
+  var p: int64 = 1
+  for i in 0..32:
+    x = Share.add(x, Share.mul_scalar(Share.retag(a[i], 64), p))
+    p = p * 2
+  return x
+
+def hash_32_bytes() -> int64:
+  var x: W = []
+  for i in 0..256:
+    x.append(ClientStore.take_share_bool(0, i))
+  var w = sha(x)
+  var o: list[I] = []
+  for i in 0..8:
+    o.append(pk(w[i]))
+  MpcOutput.send_to_client(0, o)
+  return 8
+
+def main() -> int64:
+  return 0

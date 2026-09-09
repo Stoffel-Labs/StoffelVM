@@ -3,7 +3,7 @@ name = "mpc-oprf"
 version = "0.1.0"
 
 [mpc]
-backend = "honeybadger"
+backend = "avss"
 parties = 5
 threshold = 1
 curve = "bls12_381"

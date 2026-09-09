@@ -14,6 +14,11 @@ pub enum MpcBackendError {
         name: String,
         available: Vec<&'static str>,
     },
+    InsufficientParties {
+        backend: MpcBackendKind,
+        actual: usize,
+        minimum: usize,
+    },
 }
 
 impl fmt::Display for MpcBackendError {
@@ -24,6 +29,17 @@ impl fmt::Display for MpcBackendError {
                 "Unknown MPC backend '{}'. Available: {}",
                 name,
                 available.join(", ")
+            ),
+            MpcBackendError::InsufficientParties {
+                backend,
+                actual,
+                minimum,
+            } => write!(
+                f,
+                "{} requires at least {} parties (got {})",
+                backend.display_name(),
+                minimum,
+                actual
             ),
         }
     }
@@ -38,8 +54,9 @@ impl From<MpcBackendError> for String {
 }
 
 /// Available MPC backend implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MpcBackendKind {
+    #[default]
     HoneyBadger,
     Avss,
 }
@@ -74,15 +91,27 @@ impl std::str::FromStr for MpcBackendKind {
 }
 
 impl MpcBackendKind {
-    pub fn available_names() -> Vec<&'static str> {
-        vec!["honeybadger", "avss"]
+    pub const fn minimum_parties(self) -> usize {
+        match self {
+            MpcBackendKind::HoneyBadger => 5,
+            MpcBackendKind::Avss => 4,
+        }
     }
 
-    /// Returns the default backend.
-    ///
-    /// Legacy default for callers without a compiled program manifest.
-    pub fn default_backend() -> Self {
-        MpcBackendKind::HoneyBadger
+    pub fn validate_party_count(self, actual: usize) -> MpcBackendResult<()> {
+        let minimum = self.minimum_parties();
+        if actual < minimum {
+            return Err(MpcBackendError::InsufficientParties {
+                backend: self,
+                actual,
+                minimum,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn available_names() -> Vec<&'static str> {
+        vec!["honeybadger", "avss"]
     }
 
     /// Static capability metadata for this backend family.
@@ -156,6 +185,13 @@ impl MpcBackendKind {
             MpcBackendKind::Avss => "avss",
         }
     }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            MpcBackendKind::HoneyBadger => "HoneyBadger",
+            MpcBackendKind::Avss => "AVSS",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -209,9 +245,33 @@ mod tests {
 
     #[test]
     fn test_default_is_honeybadger() {
+        assert_eq!(MpcBackendKind::default(), MpcBackendKind::HoneyBadger);
+    }
+
+    #[test]
+    fn backend_party_minimums_are_enforced() {
+        assert_eq!(MpcBackendKind::Avss.minimum_parties(), 4);
+        assert!(MpcBackendKind::Avss.validate_party_count(4).is_ok());
         assert_eq!(
-            MpcBackendKind::default_backend(),
+            MpcBackendKind::Avss.validate_party_count(3).unwrap_err(),
+            MpcBackendError::InsufficientParties {
+                backend: MpcBackendKind::Avss,
+                actual: 3,
+                minimum: 4,
+            }
+        );
+
+        assert_eq!(MpcBackendKind::HoneyBadger.minimum_parties(), 5);
+        assert!(MpcBackendKind::HoneyBadger.validate_party_count(5).is_ok());
+        assert_eq!(
             MpcBackendKind::HoneyBadger
+                .validate_party_count(4)
+                .unwrap_err(),
+            MpcBackendError::InsufficientParties {
+                backend: MpcBackendKind::HoneyBadger,
+                actual: 4,
+                minimum: 5,
+            }
         );
     }
 

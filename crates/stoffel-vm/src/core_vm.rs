@@ -10,6 +10,7 @@ mod registration;
 mod table_memory;
 
 pub use builder::VirtualMachineBuilder;
+pub use effect_scheduler::VmCooperativeExecutionMetrics;
 pub use execution::VmEntryInvocation;
 
 /// The register-based virtual machine

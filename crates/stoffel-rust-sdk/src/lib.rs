@@ -46,6 +46,7 @@
 
 pub mod backend;
 pub mod client;
+mod client_value_codec;
 pub mod compiler;
 pub mod config;
 pub mod consensus;
@@ -81,8 +82,8 @@ pub use config::{
 };
 pub use consensus::{ConsensusGate, NodePublicKey, VerifiedOrdering};
 pub use coordinator::{
-    Coordinator, OffChainCoordinator, OffChainCoordinatorClient, OffChainCoordinatorServer,
-    ShareBound,
+    Coordinator, ExecutionId, OffChainCoordinator, OffChainCoordinatorClient,
+    OffChainCoordinatorServer, ShareBound,
 };
 pub use error::{ConsensusError, CoordinatorError, Error, ErrorCategory, NetworkError, Result};
 pub use input_file::{load_client_inputs_file, load_named_inputs_file};
@@ -101,13 +102,13 @@ pub use server::{
     StoffelServer,
 };
 pub use stoffel_vm_types::compiled_binary::FunctionType;
-pub use stoffel_vm_types::core_types::ShareType;
+pub use stoffel_vm_types::core_types::{ShareDataFormat, ShareType};
 pub use types::{
     ClientId, ClientInputValue, ClientOutputValue, ClientValueType, FieldElement,
     GeneratedProgramManifest, GroupElement, MaskIndex, PartyId, ProgramArgs, PublicKey, Round,
     Share, TypedClientInputs, TypedClientOutputs, Value, ValueSummary,
 };
-pub use vm::LocalClientOutput;
+pub use vm::{LocalClientOutput, LocalPartyShareOutput, LocalShareExecutionOutput, OpaqueShare};
 
 #[derive(Debug, Clone)]
 enum ProgramSource {
@@ -353,7 +354,9 @@ impl Stoffel {
     /// Attach one coordinator client input set for local networked execution.
     ///
     /// This is distinct from named function parameters. It feeds programs that
-    /// read secret client values through `ClientStore.take_share(client_slot, i)`.
+    /// read secret client values through `ClientStore`. Values are semantic:
+    /// fixed-point positions declared by the program manifest are scaled
+    /// automatically before secret sharing.
     pub fn with_client_input<V>(mut self, client_slot: u64, values: &[V]) -> Self
     where
         V: Clone + Into<Value>,
@@ -531,6 +534,27 @@ impl Stoffel {
         vm::execute_local(&runtime, &entry).await
     }
 
+    /// Execute `main` locally when its VM return must remain secret-shared.
+    ///
+    /// Unlike [`Self::execute_local`], this method requires exactly one secret
+    /// VM return share per party. It never compares or reconstructs payload
+    /// bytes. Each share and that party's printed output are paired in a
+    /// [`LocalPartyShareOutput`].
+    pub async fn execute_local_returning_party_shares(self) -> Result<LocalShareExecutionOutput> {
+        self.execute_local_function_returning_party_shares("main")
+            .await
+    }
+
+    /// Named-function variant of [`Self::execute_local_returning_party_shares`].
+    #[tracing::instrument(skip_all, fields(function = name))]
+    pub async fn execute_local_function_returning_party_shares(
+        self,
+        name: &str,
+    ) -> Result<LocalShareExecutionOutput> {
+        let (runtime, entry) = self.build_for_local_execution(name)?;
+        vm::execute_local_returning_party_shares(&runtime, &entry).await
+    }
+
     /// Execute `main` locally and also return the program's printed output.
     ///
     /// Useful when the result a client cares about is emitted with `print`
@@ -694,7 +718,7 @@ impl Stoffel {
                     .to_owned(),
             ));
         }
-        let parameter_types = local_source_parameter_types(&self.source, name)?;
+        let source_parameter_types = local_source_parameter_types(&self.source, name)?;
         let mut probe = self.clone();
         probe.inputs.clear();
         let probe_runtime = probe.build()?;
@@ -716,14 +740,21 @@ impl Stoffel {
             .iter()
             .enumerate()
             .map(|(index, value)| {
-                if parameter_types
+                let source_marks_secret = source_parameter_types
                     .as_ref()
                     .and_then(|types| types.get(index))
-                    .is_some_and(|ty| !local_parameter_type_is_secret(ty))
+                    .map(|ty| local_parameter_type_is_secret(ty));
+                let bytecode_marks_secret = function
+                    .parameter_types()
+                    .get(index)
+                    .map(function_type_is_secret);
+                if source_marks_secret
+                    .or(bytecode_marks_secret)
+                    .unwrap_or(true)
                 {
-                    crate::program::LocalInputShape::clear_from_value(value)
-                } else {
                     crate::program::LocalInputShape::secret_from_value(value)
+                } else {
+                    crate::program::LocalInputShape::clear_from_value(value)
                 }
             })
             .collect::<Vec<_>>();
@@ -865,6 +896,20 @@ fn local_parameter_type_is_secret(ty: &str) -> bool {
             || character == ']')
     })
     .any(|token| token == "secret" || token == "Share" || token.contains("secret"))
+}
+
+fn function_type_is_secret(ty: &stoffel_vm_types::compiled_binary::FunctionType) -> bool {
+    use stoffel_vm_types::compiled_binary::FunctionType;
+
+    match ty {
+        FunctionType::Secret(_) => true,
+        FunctionType::List(element) => function_type_is_secret(element),
+        FunctionType::Dict(key, value) => {
+            function_type_is_secret(key) || function_type_is_secret(value)
+        }
+        FunctionType::Generic(_, arguments) => arguments.iter().any(function_type_is_secret),
+        _ => false,
+    }
 }
 
 fn ordered_inputs_for_parameters(

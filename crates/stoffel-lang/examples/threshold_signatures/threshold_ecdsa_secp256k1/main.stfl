@@ -1,14 +1,19 @@
 # Threshold ECDSA signature over secp256k1.
 #
-# This keeps the protocol in Stoffel source and uses VM primitives for field
-# inversion and extracting x(R) mod q.
+# The two nonlinear preprocessing products are issued as one batch.  If
+#   delta = gamma * nonce
+#   blinded_key = gamma * secret_key
+# then opening delta reveals neither secret, while
+#   delta^-1 * (gamma*e + blinded_key*r) = nonce^-1 * (e + secret_key*r).
+# The nonce's AVSS commitment is already nonce*G, so no open-in-the-exponent
+# round is needed.
 #
 # Result layout: r(32-byte big-endian) || s(32-byte big-endian) ||
 # SEC1 compressed pk(33).
 
 def main() -> bytes:
   var client_count = ClientStore.get_number_clients()
-  var secret_key: secret int64 = Share.random()
+  var secret_key: secret int64 = Share.random_field()
   var public_key = secret_key.get_commitment(0)
 
   var message = Bytes.from_string("stoffel-avss-threshold-ecdsa-demo-message-v1")
@@ -18,24 +23,25 @@ def main() -> bytes:
     var message_share = ClientStore.take_share(0, 0)
     message_field = message_share.open_field()
 
-  var gamma: secret int64 = Share.random()
-  var nonce: secret int64 = Share.random()
-  var delta_share = gamma.mul(nonce)
-  var delta = delta_share.open_field()
-  var delta_inverse = Crypto.field_inv(delta, "secp256k1")
-  var nonce_inverse = gamma.mul_field(delta_inverse)
+  var gamma: secret int64 = Share.random_field()
+  var nonce: secret int64 = Share.random_field()
+  var products = Share.batch_mul(
+    [gamma, gamma],
+    [nonce, secret_key],
+  )
+  var delta_inverse = Field.inverse(products[0].open_field())
 
-  var nonce_point = nonce.open_exp("secp256k1")
+  var nonce_point = nonce.get_commitment(0)
   var r = Crypto.point_x_to_field(nonce_point, "secp256k1")
 
-  var secret_over_nonce = secret_key.mul(nonce_inverse)
-  var message_over_nonce = nonce_inverse.mul_field(message_field)
-  var scaled_secret = secret_over_nonce.mul_field(r)
-  var response_share = message_over_nonce.add(scaled_secret)
+  var masked_numerator = gamma.mul_field(message_field).add(
+    products[1].mul_field(r),
+  )
+  var response_share = masked_numerator.mul_field(delta_inverse)
   var response = response_share.open_field()
 
   if client_count > 0 and Mpc.has_capability("client-output"):
-    var r_share = Share.from_clear(1).mul_field(r)
+    var r_share = secret_key.mul_scalar(0).add_field(r)
     var output_shares: list[Share] = [r_share, response_share]
     MpcOutput.send_to_client(0, output_shares)
 

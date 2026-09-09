@@ -8,15 +8,21 @@
 #
 # The AES circuit is long-running. To change the packaged program/backend:
 #   STOFFEL_PROGRAM=/app/programs/client_mul.stflb STOFFEL_MPC_BACKEND=honeybadger docker compose up --build
+# The default execution ID below is only for this example stack. Set STOFFEL_EXECUTION_ID to a
+# fresh nonzero 64-hex-character value for each real or overlapping invocation.
 
 x-party-common: &party-common
   build:
     context: .
     dockerfile: Dockerfile
+    additional_contexts:
+      coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}"
+      networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1}"
   networks:
     stoffel-net:
   volumes:
     - stoffel-local-store:/app/local-store
+  cap_add: [NET_ADMIN]
   environment: &party-env
     STOFFEL_AUTH_TOKEN: ${STOFFEL_AUTH_TOKEN:-stoffel-compose-honeybadger-token}
     STOFFEL_N_PARTIES: ${STOFFEL_N_PARTIES:-5}
@@ -25,15 +31,22 @@ x-party-common: &party-common
     STOFFEL_ENTRY: ${STOFFEL_ENTRY:-main}
     STOFFEL_MPC_BACKEND: ${STOFFEL_MPC_BACKEND:-honeybadger}
     STOFFEL_MPC_CURVE: ${STOFFEL_MPC_CURVE:-bls12-381}
+    STOFFEL_EXECUTION_ID: "${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}"
     RUST_MIN_STACK: ${RUST_MIN_STACK:-67108864}
     RUST_LOG: ${RUST_LOG:-info}
     RUST_BACKTRACE: "1"
+    NET_RTT_MS: "${NET_RTT_MS:-0}"
+    NET_PEER_IPS: "172.28.0.10,172.28.0.11,172.28.0.12,172.28.0.13,172.28.0.14"
+    NET_LOSS: "${NET_LOSS:-}"
+    NET_BANDWIDTH: "${NET_BANDWIDTH:-}"
 
 services:
   coordinator:
     build:
       context: .
       dockerfile: docker/coordinator.Dockerfile
+      additional_contexts:
+        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}"
     container_name: stoffel-coordinator
     hostname: coordinator
     command:
@@ -43,6 +56,8 @@ services:
       - "31415"
       - --hash
       - "0000000000000000000000000000000000000000000000000000000000000000"
+      - --execution-id
+      - "${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}"
       - --server-cert
       - /app/ids/server_cert.crt
       - --server-key
@@ -92,6 +107,7 @@ services:
       STOFFEL_LOCAL_STORE: /app/local-store/party-0.redb
       STOFFEL_CERT: /app/ids/nodes/cert0.crt
       STOFFEL_KEY: /app/ids/nodes/key0.der
+      NET_EXTRA_RTT_MS: "${PARTY0_EXTRA_RTT_MS:-0}"
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.10
@@ -129,6 +145,7 @@ services:
       STOFFEL_LOCAL_STORE: /app/local-store/party-1.redb
       STOFFEL_CERT: /app/ids/nodes/cert1.crt
       STOFFEL_KEY: /app/ids/nodes/key1.der
+      NET_EXTRA_RTT_MS: "${PARTY1_EXTRA_RTT_MS:-0}"
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.11
@@ -158,6 +175,7 @@ services:
       STOFFEL_LOCAL_STORE: /app/local-store/party-2.redb
       STOFFEL_CERT: /app/ids/nodes/cert2.crt
       STOFFEL_KEY: /app/ids/nodes/key2.der
+      NET_EXTRA_RTT_MS: "${PARTY2_EXTRA_RTT_MS:-0}"
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.12
@@ -187,6 +205,7 @@ services:
       STOFFEL_LOCAL_STORE: /app/local-store/party-3.redb
       STOFFEL_CERT: /app/ids/nodes/cert3.crt
       STOFFEL_KEY: /app/ids/nodes/key3.der
+      NET_EXTRA_RTT_MS: "${PARTY3_EXTRA_RTT_MS:-0}"
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.13
@@ -216,6 +235,7 @@ services:
       STOFFEL_LOCAL_STORE: /app/local-store/party-4.redb
       STOFFEL_CERT: /app/ids/nodes/cert4.crt
       STOFFEL_KEY: /app/ids/nodes/key4.der
+      NET_EXTRA_RTT_MS: "${PARTY4_EXTRA_RTT_MS:-0}"
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.14

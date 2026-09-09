@@ -1,5 +1,8 @@
 # syntax=docker/dockerfile:1.4
 
+# Supply `--build-context coordinator=../stoffel-mpc-coordinator` for a local
+# build. Compose supplies the matching fixes branch automatically by default.
+
 FROM rustlang/rust:nightly-bookworm AS chef
 
 RUN apt-get update && apt-get install -y \
@@ -15,11 +18,18 @@ WORKDIR /build
 FROM chef AS planner
 
 COPY . .
+# Keep the external workspace outside /build so Cargo does not attach its
+# workspace-inherited manifests to the Stoffel workspace.
+COPY --from=coordinator . /opt/stoffel-coordinator
 
 RUN mkdir -p /build/.cargo && \
     printf '%s\n' \
       '[net]' \
       'git-fetch-with-cli = true' \
+      '' \
+      '[patch."https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git"]' \
+      'stoffel-mpc-coordinator-off-chain = { path = "/opt/stoffel-coordinator/crates/off-chain" }' \
+      'stoffel-mpc-coordinator-shared = { path = "/opt/stoffel-coordinator/crates/coord-shared" }' \
       '' \
       > /build/.cargo/config.toml
 
@@ -32,6 +42,7 @@ ARG PROFILE_BUILD=false
 
 COPY --from=planner /build/recipe.json /build/recipe.json
 COPY --from=planner /build/.cargo /build/.cargo
+COPY --from=planner /opt/stoffel-coordinator /opt/stoffel-coordinator
 
 RUN mkdir -p ~/.ssh && \
     ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null || true
@@ -40,17 +51,25 @@ RUN --mount=type=ssh \
     --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=stoffel-benchmark-target-${PROFILE_BUILD}-${ENABLE_NAT},target=/build/target,sharing=locked \
+    export RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8"; \
     if [ "$PROFILE_BUILD" = "true" ]; then \
-        export CARGO_PROFILE_RELEASE_DEBUG=1; \
+        export CARGO_PROFILE_RELEASE_DEBUG=2; \
+        export CARGO_PROFILE_RELEASE_STRIP=none; \
+        export RUSTFLAGS="$RUSTFLAGS -C force-frame-pointers=yes"; \
     fi; \
     cargo chef cook --release --recipe-path recipe.json
 
 COPY . .
+COPY --from=coordinator . /opt/stoffel-coordinator
 
 RUN mkdir -p /build/.cargo && \
     printf '%s\n' \
       '[net]' \
       'git-fetch-with-cli = true' \
+      '' \
+      '[patch."https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git"]' \
+      'stoffel-mpc-coordinator-off-chain = { path = "/opt/stoffel-coordinator/crates/off-chain" }' \
+      'stoffel-mpc-coordinator-shared = { path = "/opt/stoffel-coordinator/crates/coord-shared" }' \
       '' \
       > /build/.cargo/config.toml
 
@@ -58,13 +77,16 @@ RUN --mount=type=ssh \
     --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=stoffel-benchmark-target-${PROFILE_BUILD}-${ENABLE_NAT},target=/build/target,sharing=locked \
+    export RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8"; \
     if [ "$PROFILE_BUILD" = "true" ]; then \
-        export CARGO_PROFILE_RELEASE_DEBUG=1; \
+        export CARGO_PROFILE_RELEASE_DEBUG=2; \
+        export CARGO_PROFILE_RELEASE_STRIP=none; \
+        export RUSTFLAGS="$RUSTFLAGS -C force-frame-pointers=yes"; \
     fi; \
     if [ "$ENABLE_NAT" = "true" ]; then \
-        cargo build --release --package stoffel-vm-runner --bin stoffel-run --features nat; \
+        cargo build --release --package stoffel-vm-runner --bin stoffel-run --features nat,statistics; \
     else \
-        cargo build --release --package stoffel-vm-runner --bin stoffel-run; \
+        cargo build --release --package stoffel-vm-runner --bin stoffel-run --features statistics; \
     fi; \
     if [ "$PROFILE_BUILD" != "true" ]; then \
         strip target/release/stoffel-run; \
@@ -75,8 +97,11 @@ RUN --mount=type=ssh \
 RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=stoffel-benchmark-target-${PROFILE_BUILD}-${ENABLE_NAT},target=/build/target,sharing=locked \
+    export RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8"; \
     if [ "$PROFILE_BUILD" = "true" ]; then \
-        export CARGO_PROFILE_RELEASE_DEBUG=1; \
+        export CARGO_PROFILE_RELEASE_DEBUG=2; \
+        export CARGO_PROFILE_RELEASE_STRIP=none; \
+        export RUSTFLAGS="$RUSTFLAGS -C force-frame-pointers=yes"; \
     fi; \
     cargo build --release --package stoffellang && \
     mkdir -p /build/programs && \
@@ -89,7 +114,14 @@ RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registr
       --mpc-backend honeybadger \
       --mpc-curve bls12-381 \
       --output /build/programs/mpc_aes128_circuit.stflb \
-      /build/crates/stoffel-lang/examples/mpc_aes128_circuit/main.stfl
+      /build/crates/stoffel-lang/examples/mpc_aes128_circuit/main.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --opt-level 3 \
+      --mpc-backend avss \
+      --mpc-curve secp256k1 \
+      --output /build/programs/threshold_ecdsa_secp256k1.stflb \
+      /build/crates/stoffel-lang/examples/threshold_signatures/threshold_ecdsa_secp256k1/main.stfl
 
 FROM debian:bookworm-slim AS runtime
 
@@ -111,7 +143,8 @@ WORKDIR /app
 COPY --from=builder /build/artifacts/stoffel-run /app/stoffel-run
 COPY --from=builder /build/programs /app/programs
 COPY docker/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY docker/configure-peer-netem.sh /app/configure-peer-netem.sh
+RUN chmod +x /app/entrypoint.sh /app/configure-peer-netem.sh
 
 ENV STOFFEL_PROGRAM="/app/programs/mpc_aes128_circuit.stflb"
 ENV STOFFEL_ENTRY="main"

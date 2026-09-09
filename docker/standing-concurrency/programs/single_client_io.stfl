@@ -1,0 +1,15 @@
+# Small online MPC workload for standing-node concurrency validation.
+#
+# One client contributes one secret value. The program performs an MPC
+# multiplication (which must cooperatively yield while network work is in
+# flight) and returns one secret output to that client.
+
+def main() -> int64:
+  var input: secret int64 = ClientStore.take_share(0, 0)
+  var factor = Share.from_clear_int(3, 64)
+  var product = Share.mul(input, factor)
+
+  if Mpc.has_capability("client-output"):
+    product.send_to_client(0)
+
+  return Share.open(product)

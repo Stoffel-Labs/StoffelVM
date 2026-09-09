@@ -5,6 +5,7 @@ use stoffel_vm_types::compiled_binary::{
     utils::{load_from_file, try_to_vm_functions},
     MpcBackend,
 };
+use stoffel_vm_types::instructions::Instruction;
 use stoffellang::{compile_file, convert_to_binary, save_to_file, CompilerOptions};
 
 fn manifest_dir() -> PathBuf {
@@ -155,6 +156,37 @@ fn canonical_examples_compile_to_vm_bytecode_impl() {
     }
 
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn secp256k1_ecdsa_keeps_preprocessing_minimal_and_batched() {
+    let path =
+        manifest_dir().join("examples/threshold_signatures/threshold_ecdsa_secp256k1/main.stfl");
+    let program = compile_source_file(&path).expect("threshold ECDSA example compiles");
+    let demand = program.client_io_manifest.preprocessing_demand;
+
+    assert_eq!(
+        demand.triples, 2,
+        "ECDSA needs exactly two nonlinear products"
+    );
+    assert_eq!(demand.randoms, 3, "key, mask, and nonce are random fields");
+    assert_eq!(demand.prandbits, 0);
+    assert_eq!(demand.prandints, 0);
+    assert!(!demand.dynamic);
+
+    let call_count = |symbol: &str| {
+        program
+            .main_chunk
+            .instructions
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::CALL(name) if name == symbol))
+            .count()
+    };
+
+    assert_eq!(call_count("Share.batch_mul"), 1);
+    assert_eq!(call_count("Share.mul"), 0);
+    assert_eq!(call_count("Share.open_exp"), 0);
+    assert_eq!(call_count("open_exp"), 0);
 }
 
 #[test]

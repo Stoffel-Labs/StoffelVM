@@ -1,6 +1,6 @@
 [package]
 name = "stoffel-bindgen"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Build-time Rust binding generation for Stoffel programs"
 license = "Apache-2.0"
@@ -11,5 +11,5 @@ categories = ["development-tools::build-utils", "compilers"]
 publish = true
 
 [dependencies]
-stoffellang = { version = "=0.1.2", path = "../stoffel-lang" }
+stoffellang = { version = "=0.2.0", path = "../stoffel-lang" }
 thiserror = "=2.0.18"

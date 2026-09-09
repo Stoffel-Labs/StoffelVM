@@ -18,6 +18,7 @@ use crate::vm_state::mpc_operation::{
     PendingMpcBuiltinCall, PendingMpcBuiltinOperation, PendingMpcOperation,
 };
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::sync::Arc;
 use stoffel_vm_types::core_types::{
     Closure, ObjectRef, ShareData, ShareType, TableRef, Upvalue, Value,
@@ -66,8 +67,8 @@ struct DrainedCallArgs {
     values: SmallVec<[Value; 8]>,
 }
 
-struct ResolvedCallTarget {
-    name: String,
+struct ResolvedCallTarget<'name> {
+    name: Cow<'name, str>,
     target: CallTarget,
 }
 
@@ -160,7 +161,7 @@ impl VMState {
                 if arg_count == 0 {
                     let checkpoint = CallStackCheckpoint::new(self.call_stack.len());
                     let outcome = self.call_foreign_function_internal(
-                        &function_name,
+                        function_name.as_ref(),
                         foreign_func.as_ref(),
                         &[],
                         hooks_enabled,
@@ -172,7 +173,7 @@ impl VMState {
                 } else {
                     let args = self.drain_call_args(hooks_enabled)?;
                     let outcome = match self.call_foreign_function_internal(
-                        &function_name,
+                        function_name.as_ref(),
                         foreign_func.as_ref(),
                         args.as_slice(),
                         hooks_enabled,
@@ -218,7 +219,10 @@ impl VMState {
         Ok(target)
     }
 
-    fn resolve_call_target(&mut self, function_name: &str) -> VmResult<ResolvedCallTarget> {
+    fn resolve_call_target<'name>(
+        &mut self,
+        function_name: &'name str,
+    ) -> VmResult<ResolvedCallTarget<'name>> {
         if let Some((receiver_type, method_name)) = function_name.split_once('.') {
             if self
                 .program
@@ -241,7 +245,7 @@ impl VMState {
             }
 
             return Ok(ResolvedCallTarget {
-                name: function_name.to_owned(),
+                name: Cow::Borrowed(function_name),
                 target: self.call_target(function_name)?,
             });
         }
@@ -252,7 +256,7 @@ impl VMState {
         let direct_err = match self.call_target(function_name) {
             Ok(target) => {
                 return Ok(ResolvedCallTarget {
-                    name: function_name.to_owned(),
+                    name: Cow::Borrowed(function_name),
                     target,
                 });
             }
@@ -276,9 +280,10 @@ impl VMState {
                 .method_target_name(&actual, function_name)
                 .map(str::to_owned)
             {
+                let target = self.program.call_target(&canonical_name)?;
                 return Ok(ResolvedCallTarget {
-                    name: canonical_name.clone(),
-                    target: self.program.call_target(&canonical_name)?,
+                    name: Cow::Owned(canonical_name),
+                    target,
                 });
             }
 

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "stoffel-run release tag, e.g. stoffel-run-v0.1.0"
+        description: "stoffel-run release tag, e.g. stoffel-run-v0.2.0"
         required: true
         type: string
 

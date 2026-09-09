@@ -1,0 +1,19 @@
+[package]
+name = "fedavg"
+version = "0.1.0"
+
+[mpc]
+backend = "honeybadger"
+parties = 5
+threshold = 1
+
+[build]
+source = "main.stfl"
+target_dir = "target"
+optimization_level = 3
+# Raise the optimizer budgets so the whole circuit fully unrolls/inlines, letting
+# the round-minimizing scheduler collapse the multiplies into ~426 MPC rounds
+# (vs ~3306 at default -O3 budgets). Only consulted at -O3.
+inline_budget = 100000000
+unroll_budget = 100000000
+unroll_max_expansion = 100000000

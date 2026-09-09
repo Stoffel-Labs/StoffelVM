@@ -14,6 +14,15 @@ MPC_CURVE="${STOFFEL_MPC_CURVE:-bls12-381}"
 BASE_PORT="${STOFFEL_BASE_PORT:-19100}"
 AUTH_TOKEN="${STOFFEL_AUTH_TOKEN:-stoffel-local-examples-token}"
 TIMEOUT_SECONDS="${STOFFEL_MPC_TIMEOUT_SECONDS:-90}"
+EXECUTION_ID="${STOFFEL_EXECUTION_ID:-}"
+
+if [ -z "$EXECUTION_ID" ]; then
+  EXECUTION_ID="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+fi
+if ! [[ "$EXECUTION_ID" =~ ^[[:xdigit:]]{64}$ ]] || [[ "$EXECUTION_ID" =~ ^0{64}$ ]]; then
+  echo "STOFFEL_EXECUTION_ID must be a nonzero 64-character hexadecimal value" >&2
+  exit 2
+fi
 
 if [ "$N_PARTIES" -lt 2 ]; then
   echo "run_mpc_local.sh requires at least 2 parties; got STOFFEL_N_PARTIES=${N_PARTIES}" >&2
@@ -63,6 +72,7 @@ run_party party0 \
   --threshold "$THRESHOLD" \
   --mpc-backend "$MPC_BACKEND" \
   --mpc-curve "$MPC_CURVE" \
+  --execution-id "$EXECUTION_ID" \
   --local-store "${WORK_DIR}/party0.redb"
 
 sleep 2
@@ -78,6 +88,7 @@ for ((party_id = 1; party_id < N_PARTIES; party_id++)); do
     --threshold "$THRESHOLD" \
     --mpc-backend "$MPC_BACKEND" \
     --mpc-curve "$MPC_CURVE" \
+    --execution-id "$EXECUTION_ID" \
     --local-store "${WORK_DIR}/party${party_id}.redb"
 done
 

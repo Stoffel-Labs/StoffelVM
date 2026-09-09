@@ -16,7 +16,7 @@ exercises.
 | Lists, dictionaries, nested generics, indexing, assignment through index | `language_policy_engine`, `language_mpc_schemas`, `local_dynamic_workflow`, `local_collections`, `local_nested_generics` |
 | Dynamic objects and runtime field access | `local_dynamic_workflow` |
 | Object schema declarations, base object syntax, secret-typed fields | `language_mpc_schemas` |
-| Secret values and MPC secret flow | `mpc_boolean_circuit`, `mpc_aes128_circuit`, `mpc_client_federated_average`, `avss_certificate/sign`, `mpc_share_toolkit` |
+| Secret values and MPC secret flow | `mpc_boolean_circuit`, `mpc_aes128_circuit`, `mpc_sha256_client_io`, `mpc_client_federated_average`, `avss_certificate/sign`, `mpc_share_toolkit` |
 | `if`/`elif`/`else`, `while`, `for` over ranges, lists, and strings | `language_policy_engine`, `local_control_flow`, `local_text_processing` |
 | Unary `-` and `not`, arithmetic, comparison, boolean operators | `language_policy_engine`, `local_control_flow`, `local_uint64_inverse` |
 | `mod` (floored modulo) vs `%` (truncating remainder) | `number_theory/clear/modinv_crt_int64`, `number_theory/clear/xgcd_iterative_int64` |
@@ -52,7 +52,7 @@ generators or exception handling).
 | `Mpc.party_id`, `n_parties`, `threshold`, `is_ready`, `instance_id`, `protocol_name`, `curve`, `field`, `has_capability`, `capabilities` | `mpc_runtime_info` |
 | `Mpc.rand`, `Mpc.rand_int` | `mpc_share_toolkit` |
 | `ClientStore.take_share`, `take_share_fixed`, `get_number_clients` | `avss_certificate/sign`, `mpc_client_federated_average` |
-| `MpcOutput.send_to_client` and `Share.send_to_client` | `mpc_client_private_score`, `mpc_share_toolkit`, `avss_certificate/sign` |
+| `MpcOutput.send_to_client` and `Share.send_to_client` | `mpc_client_private_score`, `mpc_sha256_client_io`, `mpc_share_toolkit`, `avss_certificate/sign` |
 | Share creation, arithmetic, scalar ops, integer and fixed-point opening, batch opening, metadata, commitments, field arithmetic, client output, exponent opening | `mpc_boolean_circuit`, `mpc_aes128_circuit`, `mpc_client_private_score`, `mpc_share_toolkit`, `mpc_client_federated_average`, `mpc_share_arithmetic`, threshold signature examples |
 | `Bytes.concat`, `Bytes.from_string` | threshold signature examples, `mpc_share_toolkit` |
 | `Crypto.sha256`, `sha512`, `hash_to_field`, `field_inv`, `point_x_to_field`, `field_to_scalar_bytes`, `point_to_sec1`, `hash_to_g1` | threshold signature examples, `avss_certificate/keygen`, `avss_share_auditor` |

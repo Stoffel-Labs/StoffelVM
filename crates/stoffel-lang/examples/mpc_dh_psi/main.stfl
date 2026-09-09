@@ -1,54 +1,58 @@
-# run-args: --client-input 0=10 --client-input 0=20 --client-input 0=30 --client-input 1=20 --client-input 1=30 --client-input 1=40 --expected-output-clients 2
-# Diffie-Hellman private set intersection (DH-PSI), built on the OPRF.
+# Threshold Diffie-Hellman PSI OPRF service.
 #
-# Two clients each contribute a set. Every element is mapped through the same
-# threshold-shared-key OPRF tag  H(e)^k  (see mpc_oprf). Equal elements map to
-# equal tags, so the intersection is found by comparing tags -- and because the
-# tags are pseudorandom, comparing them reveals nothing but the matches.
+# Clients hash each element to BLS12-381 G1 and blind the point with a fresh
+# non-zero scalar. A compressed 48-byte blinded point is packed into two
+# 24-byte field limbs for the existing secret client-input channel. Opening
+# those limbs reveals only uniformly blinded public points. The nodes then
+# apply one threshold-shared scalar key without ever reconstructing that key.
 #
-# Here the cardinality of the intersection is returned to both clients.
-#
-# (As with mpc_oprf, a production deployment blinds elements client-side so the
-# servers never see them; this example shows the tag-and-match mechanism.)
+# See crates/stoffel-rust-sdk/examples/dh_psi.rs for the complete client flow.
 
-def oprf_tag(x: bytes, key: Share) -> bytes:
-  return key.open_exp_custom(Crypto.hash_to_g1(x))
+def main() -> bytes:
+  var set_size = 1000
+  var limbs_per_point = 2
+  var limb_payload_bytes = 24
+  var point_bytes = 48
+  var key: secret int64 = Share.random_field()
 
-def main() -> int64:
-  var na = 3
-  var nb = 3
-  var key: secret int64 = Share.random()
+  # The client-IO planner needs separate literal client slots. Each client
+  # contributes two full-field shares per blinded G1 point.
+  var packed: list[Share] = list((set_size + set_size) * limbs_per_point)
+  var a_limb = 0
+  while a_limb < set_size * limbs_per_point:
+    packed[a_limb] = ClientStore.take_share(0, a_limb)
+    a_limb = a_limb + 1
+  var b_limb = 0
+  while b_limb < set_size * limbs_per_point:
+    packed[set_size * limbs_per_point + b_limb] = ClientStore.take_share(1, b_limb)
+    b_limb = b_limb + 1
 
-  # Tag client 0's set (literal slot so the client-IO manifest can resolve it).
-  var tags_a: list[bytes] = []
-  var i = 0
-  while i < na:
-    var ea: secret int64 = ClientStore.take_share(0, i)
-    tags_a.append(oprf_tag(ea.open_field(), key))
-    i = i + 1
+  # These field limbs encode public, independently blinded points. Reconstruct
+  # all limbs in one batch, then rebuild each compressed G1 generator in
+  # ordinary Stoffel list[u8] storage.
+  var opened_limbs: list[bytes] = Share.batch_open_field(packed)
+  var generators: list[bytes] = list(set_size + set_size)
+  var point_index = 0
+  while point_index < set_size + set_size:
+    var point: bytes = list(point_bytes)
+    extend(point, slice(opened_limbs[point_index * limbs_per_point], 0, limb_payload_bytes))
+    extend(point, slice(opened_limbs[point_index * limbs_per_point + 1], 0, limb_payload_bytes))
+    generators[point_index] = point
+    point_index = point_index + 1
 
-  # Tag client 1's set.
-  var tags_b: list[bytes] = []
-  i = 0
-  while i < nb:
-    var eb: secret int64 = ClientStore.take_share(1, i)
-    tags_b.append(oprf_tag(eb.open_field(), key))
-    i = i + 1
+  # Evaluate k*P for all blinded points in one batched exponent-opening round.
+  # Only group elements are reconstructed; the scalar key remains shared.
+  var keys: list[Share] = list(set_size + set_size)
+  var key_index = 0
+  while key_index < set_size + set_size:
+    keys[key_index] = key
+    key_index = key_index + 1
+  var evaluated: list[bytes] = Share.batch_open_exp_custom(keys, generators, "bls12-381-g1")
 
-  # |A intersect B| = number of client-0 tags that also appear in client 1's set.
-  var count = 0
-  i = 0
-  while i < na:
-    var j = 0
-    while j < nb:
-      if tags_a[i] == tags_b[j]:
-        count = count + 1
-      j = j + 1
-    i = i + 1
-
-  if Mpc.has_capability("client-output"):
-    Share.from_clear(count).send_to_client(0)
-    Share.from_clear(count).send_to_client(1)
-
-  assert count == 2, "{10,20,30} intersect {20,30,40} has cardinality 2"
-  return count
+  # Reserve the 96 KB response once and append each evaluated point in bulk.
+  var response: bytes = list((set_size + set_size) * point_bytes)
+  point_index = 0
+  while point_index < set_size + set_size:
+    extend(response, evaluated[point_index])
+    point_index = point_index + 1
+  return response

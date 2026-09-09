@@ -22,9 +22,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned Rust nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-08-21
           components: rustfmt, clippy
 
       - name: Cache cargo registry
@@ -34,16 +35,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-nightly-
+            ${{ runner.os }}-cargo-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-        continue-on-error: true  # Don't fail on clippy warnings initially
 
       - name: Build release runner
         run: cargo build --release --package stoffel-vm-runner --bin stoffel-run
@@ -62,25 +62,13 @@ jobs:
             --skip tests::vm_mesh_integration \
             --skip tests::vm_mpc_integration \
             --skip tests::vm_turmoil_e2e \
-            --skip optimized_aes_at_o3_matches_nist_vector \
-            --skip init_default_project_builds_with_cargo_and_sdk_bindings \
-            --skip common_command_aliases_work \
-            --skip run_executes_default_secret_bool_circuit_project \
-            --skip run_accepts_numeric_bits_for_secret_bool_list_inputs \
-            --skip run_executes_bytecode_file \
-            --skip run_auto_discovers_built_bytecode \
-            --skip run_recompiles_when_project_source_is_newer_than_bytecode \
-            --skip run_ignores_stray_bytecode_when_project_source_is_newer \
-            --skip run_recompiles_when_project_config_is_newer_than_bytecode \
-            --skip run_folder_compiles_project_when_bytecode_is_missing \
-            --skip run_rejects_non_project_directories_inside_a_project \
-            --skip dev_once_executes_default_secret_bool_circuit_project \
-            --skip dev_once_explains_input_mistakes \
-            --skip dev_once_uses_explicit_source_file \
-            --skip common_flag_aliases_work_or_explain_defaults \
-            --skip run_rejects_build_only_flags_and_honors_program_info \
-            --skip run_validates_entry_and_inputs_before_timeout \
-            --skip source_and_bytecode_extensions_are_case_insensitive
+            --skip optimized_aes_at_o3_matches_nist_vector
+
+      - name: Run heavyweight CLI integration tests serially
+        run: cargo test -p stoffel-cli --test cli -- --ignored --test-threads=1
+
+      - name: Run local coordinator lifecycle regressions serially
+        run: cargo test -p stoffel-vm-runner --test local_coordinator_e2e -- --ignored --test-threads=1 --skip optimized_aes --skip batch_mul
 
       - name: Upload VM binary
         if: matrix.os == 'ubuntu-latest'
@@ -106,6 +94,9 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          build-contexts: |
+            coordinator=https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#dffffd6e8422dcd107de79730dc4c018cf21415b
+            networking=https://github.com/Stoffel-Labs/stoffel-networking.git#49a237aa5df3211224aedf97ab0bf084ad1c8d31
           push: false
           tags: stoffelvm:test
           cache-from: type=gha
@@ -124,6 +115,9 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          build-contexts: |
+            coordinator=https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#dffffd6e8422dcd107de79730dc4c018cf21415b
+            networking=https://github.com/Stoffel-Labs/stoffel-networking.git#49a237aa5df3211224aedf97ab0bf084ad1c8d31
           push: true
           tags: |
             ghcr.io/stoffel-labs/stoffelvm:latest

@@ -8,7 +8,7 @@ use ark_ec::{CurveGroup, PrimeGroup};
 use ark_serialize::CanonicalDeserialize;
 use std::time::Duration;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
-use stoffelnet::network_utils::ClientId;
+use stoffelnet::network_utils::{ClientId, NetworkError};
 
 const OUTPUT_SHARE_LIST_MAGIC: &[u8; 5] = b"VMOS1";
 
@@ -17,6 +17,17 @@ where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
+    /// Reserve the correlated random shares used to initialize one direct
+    /// client's input masks. Standing engines allocate atomically from their
+    /// execution-scoped LMDB lane; ephemeral engines consume the in-memory
+    /// preprocessing pool.
+    pub async fn reserve_client_input_masks(
+        &self,
+        num_shares: usize,
+    ) -> Result<Vec<RobustShare<F>>, String> {
+        self.reserve_random_shares(num_shares).await
+    }
+
     /// Initialize input shares from a client. This must be called after preprocessing.
     /// The client provides shares for all parties, and each party stores its own share.
     pub async fn init_client_input(
@@ -30,14 +41,19 @@ where
 
         let num_shares = shares.len();
         let local_shares = self
-            .reserve_random_shares(num_shares)
+            .reserve_client_input_masks(num_shares)
             .await
             .map_err(|e| format!("Failed to take random shares: {}", e))?;
 
         let mut node = self.clone_node().await;
         node.preprocess
             .input
-            .init(client_id, local_shares, num_shares, self.net.clone())
+            .init(
+                client_id,
+                local_shares,
+                num_shares,
+                self.protocol_net.clone(),
+            )
             .await
             .map_err(|e| format!("Failed to initialize client input: {:?}", e))?;
 
@@ -169,12 +185,40 @@ where
             }
         }
 
-        let transport_client_id = self.client_output_transport_id(client_id).await;
+        let transport_client_id = self.client_output_transport_id(client_id).await?;
         let node = self.clone_node().await;
-        node.output
-            .init(transport_client_id, shares, input_len, self.net.clone())
+        match node
+            .output
+            .init(
+                transport_client_id,
+                shares,
+                input_len,
+                self.protocol_net.clone(),
+            )
             .await
-            .map_err(|e| format!("OutputServer.init failed: {:?}", e))
+        {
+            Ok(()) => Ok(()),
+            Err(stoffelmpc_mpc::honeybadger::output::OutputError::NetworkError(
+                error @ (NetworkError::SendError | NetworkError::ClientNotFound(_)),
+            )) => {
+                // A threshold client legitimately disconnects after collecting
+                // enough valid output shares. A slower party can therefore see
+                // a closed connection even though the output was delivered and
+                // the MPC transcript completed. Treat delivery loss as local
+                // availability, not as a failure of the shared execution.
+                tracing::warn!(
+                    client_id,
+                    transport_client_id,
+                    ?error,
+                    "client output share could not be delivered"
+                );
+                Ok(())
+            }
+            Err(stoffelmpc_mpc::honeybadger::output::OutputError::NetworkError(error)) => {
+                Err(format!("OutputServer.init network failure: {error}"))
+            }
+            Err(error) => Err(format!("OutputServer.init failed: {error:?}")),
+        }
     }
 }
 

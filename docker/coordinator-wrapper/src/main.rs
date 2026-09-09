@@ -1,28 +1,33 @@
 use std::fs;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
-use ark_ec::CurveGroup;
-use ark_ff::FftField;
 use async_trait::async_trait;
 use clap::Parser;
 use jsonrpsee::{core::RpcResult, server::RpcModule};
 use stoffel_mpc_coordinator_off_chain::{
     ClientIdentity, CoordinatorRPCBaseServer, CoordinatorRPCServerConnectionBase,
-    CoordinatorRPCServerSharedBase, OffChainCoordinatorServer, StoffelCoordinatorRPCServer,
+    CoordinatorRPCServerSharedBase, ExecutionRegistration, InputAssignment, InputClientRange,
+    OffChainCoordinatorServer, StoffelCoordinatorRPCServer,
 };
 use stoffel_mpc_coordinator_shared::rpc::RPCServerConnection;
-use stoffel_mpc_coordinator_shared::{Round, ShareBound};
-use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
-use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+use stoffel_mpc_coordinator_shared::{ExecutionId, Round};
 use tokio::sync::Mutex;
 use x509_parser::prelude::*;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about,
+    long_about = "Run one long-lived off-chain coordinator. Executions are registered dynamically \
+or optionally pre-registered with --execution-id."
+)]
 struct Args {
-    #[arg(long)]
-    hash: String,
+    #[arg(long, requires = "execution_id")]
+    hash: Option<String>,
+
+    #[arg(long, value_parser = parse_nonzero_execution_id)]
+    execution_id: Option<ExecutionId>,
 
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     initial_mpc_nodes: Vec<String>,
@@ -39,14 +44,15 @@ struct Args {
     #[arg(long)]
     t: u64,
 
-    #[arg(long)]
+    #[arg(long, default_value_t = 0)]
     n_inputs: u64,
 
-    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    #[arg(long, value_delimiter = ',', num_args = 0..)]
     output_clients: Vec<String>,
 
-    #[arg(long, default_value = "secp256k1")]
-    mpc_curve: String,
+    /// Client certificates assigned to input indices, in global index order.
+    #[arg(long, value_delimiter = ',', num_args = 0..)]
+    input_clients: Vec<String>,
 
     #[arg(long, default_value = "honeybadger")]
     mpc_backend: String,
@@ -56,68 +62,78 @@ struct Args {
 
     #[arg(long, default_value_t = 31415)]
     port: u16,
+
+    /// Optional ordinary WebSocket bind address for signed browser-client RPC.
+    #[arg(long)]
+    browser_bind_addr: Option<String>,
+}
+
+fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
+    let execution_id = value.parse::<ExecutionId>()?;
+    if execution_id.is_zero() {
+        return Err("execution ID must be nonzero".to_owned());
+    }
+    Ok(execution_id)
 }
 
 #[derive(Clone)]
-struct CoordinatorConnection<F, S>
-where
-    F: FftField,
-    S: ShareBound<F>,
-{
-    base: CoordinatorRPCServerConnectionBase<F, S>,
-    _phantom: PhantomData<(F, S)>,
+struct CoordinatorConnection {
+    base: CoordinatorRPCServerConnectionBase,
 }
 
-impl<F, S> RPCServerConnection for CoordinatorConnection<F, S>
-where
-    F: FftField,
-    S: ShareBound<F>,
-{
-    type Internal = CoordinatorRPCServerSharedBase<S::ValueType>;
+impl RPCServerConnection for CoordinatorConnection {
+    type Internal = CoordinatorRPCServerSharedBase;
 
     fn new(internal: Arc<Mutex<Self::Internal>>, id: ClientIdentity) -> Self {
         Self {
             base: CoordinatorRPCServerConnectionBase::new(internal, id),
-            _phantom: PhantomData,
         }
     }
 
     fn into_rpc(self) -> RpcModule<Self> {
         let mut rpc = StoffelCoordinatorRPCServer::into_rpc(self.clone());
-        let base_rpc = CoordinatorRPCBaseServer::into_rpc(self.base);
-        rpc.merge(base_rpc).expect("merge coordinator RPC modules");
+        rpc.merge(CoordinatorRPCBaseServer::into_rpc(self.base))
+            .expect("merge coordinator RPC modules");
         rpc
     }
 }
 
 #[async_trait]
-impl<F, S> StoffelCoordinatorRPCServer for CoordinatorConnection<F, S>
-where
-    F: FftField,
-    S: ShareBound<F>,
-{
-    async fn start_preprocessing(&self) -> RpcResult<()> {
-        self.base.transition(Round::Preprocessing).await
+impl StoffelCoordinatorRPCServer for CoordinatorConnection {
+    async fn start_preprocessing(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::Preprocessing)
+            .await
     }
 
-    async fn reserve_input_masks(&self) -> RpcResult<()> {
-        self.base.transition(Round::InputMaskReservation).await
+    async fn reserve_input_masks(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::InputMaskReservation)
+            .await
     }
 
-    async fn collect_inputs(&self) -> RpcResult<()> {
-        self.base.transition(Round::InputCollection).await
+    async fn collect_inputs(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::InputCollection)
+            .await
     }
 
-    async fn start_mpc(&self) -> RpcResult<()> {
-        self.base.transition(Round::MPCExecution).await
+    async fn start_mpc(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::MPCExecution)
+            .await
     }
 
-    async fn send_output(&self) -> RpcResult<()> {
-        self.base.transition(Round::OutputDistribution).await
+    async fn send_output(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::OutputDistribution)
+            .await
     }
 
-    async fn finalize(&self) -> RpcResult<()> {
-        self.base.transition(Round::ProgramFinished).await
+    async fn finalize(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::ProgramFinished)
+            .await
     }
 }
 
@@ -125,84 +141,99 @@ where
 async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("Failed to install default crypto provider");
+        .expect("install rustls crypto provider");
 
     let args = Args::parse();
-    match args.mpc_curve.as_str() {
-        "bls12-381" | "bls12381" => {
-            start_for_curve::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>(args).await
-        }
-        "bn254" => start_for_curve::<ark_bn254::Fr, ark_bn254::G1Projective>(args).await,
-        "curve25519" => {
-            start_for_curve::<ark_curve25519::Fr, ark_curve25519::EdwardsProjective>(args).await
-        }
-        "ed25519" => start_for_curve::<ark_ed25519::Fr, ark_ed25519::EdwardsProjective>(args).await,
-        "secp256k1" => start_for_curve::<ark_secp256k1::Fr, ark_secp256k1::Projective>(args).await,
-        "p-256" | "p256" | "secp256r1" => {
-            start_for_curve::<ark_secp256r1::Fr, ark_secp256r1::Projective>(args).await
-        }
-        other => {
-            eprintln!("unsupported --mpc-curve '{other}'");
-            std::process::exit(2);
-        }
+    let public_keys = parse_public_keys(&args.initial_mpc_nodes);
+    let input_assignment = parse_input_assignment(&args.input_clients);
+    let assigned_inputs = input_assignment
+        .ranges
+        .iter()
+        .map(|range| range.count)
+        .sum::<u64>();
+    if !input_assignment.ranges.is_empty() && assigned_inputs != args.n_inputs {
+        panic!(
+            "--input-clients supplied {} identities for --n-inputs {}",
+            assigned_inputs, args.n_inputs
+        );
     }
-}
-
-async fn start_for_curve<F, G>(args: Args)
-where
-    F: FftField,
-    G: CurveGroup<ScalarField = F>,
-    RobustShare<F>: ShareBound<F>,
-    FeldmanShamirShare<F, G>: ShareBound<F>,
-{
-    match args.mpc_backend.as_str() {
-        "honeybadger" | "hb" => start_with_share::<F, RobustShare<F>>(args).await,
-        "avss" => start_with_share::<F, FeldmanShamirShare<F, G>>(args).await,
-        other => {
-            eprintln!("unsupported --mpc-backend '{other}'");
-            std::process::exit(2);
-        }
-    }
-}
-
-async fn start_with_share<F, S>(args: Args)
-where
-    F: FftField,
-    S: ShareBound<F>,
-{
-    let hash: [u8; 32] = hex::decode(&args.hash)
+    let mut state = CoordinatorRPCServerSharedBase::new(args.n, args.t, public_keys)
+        .expect("invalid coordinator roster");
+    if let Some(execution_id) = args.execution_id {
+        let program_hash = hex::decode(
+            args.hash
+                .as_deref()
+                .expect("--hash is required with --execution-id"),
+        )
         .expect("invalid hash")
         .try_into()
         .expect("hash must be 32 bytes");
+        let min_output_shares = match args.mpc_backend.as_str() {
+            "honeybadger" | "hb" => 2 * args.t + 1,
+            "avss" => args.t + 1,
+            other => panic!("unsupported --mpc-backend {other:?}"),
+        };
+        state
+            .register_execution(ExecutionRegistration {
+                execution_id,
+                program_hash,
+                n_inputs: args.n_inputs,
+                output_clients: parse_public_keys(&args.output_clients),
+                input_assignment,
+                min_output_shares,
+            })
+            .expect("invalid initial execution");
+    }
 
-    let public_keys = parse_public_keys(&args.initial_mpc_nodes);
-    let output_client_keys = parse_public_keys(&args.output_clients);
-    let server_cert_der = fs::read(&args.server_cert).expect("could not read server cert");
-    let server_key_der = fs::read(&args.server_key).expect("could not read server key");
-
-    let server_state = CoordinatorRPCServerSharedBase::new(
-        hash,
-        args.n,
-        args.t,
-        public_keys,
-        args.n_inputs,
-        output_client_keys,
-    );
-
-    let _coord = OffChainCoordinatorServer::<CoordinatorConnection<F, S>>::start_coord(
-        server_state,
-        &args.bind_addr,
-        args.port,
-        args.t,
-        server_cert_der,
-        server_key_der,
-    )
-    .await
+    let cert = fs::read(&args.server_cert).expect("could not read server cert");
+    let key = fs::read(&args.server_key).expect("could not read server key");
+    let coord = if let Some(browser_bind_addr) = args.browser_bind_addr.as_deref() {
+        OffChainCoordinatorServer::<CoordinatorConnection>::start_coord_with_browser(
+            state,
+            &args.bind_addr,
+            args.port,
+            cert,
+            key,
+            browser_bind_addr,
+        )
+        .await
+    } else {
+        OffChainCoordinatorServer::<CoordinatorConnection>::start_coord(
+            state,
+            &args.bind_addr,
+            args.port,
+            args.t,
+            cert,
+            key,
+        )
+        .await
+    }
     .expect("failed to start coordinator");
 
     println!("Listening on {}:{}", args.bind_addr, args.port);
+    if let Some(browser_bind_addr) = args.browser_bind_addr {
+        println!("Browser RPC listening on {browser_bind_addr}");
+    }
+    wait_for_shutdown_signal().await;
+    coord.shutdown().await;
+}
 
-    tokio::time::sleep(tokio::time::Duration::MAX).await;
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.expect("install SIGINT handler"),
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("install interrupt handler");
 }
 
 fn parse_public_keys(cert_files: &[String]) -> Vec<Vec<u8>> {
@@ -212,13 +243,38 @@ fn parse_public_keys(cert_files: &[String]) -> Vec<Vec<u8>> {
             let cert_der = fs::read(cert_file)
                 .unwrap_or_else(|_| panic!("could not read certificate file {cert_file}"));
             let (_, parsed_cert) = X509Certificate::from_der(&cert_der)
-                .unwrap_or_else(|_| panic!("Failed to parse X.509 certificate {cert_file}"));
-            parsed_cert
-                .public_key()
-                .subject_public_key
-                .data
-                .as_ref()
-                .to_vec()
+                .unwrap_or_else(|_| panic!("failed to parse X.509 certificate {cert_file}"));
+            parsed_cert.public_key().subject_public_key.data.to_vec()
         })
         .collect()
+}
+
+fn parse_input_assignment(cert_files: &[String]) -> InputAssignment {
+    let mut clients = Vec::<ClientIdentity>::new();
+    let mut client_indices = std::collections::HashMap::<ClientIdentity, u32>::new();
+    let mut ranges = Vec::<InputClientRange>::new();
+    for client in parse_public_keys(cert_files) {
+        let client_index = match client_indices.get(&client) {
+            Some(index) => *index,
+            None => {
+                let index = u32::try_from(clients.len())
+                    .expect("input client count exceeds the coordinator wire format");
+                clients.push(client.clone());
+                client_indices.insert(client, index);
+                index
+            }
+        };
+        if let Some(range) = ranges
+            .last_mut()
+            .filter(|range| range.client_index == client_index)
+        {
+            range.count += 1;
+        } else {
+            ranges.push(InputClientRange {
+                client_index,
+                count: 1,
+            });
+        }
+    }
+    InputAssignment { clients, ranges }
 }

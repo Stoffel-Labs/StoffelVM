@@ -14,7 +14,10 @@ git grep -n -E "(git|branch|rev|tag)[[:space:]]*=[[:space:]]*\"" -- \
   ':!target' \
   ':!.git' \
   ':!.githooks/pre-commit' |
-  grep -E "$published_package_pattern|StoffelVM|Stoffel-Labs/stoffel" >>"$stale_package_refs" || true
+  # Restrict the package match to content after git grep's file:line prefix.
+  # Otherwise every match below crates/stoffel-* looks like a package reference.
+  grep -E ":[[:digit:]]+:.*(${published_package_pattern}|StoffelVM|Stoffel-Labs/stoffel)" \
+    >>"$stale_package_refs" || true
 
 git grep -n -E "(package[[:space:]]*=[[:space:]]*\"(${published_package_pattern})\"[^}]*path[[:space:]]*=|(${published_package_pattern})[[:space:]]*=[[:space:]]*\\{[^}]*path[[:space:]]*=)" -- \
   '*.toml' '*.rs' '*.sh' '*.yml' '*.yaml' \
@@ -57,14 +60,25 @@ MSG
   exit 1
 fi
 
+# Match CI even when a developer has a directory override or an older nightly.
+RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+export RUSTUP_TOOLCHAIN
+: "${RUSTUP_TOOLCHAIN:?missing channel in rust-toolchain.toml}"
+
 echo "pre-commit: checking formatting"
-cargo +nightly fmt --all -- --check
+cargo fmt --all -- --check
 
 echo "pre-commit: checking package/bin mapping"
-cargo +nightly check --package "$runner_package" --bin "$runner_bin"
+cargo check --package "$runner_package" --bin "$runner_bin"
 
 echo "pre-commit: running clippy"
-cargo +nightly clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 echo "pre-commit: running tests"
-cargo +nightly test --workspace --all-features
+cargo test --workspace --all-features
+
+echo "pre-commit: running heavyweight CLI tests serially"
+cargo test -p stoffel-cli --test cli -- --ignored --test-threads=1
+
+echo "pre-commit: running local coordinator lifecycle regressions serially"
+cargo test -p stoffel-vm-runner --test local_coordinator_e2e -- --ignored --test-threads=1 --skip optimized_aes --skip batch_mul

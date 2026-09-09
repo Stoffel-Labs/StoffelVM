@@ -1801,6 +1801,73 @@ fn run_until_effect_or_budget_yields_after_local_instruction_budget() {
 }
 
 #[test]
+fn run_until_effect_or_budget_counts_clear_run_instructions_individually() {
+    let mut vm = VMState::new();
+    let function = VMFunction::new(
+        "budgeted_batch".to_string(),
+        vec![],
+        Vec::new(),
+        None,
+        3,
+        vec![
+            Instruction::LDI(0, Value::I64(1)),
+            Instruction::LDI(1, Value::I64(2)),
+            Instruction::MOV(2, 0),
+            Instruction::ADD(2, 2, 1),
+            Instruction::SUB(2, 2, 0),
+            Instruction::RET(2),
+        ],
+        std::collections::HashMap::new(),
+    );
+    vm.try_insert_function(Function::vm(function))
+        .expect("register function");
+    let checkpoint = vm
+        .push_entry_frame("budgeted_batch", &[], |function| {
+            VmError::CannotExecuteForeignFunction {
+                function: function.to_owned(),
+            }
+        })
+        .expect("push entry frame");
+
+    assert!(matches!(
+        vm.run_until_effect_or_budget_to_depth(checkpoint, VmExecutionBudget::max_instructions(2))
+            .expect("initialization slice should run"),
+        VmRunSlice::BudgetExhausted
+    ));
+
+    // MOV and ADD continue inside the clear instruction run. Both must still
+    // consume one cooperative instruction from the budget.
+    assert!(matches!(
+        vm.run_until_effect_or_budget_to_depth(checkpoint, VmExecutionBudget::max_instructions(2))
+            .expect("batched slice should run"),
+        VmRunSlice::BudgetExhausted
+    ));
+    assert_eq!(
+        vm.current_activation_record().unwrap().register(r(2)),
+        Some(&Value::I64(3))
+    );
+
+    assert!(matches!(
+        vm.run_until_effect_or_budget_to_depth(checkpoint, VmExecutionBudget::max_instructions(1))
+            .expect("subtraction slice should run"),
+        VmRunSlice::BudgetExhausted
+    ));
+    assert_eq!(
+        vm.current_activation_record().unwrap().register(r(2)),
+        Some(&Value::I64(2))
+    );
+
+    match vm
+        .run_until_effect_or_budget_to_depth(checkpoint, VmExecutionBudget::max_instructions(1))
+        .expect("return slice should complete")
+    {
+        VmRunSlice::Complete(value) => assert_eq!(value, Value::I64(2)),
+        other => panic!("expected completion, got {other:?}"),
+    }
+    assert_eq!(vm.call_stack_depth(), 0);
+}
+
+#[test]
 fn run_until_effect_or_budget_yields_online_operation_without_awaiting() {
     let ty = ShareType::secret_int(64);
     let share_data = ShareData::Opaque(vec![1, 2, 3].into());

@@ -1,0 +1,45 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Profiles coordinator CPU while party 0 is inside its semantic
+ * MaskedInputsWaitReconstruct phase. Argument 1 is party 0's host PID and
+ * argument 2 is the off-chain coordinator's host PID.
+ */
+
+BEGIN
+{
+  printf("COORDINATOR_INPUT_EBPF party_pid=%d coordinator_pid=%d sample_hz=199\n", $1, $2);
+}
+
+uprobe:__PARTY_BINARY__:stoffel_input_path_probe
+/pid == $1/
+{
+  if (arg0 == 13) {
+    @active = 1;
+    @started_ns = nsecs;
+  }
+  if (arg0 == 14 && @active) {
+    printf(
+      "COORDINATOR_INPUT_TOTAL wall_ns=%llu oncpu_samples=%llu\n",
+      nsecs - @started_ns,
+      @oncpu_samples
+    );
+    print(@oncpu_stacks);
+    clear(@oncpu_stacks);
+    delete(@active);
+    delete(@started_ns);
+    delete(@oncpu_samples);
+  }
+}
+
+profile:hz:199
+/pid == $2 && @active/
+{
+  @oncpu_samples = @oncpu_samples + 1;
+  @oncpu_stacks[ustack(48)] = count();
+}
+
+END
+{
+  printf("COORDINATOR_INPUT_EBPF_END\n");
+}

@@ -1,26 +1,27 @@
 use super::{registration_token_is_valid, send_ctrl, send_session_announce, DiscoveryMessage};
-use crate::net::{
-    program_sync::{send_ctrl as send_prog_ctrl, send_program_bytes, ProgramSyncMessage},
-    session::{derive_instance_id, random_instance_id, SessionInfo, SessionMessage},
+use crate::net::session::{
+    derive_instance_id_for_execution, ExecutionId, SessionInfo, SessionMessage,
 };
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
-use stoffelnet::network_utils::PartyId;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use stoffelnet::network_utils::{NodePublicKey, PartyId};
 use stoffelnet::transports::quic::PeerConnection;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
 #[derive(Debug, Clone)]
 struct PendingSession {
+    execution_id: ExecutionId,
     program_id: [u8; 32],
     entry: String,
     n_parties: usize,
     threshold: usize,
     parties: HashMap<PartyId, SocketAddr>,
     tls_ids: HashMap<PartyId, PartyId>,
-    nonce: u64,
+    tls_public_keys: HashMap<PartyId, Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct SessionRegistration {
+    pub execution_id: ExecutionId,
     pub party_id: PartyId,
     pub listen_addr: SocketAddr,
     pub program_id: [u8; 32],
@@ -28,53 +29,36 @@ pub(super) struct SessionRegistration {
     pub n_parties: usize,
     pub threshold: usize,
     pub tls_derived_id: Option<PartyId>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SessionRegistrationEvent {
-    Created {
-        target_parties: usize,
-    },
-    Joined {
-        registered_parties: usize,
-        target_parties: usize,
-    },
-    RejectedDuplicateParty,
-    RejectedProgramMismatch,
+    pub tls_public_key: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct SessionRegistrationReport {
-    pub event: SessionRegistrationEvent,
+    pub registered_parties: usize,
+    pub target_parties: usize,
     pub ready_session: Option<SessionInfo>,
 }
 
 #[derive(Clone)]
 pub(super) struct BootnodeState {
-    parties: Arc<Mutex<HashMap<PartyId, SocketAddr>>>,
-    active_session: Arc<Mutex<Option<SessionInfo>>>,
-    program_bytes: Arc<Mutex<Option<CachedProgram>>>,
-    pending_session: Arc<Mutex<Option<PendingSession>>>,
-    expected_parties: Option<usize>,
+    session: Arc<Mutex<SessionState>>,
+    expected_parties: usize,
     session_tx: watch::Sender<Option<SessionInfo>>,
     ice_tx: broadcast::Sender<DiscoveryMessage>,
 }
 
-#[derive(Clone)]
-struct CachedProgram {
-    program_id: [u8; 32],
-    bytes: Arc<Vec<u8>>,
+#[derive(Debug, Default)]
+struct SessionState {
+    pending: Option<PendingSession>,
+    active: Option<SessionInfo>,
 }
 
 impl BootnodeState {
-    pub fn new(expected_parties: Option<usize>) -> Self {
+    pub fn new(expected_parties: usize) -> Self {
         let (session_tx, _session_rx) = watch::channel(None);
         let (ice_tx, _ice_rx) = broadcast::channel(256);
         Self {
-            parties: Arc::new(Mutex::new(HashMap::new())),
-            active_session: Arc::new(Mutex::new(None)),
-            program_bytes: Arc::new(Mutex::new(None)),
-            pending_session: Arc::new(Mutex::new(None)),
+            session: Arc::new(Mutex::new(SessionState::default())),
             expected_parties,
             session_tx,
             ice_tx,
@@ -93,138 +77,136 @@ impl BootnodeState {
         let _ = self.ice_tx.send(message);
     }
 
-    pub async fn register_peer_and_list_others(
-        &self,
-        party_id: PartyId,
-        listen_addr: SocketAddr,
-    ) -> PeerRegistration {
-        let mut parties = self.parties.lock().await;
-        let is_new = !parties.contains_key(&party_id);
-        parties.insert(party_id, listen_addr);
-        let peers = parties
-            .iter()
-            .filter(|(pid, _)| **pid != party_id)
-            .map(|(pid, addr)| (*pid, *addr))
-            .collect();
-        PeerRegistration { is_new, peers }
-    }
-
-    pub async fn register_peer(&self, party_id: PartyId, listen_addr: SocketAddr) {
-        self.parties.lock().await.insert(party_id, listen_addr);
-    }
-
-    pub async fn peer_list(&self) -> Vec<(PartyId, SocketAddr)> {
-        self.parties
-            .lock()
-            .await
-            .iter()
-            .map(|(pid, addr)| (*pid, *addr))
-            .collect()
-    }
-
-    pub async fn store_program_bytes_if_missing(
-        &self,
-        program_id: [u8; 32],
-        bytes: Vec<u8>,
-    ) -> bool {
-        let mut program_bytes = self.program_bytes.lock().await;
-        if program_bytes.is_some() {
-            return false;
-        }
-        *program_bytes = Some(CachedProgram {
-            program_id,
-            bytes: Arc::new(bytes),
-        });
-        true
-    }
-
-    pub async fn program_bytes_for(&self, program_id: &[u8; 32]) -> Option<Arc<Vec<u8>>> {
-        self.program_bytes
-            .lock()
-            .await
-            .as_ref()
-            .filter(|cached| cached.program_id == *program_id)
-            .map(|cached| cached.bytes.clone())
-    }
-
     pub async fn register_session(
         &self,
         registration: SessionRegistration,
     ) -> Result<SessionRegistrationReport, String> {
-        let mut pending = self.pending_session.lock().await;
-        let target_parties = self.expected_parties.unwrap_or(registration.n_parties);
+        if registration.execution_id.is_zero() {
+            return Err("the zero execution ID cannot identify a mesh session".to_string());
+        }
 
-        let event = match pending.as_mut() {
-            Some(session) => {
-                if session.parties.contains_key(&registration.party_id) {
-                    SessionRegistrationEvent::RejectedDuplicateParty
-                } else if session.program_id != registration.program_id {
-                    SessionRegistrationEvent::RejectedProgramMismatch
-                } else {
-                    session
-                        .parties
-                        .insert(registration.party_id, registration.listen_addr);
-                    if let Some(tls_derived_id) = registration.tls_derived_id {
-                        session
-                            .tls_ids
-                            .insert(registration.party_id, tls_derived_id);
-                    }
-                    SessionRegistrationEvent::Joined {
-                        registered_parties: session.parties.len(),
-                        target_parties: session.n_parties,
-                    }
-                }
+        let tls_public_key = match (registration.tls_derived_id, &registration.tls_public_key) {
+            (Some(compact_id), Some(public_key))
+                if !public_key.is_empty()
+                    && NodePublicKey(public_key.clone()).derive_id() == compact_id =>
+            {
+                public_key.clone()
             }
-            None => {
-                let mut parties = HashMap::new();
-                parties.insert(registration.party_id, registration.listen_addr);
-                let mut tls_ids = HashMap::new();
-                if let Some(tls_derived_id) = registration.tls_derived_id {
-                    tls_ids.insert(registration.party_id, tls_derived_id);
-                }
-                *pending = Some(PendingSession {
-                    program_id: registration.program_id,
-                    entry: registration.entry,
-                    n_parties: target_parties,
-                    threshold: registration.threshold,
-                    parties,
-                    tls_ids,
-                    nonce: session_nonce(),
-                });
-                SessionRegistrationEvent::Created { target_parties }
-            }
+            _ => return Err("invalid TLS identity".to_string()),
         };
 
-        if matches!(
-            event,
-            SessionRegistrationEvent::RejectedDuplicateParty
-                | SessionRegistrationEvent::RejectedProgramMismatch
-        ) {
+        let target_parties = self.expected_parties;
+        if target_parties == 0
+            || registration.n_parties != target_parties
+            || registration.party_id >= target_parties
+            || registration.threshold >= target_parties
+        {
+            return Err("invalid party count, party ID, or threshold".to_string());
+        }
+        let mut state = self.session.lock().await;
+
+        if let Some(active) = &state.active {
+            let exact_retry = active.execution_id == registration.execution_id
+                && active.program_id == registration.program_id
+                && active.entry == registration.entry
+                && active.n_parties == target_parties
+                && active.threshold == registration.threshold
+                && active
+                    .parties
+                    .contains(&(registration.party_id, registration.listen_addr))
+                && active
+                    .tls_ids
+                    .contains(&(registration.party_id, registration.tls_derived_id.unwrap()))
+                && active
+                    .tls_public_keys
+                    .contains(&(registration.party_id, tls_public_key.clone()));
+            if !exact_retry {
+                return Err("bootnode mesh session is already immutable".to_string());
+            }
             return Ok(SessionRegistrationReport {
-                event,
+                registered_parties: active.parties.len(),
+                target_parties: active.n_parties,
+                ready_session: Some(active.clone()),
+            });
+        }
+
+        let pending = state.pending.get_or_insert_with(|| PendingSession {
+            execution_id: registration.execution_id,
+            program_id: registration.program_id,
+            entry: registration.entry.clone(),
+            n_parties: target_parties,
+            threshold: registration.threshold,
+            parties: HashMap::new(),
+            tls_ids: HashMap::new(),
+            tls_public_keys: HashMap::new(),
+        });
+
+        if pending.execution_id != registration.execution_id
+            || pending.program_id != registration.program_id
+            || pending.entry != registration.entry
+            || pending.n_parties != target_parties
+            || pending.threshold != registration.threshold
+        {
+            return Err("registration does not match the pending mesh session".to_string());
+        }
+
+        if let Some(existing_addr) = pending.parties.get(&registration.party_id) {
+            let exact_retry = *existing_addr == registration.listen_addr
+                && pending.tls_ids.get(&registration.party_id)
+                    == registration.tls_derived_id.as_ref()
+                && pending.tls_public_keys.get(&registration.party_id) == Some(&tls_public_key);
+            if !exact_retry {
+                return Err(format!(
+                    "party {} is already registered with different identity or address",
+                    registration.party_id
+                ));
+            }
+        } else {
+            if pending
+                .tls_public_keys
+                .values()
+                .any(|existing| existing == &tls_public_key)
+                || pending
+                    .tls_ids
+                    .values()
+                    .any(|existing| Some(existing) == registration.tls_derived_id.as_ref())
+            {
+                return Err("one TLS identity cannot represent two logical parties".to_string());
+            }
+            pending
+                .parties
+                .insert(registration.party_id, registration.listen_addr);
+            pending.tls_ids.insert(
+                registration.party_id,
+                registration.tls_derived_id.expect("validated TLS identity"),
+            );
+            pending
+                .tls_public_keys
+                .insert(registration.party_id, tls_public_key);
+        }
+
+        let registered_parties = pending.parties.len();
+        if registered_parties < pending.n_parties {
+            return Ok(SessionRegistrationReport {
+                registered_parties,
+                target_parties: pending.n_parties,
                 ready_session: None,
             });
         }
 
-        let ready = pending
-            .as_ref()
-            .is_some_and(|session| session.parties.len() >= session.n_parties);
-
-        let ready_session = if ready {
-            let Some(session) = pending.take() else {
-                return Err("pending session disappeared while announcing readiness".to_string());
-            };
-            let session_info = session.into_session_info();
-            *self.active_session.lock().await = Some(session_info.clone());
-            let _ = self.session_tx.send(Some(session_info.clone()));
-            Some(session_info)
-        } else {
-            None
-        };
+        let pending = state
+            .pending
+            .take()
+            .ok_or_else(|| "pending mesh session disappeared".to_string())?;
+        let ready_session =
+            pending.into_session_info(derive_instance_id_for_execution(&registration.execution_id));
+        state.active = Some(ready_session.clone());
+        self.session_tx.send_replace(Some(ready_session.clone()));
 
         Ok(SessionRegistrationReport {
-            event,
-            ready_session,
+            registered_parties,
+            target_parties,
+            ready_session: Some(ready_session),
         })
     }
 }
@@ -232,7 +214,7 @@ impl BootnodeState {
 pub(super) fn spawn_connection_handler(
     conn: Arc<dyn PeerConnection>,
     state: BootnodeState,
-    required_auth_token: Option<String>,
+    required_auth_token: String,
 ) {
     tokio::spawn(async move {
         BootnodeConnection::new(conn, state, required_auth_token)
@@ -241,19 +223,14 @@ pub(super) fn spawn_connection_handler(
     });
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct PeerRegistration {
-    pub is_new: bool,
-    pub peers: Vec<(PartyId, SocketAddr)>,
-}
-
 struct BootnodeConnection {
     conn: Arc<dyn PeerConnection>,
     state: BootnodeState,
     session_rx: watch::Receiver<Option<SessionInfo>>,
     ice_rx: broadcast::Receiver<DiscoveryMessage>,
-    required_auth_token: Option<String>,
+    required_auth_token: String,
     waiting_for_session: bool,
+    my_execution_id: Option<ExecutionId>,
     my_party_id: Option<PartyId>,
 }
 
@@ -261,7 +238,7 @@ impl BootnodeConnection {
     fn new(
         conn: Arc<dyn PeerConnection>,
         state: BootnodeState,
-        required_auth_token: Option<String>,
+        required_auth_token: String,
     ) -> Self {
         let session_rx = state.subscribe_session();
         let ice_rx = state.subscribe_ice();
@@ -272,20 +249,14 @@ impl BootnodeConnection {
             ice_rx,
             required_auth_token,
             waiting_for_session: false,
+            my_execution_id: None,
             my_party_id: None,
         }
     }
 
     async fn run(mut self) {
-        // Read framed messages in a dedicated task so the periodic session/ICE
-        // polling below never cancels an in-progress socket read. The transport's
-        // `receive()` reads a length prefix and then the payload into a local
-        // buffer, so it is NOT cancellation-safe: wrapping it directly in a short
-        // timeout (as this loop used to) drops the future mid-read on a large
-        // message — e.g. a multi-MB program upload at session registration —
-        // leaving the QUIC stream misaligned so the registration is never decoded
-        // and the session never forms. By moving the read into its own task, the
-        // 50ms tick below cancels only a cancellation-safe channel receive.
+        // `receive()` is not cancellation-safe, so one task owns the socket read
+        // while this task reacts to complete frames and state notifications.
         let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(8);
         let reader_conn = Arc::clone(&self.conn);
         let reader = tokio::spawn(async move {
@@ -302,13 +273,21 @@ impl BootnodeConnection {
         });
 
         loop {
-            self.send_ready_session_if_waiting().await;
-            self.relay_pending_ice_messages().await;
-
-            match tokio::time::timeout(Duration::from_millis(50), msg_rx.recv()).await {
-                Ok(Some(buf)) => self.handle_buffer(buf).await,
-                Ok(None) => break,
-                Err(_) => continue,
+            tokio::select! {
+                message = msg_rx.recv() => match message {
+                    Some(buf) => self.handle_buffer(buf).await,
+                    None => break,
+                },
+                changed = self.session_rx.changed() => {
+                    if changed.is_ok() {
+                        self.send_ready_session_if_waiting().await;
+                    }
+                },
+                message = self.ice_rx.recv() => {
+                    if let Ok(message) = message {
+                        self.relay_ice_message(message).await;
+                    }
+                },
             }
         }
 
@@ -320,8 +299,8 @@ impl BootnodeConnection {
             return;
         }
 
-        let session_info = self.session_rx.borrow().clone();
-        if let Some(info) = session_info {
+        let session = self.session_rx.borrow().clone();
+        if let Some(info) = session.filter(|info| Some(info.execution_id) == self.my_execution_id) {
             if let Err(err) = send_session_announce(&*self.conn, &info).await {
                 eprintln!("[bootnode] Failed to send SessionAnnounce: {}", err);
             }
@@ -329,31 +308,33 @@ impl BootnodeConnection {
         }
     }
 
-    async fn relay_pending_ice_messages(&mut self) {
+    async fn relay_ice_message(&self, ice_msg: DiscoveryMessage) {
         let Some(party_id) = self.my_party_id else {
             return;
         };
 
-        while let Ok(ice_msg) = self.ice_rx.try_recv() {
-            let should_forward = match &ice_msg {
-                DiscoveryMessage::IceCandidates { to_party_id, .. }
-                | DiscoveryMessage::IceExchangeRequest { to_party_id, .. } => {
-                    *to_party_id == party_id
-                }
-                _ => false,
-            };
-
-            if should_forward {
-                let _ = send_ctrl(&*self.conn, &ice_msg).await;
+        let should_forward = match &ice_msg {
+            DiscoveryMessage::IceCandidates {
+                execution_id,
+                to_party_id,
+                ..
             }
+            | DiscoveryMessage::IceExchangeRequest {
+                execution_id,
+                to_party_id,
+                ..
+            } => Some(*execution_id) == self.my_execution_id && *to_party_id == party_id,
+            _ => false,
+        };
+
+        if should_forward {
+            let _ = send_ctrl(&*self.conn, &ice_msg).await;
         }
     }
 
     async fn handle_buffer(&mut self, buf: Vec<u8>) {
         if let Ok(message) = bincode::deserialize::<DiscoveryMessage>(&buf) {
             self.handle_discovery_message(message).await;
-        } else if let Ok(message) = bincode::deserialize::<ProgramSyncMessage>(&buf) {
-            self.handle_program_sync_message(message).await;
         } else if let Ok(message) = bincode::deserialize::<SessionMessage>(&buf) {
             self.handle_session_message(message);
         }
@@ -361,26 +342,20 @@ impl BootnodeConnection {
 
     async fn handle_discovery_message(&mut self, message: DiscoveryMessage) {
         match message {
-            DiscoveryMessage::Register {
-                party_id,
-                listen_addr,
-                auth_token,
-            } => {
-                self.handle_register(party_id, listen_addr, auth_token)
-                    .await;
-            }
             DiscoveryMessage::RegisterWithSession {
+                execution_id,
                 party_id,
                 listen_addr,
                 program_id,
                 entry,
                 n_parties,
                 threshold,
-                program_bytes,
                 auth_token,
                 tls_derived_id,
+                tls_public_key,
             } => {
                 let registration = SessionRegistration {
+                    execution_id,
                     party_id,
                     listen_addr,
                     program_id,
@@ -388,32 +363,21 @@ impl BootnodeConnection {
                     n_parties,
                     threshold,
                     tls_derived_id,
+                    tls_public_key,
                 };
-                self.handle_session_registration(registration, program_bytes, auth_token)
+                self.handle_session_registration(registration, auth_token)
                     .await;
             }
-            DiscoveryMessage::RequestPeers => {
-                if self.authenticated_party_id("RequestPeers").is_none() {
-                    return;
-                }
-                let peers = self.state.peer_list().await;
-                let _ = send_ctrl(&*self.conn, &DiscoveryMessage::PeerList { peers }).await;
-            }
-            DiscoveryMessage::Heartbeat => {}
-            DiscoveryMessage::ProgramFetchRequest { program_id } => {
-                if self.authenticated_party_id("ProgramFetchRequest").is_none() {
-                    return;
-                }
-                self.handle_program_fetch_request(program_id).await;
-            }
             DiscoveryMessage::IceCandidates {
+                execution_id,
                 from_party_id,
                 to_party_id,
                 ufrag,
                 pwd,
                 candidates,
             } => {
-                if !self.authenticated_sender_matches("IceCandidates", from_party_id) {
+                if !self.authenticated_sender_matches("IceCandidates", execution_id, from_party_id)
+                {
                     return;
                 }
                 eprintln!(
@@ -423,6 +387,7 @@ impl BootnodeConnection {
                     to_party_id
                 );
                 self.state.publish_ice(DiscoveryMessage::IceCandidates {
+                    execution_id,
                     from_party_id,
                     to_party_id,
                     ufrag,
@@ -431,10 +396,15 @@ impl BootnodeConnection {
                 });
             }
             DiscoveryMessage::IceExchangeRequest {
+                execution_id,
                 from_party_id,
                 to_party_id,
             } => {
-                if !self.authenticated_sender_matches("IceExchangeRequest", from_party_id) {
+                if !self.authenticated_sender_matches(
+                    "IceExchangeRequest",
+                    execution_id,
+                    from_party_id,
+                ) {
                     return;
                 }
                 eprintln!(
@@ -443,11 +413,11 @@ impl BootnodeConnection {
                 );
                 self.state
                     .publish_ice(DiscoveryMessage::IceExchangeRequest {
+                        execution_id,
                         from_party_id,
                         to_party_id,
                     });
             }
-            _ => {}
         }
     }
 
@@ -462,9 +432,25 @@ impl BootnodeConnection {
         party_id
     }
 
-    fn authenticated_sender_matches(&self, message_kind: &str, from_party_id: PartyId) -> bool {
+    fn authenticated_sender_matches(
+        &self,
+        message_kind: &str,
+        execution_id: ExecutionId,
+        from_party_id: PartyId,
+    ) -> bool {
         match self.authenticated_party_id(message_kind) {
-            Some(party_id) if party_id == from_party_id => true,
+            Some(party_id)
+                if party_id == from_party_id && self.my_execution_id == Some(execution_id) =>
+            {
+                true
+            }
+            Some(party_id) if party_id == from_party_id => {
+                eprintln!(
+                    "[bootnode] Rejected {} from party {} for unrelated execution",
+                    message_kind, party_id
+                );
+                false
+            }
             Some(party_id) => {
                 eprintln!(
                     "[bootnode] Rejected {} from party {} spoofing party {}",
@@ -476,56 +462,13 @@ impl BootnodeConnection {
         }
     }
 
-    async fn handle_register(
-        &mut self,
-        party_id: PartyId,
-        listen_addr: SocketAddr,
-        auth_token: Option<String>,
-    ) {
-        if !registration_token_is_valid(self.required_auth_token.as_deref(), auth_token.as_deref())
-        {
-            eprintln!(
-                "[bootnode] Rejected Register from party {} (invalid auth token)",
-                party_id
-            );
-            return;
-        }
-
-        self.my_party_id = Some(party_id);
-        let registration = self
-            .state
-            .register_peer_and_list_others(party_id, listen_addr)
-            .await;
-        let peers = registration.peers;
-        let _ = send_ctrl(&*self.conn, &DiscoveryMessage::PeerList { peers }).await;
-
-        if registration.is_new {
-            let joined = DiscoveryMessage::PeerJoined {
-                party_id,
-                listen_addr,
-            };
-            let _ = send_ctrl(&*self.conn, &joined).await;
-        }
-    }
-
     async fn handle_session_registration(
         &mut self,
         registration: SessionRegistration,
-        program_bytes: Option<Vec<u8>>,
-        auth_token: Option<String>,
+        auth_token: String,
     ) {
         let party_id = registration.party_id;
-        let listen_addr = registration.listen_addr;
-        eprintln!(
-            "[bootnode] Received RegisterWithSession from party {} (program: {}, n={}, t={}, has_bytes={})",
-            party_id,
-            hex::encode(&registration.program_id[..8]),
-            registration.n_parties,
-            registration.threshold,
-            program_bytes.is_some()
-        );
-        if !registration_token_is_valid(self.required_auth_token.as_deref(), auth_token.as_deref())
-        {
+        if !registration_token_is_valid(&self.required_auth_token, &auth_token) {
             eprintln!(
                 "[bootnode] Rejected RegisterWithSession from party {} (invalid auth token)",
                 party_id
@@ -534,42 +477,21 @@ impl BootnodeConnection {
             return;
         }
 
+        let execution_id = registration.execution_id;
+        let program_id = registration.program_id;
         eprintln!(
-            "[bootnode] Party {} registering for session (program: {}, n={}, t={}, has_bytes={})",
+            "[bootnode] Party {} registering for mesh (program: {}, n={}, t={})",
             party_id,
-            hex::encode(&registration.program_id[..8]),
+            hex::encode(&program_id[..8]),
             registration.n_parties,
-            registration.threshold,
-            program_bytes.is_some()
+            registration.threshold
         );
-
-        if let Some(bytes) = program_bytes {
-            let byte_len = bytes.len();
-            if !program_id_matches_bytes(&registration.program_id, &bytes) {
-                eprintln!(
-                    "[bootnode] Rejected program bytes from party {} for {} (hash mismatch)",
-                    party_id,
-                    hex::encode(&registration.program_id[..8])
-                );
-            } else if self
-                .state
-                .store_program_bytes_if_missing(registration.program_id, bytes)
-                .await
-            {
-                eprintln!(
-                    "[bootnode] Storing program bytes from party {} ({} bytes)",
-                    party_id, byte_len
-                );
-            }
-        }
-
-        self.waiting_for_session = true;
 
         let report = match self.state.register_session(registration).await {
             Ok(report) => report,
             Err(err) => {
                 eprintln!(
-                    "[bootnode] Failed to register party {} for session: {}",
+                    "[bootnode] Rejected party {} from mesh session: {}",
                     party_id, err
                 );
                 self.waiting_for_session = false;
@@ -577,48 +499,13 @@ impl BootnodeConnection {
             }
         };
 
-        match report.event {
-            SessionRegistrationEvent::Created { target_parties } => {
-                eprintln!(
-                    "[bootnode] Created pending session, waiting for {} parties (have 1)",
-                    target_parties
-                );
-            }
-            SessionRegistrationEvent::Joined {
-                registered_parties,
-                target_parties,
-            } => {
-                eprintln!(
-                    "[bootnode] Party {} joined, have {}/{} parties",
-                    party_id, registered_parties, target_parties
-                );
-            }
-            SessionRegistrationEvent::RejectedProgramMismatch => {
-                eprintln!(
-                    "[bootnode] Warning: party {} has different program_id",
-                    party_id
-                );
-                let _ = send_ctrl(&*self.conn, &DiscoveryMessage::PeerLeft { party_id }).await;
-                self.waiting_for_session = false;
-                return;
-            }
-            SessionRegistrationEvent::RejectedDuplicateParty => {
-                eprintln!(
-                    "[bootnode] Rejected RegisterWithSession from party {} (duplicate party_id)",
-                    party_id
-                );
-                let _ = send_ctrl(&*self.conn, &DiscoveryMessage::PeerLeft { party_id }).await;
-                self.waiting_for_session = false;
-                return;
-            }
-        }
-
         self.my_party_id = Some(party_id);
-        self.state.register_peer(party_id, listen_addr).await;
+        self.my_execution_id = Some(execution_id);
+        self.waiting_for_session = report.ready_session.is_none();
 
         if let Some(session_info) = report.ready_session {
             eprintln!(
-                "[bootnode] Session ready! instance_id={}, n_parties={}",
+                "[bootnode] Mesh ready: instance_id={}, n_parties={}",
                 session_info.instance_id, session_info.n_parties
             );
             if let Err(err) = send_session_announce(&*self.conn, &session_info).await {
@@ -628,46 +515,11 @@ impl BootnodeConnection {
                 );
             }
             self.waiting_for_session = false;
-        }
-    }
-
-    async fn handle_program_fetch_request(&self, program_id: [u8; 32]) {
-        if let Some(bytes) = self.state.program_bytes_for(&program_id).await {
-            eprintln!(
-                "[bootnode] Sending program bytes ({} bytes) for {}",
-                bytes.len(),
-                hex::encode(&program_id[..8])
-            );
-            let resp = DiscoveryMessage::ProgramFetchResponse {
-                program_id,
-                bytes: bytes.to_vec(),
-            };
-            let _ = send_ctrl(&*self.conn, &resp).await;
         } else {
             eprintln!(
-                "[bootnode] Program fetch request for {} but no bytes cached",
-                hex::encode(&program_id[..8])
+                "[bootnode] Mesh registration {}/{}",
+                report.registered_parties, report.target_parties
             );
-        }
-    }
-
-    async fn handle_program_sync_message(&self, message: ProgramSyncMessage) {
-        match message {
-            ProgramSyncMessage::ProgramAnnounce { .. } => {
-                let _ = send_prog_ctrl(&*self.conn, &message).await;
-            }
-            ProgramSyncMessage::ProgramFetchRequest { program_id } => {
-                if self
-                    .authenticated_party_id("ProgramSync::ProgramFetchRequest")
-                    .is_none()
-                {
-                    return;
-                }
-                if let Some(bytes) = self.state.program_bytes_for(&program_id).await {
-                    let _ = send_program_bytes(&*self.conn, program_id, bytes).await;
-                }
-            }
-            _ => {}
         }
     }
 
@@ -675,13 +527,14 @@ impl BootnodeConnection {
         match message {
             SessionMessage::SessionAnnounce(_) => {}
             SessionMessage::SessionAck {
+                execution_id,
                 party_id,
                 instance_id,
                 ..
             } => {
                 eprintln!(
-                    "[bootnode] Received SessionAck from party {} for instance {}",
-                    party_id, instance_id
+                    "[bootnode] Received SessionAck from party {} for execution {} (instance {})",
+                    party_id, execution_id, instance_id
                 );
             }
             _ => {}
@@ -690,25 +543,19 @@ impl BootnodeConnection {
 }
 
 impl PendingSession {
-    fn into_session_info(self) -> SessionInfo {
+    fn into_session_info(self, instance_id: u64) -> SessionInfo {
         SessionInfo {
+            execution_id: self.execution_id,
             program_id: self.program_id,
-            instance_id: derive_instance_id(&self.program_id, self.nonce),
+            instance_id,
             entry: self.entry,
             parties: self.parties.into_iter().collect(),
             n_parties: self.n_parties,
             threshold: self.threshold,
             tls_ids: self.tls_ids.into_iter().collect(),
+            tls_public_keys: self.tls_public_keys.into_iter().collect(),
         }
     }
-}
-
-fn session_nonce() -> u64 {
-    random_instance_id()
-}
-
-fn program_id_matches_bytes(program_id: &[u8; 32], bytes: &[u8]) -> bool {
-    blake3::hash(bytes).as_bytes() == program_id
 }
 
 #[cfg(test)]
@@ -725,35 +572,40 @@ mod tests {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     }
 
-    fn program_id(bytes: &[u8]) -> [u8; 32] {
-        *blake3::hash(bytes).as_bytes()
+    fn execution_id(byte: u8) -> ExecutionId {
+        ExecutionId::from([byte; 32])
+    }
+
+    fn tls_public_key(party_id: PartyId) -> Vec<u8> {
+        format!("test-party-{party_id}-spki").into_bytes()
     }
 
     fn registration(party_id: PartyId, program_id: [u8; 32]) -> SessionRegistration {
+        registration_for(execution_id(1), party_id, program_id)
+    }
+
+    fn registration_for(
+        execution_id: ExecutionId,
+        party_id: PartyId,
+        program_id: [u8; 32],
+    ) -> SessionRegistration {
+        let tls_public_key = tls_public_key(party_id);
         SessionRegistration {
+            execution_id,
             party_id,
             listen_addr: addr(10_000 + party_id as u16),
             program_id,
             entry: "main".to_string(),
             n_parties: 2,
             threshold: 1,
-            tls_derived_id: Some(100 + party_id),
+            tls_derived_id: Some(NodePublicKey(tls_public_key.clone()).derive_id()),
+            tls_public_key: Some(tls_public_key),
         }
     }
 
     #[derive(Default)]
     struct RecordingConnection {
         sent: StdMutex<Vec<Vec<u8>>>,
-    }
-
-    impl RecordingConnection {
-        fn sent_messages(&self) -> Vec<Vec<u8>> {
-            self.sent.lock().expect("sent lock poisoned").clone()
-        }
-
-        fn clear_sent(&self) {
-            self.sent.lock().expect("sent lock poisoned").clear();
-        }
     }
 
     impl PeerConnection for RecordingConnection {
@@ -804,74 +656,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthenticated_program_fetch_does_not_disclose_cached_bytes() {
-        let state = BootnodeState::new(None);
-        let bytes = b"compiled program".to_vec();
-        let program_id = program_id(&bytes);
-        assert!(
-            state
-                .store_program_bytes_if_missing(program_id, bytes)
-                .await
-        );
-
-        let conn = Arc::new(RecordingConnection::default());
-        let mut handler = BootnodeConnection::new(conn.clone(), state, Some("secret".to_string()));
-
-        handler
-            .handle_discovery_message(DiscoveryMessage::ProgramFetchRequest { program_id })
-            .await;
-
-        assert!(conn.sent_messages().is_empty());
-    }
-
-    #[tokio::test]
-    async fn program_fetch_requires_matching_cached_program_id() {
-        let state = BootnodeState::new(None);
-        let bytes = b"compiled program".to_vec();
-        let program_id = program_id(&bytes);
-        assert!(
-            state
-                .store_program_bytes_if_missing(program_id, bytes.clone())
-                .await
-        );
-
-        let conn = Arc::new(RecordingConnection::default());
-        let mut handler = BootnodeConnection::new(conn.clone(), state, None);
-        handler.handle_register(0, addr(10_000), None).await;
-        conn.clear_sent();
-
-        handler
-            .handle_discovery_message(DiscoveryMessage::ProgramFetchRequest {
-                program_id: [9u8; 32],
-            })
-            .await;
-        assert!(conn.sent_messages().is_empty());
-
-        handler
-            .handle_discovery_message(DiscoveryMessage::ProgramFetchRequest { program_id })
-            .await;
-        let sent = conn.sent_messages();
-        assert_eq!(sent.len(), 1);
-        let response =
-            bincode::deserialize::<DiscoveryMessage>(&sent[0]).expect("response decodes");
-        assert!(matches!(
-            response,
-            DiscoveryMessage::ProgramFetchResponse {
-                program_id: id,
-                bytes: response_bytes
-            } if id == program_id && response_bytes == bytes
-        ));
-    }
-
-    #[tokio::test]
     async fn ice_relay_rejects_unauthenticated_and_spoofed_senders() {
-        let state = BootnodeState::new(None);
+        let state = BootnodeState::new(2);
         let mut ice_rx = state.subscribe_ice();
         let conn = Arc::new(RecordingConnection::default());
-        let mut handler = BootnodeConnection::new(conn, state, None);
+        let mut handler = BootnodeConnection::new(conn, state, "test-secret".to_string());
+        let execution_id = execution_id(1);
 
         handler
             .handle_discovery_message(DiscoveryMessage::IceExchangeRequest {
+                execution_id,
                 from_party_id: 1,
                 to_party_id: 2,
             })
@@ -879,8 +673,10 @@ mod tests {
         assert!(ice_rx.try_recv().is_err());
 
         handler.my_party_id = Some(1);
+        handler.my_execution_id = Some(execution_id);
         handler
             .handle_discovery_message(DiscoveryMessage::IceExchangeRequest {
+                execution_id,
                 from_party_id: 2,
                 to_party_id: 3,
             })
@@ -889,6 +685,7 @@ mod tests {
 
         handler
             .handle_discovery_message(DiscoveryMessage::IceCandidates {
+                execution_id,
                 from_party_id: 2,
                 to_party_id: 3,
                 ufrag: "ufrag".to_string(),
@@ -900,6 +697,7 @@ mod tests {
 
         handler
             .handle_discovery_message(DiscoveryMessage::IceExchangeRequest {
+                execution_id,
                 from_party_id: 1,
                 to_party_id: 3,
             })
@@ -908,13 +706,15 @@ mod tests {
         assert!(matches!(
             relayed,
             DiscoveryMessage::IceExchangeRequest {
+                execution_id: relayed_execution_id,
                 from_party_id: 1,
                 to_party_id: 3
-            }
+            } if relayed_execution_id == execution_id
         ));
 
         handler
             .handle_discovery_message(DiscoveryMessage::IceCandidates {
+                execution_id,
                 from_party_id: 1,
                 to_party_id: 3,
                 ufrag: "ufrag".to_string(),
@@ -926,186 +726,121 @@ mod tests {
         assert!(matches!(
             relayed,
             DiscoveryMessage::IceCandidates {
+                execution_id: relayed_execution_id,
                 from_party_id: 1,
                 to_party_id: 3,
                 ..
-            }
+            } if relayed_execution_id == execution_id
         ));
     }
 
     #[tokio::test]
-    async fn session_registration_rejects_program_bytes_hash_mismatch() {
-        let state = BootnodeState::new(None);
-        let conn = Arc::new(RecordingConnection::default());
-        let mut handler = BootnodeConnection::new(conn, state.clone(), None);
-
-        handler
-            .handle_session_registration(
-                registration(0, [4u8; 32]),
-                Some(b"wrong bytes".to_vec()),
-                None,
-            )
-            .await;
-
-        assert!(state.program_bytes_for(&[4u8; 32]).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn duplicate_session_registration_does_not_authenticate_or_replace_peer() {
-        let state = BootnodeState::new(Some(2));
-        let program_id = [8u8; 32];
-
-        let first_conn = Arc::new(RecordingConnection::default());
-        let mut first_handler = BootnodeConnection::new(first_conn, state.clone(), None);
-        first_handler
-            .handle_session_registration(registration(0, program_id), None, None)
-            .await;
-
-        let attacker_addr = addr(12_345);
-        let duplicate = SessionRegistration {
-            listen_addr: attacker_addr,
-            tls_derived_id: Some(777),
-            ..registration(0, program_id)
-        };
-        let duplicate_conn = Arc::new(RecordingConnection::default());
-        let mut duplicate_handler =
-            BootnodeConnection::new(duplicate_conn.clone(), state.clone(), None);
-        duplicate_handler
-            .handle_session_registration(duplicate, None, None)
-            .await;
-
-        assert_eq!(duplicate_handler.my_party_id, None);
-        assert!(state
-            .peer_list()
-            .await
-            .iter()
-            .any(|(party_id, listen_addr)| *party_id == 0 && *listen_addr == addr(10_000)));
-        assert!(!state
-            .peer_list()
-            .await
-            .iter()
-            .any(|(party_id, listen_addr)| *party_id == 0 && *listen_addr == attacker_addr));
-
-        let sent = duplicate_conn.sent_messages();
-        assert_eq!(sent.len(), 1);
-        let response =
-            bincode::deserialize::<DiscoveryMessage>(&sent[0]).expect("response decodes");
-        assert!(matches!(
-            response,
-            DiscoveryMessage::PeerLeft { party_id: 0 }
-        ));
-    }
-
-    #[tokio::test]
-    async fn session_registration_announces_ready_without_manual_unwraps() {
-        let state = BootnodeState::new(None);
+    async fn registration_forms_one_pinned_immutable_mesh() {
+        let state = BootnodeState::new(2);
         let program_id = [7u8; 32];
 
         let first = state
             .register_session(registration(0, program_id))
             .await
             .expect("first party registers");
-        assert_eq!(
-            first.event,
-            SessionRegistrationEvent::Created { target_parties: 2 }
-        );
+        assert_eq!((first.registered_parties, first.target_parties), (1, 2));
         assert!(first.ready_session.is_none());
 
-        let second = state
+        let session = state
             .register_session(registration(1, program_id))
             .await
-            .expect("second party registers");
-        assert_eq!(
-            second.event,
-            SessionRegistrationEvent::Joined {
-                registered_parties: 2,
-                target_parties: 2
-            }
-        );
-        let session = second.ready_session.expect("session is ready");
-        assert_eq!(session.n_parties, 2);
-        assert_eq!(session.threshold, 1);
+            .expect("second party registers")
+            .ready_session
+            .expect("mesh is ready");
+        assert_eq!(session.execution_id, execution_id(1));
         assert_eq!(session.parties.len(), 2);
         assert_eq!(session.tls_ids.len(), 2);
+        assert_eq!(session.tls_public_keys.len(), 2);
+
+        assert!(state
+            .register_session(registration_for(execution_id(2), 0, program_id))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
-    async fn session_registration_rejects_mismatched_program_without_poisoning_pending_session() {
-        let state = BootnodeState::new(Some(2));
-
-        state
-            .register_session(registration(0, [1u8; 32]))
-            .await
-            .expect("first party registers");
-
-        let mismatch = state
-            .register_session(registration(1, [2u8; 32]))
-            .await
-            .expect("mismatched party is handled");
-        assert_eq!(
-            mismatch.event,
-            SessionRegistrationEvent::RejectedProgramMismatch
-        );
-        assert!(mismatch.ready_session.is_none());
-
-        let valid = state
-            .register_session(registration(1, [1u8; 32]))
-            .await
-            .expect("matching party registers after mismatch");
-        let session = valid.ready_session.expect("session becomes ready");
-        assert!(session
-            .parties
-            .iter()
-            .any(|(party_id, listen_addr)| *party_id == 1 && *listen_addr == addr(10_001)));
-    }
-
-    #[tokio::test]
-    async fn session_registration_rejects_duplicate_party_without_overwriting_existing_slot() {
-        let state = BootnodeState::new(Some(2));
-        let program_id = [9u8; 32];
+    async fn invalid_or_reused_tls_identity_does_not_poison_pending_mesh() {
+        let state = BootnodeState::new(2);
+        let program_id = [8u8; 32];
+        let mut invalid = registration(0, program_id);
+        invalid.tls_derived_id = invalid.tls_derived_id.map(|id| id ^ 1);
+        assert!(state.register_session(invalid).await.is_err());
 
         state
             .register_session(registration(0, program_id))
             .await
-            .expect("first party registers");
+            .expect("valid first identity registers");
+        let duplicate_key = tls_public_key(0);
+        let mut duplicate = registration(1, program_id);
+        duplicate.tls_derived_id = Some(NodePublicKey(duplicate_key.clone()).derive_id());
+        duplicate.tls_public_key = Some(duplicate_key);
+        assert!(state.register_session(duplicate).await.is_err());
 
-        let attacker_addr = addr(12_345);
-        let attacker_tls_id = 777;
-        let duplicate = SessionRegistration {
-            listen_addr: attacker_addr,
-            tls_derived_id: Some(attacker_tls_id),
-            ..registration(0, program_id)
-        };
-        let duplicate_report = state
-            .register_session(duplicate)
-            .await
-            .expect("duplicate party registration is handled");
-        assert_eq!(
-            duplicate_report.event,
-            SessionRegistrationEvent::RejectedDuplicateParty
-        );
-        assert!(duplicate_report.ready_session.is_none());
-
-        let final_report = state
+        assert!(state
             .register_session(registration(1, program_id))
             .await
-            .expect("second unique party registers");
-        let session = final_report.ready_session.expect("session becomes ready");
-        assert!(session
-            .parties
-            .iter()
-            .any(|(party_id, listen_addr)| *party_id == 0 && *listen_addr == addr(10_000)));
-        assert!(!session
-            .parties
-            .iter()
-            .any(|(party_id, listen_addr)| *party_id == 0 && *listen_addr == attacker_addr));
-        assert!(session
-            .tls_ids
-            .iter()
-            .any(|(party_id, tls_id)| *party_id == 0 && *tls_id == 100));
-        assert!(!session
-            .tls_ids
-            .iter()
-            .any(|(party_id, tls_id)| *party_id == 0 && *tls_id == attacker_tls_id));
+            .expect("valid second identity registers")
+            .ready_session
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn mismatched_registration_is_rejected_without_poisoning_mesh() {
+        let state = BootnodeState::new(2);
+        state
+            .register_session(registration(0, [1u8; 32]))
+            .await
+            .expect("first party registers");
+        assert!(state
+            .register_session(registration(1, [2u8; 32]))
+            .await
+            .is_err());
+        assert!(state
+            .register_session(registration(1, [1u8; 32]))
+            .await
+            .expect("matching party still completes mesh")
+            .ready_session
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn exact_registration_retries_are_idempotent() {
+        let state = BootnodeState::new(2);
+        let first = registration(0, [3u8; 32]);
+        state
+            .register_session(first.clone())
+            .await
+            .expect("initial registration succeeds");
+        let retry = state
+            .register_session(first)
+            .await
+            .expect("pending retry succeeds");
+        assert_eq!(retry.registered_parties, 1);
+
+        let second = registration(1, [3u8; 32]);
+        state
+            .register_session(second.clone())
+            .await
+            .expect("mesh completes");
+        assert!(state
+            .register_session(second)
+            .await
+            .expect("active retry succeeds")
+            .ready_session
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn zero_execution_id_is_rejected() {
+        let state = BootnodeState::new(1);
+        assert!(state
+            .register_session(registration_for(ExecutionId::from([0; 32]), 0, [3u8; 32]))
+            .await
+            .is_err());
     }
 }

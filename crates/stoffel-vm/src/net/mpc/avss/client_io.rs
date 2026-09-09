@@ -8,7 +8,7 @@ use ark_serialize::CanonicalDeserialize;
 use std::collections::HashMap;
 use std::time::Duration;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
-use stoffelnet::network_utils::ClientId;
+use stoffelnet::network_utils::{ClientId, NetworkError};
 
 const OUTPUT_SHARE_LIST_MAGIC: &[u8; 5] = b"VMOS1";
 
@@ -117,12 +117,38 @@ where
             }
         }
 
-        let transport_client_id = self.client_output_transport_id(client_id).await;
+        let transport_client_id = self.client_output_transport_id(client_id).await?;
         let node = self.clone_avss_node().await;
-        node.output_server
-            .init(transport_client_id, shares, input_len, self.net.clone())
+        match node
+            .output_server
+            .init(
+                transport_client_id,
+                shares,
+                input_len,
+                self.protocol_net.clone(),
+            )
             .await
-            .map_err(|e| format!("OutputServer.init failed: {:?}", e))
+        {
+            Ok(()) => Ok(()),
+            Err(stoffelmpc_mpc::avss_mpc::output::AvssOutputError::NetworkError(
+                error @ (NetworkError::SendError | NetworkError::ClientNotFound(_)),
+            )) => {
+                // Threshold reconstruction lets the client leave before every
+                // honest party's send completes. Do not turn that expected
+                // client churn into a divergent node execution result.
+                tracing::warn!(
+                    client_id,
+                    transport_client_id,
+                    ?error,
+                    "AVSS client output share could not be delivered"
+                );
+                Ok(())
+            }
+            Err(stoffelmpc_mpc::avss_mpc::output::AvssOutputError::NetworkError(error)) => {
+                Err(format!("OutputServer.init network failure: {error}"))
+            }
+            Err(error) => Err(format!("OutputServer.init failed: {error:?}")),
+        }
     }
 }
 

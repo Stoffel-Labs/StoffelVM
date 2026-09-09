@@ -1,0 +1,9 @@
+def main() -> int64:
+  var num_elements: int64 = 4096
+  var num_clients: int64 = 100
+  var i: int64 = 0
+  
+  while i < num_elements * num_clients:
+    var s: Share = Share.random_field()
+    i = i + 1
+  return 0

@@ -3,8 +3,8 @@ use crate::core_vm::VirtualMachine;
 use crate::mpc_values::byte_arrays::{create_byte_array, extract_byte_array};
 use crate::net::curve::MpcFieldKind;
 use crate::net::mpc_engine::{
-    MpcCapabilities, MpcEngine, MpcEngineError, MpcEngineOpenInExponent, MpcEngineResult,
-    MpcExponentGroup, MpcSessionTopology,
+    MpcCapabilities, MpcEngine, MpcEngineError, MpcEngineOpenInExponent, MpcEngineRandomness,
+    MpcEngineResult, MpcExponentGroup, MpcSessionTopology,
 };
 use crate::VirtualMachineErrorKind;
 use std::collections::HashMap;
@@ -219,9 +219,21 @@ impl MpcEngine for ConstantInputEngine {
             "not implemented",
         ))
     }
+    fn capabilities(&self) -> MpcCapabilities {
+        MpcCapabilities::RANDOMNESS
+    }
+    fn as_randomness(&self) -> Option<&dyn MpcEngineRandomness> {
+        Some(self)
+    }
     fn shutdown(&self) {}
     fn field_kind(&self) -> MpcFieldKind {
         MpcFieldKind::Bls12_381Fr
+    }
+}
+
+impl MpcEngineRandomness for ConstantInputEngine {
+    fn random_share(&self, _ty: ShareType) -> MpcEngineResult<ShareData> {
+        Ok(encode_robust_share_bls(42))
     }
 }
 
@@ -656,6 +668,25 @@ fn share_random_reports_missing_randomness_capability_through_vm_runtime() {
     assert!(
         err.contains("does not support jointly-random share generation"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn share_random_returns_an_object_with_creator_party_metadata() {
+    let mut vm = VirtualMachine::builder().with_mpc_builtins(false).build();
+    register_mpc_builtins(&mut vm);
+    vm.set_mpc_engine(Arc::new(ConstantInputEngine));
+
+    let random = vm.execute_with_args("Share.random", &[]).unwrap();
+    assert!(matches!(random, Value::Object(_)));
+    assert_eq!(
+        vm.read_share_object(&random).unwrap(),
+        (ShareType::default_secret_int(), encode_robust_share_bls(42))
+    );
+    assert_eq!(
+        vm.execute_with_args("Share.get_party_id", &[random])
+            .unwrap(),
+        Value::I64(0)
     );
 }
 

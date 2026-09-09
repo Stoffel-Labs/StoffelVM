@@ -41,7 +41,11 @@ pub(crate) const FUNCTION_NAMES: &[&str] = &[
     "ClientStore.get_number_input_clients",
     "ClientStore.get_number_output_clients",
     "ClientStore.take_share",
+    "ClientStore.take_share_bool",
     "ClientStore.take_share_fixed",
+    "ClientStore.sum_shares",
+    "ClientStore.sum_shares_bool",
+    "ClientStore.sum_shares_fixed",
     "LocalStorage.store",
     "LocalStorage.load",
     "LocalStorage.retrieve",
@@ -620,14 +624,10 @@ pub(crate) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
         let client_index = ClientInputIndex::new(args.usize(0, "client_index")?);
         let share_index = ClientShareIndex::new(args.usize(1, "share_index")?);
 
-        let client_id = ctx
-            .client_id_at_index(client_index)
-            .ok_or_else(|| format!("No client at index {}", client_index))?;
-
         // Load the client's secret input as a boolean (1-bit) share so it can be
         // consumed by the secret-bool gates (NOT/AND/XOR). Plain `take_share`
         // yields a default 64-bit integer share, which those gates reject.
-        Ok(ctx.load_client_share_as(client_id, share_index, ShareType::boolean())?)
+        Ok(ctx.load_client_share_at_as(client_index, share_index, ShareType::boolean())?)
     });
 
     register_standard_builtin!("ClientStore.take_share_fixed", |ctx| {
@@ -637,16 +637,35 @@ pub(crate) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
         let client_index = ClientInputIndex::new(args.usize(0, "client_index")?);
         let share_index = ClientShareIndex::new(args.usize(1, "share_index")?);
 
-        let client_id = ctx
-            .client_id_at_index(client_index)
-            .ok_or_else(|| format!("No client at index {}", client_index))?;
-
-        Ok(ctx.load_client_share_as(
-            client_id,
+        Ok(ctx.load_client_share_at_as(
+            client_index,
             share_index,
             ShareType::default_secret_fixed_point(),
         )?)
     });
+
+    macro_rules! register_client_share_sum {
+        ($name:literal, $fallback_type:expr) => {
+            register_standard_builtin!($name, |ctx| {
+                let args = ctx.named_args($name);
+                args.require_exact(2, "2 arguments: share_index, client_count")?;
+
+                let share_index = ClientShareIndex::new(args.usize(0, "share_index")?);
+                // The source loop always reads client zero before checking its bound,
+                // so zero and negative bounds both mean one contributing client.
+                let client_count = usize::try_from(args.i64(1, "client_count")?.max(1))
+                    .map_err(|_| "client_count is too large for this platform")?;
+                Ok(ctx.sum_client_shares_at(share_index, client_count, $fallback_type)?)
+            });
+        };
+    }
+
+    register_client_share_sum!("ClientStore.sum_shares", ShareType::default_secret_int());
+    register_client_share_sum!("ClientStore.sum_shares_bool", ShareType::boolean());
+    register_client_share_sum!(
+        "ClientStore.sum_shares_fixed",
+        ShareType::default_secret_fixed_point()
+    );
 
     register_standard_builtin!("LocalStorage.store", |mut ctx| {
         let (key_value, stored_value) = {

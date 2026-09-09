@@ -1,0 +1,27 @@
+# Multi-input/multi-output online MPC workload for standing-node validation.
+#
+# Two clients each contribute two values. Two MPC products form a dot product,
+# but each authenticated client receives a different two-value vector. This
+# makes a certificate/roster slot swap observable instead of letting symmetric
+# output delivery pass unnoticed.
+
+def main() -> int64:
+  var a0: secret int64 = ClientStore.take_share(0, 0)
+  var a1: secret int64 = ClientStore.take_share(0, 1)
+  var b0: secret int64 = ClientStore.take_share(1, 0)
+  var b1: secret int64 = ClientStore.take_share(1, 1)
+
+  var dot0 = Share.mul(a0, b0)
+  var dot1 = Share.mul(a1, b1)
+  var dot = Share.add(dot0, dot1)
+  var sum = Share.add(Share.add(a0, a1), Share.add(b0, b1))
+  var client0_sum = Share.add(a0, a1)
+  var client1_sum = Share.add(b0, b1)
+
+  if Mpc.has_capability("client-output"):
+    var client0_outputs: list[Share] = [dot, client0_sum]
+    var client1_outputs: list[Share] = [sum, client1_sum]
+    MpcOutput.send_to_client(0, client0_outputs)
+    MpcOutput.send_to_client(1, client1_outputs)
+
+  return Share.open(dot)

@@ -31,6 +31,15 @@ where
             .map_mpc_engine_operation("multiply_share")
     }
 
+    fn batch_multiply_shares(
+        &self,
+        ty: ShareType,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+    ) -> MpcEngineResult<Vec<ShareData>> {
+        crate::net::try_block_on_current(self.batch_multiply_share_async(ty, pairs))
+            .map_mpc_engine_operation("batch_multiply_shares")
+    }
+
     fn divide_fixed_by_constant(
         &self,
         ty: ShareType,
@@ -126,6 +135,79 @@ where
 
         result.map_mpc_engine_operation("open_share_in_exp_group")
     }
+
+    fn batch_open_shares_in_exp_group(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+        generator_bytes: &[u8],
+    ) -> MpcEngineResult<Vec<Vec<u8>>> {
+        if !self.supports_exponent_group(group) {
+            return Err(MpcEngineError::operation_failed(
+                "batch_open_shares_in_exp_group",
+                group.unsupported_error(self.protocol_name()),
+            ));
+        }
+
+        if group == self.native_exponent_group() {
+            let generators = vec![generator_bytes.to_vec(); shares.len()];
+            return crate::net::try_block_on_current(
+                self.batch_open_shares_in_exp_group_custom_async_impl(
+                    group,
+                    ty,
+                    shares,
+                    &generators,
+                ),
+            )
+            .map_mpc_engine_operation("batch_open_shares_in_exp_group");
+        }
+
+        shares
+            .iter()
+            .map(|share| self.open_share_in_exp_group(group, ty, share, generator_bytes))
+            .collect()
+    }
+
+    fn batch_open_shares_in_exp_group_custom(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+        generators: &[Vec<u8>],
+    ) -> MpcEngineResult<Vec<Vec<u8>>> {
+        if shares.len() != generators.len() {
+            return Err(MpcEngineError::operation_failed(
+                "batch_open_shares_in_exp_group_custom",
+                format!(
+                    "share/generator length mismatch: {} != {}",
+                    shares.len(),
+                    generators.len()
+                ),
+            ));
+        }
+        if !self.supports_exponent_group(group) {
+            return Err(MpcEngineError::operation_failed(
+                "batch_open_shares_in_exp_group_custom",
+                group.unsupported_error(self.protocol_name()),
+            ));
+        }
+
+        if group == self.native_exponent_group() {
+            return crate::net::try_block_on_current(
+                self.batch_open_shares_in_exp_group_custom_async_impl(
+                    group, ty, shares, generators,
+                ),
+            )
+            .map_mpc_engine_operation("batch_open_shares_in_exp_group_custom");
+        }
+
+        shares
+            .iter()
+            .zip(generators)
+            .map(|(share, generator)| self.open_share_in_exp_group(group, ty, share, generator))
+            .collect()
+    }
 }
 
 impl<F, G> MpcEngineFieldOpen for HoneyBadgerMpcEngine<F, G>
@@ -136,6 +218,15 @@ where
     fn open_share_as_field(&self, ty: ShareType, share_bytes: &[u8]) -> MpcEngineResult<Vec<u8>> {
         crate::net::try_block_on_current(self.open_share_as_field_async_impl(ty, share_bytes))
             .map_mpc_engine_operation("open_share_as_field")
+    }
+
+    fn batch_open_shares_as_fields(
+        &self,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> MpcEngineResult<Vec<Vec<u8>>> {
+        crate::net::try_block_on_current(self.batch_open_shares_as_fields_async_impl(ty, shares))
+            .map_mpc_engine_operation("batch_open_shares_as_fields")
     }
 }
 
@@ -173,6 +264,12 @@ where
         &self,
     ) -> Option<&dyn crate::net::mpc_engine::AsyncMpcEngineConsensus> {
         Some(self)
+    }
+
+    async fn reset_for_next_run(&self, new_instance_id: u64) -> MpcEngineResult<()> {
+        self.reset_state_for_next_run(new_instance_id)
+            .await
+            .map_mpc_engine_operation("reset_for_next_run")
     }
 
     async fn input_share_async(&self, clear: ClearShareInput) -> MpcEngineResult<ShareData> {
@@ -246,6 +343,14 @@ where
         self.random_share_async_impl(ty)
             .await
             .map_mpc_engine_operation("async_random_share")
+    }
+
+    fn try_random_share_cached(&self, _ty: ShareType) -> Option<MpcEngineResult<ShareData>> {
+        self.try_reserve_random_share().map(|share| {
+            Self::encode_share(&share)
+                .map(|bytes| ShareData::Opaque(bytes.into()))
+                .map_mpc_engine_operation("cached_random_share")
+        })
     }
 
     async fn random_integer_share_async(&self, ty: ShareType) -> MpcEngineResult<ShareData> {

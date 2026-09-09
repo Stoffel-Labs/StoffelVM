@@ -1,0 +1,13 @@
+[package]
+name = "mpc-sha256-client-io"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hex = "0.4"
+sha2 = "0.10"
+stoffel = { package = "stoffel-rust-sdk", version = "0.2.0", path = "../../../stoffel-rust-sdk" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[build-dependencies]
+stoffel-bindgen = { version = "0.2.0", path = "../../../stoffel-bindgen" }

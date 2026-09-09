@@ -686,7 +686,6 @@ where
             let engine = engine.clone();
             let tx = msg_tx.clone();
             let conn = conn.clone();
-            let net_clone = net.clone();
             let shutdown_token = self.shutdown_token.clone();
             let router = router.clone();
 
@@ -700,7 +699,20 @@ where
                         result = conn.receive() => {
                             match result {
                                 Ok(data) => {
-                                    match router.try_handle_wire_message(authenticated_sender_id, &data) {
+                                    let envelope = match crate::net::ExecutionEnvelopeV1::decode(&data) {
+                                        Ok(envelope)
+                                            if envelope.execution_id() == engine.execution_id()
+                                                && envelope.kind() == crate::net::ExecutionMessageKind::Mpc => envelope,
+                                        _ => {
+                                            let _ = tx.send(data).await;
+                                            continue;
+                                        }
+                                    };
+                                    let payload = envelope.payload();
+                                    match router
+                                        .handle_wire_message(authenticated_sender_id, payload)
+                                        .await
+                                    {
                                         Ok(true) => {
                                             continue;
                                         }
@@ -714,7 +726,7 @@ where
                                         Ok(false) => {}
                                     }
 
-                                    match router.try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
+                                    match router.try_handle_avss_open_exp_wire_message(authenticated_sender_id, payload) {
                                         Ok(true) => {
                                             continue;
                                         }
@@ -728,7 +740,7 @@ where
                                         Ok(false) => {}
                                     }
 
-                                    match router.try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
+                                    match router.try_handle_avss_g2_exp_wire_message(authenticated_sender_id, payload) {
                                         Ok(true) => {
                                             continue;
                                         }
@@ -742,8 +754,7 @@ where
                                         Ok(false) => {}
                                     }
 
-                                    // Route raw bytes to the AVSS node with sender_id
-                                    if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {
+                                    if let Err(e) = engine.process_wrapped_message(authenticated_sender_id, payload).await {
                                         // May fail to process non-protocol messages; forward as raw bytes
                                         let _ = tx.send(data).await;
                                         if !e.contains("deserialize") && !e.contains("process failed") {
@@ -807,7 +818,6 @@ where
             let engine = engine.clone();
             let tx = server_tx.clone();
             let conn = conn.clone();
-            let net_clone = net.clone();
             let shutdown_token = self.shutdown_token.clone();
             let router = router.clone();
 
@@ -818,16 +828,29 @@ where
                         result = conn.receive() => {
                             match result {
                                 Ok(data) => {
-                                    if let Ok(true) = router.try_handle_wire_message(authenticated_sender_id, &data) {
+                                    let envelope = match crate::net::ExecutionEnvelopeV1::decode(&data) {
+                                        Ok(envelope)
+                                            if envelope.execution_id() == engine.execution_id()
+                                                && envelope.kind() == crate::net::ExecutionMessageKind::Mpc => envelope,
+                                        _ => {
+                                            let _ = tx.send((authenticated_sender_id, data)).await;
+                                            continue;
+                                        }
+                                    };
+                                    let payload = envelope.payload();
+                                    if let Ok(true) = router
+                                        .handle_wire_message(authenticated_sender_id, payload)
+                                        .await
+                                    {
                                         continue;
                                     }
-                                    if let Ok(true) = router.try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data) {
+                                    if let Ok(true) = router.try_handle_avss_open_exp_wire_message(authenticated_sender_id, payload) {
                                         continue;
                                     }
-                                    if let Ok(true) = router.try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data) {
+                                    if let Ok(true) = router.try_handle_avss_g2_exp_wire_message(authenticated_sender_id, payload) {
                                         continue;
                                     }
-                                    if let Err(e) = engine.process_wrapped_message_with_network(authenticated_sender_id, &data, net_clone.clone()).await {
+                                    if let Err(e) = engine.process_wrapped_message(authenticated_sender_id, payload).await {
                                         let _ = tx.send((authenticated_sender_id, data)).await;
                                         if !e.contains("deserialize") && !e.contains("process failed") {
                                             error!(

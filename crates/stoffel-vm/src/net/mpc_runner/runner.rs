@@ -355,6 +355,16 @@ where
         })
     }
 
+    /// Rotate the MPC engine to a new instance id and clear per-run VM scratch.
+    pub async fn reset_for_next_run(&self, new_instance_id: u64) -> MpcRunnerResult<()> {
+        self.mpc_engine
+            .reset_for_next_run(new_instance_id)
+            .await
+            .map_mpc_runner_backend_err("reset_for_next_run")?;
+        self.try_with_vm_mut_result(|vm| vm.clear_local_storage())?;
+        Ok(())
+    }
+
     /// Execute multiple VM entry-point invocations concurrently.
     ///
     /// The managed VM is used as a template. Each invocation receives an

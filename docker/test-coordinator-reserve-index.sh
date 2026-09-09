@@ -7,8 +7,8 @@ AUTH_TOKEN="${STOFFEL_AUTH_TOKEN:-coord-test-token}"
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-240}"
 COMPOSE_BUILD_FLAG="${COMPOSE_BUILD_FLAG:---build}"
 EXPECTED_OUTPUT="${EXPECTED_OUTPUT:--10}"
-COORDINATOR_CONTEXT="${STOFFEL_COORDINATOR_CONTEXT:-${STOFFEL_COORDINATOR_DIR:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#feature/no-feature-gates-and-multi-type-awareness}}"
-NETWORK_CONTEXT="${STOFFEL_NETWORK_CONTEXT:-${STOFFEL_NETWORK_DIR:-https://github.com/Stoffel-Labs/stoffel-networking.git#feature/robust-identity-based-on-cert}}"
+COORDINATOR_CONTEXT="${STOFFEL_COORDINATOR_CONTEXT:-${STOFFEL_COORDINATOR_DIR:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}}"
+NETWORK_CONTEXT="${STOFFEL_NETWORK_CONTEXT:-${STOFFEL_NETWORK_DIR:-https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1}}"
 WORKLOAD_CONTAINERS=(
     stoffel-coord-party0
     stoffel-coord-party1

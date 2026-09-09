@@ -10,9 +10,37 @@ validate_env() {
         echo "Bootnode and parties require authenticated discovery registration."
         exit 2
     fi
+
+    local needs_execution_id=false
+    case "${STOFFEL_ROLE:-}" in
+        leader|party)
+            needs_execution_id=true
+            ;;
+        client)
+            if [ -n "${STOFFEL_COORD_ADDR:-}" ]; then
+                needs_execution_id=true
+            fi
+            ;;
+    esac
+
+    if [ "$needs_execution_id" = true ]; then
+        if [ -z "${STOFFEL_EXECUTION_ID:-}" ]; then
+            echo "ERROR: STOFFEL_EXECUTION_ID is required for ${STOFFEL_ROLE} mode."
+            exit 2
+        fi
+        if ! [[ "${STOFFEL_EXECUTION_ID}" =~ ^[0-9a-fA-F]{64}$ ]] \
+            || [[ "${STOFFEL_EXECUTION_ID}" =~ ^0{64}$ ]]; then
+            echo "ERROR: STOFFEL_EXECUTION_ID must be a nonzero 64-character hexadecimal value."
+            exit 2
+        fi
+    fi
 }
 
 validate_env
+
+if [ "${STOFFEL_ROLE}" = "leader" ] || [ "${STOFFEL_ROLE}" = "party" ]; then
+    /app/configure-peer-netem.sh
+fi
 
 # Resolve the IP address peers should use to connect to this node.
 # STOFFEL_ADVERTISE_IP can be set explicitly; otherwise auto-detect from
@@ -28,6 +56,7 @@ echo "Role: ${STOFFEL_ROLE}"
     if [ "${STOFFEL_ROLE}" = "client" ]; then
         echo "Inputs: ${STOFFEL_INPUTS}"
         echo "Client Index: ${STOFFEL_CLIENT_INDEX:-unset}"
+        echo "Manifest Slot: ${STOFFEL_CLIENT_SLOT:-auto}"
         echo "Servers: ${STOFFEL_SERVERS}"
 else
     echo "Party ID: ${STOFFEL_PARTY_ID}"
@@ -41,10 +70,10 @@ echo "Threshold: ${STOFFEL_THRESHOLD}"
 echo "Program: ${STOFFEL_PROGRAM}"
 echo "Entry: ${STOFFEL_ENTRY}"
 echo "Coordinator: ${STOFFEL_COORD_ADDR:-N/A}"
+echo "Execution ID: ${STOFFEL_EXECUTION_ID:-N/A}"
 echo "Preproc Store: ${STOFFEL_PREPROC_STORE:-none}"
 echo "Local Store: ${STOFFEL_LOCAL_STORE:-none}"
 echo "Profiler: ${STOFFEL_PROFILE:-none}"
-echo "Upload Program Bytes: ${STOFFEL_UPLOAD_PROGRAM_BYTES:-true}"
 echo "Auth Token: $( [ -n "${STOFFEL_AUTH_TOKEN:-}" ] && echo "configured" || echo "not set" )"
 echo "=========================================="
 
@@ -115,6 +144,15 @@ build_command() {
         cmd="${cmd} --servers ${STOFFEL_SERVERS}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD:-1}"
+        if [ -n "${STOFFEL_PROGRAM:-}" ]; then
+            cmd="${cmd} --program ${STOFFEL_PROGRAM}"
+        fi
+        if [ -n "${STOFFEL_CLIENT_SLOT:-}" ]; then
+            cmd="${cmd} --client-slot ${STOFFEL_CLIENT_SLOT}"
+        fi
+        if [ "${STOFFEL_RAW_CLIENT_IO:-}" = "true" ]; then
+            cmd="${cmd} --raw-client-io"
+        fi
         if [ -n "${STOFFEL_OUTPUTS:-}" ]; then
             cmd="${cmd} --outputs ${STOFFEL_OUTPUTS}"
         fi
@@ -123,6 +161,7 @@ build_command() {
         fi
         if [ -n "${STOFFEL_COORD_ADDR:-}" ]; then
             cmd="${cmd} --off-chain-coord ${STOFFEL_COORD_ADDR}"
+            cmd="${cmd} --execution-id ${STOFFEL_EXECUTION_ID}"
             cmd="${cmd} --cert ${STOFFEL_CERT}"
             cmd="${cmd} --key ${STOFFEL_KEY}"
             cmd="${cmd} --timestamp ${STOFFEL_TIMESTAMP:-0}"
@@ -143,10 +182,6 @@ build_command() {
     # Add program path and entry function for non-client modes
     cmd="${cmd} ${STOFFEL_PROGRAM} ${STOFFEL_ENTRY}"
 
-    if [ "${STOFFEL_UPLOAD_PROGRAM_BYTES:-true}" = "false" ]; then
-        cmd="${cmd} --no-program-upload"
-    fi
-
     if [ "${STOFFEL_ROLE}" = "leader" ]; then
         # Leader mode: runs bootnode + party 0
         cmd="${cmd} --leader"
@@ -156,6 +191,9 @@ build_command() {
         BIND_PORT=$(echo "${STOFFEL_BIND_ADDR}" | awk -F: '{print $NF}')
         ADVERTISE_PORT=$((BIND_PORT + 1000))
         cmd="${cmd} --advertise ${STOFFEL_ADVERTISE_IP}:${ADVERTISE_PORT}"
+        if [ -n "${STOFFEL_ONE_OFF:-}" ]; then
+            cmd="${cmd} --one-off"
+        fi
     elif [ "${STOFFEL_ROLE}" = "bootnode" ]; then
         # Bootnode-only mode (no program execution)
         cmd="/app/stoffel-run --bootnode"
@@ -171,6 +209,10 @@ build_command() {
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD}"
         BIND_PORT=$(echo "${STOFFEL_BIND_ADDR}" | awk -F: '{print $NF}')
         cmd="${cmd} --advertise ${STOFFEL_ADVERTISE_IP}:${BIND_PORT}"
+    fi
+
+    if [ "${STOFFEL_ROLE}" = "leader" ] || [ "${STOFFEL_ROLE}" = "party" ]; then
+        cmd="${cmd} --execution-id ${STOFFEL_EXECUTION_ID}"
     fi
 
     # Coordinator flags (for leader, party, and bootnode modes)
@@ -195,6 +237,10 @@ build_command() {
 
     if [ -n "${STOFFEL_CLIENT_INPUT_COUNT:-}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
         cmd="${cmd} --client-input-count ${STOFFEL_CLIENT_INPUT_COUNT}"
+    fi
+
+    if [ -n "${STOFFEL_CLIENT_INPUT_TOTAL:-}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
+        cmd="${cmd} --client-input-total ${STOFFEL_CLIENT_INPUT_TOTAL}"
     fi
 
     if [ -n "${STOFFEL_PREPROC_STORE:-}" ] && [ "${STOFFEL_ROLE}" != "bootnode" ]; then
@@ -271,7 +317,7 @@ run_command() {
         perf)
             exec perf record \
                 -F "${STOFFEL_PERF_FREQUENCY:-99}" \
-                -g \
+                --call-graph dwarf,16384 \
                 -o "${out_dir}/${label}.perf.data" \
                 -- $cmd
             ;;

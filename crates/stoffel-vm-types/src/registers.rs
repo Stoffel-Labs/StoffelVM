@@ -1,7 +1,7 @@
 //! Register-bank layout shared by the compiler-facing types and the VM runtime.
 
 use crate::core_types::Value;
-use smallvec::SmallVec;
+use std::cmp::Ordering;
 use std::fmt;
 
 /// Default ABI boundary between clear and secret physical registers.
@@ -90,6 +90,40 @@ pub enum ClearRegisterReadResult {
     NotClearRegister,
     RegisterOutOfBounds,
     SourcePendingReveal,
+}
+
+/// Result of attempting a local operation entirely inside the clear register bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearRegisterOperationResult {
+    Applied,
+    NotClearRegister,
+    RegisterOutOfBounds(RegisterIndex),
+    SourcePendingReveal(RegisterIndex),
+    UnsupportedOperands,
+}
+
+/// Result of attempting a comparison entirely inside the clear register bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearRegisterCompareResult {
+    Compared(Ordering),
+    NotClearRegister,
+    RegisterOutOfBounds(RegisterIndex),
+    SourcePendingReveal(RegisterIndex),
+    UnsupportedOperands,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastClearBinaryOp {
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    BitAnd,
+    BitOr,
+    BitXor,
+    ShiftLeft,
+    ShiftRight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -230,8 +264,8 @@ impl Eq for RegisterSlot {}
 #[derive(Clone)]
 pub struct RegisterFile {
     layout: RegisterLayout,
-    clear: SmallVec<[RegisterSlot; 16]>,
-    secret: SmallVec<[RegisterSlot; 16]>,
+    clear: Vec<RegisterSlot>,
+    secret: Vec<RegisterSlot>,
 }
 
 impl RegisterFile {
@@ -251,8 +285,8 @@ impl RegisterFile {
 
     pub fn from_absolute_values(layout: RegisterLayout, values: Vec<Value>) -> Self {
         let clear_len = values.len().min(layout.secret_start());
-        let mut clear = SmallVec::new();
-        let mut secret = SmallVec::new();
+        let mut clear = Vec::with_capacity(clear_len);
+        let mut secret = Vec::with_capacity(values.len().saturating_sub(clear_len));
 
         for (index, value) in values.into_iter().enumerate() {
             if index < clear_len {
@@ -273,6 +307,7 @@ impl RegisterFile {
         self.layout
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         if self.secret.is_empty() {
             self.clear.len()
@@ -285,6 +320,7 @@ impl RegisterFile {
         self.clear.is_empty() && self.secret.is_empty()
     }
 
+    #[inline]
     pub fn get_slot(&self, register: RegisterIndex) -> Option<&RegisterSlot> {
         match self.layout.address(register) {
             RegisterAddress {
@@ -298,6 +334,7 @@ impl RegisterFile {
         }
     }
 
+    #[inline]
     pub fn get_slot_mut(&mut self, register: RegisterIndex) -> Option<&mut RegisterSlot> {
         match self.layout.address(register) {
             RegisterAddress {
@@ -315,10 +352,12 @@ impl RegisterFile {
         self.get_slot(register).is_some()
     }
 
+    #[inline]
     pub fn get(&self, register: RegisterIndex) -> Option<&Value> {
         self.get_slot(register).and_then(RegisterSlot::as_value)
     }
 
+    #[inline]
     pub fn get_mut(&mut self, register: RegisterIndex) -> Option<&mut Value> {
         self.get_slot_mut(register)
             .and_then(RegisterSlot::as_value_mut)
@@ -348,6 +387,303 @@ impl RegisterFile {
         } else {
             ClearRegisterCopyResult::NotClearRegister
         }
+    }
+
+    /// Read two clear registers, apply a local operation, and write its result
+    /// without repeating bank translation and bounds checks at each step.
+    #[inline]
+    pub fn apply_clear_binary<E>(
+        &mut self,
+        dest: RegisterIndex,
+        lhs: RegisterIndex,
+        rhs: RegisterIndex,
+        op: impl FnOnce(&Value, &Value) -> Option<Result<Value, E>>,
+    ) -> Result<ClearRegisterOperationResult, E> {
+        let dest_index = dest.index();
+        let lhs_index = lhs.index();
+        let rhs_index = rhs.index();
+        let register_count = self.len();
+
+        for register in [dest, lhs, rhs] {
+            if register.index() >= register_count {
+                return Ok(ClearRegisterOperationResult::RegisterOutOfBounds(register));
+            }
+        }
+        if dest_index >= self.clear.len()
+            || lhs_index >= self.clear.len()
+            || rhs_index >= self.clear.len()
+        {
+            return Ok(ClearRegisterOperationResult::NotClearRegister);
+        }
+
+        let result = {
+            let Some(left) = self.clear[lhs_index].as_value() else {
+                return Ok(ClearRegisterOperationResult::SourcePendingReveal(lhs));
+            };
+            let Some(right) = self.clear[rhs_index].as_value() else {
+                return Ok(ClearRegisterOperationResult::SourcePendingReveal(rhs));
+            };
+            let Some(result) = op(left, right) else {
+                return Ok(ClearRegisterOperationResult::UnsupportedOperands);
+            };
+            result?
+        };
+
+        match &mut self.clear[dest_index] {
+            RegisterSlot::Ready(value) => *value = result,
+            slot @ RegisterSlot::PendingReveal => *slot = RegisterSlot::ready(result),
+        }
+        Ok(ClearRegisterOperationResult::Applied)
+    }
+
+    /// Compare two values in the clear bank with one bank translation/bounds pass.
+    #[inline]
+    pub fn compare_clear(
+        &self,
+        lhs: RegisterIndex,
+        rhs: RegisterIndex,
+        op: impl FnOnce(&Value, &Value) -> Option<Ordering>,
+    ) -> ClearRegisterCompareResult {
+        let lhs_index = lhs.index();
+        let rhs_index = rhs.index();
+        let register_count = self.len();
+
+        for register in [lhs, rhs] {
+            if register.index() >= register_count {
+                return ClearRegisterCompareResult::RegisterOutOfBounds(register);
+            }
+        }
+        if lhs_index >= self.clear.len() || rhs_index >= self.clear.len() {
+            return ClearRegisterCompareResult::NotClearRegister;
+        }
+
+        let Some(left) = self.clear[lhs_index].as_value() else {
+            return ClearRegisterCompareResult::SourcePendingReveal(lhs);
+        };
+        let Some(right) = self.clear[rhs_index].as_value() else {
+            return ClearRegisterCompareResult::SourcePendingReveal(rhs);
+        };
+        match op(left, right) {
+            Some(ordering) => ClearRegisterCompareResult::Compared(ordering),
+            None => ClearRegisterCompareResult::UnsupportedOperands,
+        }
+    }
+
+    /// Add same-type primitive numeric values directly in the clear bank.
+    ///
+    /// This remains separate from the less-common binary operations so LLVM
+    /// can inline the compact ADD path without also inlining every opcode.
+    #[inline(always)]
+    pub fn try_add_clear_primitive(
+        &mut self,
+        dest: RegisterIndex,
+        lhs: RegisterIndex,
+        rhs: RegisterIndex,
+    ) -> bool {
+        let (dest, lhs, rhs) = (dest.index(), lhs.index(), rhs.index());
+        if dest >= self.clear.len() || lhs >= self.clear.len() || rhs >= self.clear.len() {
+            return false;
+        }
+
+        macro_rules! checked_add {
+            ($left:expr, $right:expr, $variant:ident) => {
+                match $left.checked_add(*$right) {
+                    Some(value) => PrimitiveNumeric::$variant(value),
+                    None => return false,
+                }
+            };
+        }
+
+        let result = match (self.clear[lhs].as_value(), self.clear[rhs].as_value()) {
+            (Some(Value::I64(left)), Some(Value::I64(right))) => checked_add!(left, right, I64),
+            (Some(Value::I32(left)), Some(Value::I32(right))) => checked_add!(left, right, I32),
+            (Some(Value::I16(left)), Some(Value::I16(right))) => checked_add!(left, right, I16),
+            (Some(Value::I8(left)), Some(Value::I8(right))) => checked_add!(left, right, I8),
+            (Some(Value::U64(left)), Some(Value::U64(right))) => checked_add!(left, right, U64),
+            (Some(Value::U32(left)), Some(Value::U32(right))) => checked_add!(left, right, U32),
+            (Some(Value::U16(left)), Some(Value::U16(right))) => checked_add!(left, right, U16),
+            (Some(Value::U8(left)), Some(Value::U8(right))) => checked_add!(left, right, U8),
+            (Some(Value::Float(left)), Some(Value::Float(right))) => {
+                PrimitiveNumeric::Float(crate::core_types::F64(left.0 + right.0))
+            }
+            _ => return false,
+        };
+
+        let Some(dest) = self.clear[dest].as_value_mut() else {
+            return false;
+        };
+        result.assign_to(dest);
+        true
+    }
+
+    /// Apply one same-type primitive operation directly in the clear bank.
+    ///
+    /// The operation is a const parameter so dispatch is resolved once per VM
+    /// opcode, while the value match remains shared and supports every primitive
+    /// width. Unsupported and exceptional cases fall back to the full runtime.
+    #[inline]
+    pub fn try_apply_clear_binary_primitive<const OP: u8>(
+        &mut self,
+        dest: RegisterIndex,
+        lhs: RegisterIndex,
+        rhs: RegisterIndex,
+    ) -> bool {
+        let (dest, lhs, rhs) = (dest.index(), lhs.index(), rhs.index());
+        if dest >= self.clear.len() || lhs >= self.clear.len() || rhs >= self.clear.len() {
+            return false;
+        }
+
+        macro_rules! integer_result {
+            ($left:expr, $right:expr, $variant:ident) => {{
+                let value = if OP == FastClearBinaryOp::Subtract as u8 {
+                    $left.checked_sub(*$right)
+                } else if OP == FastClearBinaryOp::Multiply as u8 {
+                    $left.checked_mul(*$right)
+                } else if OP == FastClearBinaryOp::Divide as u8 {
+                    $left.checked_div(*$right)
+                } else if OP == FastClearBinaryOp::Modulo as u8 {
+                    $left.checked_rem(*$right)
+                } else if OP == FastClearBinaryOp::BitAnd as u8 {
+                    Some(*$left & *$right)
+                } else if OP == FastClearBinaryOp::BitOr as u8 {
+                    Some(*$left | *$right)
+                } else if OP == FastClearBinaryOp::BitXor as u8 {
+                    Some(*$left ^ *$right)
+                } else if OP == FastClearBinaryOp::ShiftLeft as u8 {
+                    u32::try_from(*$right)
+                        .ok()
+                        .and_then(|amount| $left.checked_shl(amount))
+                } else if OP == FastClearBinaryOp::ShiftRight as u8 {
+                    u32::try_from(*$right)
+                        .ok()
+                        .and_then(|amount| $left.checked_shr(amount))
+                } else {
+                    return false;
+                };
+                let Some(value) = value else { return false };
+                PrimitiveNumeric::$variant(value)
+            }};
+        }
+
+        macro_rules! float_result {
+            ($left:expr, $right:expr) => {{
+                let value = if OP == FastClearBinaryOp::Subtract as u8 {
+                    $left - $right
+                } else if OP == FastClearBinaryOp::Multiply as u8 {
+                    $left * $right
+                } else if OP == FastClearBinaryOp::Divide as u8 && $right != 0.0 {
+                    $left / $right
+                } else if OP == FastClearBinaryOp::Modulo as u8 && $right != 0.0 {
+                    $left % $right
+                } else {
+                    return false;
+                };
+                PrimitiveNumeric::Float(crate::core_types::F64(value))
+            }};
+        }
+
+        let result = match (self.clear[lhs].as_value(), self.clear[rhs].as_value()) {
+            (Some(Value::Bool(left)), Some(Value::Bool(right))) => {
+                if OP == FastClearBinaryOp::BitAnd as u8 {
+                    PrimitiveNumeric::Bool(*left && *right)
+                } else if OP == FastClearBinaryOp::BitOr as u8 {
+                    PrimitiveNumeric::Bool(*left || *right)
+                } else if OP == FastClearBinaryOp::BitXor as u8 {
+                    PrimitiveNumeric::Bool(*left ^ *right)
+                } else {
+                    return false;
+                }
+            }
+            (Some(Value::I64(left)), Some(Value::I64(right))) => {
+                integer_result!(left, right, I64)
+            }
+            (Some(Value::I32(left)), Some(Value::I32(right))) => {
+                integer_result!(left, right, I32)
+            }
+            (Some(Value::I16(left)), Some(Value::I16(right))) => {
+                integer_result!(left, right, I16)
+            }
+            (Some(Value::I8(left)), Some(Value::I8(right))) => {
+                integer_result!(left, right, I8)
+            }
+            (Some(Value::U64(left)), Some(Value::U64(right))) => {
+                integer_result!(left, right, U64)
+            }
+            (Some(Value::U32(left)), Some(Value::U32(right))) => {
+                integer_result!(left, right, U32)
+            }
+            (Some(Value::U16(left)), Some(Value::U16(right))) => {
+                integer_result!(left, right, U16)
+            }
+            (Some(Value::U8(left)), Some(Value::U8(right))) => {
+                integer_result!(left, right, U8)
+            }
+            (Some(Value::Float(left)), Some(Value::Float(right))) => {
+                float_result!(left.0, right.0)
+            }
+            _ => return false,
+        };
+
+        let Some(dest) = self.clear[dest].as_value_mut() else {
+            return false;
+        };
+        result.assign_to(dest);
+        true
+    }
+
+    #[inline]
+    pub fn try_bit_not_clear_primitive(&mut self, dest: RegisterIndex, src: RegisterIndex) -> bool {
+        let (dest, src) = (dest.index(), src.index());
+        if dest >= self.clear.len() || src >= self.clear.len() {
+            return false;
+        }
+
+        let result = match self.clear[src].as_value() {
+            Some(Value::I64(value)) => PrimitiveNumeric::I64(!*value),
+            Some(Value::I32(value)) => PrimitiveNumeric::I32(!*value),
+            Some(Value::I16(value)) => PrimitiveNumeric::I16(!*value),
+            Some(Value::I8(value)) => PrimitiveNumeric::I8(!*value),
+            Some(Value::U64(value)) => PrimitiveNumeric::U64(!*value),
+            Some(Value::U32(value)) => PrimitiveNumeric::U32(!*value),
+            Some(Value::U16(value)) => PrimitiveNumeric::U16(!*value),
+            Some(Value::U8(value)) => PrimitiveNumeric::U8(!*value),
+            Some(Value::Bool(value)) => PrimitiveNumeric::Bool(!*value),
+            _ => return false,
+        };
+
+        let Some(dest) = self.clear[dest].as_value_mut() else {
+            return false;
+        };
+        result.assign_to(dest);
+        true
+    }
+
+    /// Compare same-type clear primitives without widening through the generic
+    /// numeric comparison machinery.
+    #[inline(always)]
+    pub fn try_compare_clear_primitive(
+        &self,
+        lhs: RegisterIndex,
+        rhs: RegisterIndex,
+    ) -> Option<Ordering> {
+        let (lhs, rhs) = (lhs.index(), rhs.index());
+        let (left, right) = (
+            self.clear.get(lhs)?.as_value()?,
+            self.clear.get(rhs)?.as_value()?,
+        );
+        Some(match (left, right) {
+            (Value::I64(left), Value::I64(right)) => left.cmp(right),
+            (Value::I32(left), Value::I32(right)) => left.cmp(right),
+            (Value::I16(left), Value::I16(right)) => left.cmp(right),
+            (Value::I8(left), Value::I8(right)) => left.cmp(right),
+            (Value::U64(left), Value::U64(right)) => left.cmp(right),
+            (Value::U32(left), Value::U32(right)) => left.cmp(right),
+            (Value::U16(left), Value::U16(right)) => left.cmp(right),
+            (Value::U8(left), Value::U8(right)) => left.cmp(right),
+            (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
+            (Value::Float(left), Value::Float(right)) => left.0.partial_cmp(&right.0)?,
+            _ => return None,
+        })
     }
 
     #[inline]
@@ -504,6 +840,47 @@ impl RegisterFile {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PrimitiveNumeric {
+    I64(i64),
+    I32(i32),
+    I16(i16),
+    I8(i8),
+    U64(u64),
+    U32(u32),
+    U16(u16),
+    U8(u8),
+    Float(crate::core_types::F64),
+    Bool(bool),
+}
+
+impl PrimitiveNumeric {
+    #[inline(always)]
+    fn assign_to(self, dest: &mut Value) {
+        macro_rules! assign {
+            ($value:expr, $variant:ident) => {
+                match dest {
+                    Value::$variant(current) => *current = $value,
+                    _ => *dest = Value::$variant($value),
+                }
+            };
+        }
+
+        match self {
+            Self::I64(value) => assign!(value, I64),
+            Self::I32(value) => assign!(value, I32),
+            Self::I16(value) => assign!(value, I16),
+            Self::I8(value) => assign!(value, I8),
+            Self::U64(value) => assign!(value, U64),
+            Self::U32(value) => assign!(value, U32),
+            Self::U16(value) => assign!(value, U16),
+            Self::U8(value) => assign!(value, U8),
+            Self::Float(value) => assign!(value, Float),
+            Self::Bool(value) => assign!(value, Bool),
+        }
+    }
+}
+
 #[inline]
 fn clone_clear_register_value(value: &Value) -> Value {
     match value {
@@ -534,10 +911,8 @@ fn clone_secret_register_value(value: &Value) -> Option<Value> {
     }
 }
 
-fn default_slots(len: usize) -> SmallVec<[RegisterSlot; 16]> {
-    let mut slots = SmallVec::new();
-    slots.resize(len, RegisterSlot::default());
-    slots
+fn default_slots(len: usize) -> Vec<RegisterSlot> {
+    vec![RegisterSlot::default(); len]
 }
 
 impl Default for RegisterFile {
@@ -576,6 +951,165 @@ mod tests {
 
     const fn r(index: usize) -> RegisterIndex {
         RegisterIndex::new(index)
+    }
+
+    fn apply_binary<const OP: u8>(left: Value, right: Value) -> Option<Value> {
+        let mut registers = RegisterFile::from(vec![Value::Unit, left, right]);
+        registers
+            .try_apply_clear_binary_primitive::<OP>(r(0), r(1), r(2))
+            .then(|| registers.get(r(0)).expect("binary result").clone())
+    }
+
+    fn apply_add(left: Value, right: Value) -> Option<Value> {
+        let mut registers = RegisterFile::from(vec![Value::Unit, left, right]);
+        registers
+            .try_add_clear_primitive(r(0), r(1), r(2))
+            .then(|| registers.get(r(0)).expect("add result").clone())
+    }
+
+    fn apply_not(value: Value) -> Option<Value> {
+        let mut registers = RegisterFile::from(vec![Value::Unit, value]);
+        registers
+            .try_bit_not_clear_primitive(r(0), r(1))
+            .then(|| registers.get(r(0)).expect("not result").clone())
+    }
+
+    #[test]
+    fn primitive_fast_paths_cover_every_integer_width() {
+        macro_rules! assert_integer {
+            ($variant:ident, $left:expr, $right:expr) => {{
+                let left = $left;
+                let right = $right;
+                assert_eq!(
+                    apply_add(Value::$variant(left), Value::$variant(right)),
+                    Some(Value::$variant(left + right))
+                );
+                macro_rules! binary {
+                    ($op:ident, $expected:expr) => {
+                        assert_eq!(
+                            apply_binary::<{ FastClearBinaryOp::$op as u8 }>(
+                                Value::$variant(left),
+                                Value::$variant(right),
+                            ),
+                            Some(Value::$variant($expected))
+                        )
+                    };
+                }
+                binary!(Subtract, left - right);
+                binary!(Multiply, left * right);
+                binary!(Divide, left / right);
+                binary!(Modulo, left % right);
+                binary!(BitAnd, left & right);
+                binary!(BitOr, left | right);
+                binary!(BitXor, left ^ right);
+                binary!(ShiftLeft, left << right);
+                binary!(ShiftRight, left >> right);
+                assert_eq!(
+                    apply_not(Value::$variant(left)),
+                    Some(Value::$variant(!left))
+                );
+                let registers =
+                    RegisterFile::from(vec![Value::$variant(left), Value::$variant(right)]);
+                assert_eq!(
+                    registers.try_compare_clear_primitive(r(0), r(1)),
+                    Some(Ordering::Greater)
+                );
+            }};
+        }
+
+        assert_integer!(I64, 12i64, 3i64);
+        assert_integer!(I32, 12i32, 3i32);
+        assert_integer!(I16, 12i16, 3i16);
+        assert_integer!(I8, 12i8, 3i8);
+        assert_integer!(U64, 12u64, 3u64);
+        assert_integer!(U32, 12u32, 3u32);
+        assert_integer!(U16, 12u16, 3u16);
+        assert_integer!(U8, 12u8, 3u8);
+    }
+
+    #[test]
+    fn primitive_fast_paths_cover_float_and_bool_operations() {
+        let left = crate::core_types::F64(12.0);
+        let right = crate::core_types::F64(3.0);
+        assert_eq!(
+            apply_add(Value::Float(left), Value::Float(right)),
+            Some(Value::Float(crate::core_types::F64(15.0)))
+        );
+        assert_eq!(
+            apply_binary::<{ FastClearBinaryOp::Subtract as u8 }>(
+                Value::Float(left),
+                Value::Float(right),
+            ),
+            Some(Value::Float(crate::core_types::F64(9.0)))
+        );
+        assert_eq!(
+            apply_binary::<{ FastClearBinaryOp::Multiply as u8 }>(
+                Value::Float(left),
+                Value::Float(right),
+            ),
+            Some(Value::Float(crate::core_types::F64(36.0)))
+        );
+        assert_eq!(
+            apply_binary::<{ FastClearBinaryOp::Divide as u8 }>(
+                Value::Float(left),
+                Value::Float(right),
+            ),
+            Some(Value::Float(crate::core_types::F64(4.0)))
+        );
+        assert_eq!(
+            apply_binary::<{ FastClearBinaryOp::Modulo as u8 }>(
+                Value::Float(left),
+                Value::Float(crate::core_types::F64(5.0)),
+            ),
+            Some(Value::Float(crate::core_types::F64(2.0)))
+        );
+
+        assert_eq!(
+            apply_binary::<{ FastClearBinaryOp::BitAnd as u8 }>(
+                Value::Bool(true),
+                Value::Bool(false),
+            ),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            apply_binary::<{ FastClearBinaryOp::BitOr as u8 }>(
+                Value::Bool(true),
+                Value::Bool(false),
+            ),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            apply_binary::<{ FastClearBinaryOp::BitXor as u8 }>(
+                Value::Bool(true),
+                Value::Bool(true),
+            ),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(apply_not(Value::Bool(true)), Some(Value::Bool(false)));
+    }
+
+    #[test]
+    fn primitive_fast_paths_reject_unsupported_or_invalid_operands() {
+        assert_eq!(apply_add(Value::I64(1), Value::I32(2)), None);
+        assert_eq!(
+            apply_binary::<{ FastClearBinaryOp::Divide as u8 }>(Value::I64(1), Value::I64(0),),
+            None
+        );
+        assert_eq!(
+            apply_binary::<{ FastClearBinaryOp::BitAnd as u8 }>(
+                Value::Float(crate::core_types::F64(1.0)),
+                Value::Float(crate::core_types::F64(2.0)),
+            ),
+            None
+        );
+
+        let mut registers = RegisterFile::new(RegisterLayout::new(1), 2);
+        assert!(!registers.try_add_clear_primitive(r(0), r(0), r(1)));
+        assert_eq!(apply_add(Value::I64(i64::MAX), Value::I64(1)), None);
+        registers
+            .set_pending_reveal(r(0))
+            .expect("clear register exists");
+        assert_eq!(registers.try_compare_clear_primitive(r(0), r(0)), None);
     }
 
     #[test]

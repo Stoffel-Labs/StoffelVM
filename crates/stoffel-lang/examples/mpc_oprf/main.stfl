@@ -1,34 +1,62 @@
-# run-args: --client-input 0=42
-# Oblivious PRF (OPRF): F_k(x) = H(x)^k over the BLS12-381 G1 curve.
+# Threshold BLS12-381 OPRF service.
 #
-# The servers jointly hold the PRF key k as a secret share and never reveal it.
-# Evaluation hashes the input to a curve point and raises it to the shared key
-# via open-in-exponent (Share.open_exp_custom). The 48-byte result is
-# deterministic for a fixed key and pseudorandom without knowledge of k -- the
-# building block for DH-based PSI (mpc_dh_psi) and private keyword search.
+# The client hashes each message to G1, blinds the point with a fresh non-zero
+# scalar, and packs the compressed point into two field limbs for ClientStore.
+# The nodes learn only the uniformly blinded point and evaluate it with one
+# persistent threshold-shared key. The client unblinds and finalizes the
+# returned point locally.
 #
-# A production OPRF additionally has the client BLIND its input (send H(x)^r,
-# unblind the H(x)^{rk} response to H(x)^k) so the servers never learn x. That
-# blinding/unblinding is client-side and wraps this server-side evaluation core.
-
-def oprf(input_bytes: bytes, key: Share) -> bytes:
-  var point = Crypto.hash_to_g1(input_bytes)
-  return key.open_exp_custom(point)
+# This example evaluates three requests in one batch: two independently
+# blinded encodings of the same message and one different message. See the
+# release client in crates/stoffel-rust-sdk/examples/oprf.rs.
 
 def main() -> bytes:
-  # Shared, secret PRF key (never opened).
-  var key: secret int64 = Share.random()
+  var request_count = 3
+  var limbs_per_point = 2
+  var limb_payload_bytes = 24
+  var point_bytes = 48
 
-  # Default input; a client may instead supply it as a field share.
-  var x = Bytes.from_string("alice@example.com")
-  if ClientStore.get_number_clients() > 0:
-    var x_share = ClientStore.take_share(0, 0)
-    x = x_share.open_field()
+  # Generate the service key cooperatively on first use, then persist only the
+  # per-node shares. Stable deployments give every node a durable, private
+  # --local-store path and keep this versioned key identifier unchanged until
+  # an intentional rotation.
+  var key_id = "oprf:bls12-381-g1:sk:v1"
+  if LocalStorage.exists(key_id):
+    # Validate the persisted share envelope before loading it as a typed value.
+    discard LocalStorage.load_share(key_id)
+  else:
+    var generated_key: secret int64 = Share.random_field()
+    discard LocalStorage.store(key_id, generated_key)
+  var key: secret int64 = LocalStorage.load(key_id)
 
-  var fx = oprf(x, key)
-  var fx_again = oprf(x, key)
-  var fy = oprf(Bytes.from_string("bob@example.com"), key)
+  var packed: list[Share] = list(request_count * limbs_per_point)
+  var limb_index = 0
+  while limb_index < request_count * limbs_per_point:
+    packed[limb_index] = ClientStore.take_share(0, limb_index)
+    limb_index = limb_index + 1
 
-  assert fx == fx_again, "OPRF must be deterministic for a fixed key and input"
-  assert not (fx == fy), "distinct inputs must give distinct OPRF outputs"
-  return fx
+  # The limbs encode public blinded points, so revealing them does not reveal
+  # the messages. One batch reconstructs every limb.
+  var opened_limbs: list[bytes] = Share.batch_open_field(packed)
+  var generators: list[bytes] = list(request_count)
+  var request_index = 0
+  while request_index < request_count:
+    var point: bytes = list(point_bytes)
+    extend(point, slice(opened_limbs[request_index * limbs_per_point], 0, limb_payload_bytes))
+    extend(point, slice(opened_limbs[request_index * limbs_per_point + 1], 0, limb_payload_bytes))
+    generators[request_index] = point
+    request_index = request_index + 1
+
+  var keys: list[Share] = list(request_count)
+  request_index = 0
+  while request_index < request_count:
+    keys[request_index] = key
+    request_index = request_index + 1
+  var evaluated: list[bytes] = Share.batch_open_exp_custom(keys, generators, "bls12-381-g1")
+
+  var response: bytes = list(request_count * point_bytes)
+  request_index = 0
+  while request_index < request_count:
+    extend(response, evaluated[request_index])
+    request_index = request_index + 1
+  return response

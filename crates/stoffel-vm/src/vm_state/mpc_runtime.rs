@@ -259,6 +259,16 @@ impl MpcRuntimeState {
     {
         Ok(self.client_store.try_replace_client_input(inputs)?)
     }
+
+    pub(super) fn try_replace_client_input_with_types<F, I>(&self, inputs: I) -> VmResult<usize>
+    where
+        F: ark_ff::FftField,
+        I: IntoIterator<Item = (ClientId, Vec<RobustShare<F>>, Option<Vec<ShareType>>)>,
+    {
+        Ok(self
+            .client_store
+            .try_replace_client_input_with_types(inputs)?)
+    }
     pub(super) fn client_share<F>(
         &self,
         client_id: ClientId,
@@ -270,6 +280,7 @@ impl MpcRuntimeState {
         self.client_store.get_client_share(client_id, index)
     }
 
+    #[cfg(test)]
     pub(super) fn client_share_as(
         &self,
         client_id: ClientId,
@@ -296,6 +307,75 @@ impl MpcRuntimeState {
         };
 
         Ok(Value::Share(share_type, share.into_data()))
+    }
+
+    pub(super) fn client_share_at_as(
+        &self,
+        client_index: ClientInputIndex,
+        share_index: ClientShareIndex,
+        request: ClientShareRequest,
+    ) -> VmResult<Value> {
+        let requested_type = request.requested_type();
+        let (client_id, share) = self
+            .client_store
+            .get_client_share_data_at(client_index, share_index)
+            .ok_or_else(|| {
+                format!(
+                    "No client share at client slot {} and share index {}",
+                    client_index, share_index
+                )
+            })?;
+        if let Some(stored_type) = share.share_type() {
+            if stored_type != requested_type {
+                return Err(VmError::ClientShareTypeMismatch {
+                    client_id,
+                    index: share_index,
+                    stored_type,
+                    requested_type,
+                });
+            }
+        }
+        Ok(Value::Share(requested_type, share.into_data()))
+    }
+
+    pub(super) fn sum_client_shares_at(
+        &self,
+        share_index: ClientShareIndex,
+        client_count: usize,
+        fallback_type: ShareType,
+    ) -> VmResult<Value> {
+        let shares = self
+            .client_store
+            .snapshot_share_column(share_index, client_count)
+            .ok_or_else(|| {
+                format!(
+                    "Cannot sum client input column {} across {} clients",
+                    share_index,
+                    client_count.max(1)
+                )
+            })?;
+        // Modern runners hydrate the semantic type from the client-I/O manifest.
+        // Falling back keeps older untyped payloads compatible with the source
+        // builtin (`take_share`, `take_share_bool`, or `take_share_fixed`).
+        let requested_type = shares
+            .iter()
+            .find_map(ClientShare::share_type)
+            .unwrap_or(fallback_type);
+        let mut data = Vec::with_capacity(shares.len());
+        for (client_index, share) in shares.into_iter().enumerate() {
+            if let Some(stored_type) = share.share_type() {
+                if stored_type != requested_type {
+                    return Err(format!(
+                        "Client share at slot {} index {} has type {:?}, requested {:?}",
+                        client_index, share_index, stored_type, requested_type
+                    )
+                    .into());
+                }
+            }
+            data.push(share.into_data());
+        }
+        let sum = self.share_runtime()?.sum_data(requested_type, &data)?;
+        Ok(Value::Share(requested_type, sum))
     }
 
     pub(super) fn client_share_inferred_or_default(

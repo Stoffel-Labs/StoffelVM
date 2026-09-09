@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "CLI release tag, e.g. cli-v0.1.0"
+        description: "CLI release tag, e.g. cli-v0.2.0"
         required: true
         type: string
 
@@ -51,12 +51,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Check tag matches stoffel-cli version
+      - name: Check tag matches stoffel version
         run: |
           crate_version="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c "import sys,json; m=json.load(sys.stdin); print(next(p['version'] for p in m['packages'] if p['name']=='stoffel-cli'))")"
+            | python3 -c "import sys,json; m=json.load(sys.stdin); print(next(p['version'] for p in m['packages'] if p['name']=='stoffel'))")"
           if [ "$crate_version" != "${{ steps.ref.outputs.version }}" ]; then
-            echo "Tag ${{ steps.ref.outputs.tag }} does not match stoffel-cli version $crate_version"; exit 1
+            echo "Tag ${{ steps.ref.outputs.tag }} does not match stoffel version $crate_version"; exit 1
           fi
 
       - name: Check tag commit is contained in main
@@ -94,7 +94,7 @@ jobs:
 
       - name: Build stoffel CLI and runner
         run: |
-          cargo build --release -p stoffel-cli --bin stoffel --locked --target ${{ matrix.target }}
+          cargo build --release -p stoffel --bin stoffel --locked --target ${{ matrix.target }}
           cargo build --release -p stoffel-vm-runner --bin stoffel-run --locked --target ${{ matrix.target }}
 
       - name: Package binaries

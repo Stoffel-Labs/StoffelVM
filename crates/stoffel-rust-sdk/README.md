@@ -8,7 +8,7 @@ bytecode loading, VM execution, and MPC participant configuration in Rust apps.
 Add the crate and import the prelude:
 
 ```toml
-stoffel-rust-sdk = "=0.1.2"
+stoffel-rust-sdk = "=0.2.0"
 ```
 
 ```rust
@@ -66,9 +66,8 @@ assert_eq!(result, vec![Value::I64(100)]);
   `ClientStore.take_share` can still receive local coordinator client input
   through `with_client_input` or replace the full local client input set through
   `with_client_inputs`.
-  AVSS local coordinator execution is wired for no-input programs and BLS12-381
-  local client input; other AVSS curves still reject local client input at the
-  SDK boundary until the lower runner supports them.
+  AVSS local coordinator execution and client input support every SDK curve:
+  BLS12-381, BN254, Curve25519, Ed25519, secp256k1, and P-256.
 - `runtime.local_network()` exposes the same coordinator-backed local run as a
   small builder for advanced local smoke tests that need a custom entrypoint,
   timeout, or runner binary path:
@@ -107,7 +106,7 @@ assert_eq!(result, vec![Value::I64(100)]);
   `stoffel-networking`. For programs with `ClientStore` metadata,
   `runtime.offchain_client_config(slot)` derives the typed client IO settings
   from the compiled program and MPC runtime; callers then provide coordinator
-  address, node RPC addresses, timestamp, and client identity material before
+  address, node RPC addresses, a nonzero execution ID, timestamp, and client identity material before
   calling `client.run_typed(...)`, `client.submit_typed(...)`, `client.run(...)`,
   or `client.submit(...)`. Server launch for those programs uses
   `ServerBuilder::offchain_coordinator(...)` to pass the
@@ -115,7 +114,7 @@ assert_eq!(result, vec![Value::I64(100)]);
   and expected client certificates through to `stoffel-run`.
 - AVSS protocol operations are owned by `stoffel-vm` and `mpc-protocols`.
   The SDK exposes the intended API boundary but does not implement an in-memory
-  AVSS substitute. Local BLS12-381 AVSS programs delegate through the real
+  AVSS substitute. Local AVSS programs on any supported curve delegate through the real
   `stoffel-run` coordinator path:
 
   ```rust
@@ -132,16 +131,17 @@ assert_eq!(result, vec![Value::I64(100)]);
   # }
   ```
 
-  Programs that read `ClientStore.take_share` can also receive BLS12-381 AVSS
-  local client input through `with_client_input`.
+  Programs that read `ClientStore.take_share` can receive AVSS local client
+  input through `with_client_input` on every supported curve.
 
-  When deployment/server code already owns a live BLS12-381
-  `stoffel-vm::net::avss_engine::Bls12381AvssMpcEngine`, wrap it with
-  `AvssEngine::from_bls12381_engine(...)` and attach it with
-  `ServerBuilder::with_avss_engine(...)` to use the SDK AVSS methods. The
-  builder validates that the engine curve matches the selected AVSS backend. A
-  configured `StoffelServer` that has not been started does not fabricate an
-  engine; `engine.is_live()` reports whether calls will delegate to a VM engine.
+  When deployment/server code already owns a live generic VM AVSS engine, wrap
+  it with `AvssEngine::from_engine(engine)` and attach it with
+  `ServerBuilder::with_avss_engine(...)`. The SDK infers the curve from the VM
+  engine's group type, so there is no curve-specific constructor or separate
+  curve argument that can disagree with the engine. The builder validates that
+  the inferred engine curve matches the selected AVSS backend. A configured
+  `StoffelServer` that has not been started does not fabricate an engine;
+  `engine.is_live()` reports whether calls delegate to a VM engine.
 
   AVSS/Feldman share payloads can still be represented at the SDK boundary and
   inspected without running protocol logic:

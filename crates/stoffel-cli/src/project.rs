@@ -112,6 +112,12 @@ impl Default for BuildConfig {
 
 impl Project {
     pub fn init(path: &Path, template: Template, force: bool) -> Result<()> {
+        if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            anyhow::bail!(
+                "cannot initialize project through symlink {}",
+                path.display()
+            );
+        }
         if path.exists() && !path.is_dir() {
             anyhow::bail!(
                 "{} is a file; pass a directory path for the new Stoffel project",
@@ -445,16 +451,14 @@ fn levenshtein(left: &str, right: &str) -> usize {
 
 fn init_stoffel_project(path: &Path) -> Result<()> {
     let name = project_name(path);
-    write_new(path.join(CONFIG_FILE), &default_config_text(name.clone()))?;
-    write_new(path.join("src/main.stfl"), default_stoffel_program_text())?;
-    write_new(path.join("Cargo.toml"), &default_cargo_toml_text(&name))?;
+    write_new(path, CONFIG_FILE, &default_config_text(name.clone()))?;
+    write_new(path, "src/main.stfl", default_stoffel_program_text())?;
+    write_new(path, "Cargo.toml", &default_cargo_toml_text(&name))?;
+    write_new(path, "build.rs", &default_build_rs_text("src/main.stfl"))?;
+    write_new(path, "src/main.rs", default_main_rs_text())?;
     write_new(
-        path.join("build.rs"),
-        &default_build_rs_text("src/main.stfl"),
-    )?;
-    write_new(path.join("src/main.rs"), default_main_rs_text())?;
-    write_new(
-        path.join("README.md"),
+        path,
+        "README.md",
         &format!(
             "{}\nBuild the Rust SDK wrapper with included bindings:\n\n```sh\ncargo build\n```\n\nRun the Rust SDK wrapper:\n\n```sh\ncargo run\n```\n",
             default_readme_text("Stoffel Project")
@@ -465,15 +469,18 @@ fn init_stoffel_project(path: &Path) -> Result<()> {
 
 pub fn init_library_project(path: &Path) -> Result<()> {
     write_new(
-        path.join(CONFIG_FILE),
+        path,
+        CONFIG_FILE,
         &default_library_config_text(project_name(path)),
     )?;
     write_new(
-        path.join("src/lib.stfl"),
+        path,
+        "src/lib.stfl",
         "def add(a: int64, b: int64) -> int64:\n  return a + b\n",
     )?;
     write_new(
-        path.join("README.md"),
+        path,
+        "README.md",
         "# Stoffel Library\n\nValidate the library source:\n\n```sh\nstoffel check\n```\n\nBuild bytecode when you need an artifact:\n\n```sh\nstoffel build\n```\n",
     )?;
     Ok(())
@@ -481,13 +488,11 @@ pub fn init_library_project(path: &Path) -> Result<()> {
 
 fn init_python_project(path: &Path) -> Result<()> {
     init_stoffel_project(path)?;
-    write_new(path.join("requirements.txt"), "stoffel-python-sdk\n")?;
+    write_new(path, "requirements.txt", "stoffel-python-sdk\n")?;
+    write_new(path, "app.py", "print(\"Stoffel Python SDK project\")\n")?;
     write_new(
-        path.join("app.py"),
-        "print(\"Stoffel Python SDK project\")\n",
-    )?;
-    write_new(
-        path.join("README.md"),
+        path,
+        "README.md",
         &format!(
             "{}\nPython wrapper files are included for SDK integration. Install Python dependencies with:\n\n```sh\npython3 -m pip install -r requirements.txt\n```\n",
             default_readme_text("Stoffel Python Project")
@@ -498,30 +503,36 @@ fn init_python_project(path: &Path) -> Result<()> {
 
 fn init_rust_project(path: &Path) -> Result<()> {
     write_new(
-        path.join("stoffel/Stoffel.toml"),
+        path,
+        "stoffel/Stoffel.toml",
         &config_text(project_name(path), "src/program.stfl"),
     )?;
     write_new(
-        path.join("stoffel/src/program.stfl"),
+        path,
+        "stoffel/src/program.stfl",
         "def main(a: secret int64, b: secret int64) -> secret int64:\n  return a + b\n",
     )?;
     write_new(
-        path.join("Cargo.toml"),
+        path,
+        "Cargo.toml",
         &format!(
-            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstoffel = {{ package = \"stoffel-rust-sdk\", version = \"=0.1.2\" }}\ntokio = {{ version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }}\n\n[build-dependencies]\nstoffel-bindgen = \"=0.1.2\"\n",
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstoffel = {{ package = \"stoffel-rust-sdk\", version = \"=0.2.0\" }}\ntokio = {{ version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }}\n\n[build-dependencies]\nstoffel-bindgen = \"=0.2.0\"\n",
             project_name(path)
         ),
     )?;
     write_new(
-        path.join("build.rs"),
+        path,
+        "build.rs",
         &default_build_rs_text("stoffel/src/program.stfl"),
     )?;
     write_new(
-        path.join("src/main.rs"),
+        path,
+        "src/main.rs",
         "use stoffel::prelude::*;\n\n#[allow(dead_code, unused_mut, unused_variables)]\nmod stoffel_bindings {\n    include!(concat!(env!(\"OUT_DIR\"), \"/stoffel_bindings.rs\"));\n}\n\n#[tokio::main]\nasync fn main() -> stoffel::Result<()> {\n    let result = Stoffel::compile_file(\"stoffel/src/program.stfl\")?\n        .manifest::<stoffel_bindings::ProgramManifest>()\n        .parties(5)\n        .threshold(1)\n        .with_inputs(&[(\"a\", 40_i64), (\"b\", 2_i64)])\n        .execute_local()\n        .await?;\n    println!(\"{}\", result[0]);\n    Ok(())\n}\n",
     )?;
     write_new(
-        path.join("README.md"),
+        path,
+        "README.md",
         "# Stoffel Rust Project\n\nThe Stoffel program lives in `stoffel/src/program.stfl` and has its own `stoffel/Stoffel.toml`.\n\nValidate the Stoffel program:\n\n```sh\nstoffel check stoffel\n```\n\nRun the Stoffel program through the CLI:\n\n```sh\nstoffel run stoffel --input a=40 --input b=2\n```\n\nRun the Rust local-MPC wrapper:\n\n```sh\ncargo run\n```\n",
     )?;
     Ok(())
@@ -530,15 +541,18 @@ fn init_rust_project(path: &Path) -> Result<()> {
 fn init_solidity_foundry_project(path: &Path) -> Result<()> {
     init_stoffel_project(path)?;
     write_new(
-        path.join("foundry.toml"),
+        path,
+        "foundry.toml",
         "[profile.default]\nsrc = \"contracts\"\nout = \"out\"\nlibs = [\"lib\"]\n",
     )?;
     write_new(
-        path.join("contracts/StoffelApp.sol"),
+        path,
+        "contracts/StoffelApp.sol",
         "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\ncontract StoffelApp {}\n",
     )?;
     write_new(
-        path.join("README.md"),
+        path,
+        "README.md",
         &format!(
             "{}\nFoundry contract files are included under `contracts/`. Build the Solidity project with:\n\n```sh\nforge build\n```\n",
             default_readme_text("Stoffel Foundry Project")
@@ -550,22 +564,26 @@ fn init_solidity_foundry_project(path: &Path) -> Result<()> {
 fn init_solidity_hardhat_project(path: &Path) -> Result<()> {
     init_stoffel_project(path)?;
     write_new(
-        path.join("package.json"),
+        path,
+        "package.json",
         &format!(
             "{{\n  \"name\": \"{}\",\n  \"version\": \"0.1.0\",\n  \"devDependencies\": {{\n    \"hardhat\": \"^2.22.0\"\n  }}\n}}\n",
             project_name(path)
         ),
     )?;
     write_new(
-        path.join("hardhat.config.js"),
+        path,
+        "hardhat.config.js",
         "module.exports = { solidity: \"0.8.20\" };\n",
     )?;
     write_new(
-        path.join("contracts/StoffelApp.sol"),
+        path,
+        "contracts/StoffelApp.sol",
         "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\ncontract StoffelApp {}\n",
     )?;
     write_new(
-        path.join("README.md"),
+        path,
+        "README.md",
         &format!(
             "{}\nHardhat contract files are included under `contracts/`. Install JavaScript dependencies, then compile contracts:\n\n```sh\nnpm install\nnpx hardhat compile\n```\n",
             default_readme_text("Stoffel Hardhat Project")
@@ -864,12 +882,19 @@ fn validate_target_dir(
             target_dir.display()
         );
     }
+    validate_project_controlled_path(root, &root.join(target_dir), allow_existing_final_file)
+        .with_context(|| format!("invalid build.target_dir {}", target_dir.display()))?;
     let mut absolute = root.to_path_buf();
     let mut components = target_dir.components().peekable();
     while let Some(component) = components.next() {
         absolute.push(component.as_os_str());
         let is_final = components.peek().is_none();
-        if absolute.exists() && !absolute.is_dir() && !(allow_existing_final_file && is_final) {
+        let metadata = fs::symlink_metadata(&absolute).ok();
+        if metadata.is_some_and(|metadata| {
+            !metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && !(allow_existing_final_file && is_final)
+        }) {
             anyhow::bail!(
                 "invalid build.target_dir {}; {} is an existing file",
                 target_dir.display(),
@@ -896,7 +921,67 @@ fn collect_stfl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn write_new(path: PathBuf, contents: &str) -> Result<()> {
+pub(crate) fn validate_project_controlled_path(
+    root: &Path,
+    path: &Path,
+    allow_final_symlink: bool,
+) -> Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        anyhow::anyhow!(
+            "project-controlled path {} is outside project root {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        anyhow::bail!(
+            "project-controlled path {} escapes project root {}",
+            path.display(),
+            root.display()
+        );
+    }
+
+    let mut current = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        current.push(component.as_os_str());
+        let is_final = components.peek().is_none();
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if allow_final_symlink && is_final {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "project-controlled path {} traverses symlink {}",
+                    path.display(),
+                    current.display()
+                );
+            }
+            Ok(metadata) if !is_final && !metadata.is_dir() => {
+                anyhow::bail!(
+                    "project-controlled path {} has non-directory component {}; it is an existing file, not a directory",
+                    path.display(),
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_new(root: &Path, relative: impl AsRef<Path>, contents: &str) -> Result<()> {
+    let path = root.join(relative);
     if let Some(parent) = path.parent() {
         if parent.exists() && !parent.is_dir() {
             anyhow::bail!(
@@ -905,6 +990,7 @@ fn write_new(path: PathBuf, contents: &str) -> Result<()> {
                 parent.display()
             );
         }
+        validate_project_controlled_path(root, &path, false)?;
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
@@ -957,7 +1043,7 @@ fn default_stoffel_program_text() -> &'static str {
 
 fn default_cargo_toml_text(name: &str) -> String {
     format!(
-        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstoffel = {{ package = \"stoffel-rust-sdk\", version = \"=0.1.2\" }}\ntokio = {{ version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }}\n\n[build-dependencies]\nstoffel-bindgen = \"=0.1.2\"\n"
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstoffel = {{ package = \"stoffel-rust-sdk\", version = \"=0.2.0\" }}\ntokio = {{ version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }}\n\n[build-dependencies]\nstoffel-bindgen = \"=0.2.0\"\n"
     )
 }
 

@@ -2,12 +2,28 @@
 
 All notable changes to the Stoffel crates are tracked here.
 
-## [Unreleased]
+## [0.2.0] - 2026-09-03
 
-### Changed
+#### Added
 
-- Bumped `stoffelcrypto` (mpc-protocols) to `0.1.1` and `stoffelnet` to `0.1.1` across the workspace and coordinator wrapper. `stoffelmpc-network` follows to `0.1.1` via the lockfile. `stoffel-mpc-coordinator-shared` and `stoffel-mpc-coordinator-off-chain` remain on `0.1.0`.
-- Adapted the AVSS engine to the `stoffelcrypto` 0.1.1 API: `verify_feldman` now takes an `expected_id`, and the AVSS share store values carry a receive timestamp alongside the shares. Existing verification semantics are preserved by binding shares to their own embedded evaluation id.
+- Added compiler and VM measurement coverage for AES/CTR/CBC MPC round counts, full-unroll correctness, and regression cases around batching, public-gate folding, and secret-multiplication preservation.
+
+#### Changed
+
+- Updated `stoffelcrypto` and `stoffelnet` to `0.1.1`, with matching AVSS share verification and timestamped share-store support.
+- Reworked resolved bytecode handling with operand validation, compact resolved operands, resolved function headers, and improved constant/label/function metadata resolution.
+- Improved `-O3` MPC optimization substantially: batched independent `Share.batch_mul` calls, cross-block CTR scheduling, constant branch folding, public-gate folding, bounded multi-return inlining, loop vectorization, and faster dependency tracking.
+- Reduced AES-family MPC round counts in the tracked examples while preserving NIST/equivalence checks, including AES `-O3` from 3306 to 296 rounds, CTR `-O3` from 4774 to 418 rounds, and CBC `-O3` from 22876 to 1061 rounds across the optimizer and example updates.
+- Updated MPC examples to use `add_constant` in place of `add_scalar` for clearer API semantics.
+
+#### Fixed
+
+- Fixed non-hermetic compiler optimization budgets that could leak through process-global environment variables across tests or concurrent compiles.
+- Fixed full-unroll AES/CTR/CBC miscompiles caused by incomplete dependency modeling for in-place mutators, indexed writes, and field writes.
+- Fixed `Share.batch_mul` fusion cases that could pass nested arrays to runtime scalar-share extraction by flattening nested operands and restoring result shape safely.
+- Fixed public secret-multiplication batching edge cases by localizing provably public operands to local `mul_scalar` operations where appropriate.
+- Fixed AVSS runner preprocessing so it no longer depends on receiving a client input.
+- Fixed MPC runtime cloning so independent clones preserve client-store counts.
 
 ## [0.1.2] - 2026-09-03
 
@@ -41,28 +57,6 @@ All notable changes to the Stoffel crates are tracked here.
 - Changed the Rust SDK runner lookup to resolve `stoffel-run` from `PATH` instead of assuming Cargo's bin directory.
 - Updated runner release targets and prebuilt target listings to publish macOS `arm64` binaries only.
 
-### Dev - full branch changelog
-
-#### Added
-
-- Added compiler and VM measurement coverage for AES/CTR/CBC MPC round counts, full-unroll correctness, and regression cases around batching, public-gate folding, and secret-multiplication preservation.
-
-#### Changed
-
-- Reworked resolved bytecode handling with operand validation, compact resolved operands, resolved function headers, and improved constant/label/function metadata resolution.
-- Improved `-O3` MPC optimization substantially: batched independent `Share.batch_mul` calls, cross-block CTR scheduling, constant branch folding, public-gate folding, bounded multi-return inlining, loop vectorization, and faster dependency tracking.
-- Reduced AES-family MPC round counts in the tracked examples while preserving NIST/equivalence checks, including AES `-O3` from 3306 to 296 rounds, CTR `-O3` from 4774 to 418 rounds, and CBC `-O3` from 22876 to 1061 rounds across the optimizer and example updates.
-- Updated MPC examples to use `add_constant` in place of `add_scalar` for clearer API semantics.
-
-#### Fixed
-
-- Fixed non-hermetic compiler optimization budgets that could leak through process-global environment variables across tests or concurrent compiles.
-- Fixed full-unroll AES/CTR/CBC miscompiles caused by incomplete dependency modeling for in-place mutators, indexed writes, and field writes.
-- Fixed `Share.batch_mul` fusion cases that could pass nested arrays to runtime scalar-share extraction by flattening nested operands and restoring result shape safely.
-- Fixed public secret-multiplication batching edge cases by localizing provably public operands to local `mul_scalar` operations where appropriate.
-- Fixed AVSS runner preprocessing so it no longer depends on receiving a client input.
-- Fixed MPC runtime cloning so independent clones preserve client-store counts.
-
 ## [0.1.0] - 2026-06-22
 
 ### Added
@@ -72,5 +66,5 @@ All notable changes to the Stoffel crates are tracked here.
 
 ### Notes
 
-- `stoffel-bindgen` is currently marked `publish = false`; `stoffel-cli` is released as a GitHub binary artifact rather than a crates.io package.
-- Publish order for the initial crate release is `stoffel-vm-types`, `stoffellang`, `stoffel-vm`, `stoffel-vm-runner`, `stoffel-rust-sdk`, then downstream binary artifacts such as `stoffel-cli`.
+- `stoffel-bindgen` is currently marked `publish = false`; the `stoffel` CLI crate is published for `cargo install stoffel` and also released as a GitHub binary artifact.
+- Publish order for the initial crate release is `stoffel-vm-types`, `stoffellang`, `stoffel-vm`, `stoffel-vm-runner`, `stoffel-rust-sdk`, then downstream binary artifacts such as the `stoffel` CLI.

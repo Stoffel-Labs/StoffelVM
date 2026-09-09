@@ -21,6 +21,10 @@ def main(a: int64, b: int64) -> int64:
   return a + b
 "#;
 
+fn offchain_config_builder() -> OffChainClientConfigBuilder {
+    OffChainClientConfig::builder().execution_id(ExecutionId::from_bytes([0x51; 32]))
+}
+
 mod federated_average_bindings {
     include!("fixtures/mpc_client_federated_average_bindings.rs");
 }
@@ -32,6 +36,9 @@ fn public_sdk_types_are_send_and_sync_where_expected() {
     assert_send_sync::<Stoffel>();
     assert_send_sync::<StoffelRuntime>();
     assert_send_sync::<stoffel::LocalNetworkBuilder<'static>>();
+    assert_send_sync::<LocalShareExecutionOutput>();
+    assert_send_sync::<LocalPartyShareOutput>();
+    assert_send_sync::<OpaqueShare>();
     assert_send_sync::<Program>();
     assert_send_sync::<ProgramSummary>();
     assert_send_sync::<BytecodeSummary>();
@@ -1851,10 +1858,9 @@ async fn local_network_builder_rejects_zero_timeout_before_runner_lookup() -> st
     Ok(())
 }
 
-#[tokio::test]
-async fn local_execution_rejects_non_bls_avss_client_inputs_before_runner_lookup(
-) -> stoffel::Result<()> {
-    let err = Stoffel::compile(
+#[test]
+fn local_execution_preserves_non_bls_avss_client_input_configuration() -> stoffel::Result<()> {
+    let runtime = Stoffel::compile(
         r#"
 def main() -> int64:
   var share = ClientStore.take_share(0, 0)
@@ -1867,15 +1873,15 @@ def main() -> int64:
         curve: Curve::Ed25519,
     })
     .with_client_input(0, &[42_i64])
-    .execute_local()
-    .await
-    .unwrap_err();
+    .build()?;
 
-    assert!(matches!(
-        err,
-        stoffel::Error::Unsupported(message)
-            if message.contains("AVSS local client inputs only for bls12_381")
-    ));
+    assert_eq!(
+        runtime.mpc_config().unwrap().backend,
+        MpcBackend::Avss {
+            curve: Curve::Ed25519
+        }
+    );
+    runtime.validate_client_inputs()?;
     Ok(())
 }
 
@@ -2457,7 +2463,7 @@ fn stoffel_direct_participant_builders_do_not_require_compilation() -> stoffel::
 
 #[test]
 fn offchain_client_config_defaults_to_five_party_topology() -> stoffel::Result<()> {
-    let config = OffChainClientConfig::builder()
+    let config = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .node_rpc_addresses(["127.0.0.1:19100"])
@@ -2467,7 +2473,7 @@ fn offchain_client_config_defaults_to_five_party_topology() -> stoffel::Result<(
     assert_eq!(config.threshold, 1);
     assert_eq!(config.backend, MpcBackend::HoneyBadger);
 
-    let invalid_topology = OffChainClientConfig::builder()
+    let invalid_topology = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .parties(4)
@@ -2481,7 +2487,7 @@ fn offchain_client_config_defaults_to_five_party_topology() -> stoffel::Result<(
         stoffel::Error::Configuration(message) if message.contains("at least 5")
     ));
 
-    let zero_threshold = OffChainClientConfig::builder()
+    let zero_threshold = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .threshold(0)
@@ -2499,7 +2505,13 @@ fn offchain_client_config_defaults_to_five_party_topology() -> stoffel::Result<(
 
 #[test]
 fn offchain_client_config_reports_actionable_validation_errors() {
-    let missing_port = OffChainClientConfig::builder()
+    let missing_execution_id = OffChainClientConfig::builder().build().unwrap_err();
+    assert!(matches!(
+        missing_execution_id,
+        stoffel::Error::Configuration(message) if message.contains("execution ID")
+    ));
+
+    let missing_port = offchain_config_builder()
         .timestamp(1)
         .node_rpc_address("127.0.0.1:19100")
         .identity_der(vec![1], vec![2])
@@ -2510,7 +2522,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("coordinator port")
     ));
 
-    let missing_timestamp = OffChainClientConfig::builder()
+    let missing_timestamp = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .node_rpc_address("127.0.0.1:19100")
         .identity_der(vec![1], vec![2])
@@ -2521,7 +2533,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("timestamp")
     ));
 
-    let missing_cert = OffChainClientConfig::builder()
+    let missing_cert = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .node_rpc_address("127.0.0.1:19100")
@@ -2532,7 +2544,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("certificate")
     ));
 
-    let empty_host = OffChainClientConfig::builder()
+    let empty_host = offchain_config_builder()
         .coordinator(" ", 19000)
         .timestamp(1)
         .node_rpc_address("127.0.0.1:19100")
@@ -2544,17 +2556,22 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("host")
     ));
 
-    let unsupported_curve = OffChainClientConfig::builder()
+    let non_bls_curve = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .avss(Curve::Bn254)
         .node_rpc_address("127.0.0.1:19100")
         .identity_der(vec![1], vec![2])
         .build()
-        .unwrap_err();
-    assert!(matches!(unsupported_curve, stoffel::Error::Unsupported(_)));
+        .expect("BN254 AVSS client config");
+    assert_eq!(
+        non_bls_curve.backend,
+        MpcBackend::Avss {
+            curve: Curve::Bn254
+        }
+    );
 
-    let invalid_threshold = OffChainClientConfig::builder()
+    let invalid_threshold = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .parties(5)
@@ -2566,7 +2583,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         .unwrap_err();
     assert!(matches!(invalid_threshold, stoffel::Error::Unsupported(_)));
 
-    let missing_rpc = OffChainClientConfig::builder()
+    let missing_rpc = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .identity_der(vec![1], vec![2])
@@ -2577,7 +2594,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("node RPC")
     ));
 
-    let invalid_rpc = OffChainClientConfig::builder()
+    let invalid_rpc = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .node_rpc_address("not-a-socket")
@@ -2586,7 +2603,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         .unwrap_err();
     assert!(matches!(invalid_rpc, stoffel::Error::Configuration(_)));
 
-    let zero_timeout = OffChainClientConfig::builder()
+    let zero_timeout = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .node_rpc_address("127.0.0.1:19100")
@@ -2601,6 +2618,30 @@ fn offchain_client_config_reports_actionable_validation_errors() {
 }
 
 #[test]
+fn offchain_client_config_accepts_every_avss_curve() {
+    let curves = [
+        Curve::Bls12_381,
+        Curve::Bn254,
+        Curve::Curve25519,
+        Curve::Ed25519,
+        Curve::Secp256k1,
+        Curve::Secp256r1,
+    ];
+
+    for curve in curves {
+        let config = offchain_config_builder()
+            .coordinator("127.0.0.1", 19000)
+            .timestamp(1)
+            .avss(curve)
+            .node_rpc_address("127.0.0.1:19100")
+            .identity_der(vec![1], vec![2])
+            .build()
+            .unwrap_or_else(|error| panic!("{curve:?} AVSS client config failed: {error}"));
+        assert_eq!(config.backend, MpcBackend::Avss { curve });
+    }
+}
+
+#[test]
 fn offchain_client_config_round_trips_toml_and_identity_files() -> stoffel::Result<()> {
     let dir = tempdir()?;
     let cert_path = dir.path().join("client.cert.der");
@@ -2608,7 +2649,7 @@ fn offchain_client_config_round_trips_toml_and_identity_files() -> stoffel::Resu
     std::fs::write(&cert_path, [1_u8, 2, 3])?;
     std::fs::write(&key_path, [4_u8, 5, 6])?;
 
-    let config = OffChainClientConfig::builder()
+    let config = offchain_config_builder()
         .coordinator("localhost", 19000)
         .timestamp(42)
         .parties(5)
@@ -2629,7 +2670,7 @@ fn offchain_client_config_round_trips_toml_and_identity_files() -> stoffel::Resu
     reparsed.validate()?;
     assert_eq!(reparsed, config);
 
-    let missing_identity = OffChainClientConfig::builder()
+    let missing_identity = offchain_config_builder()
         .coordinator("localhost", 19000)
         .timestamp(42)
         .node_rpc_address("127.0.0.1:19100")
@@ -2710,6 +2751,7 @@ def main() -> int64:
     .build()?;
     let config = runtime
         .offchain_client_config(0)?
+        .execution_id(ExecutionId::from_bytes([0x52; 32]))
         .coordinator("127.0.0.1", 9)
         .timestamp(1)
         .node_rpc_addresses(["127.0.0.1:19100"])
@@ -2747,6 +2789,7 @@ def main() -> int64:
 
     let config = runtime
         .offchain_client_config(0)?
+        .execution_id(ExecutionId::from_bytes([0x53; 32]))
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .node_rpc_addresses(["127.0.0.1:19100"])
@@ -3339,6 +3382,35 @@ async fn execute_local_uses_real_local_avss_coordinator_runner_for_no_input_prog
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a real localhost coordinator and AVSS MPC party mesh; requires target/debug/stoffel-run"]
+async fn execute_local_preserves_party_local_opaque_return_shares() -> stoffel::Result<()> {
+    let result = Stoffel::compile(
+        "def main() -> secret int64:\n  var share: secret int64 = Share.random()\n  return share",
+    )?
+    .parties(5)
+    .threshold(1)
+    .avss(Curve::Bls12_381)
+    .local_runner_path("target/debug/stoffel-run")
+    .execute_local_returning_party_shares()
+    .await?;
+
+    assert!(result.client_outputs.is_empty());
+    assert_eq!(result.shares().len(), 5);
+    assert_eq!(result.party_outputs.len(), 5);
+
+    let mut payloads = std::collections::HashSet::new();
+    for party in &result.party_outputs {
+        let share = &party.returned_share;
+        assert_eq!(share.share_type, ShareType::secret_int(64));
+        assert_eq!(share.backend_format, ShareDataFormat::Feldman);
+        assert!(!share.as_bytes().is_empty());
+        payloads.insert(share.as_bytes().to_vec());
+    }
+    assert_eq!(payloads.len(), 5, "each party must retain its own share");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a real localhost coordinator, AVSS MPC party mesh, and coordinator client"]
 async fn execute_local_submits_avss_clientstore_inputs_through_coordinator() -> stoffel::Result<()>
 {
@@ -3353,6 +3425,30 @@ def main() -> int64:
     .parties(5)
     .threshold(1)
     .avss(Curve::Bls12_381)
+    .with_client_input(0, &[42_i64])
+    .local_runner_path("target/debug/stoffel-run")
+    .execute_local()
+    .await?;
+
+    assert_eq!(result, vec![Value::I64(47)]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a real localhost coordinator, BN254 AVSS party mesh, and coordinator client"]
+async fn execute_local_submits_bn254_avss_clientstore_inputs_through_coordinator(
+) -> stoffel::Result<()> {
+    let result = Stoffel::compile(
+        r#"
+def main() -> int64:
+  var share = ClientStore.take_share(0, 0)
+  var opened: int64 = share.open()
+  return opened + 5
+"#,
+    )?
+    .parties(5)
+    .threshold(1)
+    .avss(Curve::Bn254)
     .with_client_input(0, &[42_i64])
     .local_runner_path("target/debug/stoffel-run")
     .execute_local()
@@ -3480,10 +3576,16 @@ async fn execute_local_adapts_prd_secret_int_quickstart() -> stoffel::Result<()>
         .parties(5)
         .threshold(1)
         .with_inputs(&[("a", 42_i64), ("b", 58_i64)])
-        .execute_local()
+        .execute_local_returning_party_shares()
         .await?;
 
-    assert_eq!(result, vec![Value::I64(100)]);
+    assert!(result.client_outputs.is_empty());
+    assert_eq!(result.shares().len(), 5);
+    assert!(result.shares().all(|share| {
+        share.share_type == ShareType::secret_int(64)
+            && share.backend_format == ShareDataFormat::Opaque
+            && !share.as_bytes().is_empty()
+    }));
     Ok(())
 }
 
@@ -3499,10 +3601,16 @@ async fn execute_local_adapts_loaded_secret_int_bytecode() -> stoffel::Result<()
         .parties(5)
         .threshold(1)
         .with_inputs(&[("a", 42_i64), ("b", 58_i64)])
-        .execute_local()
+        .execute_local_returning_party_shares()
         .await?;
 
-    assert_eq!(result, vec![Value::I64(100)]);
+    assert!(result.client_outputs.is_empty());
+    assert_eq!(result.shares().len(), 5);
+    assert!(result.shares().all(|share| {
+        share.share_type == ShareType::secret_int(64)
+            && share.backend_format == ShareDataFormat::Opaque
+            && !share.as_bytes().is_empty()
+    }));
     Ok(())
 }
 
@@ -3985,11 +4093,21 @@ async fn avss_engine_surface_does_not_fake_protocol_operations() -> stoffel::Res
     let err = engine.generate_random_share("key").await.unwrap_err();
     assert!(matches!(err, stoffel::Error::Unsupported(_)));
     let err = engine
+        .generate_random_share_with_session("key")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, stoffel::Error::Unsupported(_)));
+    let err = engine
         .generate_share_with_secret("key", FieldElement::from_bytes([1, 2, 3]))
         .await
         .unwrap_err();
     assert!(matches!(err, stoffel::Error::Unsupported(_)));
-    let err = engine.await_received_share("key").await.unwrap_err();
+    let err = engine
+        .generate_share_with_secret_and_session("key", FieldElement::from_bytes([1, 2, 3]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, stoffel::Error::Unsupported(_)));
+    let err = engine.await_received_share("key", 0).await.unwrap_err();
     assert!(matches!(err, stoffel::Error::Unsupported(_)));
     let err = engine.get_share("key").await.unwrap_err();
     assert!(matches!(err, stoffel::Error::Unsupported(_)));

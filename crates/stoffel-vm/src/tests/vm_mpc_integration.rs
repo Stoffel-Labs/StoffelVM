@@ -116,7 +116,10 @@ async fn test_vm_mpc_multiplication_integration() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");

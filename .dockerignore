@@ -25,6 +25,9 @@ profiles/
 *.heaptrack.gz
 perf.data*
 callgrind.out.*
+docker/test-*.sh
+docker-compose*.yml
+docker/standing-concurrency/acceptance.py
 
 # Local development files
 .env

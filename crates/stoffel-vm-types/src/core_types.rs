@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 const ARRAY_DENSE_INLINE_CAPACITY: usize = 16;
 const ARRAY_DENSE_INDEX_LIMIT: usize = 32;
+const ARRAY_MAX_EAGER_DENSE_CAPACITY: usize = 1 << 17;
 const TABLE_DISPLAY_ENTRY_LIMIT: usize = 10;
 
 pub type TableMemoryResult<T> = Result<T, TableMemoryError>;
@@ -228,6 +229,8 @@ pub struct Array {
     elements: SmallVec<[Value; ARRAY_DENSE_INLINE_CAPACITY]>,
     /// Storage for large indices and non-numeric keys
     extra_fields: FxHashMap<Value, Value>,
+    /// Numeric indices below this bound use contiguous storage.
+    dense_index_limit: usize,
     /// Cached length for O(1) access
     length_hint: usize,
 }
@@ -237,16 +240,24 @@ impl Array {
         Array {
             elements: SmallVec::new(),
             extra_fields: FxHashMap::default(),
+            dense_index_limit: ARRAY_DENSE_INDEX_LIMIT,
             length_hint: 0,
         }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
+        // Honor ordinary capacity requests while refusing pathological eager
+        // allocations from untrusted bytecode. Oversized hints retain the
+        // default sparse-array behavior and grow only on actual writes.
+        let eager_capacity = if capacity <= ARRAY_MAX_EAGER_DENSE_CAPACITY {
+            capacity
+        } else {
+            0
+        };
         Array {
-            // This is a VM-visible hint, not permission to reserve arbitrary
-            // host memory. Grow the dense part on real writes instead.
-            elements: SmallVec::with_capacity(capacity.min(ARRAY_DENSE_INLINE_CAPACITY)),
+            elements: SmallVec::with_capacity(eager_capacity),
             extra_fields: FxHashMap::default(),
+            dense_index_limit: ARRAY_DENSE_INDEX_LIMIT.max(eager_capacity),
             length_hint: 0,
         }
     }
@@ -289,7 +300,7 @@ impl Array {
 
                 // Update length_hint to the highest occupied numeric index + 1
                 self.length_hint = self.length_hint.max(new_len);
-                if idx_usize < ARRAY_DENSE_INDEX_LIMIT {
+                if idx_usize < self.dense_index_limit {
                     if idx_usize >= self.elements.len() {
                         self.elements.resize(idx_usize + 1, Value::Unit);
                     }
@@ -325,7 +336,7 @@ impl Array {
             })?;
 
             self.length_hint = self.length_hint.max(new_len);
-            if idx < ARRAY_DENSE_INDEX_LIMIT {
+            if idx < self.dense_index_limit {
                 if idx >= self.elements.len() {
                     self.elements.resize(idx + 1, Value::Unit);
                 }
@@ -2858,6 +2869,21 @@ mod tests {
 
         assert_eq!(array.length(), 0);
         assert!(array.elements.capacity() <= ARRAY_DENSE_INLINE_CAPACITY);
+    }
+
+    #[test]
+    fn bounded_array_capacity_reserves_dense_storage_and_indexing_grows_length() {
+        let mut array = Array::with_capacity(64);
+
+        assert_eq!(array.length(), 0);
+        assert!(array.elements.capacity() >= 64);
+        array
+            .try_set(Value::I64(63), Value::U8(9))
+            .expect("set reserved numeric index");
+
+        assert_eq!(array.length(), 64);
+        assert_eq!(array.get(&Value::I64(63)), Some(&Value::U8(9)));
+        assert!(!array.extra_fields.contains_key(&Value::I64(63)));
     }
 
     #[test]

@@ -1,8 +1,11 @@
-use super::shares::verify_feldman_self;
 use super::*;
 use crate::net::curve::SupportedMpcField;
 use crate::net::mpc_engine::{DurableIdentityDigest, MpcEngine};
-use crate::storage::preproc::{self, LmdbPreprocStore, PreprocBlob, PreprocKeyScope, PreprocStore};
+use crate::net::session::ExecutionId;
+use crate::storage::preproc::{
+    self, LmdbPreprocStore, OwnedPreprocBundle, PreprocBlob, PreprocKeyScope, PreprocStore,
+    TakenPreproc,
+};
 use ark_bls12_381::{Fr, G1Projective as G1, G2Projective as G2};
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_ff::{FftField, PrimeField, UniformRand};
@@ -10,7 +13,77 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::test_rng;
 use std::sync::Arc;
 use stoffel_vm_types::core_types::{ClearShareValue, ShareType, F64};
+use stoffelmpc_mpc::avss_mpc::triple_gen::BeaverTriple;
+use stoffelmpc_mpc::common::share::avss::verify_feldman;
+use stoffelmpc_mpc::common::ProtocolSessionId;
 use stoffelnet::transports::quic::QuicNetworkManager;
+
+#[tokio::test]
+async fn avss_named_config_installs_execution_scoped_protocol_network() {
+    let n = 4;
+    let t = 1;
+    let execution_id = ExecutionId::from_bytes([0xA5; 32]);
+    let session =
+        MpcSessionConfig::try_new(0x1122_3344, 0, n, t, Arc::new(QuicNetworkManager::new()))
+            .unwrap()
+            .try_with_execution_id(execution_id)
+            .unwrap();
+    let engine = AvssMpcEngine::<Fr, G1>::from_config(AvssEngineConfig::new(
+        session,
+        Fr::from(9u64),
+        Arc::new(vec![G1::generator(); n]),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(engine.protocol_net().execution_id(), execution_id);
+}
+
+#[tokio::test]
+async fn await_received_share_selects_the_exact_session_from_the_same_dealer() {
+    let n = 4;
+    let t = 1;
+    let instance_id = 0x1122_4455;
+    let session =
+        MpcSessionConfig::try_new(instance_id, 3, n, t, Arc::new(QuicNetworkManager::new()))
+            .unwrap();
+    let engine = AvssMpcEngine::<Fr, G1>::from_config(AvssEngineConfig::new(
+        session,
+        Fr::from(9u64),
+        Arc::new(vec![G1::generator(); n]),
+    ))
+    .await
+    .unwrap();
+
+    let wrong_dealer_share = generate_feldman_shares(Fr::from(111u64), n, t)[3].clone();
+    let expected_dealer_share = generate_feldman_shares(Fr::from(222u64), n, t)[3].clone();
+    let dealer_sessions = AvssSessionIds::new(instance_id, 2, n);
+    let wrong_session = dealer_sessions.next_dealer_session().unwrap();
+    let expected_session = dealer_sessions.next_dealer_session().unwrap();
+    let node = engine.clone_avss_node().await;
+    let mut received = node.share_gen_avss.avss.shares.lock().await;
+    received.insert(
+        wrong_session,
+        (std::time::Instant::now(), Some(vec![wrong_dealer_share])),
+    );
+    received.insert(
+        expected_session,
+        (
+            std::time::Instant::now(),
+            Some(vec![expected_dealer_share.clone()]),
+        ),
+    );
+    drop(received);
+
+    let selected = engine
+        .await_received_share("expected-key", expected_session.as_u128())
+        .await
+        .expect("the requested dealer share is already available");
+    assert_eq!(
+        selected.feldmanshare.share,
+        expected_dealer_share.feldmanshare.share
+    );
+}
 
 #[test]
 fn upstream_ransha_commitment_transform_produces_verifiable_ed25519_shares() {
@@ -65,7 +138,7 @@ fn upstream_ransha_commitment_transform_produces_verifiable_ed25519_shares() {
     }
 
     for share in &computed[2 * t..] {
-        assert!(verify_feldman_self(share));
+        assert!(verify_feldman(share.clone(), share.feldmanshare.id));
     }
 }
 
@@ -164,7 +237,7 @@ fn test_feldman_verification() {
             FeldmanShamirShare::new(y, i, t, commitments.clone()).expect("Failed to create share");
 
         assert!(
-            verify_feldman_self(&share),
+            verify_feldman(share.clone(), share.feldmanshare.id),
             "Feldman verification failed for party {}",
             i
         );
@@ -392,6 +465,383 @@ async fn preprocess_reserves_persistent_avss_random_shares_when_loaded() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standing_avss_consumption_uses_owned_bundle_without_touching_reservoir() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LmdbPreprocStore::open(dir.path()).unwrap());
+    let program_hash = [0xD4; 32];
+    let execution_a = ExecutionId::from_bytes([0xA4; 32]);
+    let party_id = 0;
+    let n = 4;
+    let t = 1;
+    let identity = DurableIdentityDigest::from_legacy_party_id(party_id);
+    let reservoir = PreprocKeyScope::new(
+        program_hash,
+        crate::net::curve::MpcFieldKind::Bls12_381Fr,
+        n,
+        t,
+        identity,
+    );
+    let shares_a = generate_feldman_shares(Fr::from(17u64), 1, t);
+    let shares_b = generate_feldman_shares(Fr::from(29u64), 1, t);
+    let (reservoir_data, reservoir_item_size) =
+        preproc::serialize_feldman_shares::<Fr, G1>(&shares_b).unwrap();
+    store
+        .store(
+            &reservoir.random_share(),
+            &PreprocBlob::try_new(reservoir_data, reservoir_item_size, shares_b.len()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let session = MpcSessionConfig::try_new(
+        9_000_001,
+        party_id,
+        n,
+        t,
+        Arc::new(QuicNetworkManager::new()),
+    )
+    .unwrap()
+    .try_with_execution_id(execution_a)
+    .unwrap();
+    let engine = AvssMpcEngine::<Fr, G1>::from_config(
+        AvssEngineConfig::new(session, Fr::from(5u64), Arc::new(vec![G1::generator(); n]))
+            .with_deployment_mode(crate::net::engine_config::DeploymentMode::Standing)
+            .with_preprocessing_counts(1, 0),
+    )
+    .await
+    .unwrap();
+    engine
+        .preproc_persistence_ops()
+        .unwrap()
+        .set_preproc_store(store.clone(), program_hash)
+        .unwrap();
+
+    let (data, item_size) = preproc::serialize_feldman_shares::<Fr, G1>(&shares_a).unwrap();
+    let bundle = OwnedPreprocBundle {
+        random: Some(TakenPreproc {
+            count: shares_a.len() as u32,
+            item_size,
+            data,
+        }),
+        ..Default::default()
+    };
+    engine.activate_preallocated_standing(bundle).await.unwrap();
+
+    let taken = engine.reserve_random_shares(1).await.unwrap();
+    assert_eq!(taken[0].feldmanshare.share, shares_a[0].feldmanshare.share);
+    assert!(
+        store
+            .load(&reservoir.random_share())
+            .await
+            .unwrap()
+            .is_some(),
+        "online execution must consume only its already-owned bundle"
+    );
+    assert_eq!(store.available(&reservoir.random_share()).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn standing_avss_activation_normalizes_every_triple_without_reordering() {
+    let party_id = 0;
+    let n = 4;
+    let t = 1;
+    let execution_id = ExecutionId::from_bytes([0xC4; 32]);
+    let mut triples = Vec::new();
+    for offset in 0..2u64 {
+        let a = generate_feldman_shares(Fr::from(11 + offset), n, t)[party_id].clone();
+        let b = generate_feldman_shares(Fr::from(21 + offset), n, t)[party_id].clone();
+        let mut c = generate_feldman_shares(Fr::from((11 + offset) * (21 + offset)), n, t)
+            [party_id]
+            .clone();
+        // Upstream AVSS triple generation uses the zero-based party index for
+        // c, while Feldman a/b and online shares use one-based identifiers.
+        c.feldmanshare.id = party_id;
+        triples.push(BeaverTriple { a, b, c });
+    }
+    let expected_a = triples
+        .iter()
+        .map(|triple| triple.a.feldmanshare.share)
+        .collect::<Vec<_>>();
+    let (data, item_size) = preproc::serialize_avss_triples::<Fr, G1>(&triples).unwrap();
+
+    let session = MpcSessionConfig::try_new(
+        9_000_002,
+        party_id,
+        n,
+        t,
+        Arc::new(QuicNetworkManager::new()),
+    )
+    .unwrap()
+    .try_with_execution_id(execution_id)
+    .unwrap();
+    let engine = AvssMpcEngine::<Fr, G1>::from_config(
+        AvssEngineConfig::new(session, Fr::from(5u64), Arc::new(vec![G1::generator(); n]))
+            .with_deployment_mode(crate::net::engine_config::DeploymentMode::Standing)
+            .with_preprocessing_counts(0, triples.len()),
+    )
+    .await
+    .unwrap();
+    engine
+        .activate_preallocated_standing(OwnedPreprocBundle {
+            beaver: Some(TakenPreproc {
+                count: triples.len() as u32,
+                item_size,
+                data,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let node = engine.clone_avss_node().await;
+    let installed = node
+        .preprocessing_material
+        .lock()
+        .await
+        .take_triples(triples.len())
+        .unwrap();
+    assert_eq!(installed.len(), 2);
+    assert_eq!(
+        installed
+            .iter()
+            .map(|triple| triple.a.feldmanshare.share)
+            .collect::<Vec<_>>(),
+        expected_a,
+        "activation must preserve the correlated triple order"
+    );
+    assert!(installed.iter().all(|triple| {
+        triple.c.feldmanshare.id == triple.a.feldmanshare.id
+            && triple.c.feldmanshare.id == triple.b.feldmanshare.id
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standing_avss_reservoir_uses_stable_program_scope_despite_execution_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LmdbPreprocStore::open(dir.path()).unwrap());
+    let execution_id = ExecutionId::from_bytes([0xE2; 32]);
+    let program_a = [0xA2; 32];
+    let program_b = [0xB2; 32];
+    let party_id = 0;
+    let n = 4;
+    let t = 1;
+    let identity = DurableIdentityDigest::from_legacy_party_id(party_id);
+    let stable_a = PreprocKeyScope::new(
+        program_a,
+        crate::net::curve::MpcFieldKind::Bls12_381Fr,
+        n,
+        t,
+        identity,
+    );
+    let stable_b = PreprocKeyScope::new(
+        program_b,
+        crate::net::curve::MpcFieldKind::Bls12_381Fr,
+        n,
+        t,
+        identity,
+    );
+    for (key, count, fill) in [
+        (stable_a.random_share(), 2, 0xA2),
+        (stable_b.random_share(), 3, 0xB2),
+    ] {
+        store
+            .store(
+                &key,
+                &PreprocBlob::try_new(vec![fill; count], 1, count).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn make_reservoir(
+        store: Arc<LmdbPreprocStore>,
+        program_hash: [u8; 32],
+        execution_id: ExecutionId,
+        instance_id: u64,
+        n: usize,
+        t: usize,
+    ) -> Arc<AvssMpcEngine<Fr, G1>> {
+        let session =
+            MpcSessionConfig::try_new(instance_id, 0, n, t, Arc::new(QuicNetworkManager::new()))
+                .unwrap()
+                .try_with_execution_id(execution_id)
+                .unwrap();
+        let engine = AvssMpcEngine::<Fr, G1>::from_config(
+            AvssEngineConfig::new(session, Fr::from(5u64), Arc::new(vec![G1::generator(); n]))
+                .with_preprocessing_counts(1, 1)
+                .with_deployment_mode(crate::net::engine_config::DeploymentMode::Standing),
+        )
+        .await
+        .unwrap();
+        engine
+            .preproc_persistence_ops()
+            .unwrap()
+            .set_preproc_store(store, program_hash)
+            .unwrap();
+        engine.use_program_preproc_reservoir();
+        engine
+    }
+
+    let reservoir_a = make_reservoir(store.clone(), program_a, execution_id, 9_000_101, n, t).await;
+    let snapshot_a = reservoir_a.standing_preproc_snapshot().await.unwrap();
+    let snapshot_b = make_reservoir(store.clone(), program_b, execution_id, 9_000_102, n, t)
+        .await
+        .standing_preproc_snapshot()
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot_a.random.count, 2);
+    assert_eq!(snapshot_b.random.count, 3);
+    let error = reservoir_a
+        .activate_preallocated_standing(OwnedPreprocBundle::default())
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("program reservoir cannot be activated"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standing_avss_activation_requires_complete_owned_bundle_without_top_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LmdbPreprocStore::open(dir.path()).unwrap());
+    let program_hash = [0xC2; 32];
+    let execution_id = ExecutionId::from_bytes([0xD2; 32]);
+    let party_id = 0;
+    let n = 4;
+    let t = 1;
+    let identity = DurableIdentityDigest::from_legacy_party_id(party_id);
+    let stable = PreprocKeyScope::new(
+        program_hash,
+        crate::net::curve::MpcFieldKind::Bls12_381Fr,
+        n,
+        t,
+        identity,
+    );
+    let stable_random = generate_feldman_shares(Fr::from(41u64), 1, t);
+    let execution_random = generate_feldman_shares(Fr::from(43u64), 1, t);
+    let (data, item_size) = preproc::serialize_feldman_shares::<Fr, G1>(&stable_random).unwrap();
+    store
+        .store(
+            &stable.random_share(),
+            &PreprocBlob::try_new(data, item_size, 1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let session = MpcSessionConfig::try_new(
+        9_000_103,
+        party_id,
+        n,
+        t,
+        Arc::new(QuicNetworkManager::new()),
+    )
+    .unwrap()
+    .try_with_execution_id(execution_id)
+    .unwrap();
+    let engine = AvssMpcEngine::<Fr, G1>::from_config(
+        AvssEngineConfig::new(session, Fr::from(5u64), Arc::new(vec![G1::generator(); n]))
+            .with_preprocessing_counts(1, 0)
+            .with_deployment_mode(crate::net::engine_config::DeploymentMode::Standing),
+    )
+    .await
+    .unwrap();
+    engine
+        .preproc_persistence_ops()
+        .unwrap()
+        .set_preproc_store(store.clone(), program_hash)
+        .unwrap();
+
+    let before_stable = store.scope_availability(&stable).await.unwrap();
+    let error = engine
+        .activate_preallocated_standing(OwnedPreprocBundle::default())
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("does not match target"),
+        "unexpected error: {error}"
+    );
+    assert!(!engine.is_ready());
+    assert_eq!(
+        store.scope_availability(&stable).await.unwrap(),
+        before_stable
+    );
+    let (data, item_size) = preproc::serialize_feldman_shares::<Fr, G1>(&execution_random).unwrap();
+    let bundle = OwnedPreprocBundle {
+        random: Some(TakenPreproc {
+            count: 1,
+            item_size,
+            data,
+        }),
+        ..Default::default()
+    };
+    engine.activate_preallocated_standing(bundle).await.unwrap();
+    assert!(engine.is_ready());
+    let taken = engine.reserve_random_shares(1).await.unwrap();
+    assert_eq!(
+        taken[0].feldmanshare.share,
+        execution_random[0].feldmanshare.share
+    );
+    assert_eq!(
+        store.available(&stable.random_share()).await.unwrap(),
+        1,
+        "execution consumption must not touch the program reservoir"
+    );
+}
+
+#[test]
+fn standing_avss_inventory_agreement_rebuilds_every_party_on_divergence() {
+    let targets = preproc::PoolAvailability {
+        beaver: 8,
+        random: 16,
+        prand_bit: 0,
+        prand_int: 0,
+    };
+    let generation = [0x31; 32];
+    let fresh = [0x52; 32];
+    let full = StandingPreprocSnapshot {
+        generation_id: Some(generation),
+        beaver: preproc::PreprocMeta {
+            count: 8,
+            consumed: 0,
+            item_size: 96,
+        },
+        random: preproc::PreprocMeta {
+            count: 16,
+            consumed: 0,
+            item_size: 64,
+        },
+        ..Default::default()
+    };
+
+    let reuse = agree_standing_preproc_plan(targets, &[full; 4], fresh).unwrap();
+    assert_eq!(reuse.action, StandingPreprocAction::Reuse);
+    assert_eq!(reuse.generation_id, generation);
+
+    let mut short = full;
+    short.random.count = 7;
+    let top_up = agree_standing_preproc_plan(targets, &[short; 4], fresh).unwrap();
+    assert_eq!(top_up.action, StandingPreprocAction::TopUp);
+    assert_eq!(top_up.generation_id, fresh);
+
+    let mut divergent = [full; 4];
+    divergent[2].random.count = 15;
+    let rebuild = agree_standing_preproc_plan(targets, &divergent, fresh).unwrap();
+    assert_eq!(rebuild.action, StandingPreprocAction::Rebuild);
+    assert_eq!(rebuild.generation_id, fresh);
+
+    let mut missing = [full; 4];
+    missing[2] = StandingPreprocSnapshot::default();
+    assert_eq!(
+        agree_standing_preproc_plan(targets, &missing, fresh)
+            .unwrap()
+            .action,
+        StandingPreprocAction::Rebuild
+    );
+}
+
 #[test]
 fn test_feldman_share_serialization_roundtrip() {
     let n = 4;
@@ -485,7 +935,7 @@ where
         assert_eq!(share.feldmanshare.id, decoded.feldmanshare.id);
         assert_eq!(share.feldmanshare.degree, decoded.feldmanshare.degree);
         assert_eq!(share.feldmanshare.share, decoded.feldmanshare.share);
-        assert!(verify_feldman_self(&decoded));
+        assert!(verify_feldman(decoded.clone(), decoded.feldmanshare.id));
     }
 
     let required = t + 1;
@@ -700,6 +1150,31 @@ fn avss_open_reconstruction_filters_byzantine_feldman_contributions() {
 }
 
 #[test]
+fn avss_open_reconstruction_skips_replayed_feldman_ids() {
+    let n = 4;
+    let t = 1;
+    let secret = Fr::from(12345u64);
+    let honest_shares = generate_feldman_shares(secret, n, t);
+
+    let local_share =
+        Bls12381AvssMpcEngine::encode_feldman_share(&honest_shares[0]).expect("encode local");
+    let replayed = local_share.clone();
+    let second_valid =
+        Bls12381AvssMpcEngine::encode_feldman_share(&honest_shares[1]).expect("encode valid");
+
+    let recovered = Bls12381AvssMpcEngine::reconstruct_verified_secret(
+        &local_share,
+        &[local_share.clone(), replayed, second_valid],
+        n,
+        t,
+        "replayed AVSS open",
+    )
+    .expect("a replayed ID must not prevent later unique honest shares from reconstructing");
+
+    assert_eq!(recovered, secret);
+}
+
+#[test]
 fn avss_open_reconstruction_rejects_non_verifiable_local_feldman_share() {
     let n = 4;
     let t = 1;
@@ -709,7 +1184,7 @@ fn avss_open_reconstruction_rejects_non_verifiable_local_feldman_share() {
     corrupted_local.commitments = vec![G1::generator(); t + 1];
 
     assert!(
-        !verify_feldman_self(&corrupted_local),
+        !verify_feldman(corrupted_local.clone(), corrupted_local.feldmanshare.id),
         "test setup should model a local Feldman share with invalid commitments"
     );
 
@@ -1087,11 +1562,11 @@ async fn test_avss_input_share_is_local_constant_sharing() {
         "parties evaluate at distinct share ids"
     );
     assert!(
-        verify_feldman_self(&s0),
+        stoffelmpc_mpc::common::share::avss::verify_feldman(s0.clone(), s0.feldmanshare.id),
         "constant share must pass Feldman verification"
     );
     assert!(
-        verify_feldman_self(&s1),
+        stoffelmpc_mpc::common::share::avss::verify_feldman(s1.clone(), s1.feldmanshare.id),
         "constant share must pass Feldman verification"
     );
 

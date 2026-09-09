@@ -1,12 +1,14 @@
 # Federated matrix average using fixed-point client shares.
 #
-# Each client contributes six fixed-point values representing a 2x3 matrix.
+# Two clients contribute six fixed-point values each, representing 2x3 matrices.
 # The program returns per-position averages and sends each summed share back to
 # client 0 when client-output is available.
 
 def federated_average_2x3() -> list[fix64]:
   var matrix_size: int64 = 6
-  var num_clients: int64 = ClientStore.get_number_clients()
+  # Keep the example's two-client schema static so the compiler can emit the
+  # exact per-client input contract required by distributed admission.
+  var num_clients: int64 = 2
   var result: list[fix64] = []
   var output_shares: list[Share] = []
 

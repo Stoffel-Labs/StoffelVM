@@ -1,4 +1,4 @@
-use crate::net::engine_config::MpcSessionConfig;
+use crate::net::engine_config::{DeploymentMode, MpcSessionConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HoneyBadgerPreprocessingConfig {
@@ -19,6 +19,7 @@ impl HoneyBadgerPreprocessingConfig {
 pub struct HoneyBadgerEngineConfig {
     pub session: MpcSessionConfig,
     pub preprocessing: HoneyBadgerPreprocessingConfig,
+    pub deployment_mode: DeploymentMode,
 }
 
 impl HoneyBadgerEngineConfig {
@@ -29,6 +30,12 @@ impl HoneyBadgerEngineConfig {
         Self {
             session,
             preprocessing,
+            deployment_mode: DeploymentMode::OneShot,
         }
+    }
+
+    pub const fn with_deployment_mode(mut self, deployment_mode: DeploymentMode) -> Self {
+        self.deployment_mode = deployment_mode;
+        self
     }
 }

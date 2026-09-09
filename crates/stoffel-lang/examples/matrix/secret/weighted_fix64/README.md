@@ -5,7 +5,7 @@ Three stations' private fix64 readings are fused with public reliability weights
 Run from this directory with the documented client inputs:
 
 ```sh
-stoffel run . --client-input 0=65536 --client-input 0=131072 --client-input 1=98304 --client-input 1=32768 --client-input 2=163840 --client-input 2=65536
+stoffel run . --client-input 0=1 --client-input 0=2 --client-input 1=1.5 --client-input 1=0.5 --client-input 2=2.5 --client-input 2=1
 ```
 
 The program asserts its own results and prints a summary; a non-zero exit

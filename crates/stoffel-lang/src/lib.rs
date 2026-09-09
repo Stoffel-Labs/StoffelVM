@@ -9,6 +9,7 @@ pub mod ast;
 pub mod binary_converter;
 pub mod builtin_registry;
 pub mod bytecode;
+mod client_io_planner;
 pub mod codegen;
 pub mod compiler;
 pub mod core_types;

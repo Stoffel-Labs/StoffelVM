@@ -5,9 +5,10 @@ Three clients submit one private `fix64` value each; the sum is divided by the p
 Run from this directory with the documented client inputs:
 
 ```sh
-stoffel run . --client-input 0=98304 --client-input 1=163840 --client-input 2=131072
+stoffel run . --client-input 0=1.5 --client-input 1=2.5 --client-input 2=2
 ```
 
-Fixed-point client inputs are raw 2^16-scaled integers (98304 = 1.5). Secure
-division is approximate (probabilistic truncation), so the result is correct to
-within fixed-point tolerance. The program asserts its own result.
+Fixed-point client inputs use ordinary values; Q16 scaling is derived from the
+program manifest. Secure division is approximate (probabilistic truncation),
+so the result is correct to within fixed-point tolerance. The program asserts
+its own result.

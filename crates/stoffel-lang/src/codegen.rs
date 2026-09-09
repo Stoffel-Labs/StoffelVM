@@ -33,6 +33,18 @@ fn infer_single_share_type(node: &AstNode) -> Option<ShareType> {
             AstNode::Identifier(name, _) if name == "ClientStore.take_share_fixed" => {
                 Some(ShareType::default_secret_fixed_point())
             }
+            AstNode::Identifier(name, _) if name == "ClientStore.take_share_bool" => {
+                Some(ShareType::boolean())
+            }
+            AstNode::Identifier(name, _) if name == "ClientStore.sum_shares_fixed" => {
+                Some(ShareType::default_secret_fixed_point())
+            }
+            AstNode::Identifier(name, _) if name == "ClientStore.sum_shares_bool" => {
+                Some(ShareType::boolean())
+            }
+            AstNode::Identifier(name, _) if name == "ClientStore.sum_shares" => {
+                Some(ShareType::default_secret_int())
+            }
             AstNode::Identifier(name, _) if name == "ClientStore.take_share" => {
                 Some(ShareType::default_secret_int())
             }
@@ -59,7 +71,7 @@ fn fixed_share_type(bits: u8) -> ShareType {
     )
 }
 
-fn share_type_for_secret_scalar_symbol_type(ty: &SymbolType) -> Option<ShareType> {
+pub(crate) fn share_type_for_secret_scalar_symbol_type(ty: &SymbolType) -> Option<ShareType> {
     if !ty.is_secret() {
         return None;
     }
@@ -1279,9 +1291,10 @@ impl CodeGenerator {
             | "ClientStore.take_share_fixed"
             | "ClientStore.take_share_bool" => {
                 // The client slot may be a literal, a loop variable (records every
-                // client in the loop range), or a clear-int constant.
+                // client in the loop range), or a clear-int constant. Runtime
+                // client-count loops are recorded later by client_io_planner as
+                // dynamic input templates, so they are intentionally silent here.
                 let Some(client_slots) = self.input_ordinals_for_node(arguments.first()) else {
-                    Self::warn_unrecorded_client_io(function_name, "input");
                     return;
                 };
                 let Some(input_ordinals) = self.input_ordinals_for_node(arguments.get(1)) else {
@@ -1303,6 +1316,33 @@ impl CodeGenerator {
                             inputs.resize(ordinal + 1, None);
                         }
                         inputs[ordinal] = Some(share_type);
+                    }
+                }
+            }
+            "ClientStore.sum_shares"
+            | "ClientStore.sum_shares_bool"
+            | "ClientStore.sum_shares_fixed" => {
+                let Some(input_ordinals) = self.input_ordinals_for_node(arguments.first()) else {
+                    return;
+                };
+                let Some(client_counts) = self.input_ordinals_for_node(arguments.get(1)) else {
+                    return;
+                };
+                let share_type = match function_name {
+                    "ClientStore.sum_shares_bool" => ShareType::boolean(),
+                    "ClientStore.sum_shares_fixed" => ShareType::default_secret_fixed_point(),
+                    _ => ShareType::default_secret_int(),
+                };
+                for client_count in client_counts {
+                    for client_slot in 0..client_count.max(1) {
+                        let inputs = self.client_inputs.entry(client_slot).or_default();
+                        for input_ordinal in &input_ordinals {
+                            let ordinal = *input_ordinal as usize;
+                            if inputs.len() <= ordinal {
+                                inputs.resize(ordinal + 1, None);
+                            }
+                            inputs[ordinal] = Some(share_type);
+                        }
                     }
                 }
             }
@@ -1364,13 +1404,44 @@ impl CodeGenerator {
         // builtin's default: `secret bool`/`secret uintN` for take_share,
         // a concrete fixed-point layout for take_share_fixed.
         let annotation_applies = match function_name.as_str() {
-            "ClientStore.take_share" => !matches!(share_type, ShareType::SecretFixedPoint { .. }),
-            "ClientStore.take_share_fixed" => {
+            "ClientStore.take_share" | "ClientStore.sum_shares" => {
+                !matches!(share_type, ShareType::SecretFixedPoint { .. })
+            }
+            "ClientStore.take_share_bool" | "ClientStore.sum_shares_bool" => {
+                share_type.is_boolean()
+            }
+            "ClientStore.take_share_fixed" | "ClientStore.sum_shares_fixed" => {
                 matches!(share_type, ShareType::SecretFixedPoint { .. })
             }
             _ => false,
         };
         if !annotation_applies {
+            return;
+        }
+        if matches!(
+            function_name.as_str(),
+            "ClientStore.sum_shares"
+                | "ClientStore.sum_shares_bool"
+                | "ClientStore.sum_shares_fixed"
+        ) {
+            let Some(input_ordinals) = self.input_ordinals_for_node(arguments.first()) else {
+                return;
+            };
+            let Some(client_counts) = self.input_ordinals_for_node(arguments.get(1)) else {
+                return;
+            };
+            for client_count in client_counts {
+                for client_slot in 0..client_count.max(1) {
+                    let inputs = self.client_inputs.entry(client_slot).or_default();
+                    for input_ordinal in &input_ordinals {
+                        let ordinal = *input_ordinal as usize;
+                        if inputs.len() <= ordinal {
+                            inputs.resize(ordinal + 1, None);
+                        }
+                        inputs[ordinal] = Some(share_type);
+                    }
+                }
+            }
             return;
         }
         let Some(client_slot) = int_literal_u64(arguments.first()) else {
@@ -1396,12 +1467,16 @@ impl CodeGenerator {
         let Some(AstNode::Identifier(list_name, _)) = arguments.first() else {
             return;
         };
-        let Some(share_type) = arguments
+        let share_type = arguments
             .get(1)
             .and_then(|argument| self.share_type_for_node(argument))
-        else {
-            return;
-        };
+            // A user helper declared as returning the generic `Share` object
+            // does not carry a concrete bit layout through semantic typing.
+            // The VM treats such shares as the default secret integer unless a
+            // more precise annotation is available, so mirror that fallback in
+            // the client-IO manifest instead of leaving an appended output list
+            // empty (which would omit the client from output coordination).
+            .unwrap_or_else(ShareType::default_secret_int);
         let repeat = self.active_loop_iteration_count();
         self.variable_share_lists
             .entry(list_name.clone())
@@ -1482,7 +1557,15 @@ impl CodeGenerator {
                     _ => None,
                 }
             }
-            _ => None,
+            // Index and field access nodes carry their element type through the
+            // semantic symbol table even when no scalar value has been assigned
+            // to a named variable yet. Preserve that type for client-output
+            // manifests instead of degrading, for example, `secret bool` list
+            // elements to the default 64-bit secret integer.
+            _ => self
+                .type_hint_for_node(node)
+                .as_ref()
+                .and_then(share_type_for_secret_scalar_symbol_type),
         }
     }
 
@@ -1627,6 +1710,7 @@ impl CodeGenerator {
             // program AST by `preprocessing_planner` and stamped into the
             // manifest in `generate_bytecode`; leave it at the default here.
             preprocessing_demand: PreprocessingDemand::default(),
+            dynamic_client_inputs: Vec::new(),
         }
     }
 
@@ -3511,16 +3595,29 @@ pub fn generate_bytecode_with_opt_level(
     node: &AstNode,
     opt_level: u8,
 ) -> CompilerResult<CompiledProgram> {
+    generate_bytecode_with_opt_level_and_backend(node, opt_level, MpcBackend::default())
+}
+
+pub fn generate_bytecode_with_opt_level_and_backend(
+    node: &AstNode,
+    opt_level: u8,
+    mpc_backend: MpcBackend,
+) -> CompilerResult<CompiledProgram> {
     let mut generator = CodeGenerator::new();
     generator.opt_level = opt_level;
     collect_reassigned_vars(node, &mut generator.reassigned_vars);
     let (_result_vr, _result_is_secret) = generator.compile_node(node)?;
     let mut program = generator.finalize_program()?;
+    // Codegen records direct ClientStore calls inside each function. Augment
+    // that data by following literal clear-integer arguments through helper
+    // calls so client slots and ordinals hidden behind helpers are not omitted.
+    crate::client_io_planner::merge_inferred_client_inputs(node, &mut program.client_io_manifest);
     // Compute the program's MPC preprocessing demand interprocedurally over the
     // whole AST (call-multiplicity- and list-length-aware) and stamp it into the
     // client-IO manifest, replacing the placeholder set during finalisation.
     program.client_io_manifest.preprocessing_demand =
-        crate::preprocessing_planner::plan_preprocessing_demand(node);
+        crate::preprocessing_planner::plan_preprocessing_demand_for_backend(node, mpc_backend);
+    program.client_io_manifest.mpc_backend = mpc_backend;
     if std::env::var("STOFFEL_DEBUG_DEMAND").is_ok() {
         eprintln!(
             "[stoffel-lang] preprocessing demand: {:?}",

@@ -1,0 +1,26 @@
+# Local-instruction workload for standing-node scheduler fairness validation.
+#
+# Both entries remain runnable without an MPC/network effect. The long entry is
+# deliberately much larger than the scheduler's local-instruction budget; the
+# short entry is still large enough to cross that budget at least once. A
+# short-before-long completion therefore demonstrates instruction-budget
+# yielding between runnable VM tasks instead of progress only while one task is
+# blocked on the network.
+
+def cpu_long() -> int64:
+  var accumulator: int64 = 0
+  for round in 0..5000000:
+    accumulator = accumulator + round
+  return accumulator
+
+def cpu_short() -> int64:
+  var accumulator: int64 = 0
+  for round in 0..25000:
+    accumulator = accumulator + round
+  return accumulator
+
+def main() -> int64:
+  # Standing admissions execute the two workloads as alternate entry points.
+  # Keep both reachable from the canonical entry so the binary compiler emits
+  # both functions instead of pruning the unreferenced long workload.
+  return cpu_long() + cpu_short()

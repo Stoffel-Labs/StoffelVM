@@ -226,6 +226,7 @@ fn foreign_arguments_centralize_arity_and_type_checks() {
     assert_eq!(args.string(0, "name").expect("string"), "alice");
     assert_eq!(args.cloned_string(0, "name").expect("cloned"), "alice");
     assert_eq!(args.usize(1, "index").expect("usize"), 7);
+    assert_eq!(args.i64(1, "index").expect("i64"), 7);
     assert_eq!(args.u64(1, "index").expect("u64"), 7);
     assert_eq!(args.array_ref(2, "array").expect("array").id(), 3);
     assert_eq!(args.array_id(2, "array").expect("array id"), 3);

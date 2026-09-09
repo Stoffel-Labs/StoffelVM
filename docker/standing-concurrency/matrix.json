@@ -1,0 +1,63 @@
+{
+  "schema": "stoffel-standing-compose-matrix/v1",
+  "description": "Six executions admitted together to the same five standing party containers.",
+  "executions": [
+    {
+      "name": "hb-single-same-a",
+      "execution_id": "0000000000000000000000000000000000000000000000000000000000000011",
+      "fixture": "single_client_io",
+      "backend": "honeybadger",
+      "curve": "bls12-381",
+      "clients": [{"certificate": "cert0.crt", "manifest_slot": 0, "inputs": [7], "outputs": 1, "expected": [21]}]
+    },
+    {
+      "name": "hb-single-same-b",
+      "execution_id": "0000000000000000000000000000000000000000000000000000000000000012",
+      "fixture": "single_client_io",
+      "backend": "honeybadger",
+      "curve": "bls12-381",
+      "clients": [{"certificate": "cert0.crt", "manifest_slot": 0, "inputs": [7], "outputs": 1, "expected": [21]}]
+    },
+    {
+      "name": "hb-single-different-a",
+      "execution_id": "0000000000000000000000000000000000000000000000000000000000000013",
+      "fixture": "single_client_io",
+      "backend": "honeybadger",
+      "curve": "bls12-381",
+      "clients": [{"certificate": "cert0.crt", "manifest_slot": 0, "inputs": [4], "outputs": 1, "expected": [12]}]
+    },
+    {
+      "name": "hb-multi-io",
+      "execution_id": "0000000000000000000000000000000000000000000000000000000000000015",
+      "fixture": "multi_client_io",
+      "backend": "honeybadger",
+      "curve": "bls12-381",
+      "clients": [
+        {"certificate": "cert1.crt", "manifest_slot": 1, "inputs": [4, 5], "outputs": 2, "expected": [14, 9]},
+        {"certificate": "cert0.crt", "manifest_slot": 0, "inputs": [2, 3], "outputs": 2, "expected": [23, 5]}
+      ]
+    },
+    {
+      "name": "avss-multi-io",
+      "execution_id": "0000000000000000000000000000000000000000000000000000000000000017",
+      "fixture": "multi_client_io",
+      "backend": "avss",
+      "curve": "bls12-381",
+      "clients": [
+        {"certificate": "cert0.crt", "manifest_slot": 0, "inputs": [2, 3], "outputs": 2, "expected": [23, 5]},
+        {"certificate": "cert1.crt", "manifest_slot": 1, "inputs": [4, 5], "outputs": 2, "expected": [14, 9]}
+      ]
+    },
+    {
+      "name": "hb-output-only-client",
+      "execution_id": "0000000000000000000000000000000000000000000000000000000000000018",
+      "fixture": "output_only_client_io",
+      "backend": "honeybadger",
+      "curve": "bls12-381",
+      "clients": [
+        {"certificate": "cert0.crt", "manifest_slot": 0, "inputs": [6], "outputs": 0, "expected": []},
+        {"certificate": "cert1.crt", "manifest_slot": 1, "inputs": [], "outputs": 1, "expected": [30]}
+      ]
+    }
+  ]
+}

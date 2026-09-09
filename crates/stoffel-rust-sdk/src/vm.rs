@@ -8,11 +8,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::client_value_codec::{decode_fixed_point_value, encode_fixed_point_value};
 use crate::config::MpcBackend;
 use crate::error::{Error, Result};
+use crate::program::Program;
 use crate::runtime::StoffelRuntime;
 use crate::types::Value;
-use stoffel_vm_types::core_types::{ShareType, TableRef, Value as VmValue};
+use stoffel_vm_types::core_types::{ShareDataFormat, ShareType, TableRef, Value as VmValue};
 
 pub fn execute_clear(runtime: &StoffelRuntime, function_name: &str) -> Result<Vec<Value>> {
     let args = runtime.input_values_for_function(function_name)?;
@@ -97,6 +99,23 @@ pub async fn execute_local(runtime: &StoffelRuntime, function_name: &str) -> Res
     execute_local_with_options(runtime, function_name, LocalExecutionOptions::default()).await
 }
 
+/// Execute a local MPC entrypoint whose VM return is secret-shared.
+///
+/// Use [`execute_local`] for public VM returns. This method requires exactly
+/// one unrevealed return share from every compute party and preserves each
+/// party's backend bytes without reconstruction.
+pub async fn execute_local_returning_party_shares(
+    runtime: &StoffelRuntime,
+    function_name: &str,
+) -> Result<LocalShareExecutionOutput> {
+    execute_local_returning_party_shares_options(
+        runtime,
+        function_name,
+        LocalExecutionOptions::default(),
+    )
+    .await
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LocalExecutionOptions {
     pub(crate) runner_path: Option<PathBuf>,
@@ -119,6 +138,103 @@ pub struct LocalClientOutput {
     pub client_slot: u64,
     pub values: Vec<Value>,
     pub raw: Vec<u64>,
+}
+
+/// One party's uninterpreted secret-share payload returned by the VM.
+///
+/// The SDK exposes the share metadata so callers can validate compatibility,
+/// but deliberately provides no reconstruction or decoding operation. The
+/// backend bytes can be borrowed for hashing or sealing, or consumed for
+/// durable storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueShare {
+    /// The Stoffel secret type carried by this share.
+    pub share_type: ShareType,
+    /// The MPC backend's serialization format. The SDK treats the serialized
+    /// bytes as opaque regardless of this tag.
+    pub backend_format: ShareDataFormat,
+    bytes: Vec<u8>,
+}
+
+impl OpaqueShare {
+    fn from_runner(share: stoffel_vm_runner::ReturnedShare) -> Self {
+        Self {
+            share_type: share.share_type,
+            backend_format: share.format,
+            bytes: share.data,
+        }
+    }
+
+    /// Borrow the exact party-local backend serialization.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume this value and return the exact party-local backend
+    /// serialization.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// One compute party's secret VM return and printed public output.
+///
+/// `returned_share` contains the exact party-local backend serialization held
+/// by this party. The SDK validates only its type/format metadata; it never
+/// compares or reconstructs the secret payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPartyShareOutput {
+    /// Runner-assigned compute-party name.
+    pub party: String,
+    /// This party's public program output, excluding VM return markers.
+    pub program_output: String,
+    /// This party's unrevealed VM return value.
+    pub returned_share: OpaqueShare,
+}
+
+/// Result of a local MPC execution whose VM return remains secret-shared.
+///
+/// There is deliberately no public `values` field: public VM returns use
+/// [`execute_local`], while this type guarantees exactly one
+/// [`LocalPartyShareOutput::returned_share`] per party. Printed output remains
+/// party-scoped so callers must choose whether and how to establish agreement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalShareExecutionOutput {
+    /// Party-local outputs, each paired with exactly one opaque return share.
+    pub party_outputs: Vec<LocalPartyShareOutput>,
+    /// Values explicitly reconstructed for clients via `send_to_client`.
+    /// These are separate from the unreconstructed VM return shares.
+    pub client_outputs: Vec<LocalClientOutput>,
+}
+
+impl LocalShareExecutionOutput {
+    /// Iterate over the returned party-local shares in party-output order.
+    pub fn shares(&self) -> impl ExactSizeIterator<Item = &OpaqueShare> {
+        self.party_outputs.iter().map(|party| &party.returned_share)
+    }
+}
+
+#[derive(Debug)]
+struct LocalPartyExecutionDetails {
+    party: String,
+    program_output: String,
+    returned_shares: Vec<OpaqueShare>,
+}
+
+#[derive(Debug)]
+struct LocalExecutionDetails {
+    values: Vec<Value>,
+    program_output: String,
+    party_outputs: Vec<LocalPartyExecutionDetails>,
+    client_outputs: Vec<LocalClientOutput>,
+}
+
+impl LocalExecutionDetails {
+    fn has_party_shares(&self) -> bool {
+        self.party_outputs
+            .iter()
+            .any(|party| !party.returned_shares.is_empty())
+    }
 }
 
 impl LocalClientOutput {
@@ -157,16 +273,15 @@ fn value_is_set(value: &Value) -> bool {
 
 /// Decode one reconstructed field value into a typed SDK [`Value`] using the
 /// share type the manifest declared for that output position.
-fn decode_client_output_value(raw: u64, share_type: ShareType) -> Value {
-    match share_type {
+fn decode_client_output_value(raw: u64, share_type: ShareType) -> Result<Value> {
+    Ok(match share_type {
         ShareType::SecretInt { bit_length: 1 } => Value::Bool(raw != 0),
         ShareType::SecretInt { .. } => Value::I64(raw as i64),
         ShareType::SecretUInt { .. } => Value::U64(raw),
         ShareType::SecretFixedPoint { precision } => {
-            let scale = (1u128 << precision.fractional_bits()) as f64;
-            Value::Float((raw as i64) as f64 / scale)
+            Value::Float(decode_fixed_point_value(raw as i64, precision)?)
         }
-    }
+    })
 }
 
 pub(crate) async fn execute_local_with_options(
@@ -188,6 +303,62 @@ pub(crate) async fn execute_local_capturing_with_options(
     function_name: &str,
     options: LocalExecutionOptions,
 ) -> Result<(Vec<Value>, String, Vec<LocalClientOutput>)> {
+    let output = execute_local_details_with_options(runtime, function_name, options).await?;
+    if output.has_party_shares() {
+        return Err(Error::Computation(
+            "secret VM returns are party-local; use execute_local_returning_party_shares() to preserve them"
+                .to_owned(),
+        ));
+    }
+    Ok((output.values, output.program_output, output.client_outputs))
+}
+
+pub(crate) async fn execute_local_returning_party_shares_options(
+    runtime: &StoffelRuntime,
+    function_name: &str,
+    options: LocalExecutionOptions,
+) -> Result<LocalShareExecutionOutput> {
+    let output = execute_local_details_with_options(runtime, function_name, options).await?;
+    if !output.has_party_shares() {
+        return Err(Error::Computation(
+            "the VM returned public values; use execute_local() for public returns".to_owned(),
+        ));
+    }
+
+    let party_outputs = output
+        .party_outputs
+        .into_iter()
+        .map(|mut party| {
+            if party.returned_shares.len() != 1 {
+                return Err(Error::Computation(format!(
+                    "local party {} returned {} secret shares, expected exactly one VM return share",
+                    party.party,
+                    party.returned_shares.len()
+                )));
+            }
+            Ok(LocalPartyShareOutput {
+                party: party.party,
+                program_output: party.program_output,
+                returned_share: party
+                    .returned_shares
+                    .pop()
+                    .expect("share count was checked above"),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(LocalShareExecutionOutput {
+        party_outputs,
+        client_outputs: output.client_outputs,
+    })
+}
+
+/// Run a real local MPC network and retain enough internal detail to support
+/// both the public-return and party-share SDK surfaces.
+async fn execute_local_details_with_options(
+    runtime: &StoffelRuntime,
+    function_name: &str,
+    options: LocalExecutionOptions,
+) -> Result<LocalExecutionDetails> {
     if runtime.program().function(function_name).is_none() {
         return Err(Error::FunctionNotFound(function_name.to_owned()));
     }
@@ -204,32 +375,8 @@ pub(crate) async fn execute_local_capturing_with_options(
         .ok_or_else(|| Error::Configuration("MPC configuration is required".to_owned()))?;
     let flattened_client_inputs = flatten_local_client_inputs(runtime.client_inputs())?;
     validate_flattened_local_client_inputs(runtime, &flattened_client_inputs)?;
-    if matches!(
-        mpc_config.backend,
-        MpcBackend::Avss {
-            curve: crate::config::Curve::Bn254
-                | crate::config::Curve::Curve25519
-                | crate::config::Curve::Ed25519
-        }
-    ) && !runtime.client_inputs().is_empty()
-    {
-        return Err(Error::Unsupported(
-            "SDK local coordinator execution currently supports AVSS local client inputs only for bls12_381"
-                .to_owned(),
-        ));
-    }
-    let local_client_inputs = flattened_client_inputs
-        .iter()
-        .map(|(client_slot, values)| {
-            Ok(stoffel_vm_runner::LocalClientInput::raw(
-                *client_slot,
-                values
-                    .iter()
-                    .map(local_client_input_value)
-                    .collect::<Result<Vec<_>>>()?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let local_client_inputs =
+        local_client_inputs_for_runner(runtime.program(), &flattened_client_inputs)?;
     let runner_path = resolve_stoffel_run_binary(
         options
             .runner_path
@@ -268,19 +415,52 @@ pub(crate) async fn execute_local_capturing_with_options(
         .await
         .map_err(|error| Error::Computation(error.to_string()))?;
 
-    let program_output = local_program_output(&output);
+    let party_outputs = output
+        .party_outputs
+        .iter()
+        .map(|party| {
+            let returned_shares = party
+                .returned_shares()
+                .map_err(|error| {
+                    Error::Computation(format!(
+                        "could not decode secret VM return from party {}: {error}",
+                        party.name
+                    ))
+                })?
+                .into_iter()
+                .map(OpaqueShare::from_runner)
+                .collect();
+            Ok(LocalPartyExecutionDetails {
+                party: party.name.clone(),
+                program_output: local_program_output_without_return_markers(&party.stdout),
+                returned_shares,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let has_party_shares = party_outputs
+        .iter()
+        .any(|party| !party.returned_shares.is_empty());
+    let program_output = party_outputs
+        .first()
+        .map(|party| party.program_output.clone())
+        .unwrap_or_default();
     print!("{program_output}");
 
-    let returned = output.consistent_returned_values().map_err(|error| {
-        Error::Computation(format!(
-            "local coordinator run did not produce consistent VM return values: {error}\noutput:\n{}",
-            output.combined_output
-        ))
-    })?;
-    let values = returned
-        .iter()
-        .map(|value| parse_runner_return_value(value))
-        .collect::<Result<Vec<_>>>()?;
+    let values = if has_party_shares {
+        validate_party_share_returns(&output, &party_outputs)?;
+        Vec::new()
+    } else {
+        let returned = output.consistent_returned_values().map_err(|error| {
+            Error::Computation(format!(
+                "local coordinator run did not produce consistent VM return values: {error}\noutput:\n{}",
+                output.combined_output
+            ))
+        })?;
+        returned
+            .iter()
+            .map(|value| parse_runner_return_value(value))
+            .collect::<Result<Vec<_>>>()?
+    };
     let manifest = runtime.program().client_io_manifest();
     let client_outputs = output
         .client_outputs
@@ -298,26 +478,59 @@ pub(crate) async fn execute_local_capturing_with_options(
                 .enumerate()
                 .map(|(index, &raw)| match output_types.get(index) {
                     Some(share_type) => decode_client_output_value(raw, *share_type),
-                    None => Value::U64(raw),
+                    None => Ok(Value::U64(raw)),
                 })
-                .collect();
-            LocalClientOutput {
+                .collect::<Result<Vec<_>>>()?;
+            Ok(LocalClientOutput {
                 client_slot: record.client_slot,
                 values: typed,
                 raw: record.values.clone(),
-            }
+            })
         })
-        .collect();
-    Ok((values, program_output, client_outputs))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(LocalExecutionDetails {
+        values,
+        program_output,
+        party_outputs,
+        client_outputs,
+    })
 }
 
-/// The first party's printed program output, with `Program returned:` markers
-/// removed. Empty when no party produced output.
-fn local_program_output(output: &stoffel_vm_runner::LocalCoordinatorRunOutput) -> String {
-    let Some(first_party) = output.party_outputs.first() else {
-        return String::new();
+fn validate_party_share_returns(
+    output: &stoffel_vm_runner::LocalCoordinatorRunOutput,
+    party_outputs: &[LocalPartyExecutionDetails],
+) -> Result<()> {
+    let Some(first_party) = party_outputs.first() else {
+        return Err(Error::Computation(
+            "local coordinator run did not produce any party output".to_owned(),
+        ));
     };
-    local_program_output_without_return_markers(&first_party.stdout)
+    let expected_metadata = first_party
+        .returned_shares
+        .iter()
+        .map(|share| (share.share_type, share.backend_format))
+        .collect::<Vec<_>>();
+
+    for (raw_party, party) in output.party_outputs.iter().zip(party_outputs) {
+        if raw_party.returned_values().len() != party.returned_shares.len() {
+            return Err(Error::Computation(format!(
+                "local party {} mixed secret and public VM return values",
+                party.party
+            )));
+        }
+        let metadata = party
+            .returned_shares
+            .iter()
+            .map(|share| (share.share_type, share.backend_format))
+            .collect::<Vec<_>>();
+        if metadata != expected_metadata {
+            return Err(Error::Computation(format!(
+                "local party {} returned opaque share metadata {:?}, expected {:?} from party {}",
+                party.party, metadata, expected_metadata, first_party.party
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn local_program_output_without_return_markers(stdout: &str) -> String {
@@ -397,19 +610,54 @@ fn flatten_local_client_input_value(value: &Value, out: &mut Vec<Value>) -> Resu
     }
 }
 
-fn local_client_input_value(value: &Value) -> Result<String> {
-    match value {
-        Value::I64(value) => Ok(value.to_string()),
-        Value::U64(value) if i64::try_from(*value).is_ok() => Ok(value.to_string()),
-        Value::U64(value) => Ok(format!("0x{value:x}")),
-        Value::Bool(value) => Ok(if *value { "1" } else { "0" }.to_owned()),
-        Value::Bytes(value) => Ok(format!("0x{}", hex_encode(value))),
-        Value::Float(_) | Value::String(_) | Value::List(_) | Value::Object(_) | Value::Unit => {
-            Err(Error::InvalidInput(
-                "local coordinator client inputs support integers, booleans, 0x-prefixed hex bytes, and lists of those values"
-                    .to_owned(),
+fn local_client_inputs_for_runner(
+    program: &Program,
+    inputs: &[(u64, Vec<Value>)],
+) -> Result<Vec<stoffel_vm_runner::LocalClientInput>> {
+    inputs
+        .iter()
+        .map(|(client_slot, values)| {
+            let input_types = program
+                .client(*client_slot)
+                .map(|client| client.inputs())
+                .unwrap_or(&[]);
+            let encoded = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    local_client_input_value(value, input_types.get(index).copied())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(stoffel_vm_runner::LocalClientInput::raw(
+                *client_slot,
+                encoded,
             ))
+        })
+        .collect()
+}
+
+fn local_client_input_value(value: &Value, share_type: Option<ShareType>) -> Result<String> {
+    match (share_type, value) {
+        (Some(ShareType::SecretFixedPoint { precision }), value) => {
+            Ok(encode_fixed_point_value(value, precision)?.to_string())
         }
+        (_, Value::I64(value)) => Ok(value.to_string()),
+        (_, Value::U64(value)) if i64::try_from(*value).is_ok() => Ok(value.to_string()),
+        (_, Value::U64(value)) => Ok(format!("0x{value:x}")),
+        (_, Value::Bool(value)) => Ok(if *value { "1" } else { "0" }.to_owned()),
+        (_, Value::Bytes(value)) => Ok(format!("0x{}", hex_encode(value))),
+        (Some(share_type), value) => Err(Error::InvalidInput(format!(
+            "local client input kind '{}' is not compatible with manifest share type {share_type:?}",
+            value.kind()
+        ))),
+        (None, Value::Float(_))
+        | (None, Value::String(_))
+        | (None, Value::List(_))
+        | (None, Value::Object(_))
+        | (None, Value::Unit) => Err(Error::InvalidInput(
+            "local coordinator client inputs without manifest types support integers, booleans, 0x-prefixed hex bytes, and lists of those values"
+                .to_owned(),
+        )),
     }
 }
 
@@ -593,6 +841,24 @@ fn workspace_root() -> Option<PathBuf> {
 
 fn parse_runner_return_value(value: &str) -> Result<Value> {
     let value = value.trim();
+    if let Some(rest) = value.strip_prefix("byte[") {
+        let (declared_len, encoded) = rest.split_once("] 0x").ok_or_else(|| {
+            Error::Computation(format!("invalid byte-array runner result '{value}'"))
+        })?;
+        let declared_len = declared_len.parse::<usize>().map_err(|error| {
+            Error::Computation(format!(
+                "invalid byte-array length in runner result '{value}': {error}"
+            ))
+        })?;
+        let bytes = hex_decode(encoded)?;
+        if bytes.len() != declared_len {
+            return Err(Error::Computation(format!(
+                "runner result declared {declared_len} byte(s), encoded {}",
+                bytes.len()
+            )));
+        }
+        return Ok(Value::Bytes(bytes));
+    }
     if value == "true" {
         return Ok(Value::Bool(true));
     }
@@ -612,6 +878,36 @@ fn parse_runner_return_value(value: &str) -> Result<Value> {
         return Ok(Value::Float(value));
     }
     Ok(Value::String(value.to_owned()))
+}
+
+fn hex_decode(encoded: &str) -> Result<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err(Error::Computation(
+            "runner byte-array result contains odd-length hex".to_owned(),
+        ));
+    }
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    pairs
+        .iter()
+        .map(|pair| {
+            let high = hex_nibble(pair[0])?;
+            let low = hex_nibble(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(Error::Computation(format!(
+            "runner byte-array result contains non-hex byte {:?}",
+            char::from(byte)
+        ))),
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -752,10 +1048,112 @@ fn sdk_value_from_vm_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        find_binary_in_path, local_program_output_without_return_markers, path_is_under,
-        target_profile_dir_from_exe,
+        decode_client_output_value, find_binary_in_path, local_client_inputs_for_runner,
+        local_program_output_without_return_markers, parse_runner_return_value, path_is_under,
+        target_profile_dir_from_exe, validate_party_share_returns, LocalPartyExecutionDetails,
+        OpaqueShare,
     };
+    use crate::types::Value;
     use std::path::PathBuf;
+    use stoffel_vm_runner::{LocalCoordinatorRunOutput, LocalPartyOutput, ReturnedShare};
+    use stoffel_vm_types::core_types::{ShareDataFormat, ShareType};
+
+    fn opaque_party(name: &str, payload: u8) -> (LocalPartyOutput, LocalPartyExecutionDetails) {
+        let returned_share = ReturnedShare::new(
+            ShareType::secret_int(64),
+            ShareDataFormat::Feldman,
+            vec![payload],
+        );
+        let encoded = returned_share.to_string();
+        let share = OpaqueShare::from_runner(returned_share);
+        (
+            LocalPartyOutput {
+                name: name.to_owned(),
+                stdout: format!("Program returned: {encoded}\n"),
+                stderr: String::new(),
+                combined: format!("Program returned: {encoded}\n"),
+            },
+            LocalPartyExecutionDetails {
+                party: name.to_owned(),
+                program_output: String::new(),
+                returned_shares: vec![share],
+            },
+        )
+    }
+
+    #[test]
+    fn local_client_inputs_use_manifest_fixed_point_precision() -> crate::Result<()> {
+        let runtime = crate::Stoffel::compile(
+            r#"
+def main() -> int64:
+  var num_elements: int64 = 2
+  var num_clients: int64 = 2
+  var element_index: int64 = 0
+  while element_index < num_elements:
+    discard ClientStore.take_share_fixed(0, element_index)
+    var client_index: int64 = 1
+    while client_index < num_clients:
+      discard ClientStore.take_share_fixed(client_index, element_index)
+      client_index += 1
+    element_index += 1
+  return 0
+"#,
+        )?
+        .build()?;
+        let inputs = vec![
+            (0, vec![Value::I64(0), Value::I64(0)]),
+            (1, vec![Value::I64(1), Value::I64(1)]),
+        ];
+
+        let encoded = local_client_inputs_for_runner(runtime.program(), &inputs)?;
+
+        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded[0].values, vec!["0", "0"]);
+        assert_eq!(encoded[1].values, vec!["65536", "65536"]);
+        Ok(())
+    }
+
+    #[test]
+    fn local_fixed_point_client_outputs_decode_semantically() -> crate::Result<()> {
+        let share_type = ShareType::default_secret_fixed_point();
+
+        assert_eq!(
+            decode_client_output_value(98_304, share_type)?,
+            Value::Float(1.5)
+        );
+        assert_eq!(
+            decode_client_output_value((-32_768_i64) as u64, share_type)?,
+            Value::Float(-0.5)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn opaque_party_returns_allow_distinct_payloads_with_matching_metadata() {
+        let (raw_a, party_a) = opaque_party("party-0", 0x11);
+        let (raw_b, party_b) = opaque_party("party-1", 0x22);
+        let output = LocalCoordinatorRunOutput {
+            combined_output: String::new(),
+            party_outputs: vec![raw_a, raw_b],
+            client_outputs: Vec::new(),
+        };
+
+        validate_party_share_returns(&output, &[party_a, party_b]).unwrap();
+    }
+
+    #[test]
+    fn opaque_party_returns_reject_mixed_public_and_secret_markers() {
+        let (mut raw, party) = opaque_party("party-0", 0x11);
+        raw.combined.push_str("Program returned: 7\n");
+        let output = LocalCoordinatorRunOutput {
+            combined_output: String::new(),
+            party_outputs: vec![raw],
+            client_outputs: Vec::new(),
+        };
+
+        let error = validate_party_share_returns(&output, &[party]).unwrap_err();
+        assert!(error.to_string().contains("mixed secret and public"));
+    }
 
     #[test]
     fn local_program_output_filter_removes_runner_return_markers() {
@@ -765,6 +1163,19 @@ mod tests {
             local_program_output_without_return_markers(stdout),
             "polynomial p\n"
         );
+    }
+
+    #[test]
+    fn runner_byte_array_result_decodes_to_sdk_bytes() {
+        assert_eq!(
+            parse_runner_return_value("byte[4] 0x0011aaff").unwrap(),
+            Value::Bytes(vec![0x00, 0x11, 0xaa, 0xff])
+        );
+    }
+
+    #[test]
+    fn runner_byte_array_result_rejects_length_mismatch() {
+        assert!(parse_runner_return_value("byte[3] 0x0011").is_err());
     }
 
     #[test]

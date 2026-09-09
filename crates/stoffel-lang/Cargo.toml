@@ -2,7 +2,7 @@
 name = "stoffellang"
 description = "Compiler for Stoffel programs targeting the Stoffel VM bytecode format"
 authors = ["Gabriel Arrouye"]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Stoffel-Labs/stoffel"
@@ -14,7 +14,7 @@ categories = ["compilers", "cryptography", "parser-implementations"]
 name = "stoffellang"
 
 [dependencies]
-stoffel-vm-types = { version = "=0.1.2", path = "../stoffel-vm-types" }
+stoffel-vm-types = { version = "=0.2.0", path = "../stoffel-vm-types" }
 colored = "=3.1.1"
 edit-distance = "=2.2.2"
 clap = { version = "=4.6.1", features = ["derive"] }

@@ -33,6 +33,7 @@ def call_closure_with_arg[T, U](closure: Closure, value: T) -> U {.builtin: "cal
 def get_upvalue[T](name: string) -> T {.builtin.}:
 def set_upvalue[T](name: string, value: T) -> void {.builtin.}:
 def append[T](array: list[T], value: T) -> void {.builtin: "append".}:
+def list[T](capacity: int64 = 0) -> list[T] {.builtin: "create_array".}:
 def extend[T](array: list[T], values: list[T]) -> void {.builtin: "extend".}:
 def copy[T](array: list[T]) -> list[T] {.builtin: "copy".}:
 def count[T](array: list[T], value: T) -> int64 {.builtin: "count".}:

@@ -4,6 +4,7 @@ use crate::net::curve::{MpcCurveConfig, MpcFieldKind};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::num::NonZeroUsize;
+use stoffelnet::network_utils::CertificateIdentity;
 use x509_parser::prelude::*;
 
 /// Durable program-side identity used for local persistent MPC state.
@@ -29,6 +30,16 @@ impl DurableIdentityDigest {
         let (_, cert) = X509Certificate::from_der(cert_der)
             .map_err(|error| format!("parse X.509 certificate: {error:?}"))?;
         Ok(Self::from_public_key_bytes(cert.public_key().raw))
+    }
+
+    /// Preserve the exact certificate principal frozen by execution admission.
+    ///
+    /// The transport has already domain-separated and hashed the certificate
+    /// SPKI into `CertificateIdentity`; using those bytes directly keeps the
+    /// durable owner independent of mutable compact client IDs or connection
+    /// ordering.
+    pub const fn from_certificate_identity(identity: CertificateIdentity) -> Self {
+        Self(identity.into_bytes())
     }
 
     pub fn from_legacy_party_id(party_id: usize) -> Self {
@@ -263,6 +274,15 @@ impl MpcSessionTopology {
 
     pub const fn threshold(self) -> usize {
         self.threshold.value()
+    }
+
+    pub const fn with_instance(self, instance_id: u64) -> Self {
+        Self {
+            instance_id: MpcInstanceId::new(instance_id),
+            party_id: self.party_id,
+            party_count: self.party_count,
+            threshold: self.threshold,
+        }
     }
 }
 

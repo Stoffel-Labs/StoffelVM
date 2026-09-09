@@ -1,15 +1,69 @@
 use super::{
     add_share_for_curve, add_share_scalar_for_curve, mul_share_field_for_curve,
-    mul_share_scalar_for_curve, scale_fixed_point_scalar, sub_share_for_curve, ShareAlgebraError,
+    mul_share_scalar_for_curve, scale_fixed_point_scalar, sub_share_for_curve,
+    sum_share_data_for_curve, ShareAlgebraError,
 };
 use crate::net::curve::MpcCurveConfig;
 use ark_bls12_381::{Fr, G1Projective};
 use ark_ec::PrimeGroup;
 use ark_ed25519::{EdwardsProjective, Fr as EdFr};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use stoffel_vm_types::core_types::ShareType;
+use stoffel_vm_types::core_types::{ShareData, ShareType};
 use stoffelmpc_mpc::common::share::avss::verify_feldman;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
+use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+
+#[test]
+fn robust_share_sum_decodes_each_input_once_and_preserves_metadata() {
+    let shares = [2u64, 3, 5]
+        .into_iter()
+        .map(|value| {
+            let share = RobustShare::new(Fr::from(value), 2, 1);
+            let mut bytes = Vec::new();
+            share.serialize_compressed(&mut bytes).unwrap();
+            ShareData::Opaque(bytes.into())
+        })
+        .collect::<Vec<_>>();
+
+    for share_type in [
+        ShareType::secret_int(32),
+        ShareType::secret_uint(32),
+        ShareType::boolean(),
+        ShareType::secret_fixed_point_from_bits(32, 8),
+    ] {
+        let sum = sum_share_data_for_curve(MpcCurveConfig::Bls12_381, share_type, &shares)
+            .expect("sum robust shares");
+        let decoded = RobustShare::<Fr>::deserialize_compressed(sum.as_bytes()).unwrap();
+        assert_eq!(decoded.share[0], Fr::from(10u64), "type {share_type:?}");
+        assert_eq!(decoded.id, 2, "type {share_type:?}");
+        assert_eq!(decoded.degree, 1, "type {share_type:?}");
+    }
+}
+
+#[test]
+fn feldman_share_sum_preserves_verifiable_commitments() {
+    let shares = [
+        test_feldman_share(2, 3, 1),
+        test_feldman_share(5, 7, 1),
+        test_feldman_share(11, 13, 1),
+    ];
+    let data = shares
+        .iter()
+        .map(|share| ShareData::Feldman {
+            data: encode_feldman_share(share).into(),
+            commitments: Vec::<Vec<u8>>::new().into(),
+        })
+        .collect::<Vec<_>>();
+
+    let sum = sum_share_data_for_curve(MpcCurveConfig::Bls12_381, ShareType::secret_int(64), &data)
+        .expect("sum Feldman shares");
+    let decoded = decode_feldman_share(sum.as_bytes());
+    assert!(verify_feldman(decoded.clone(), decoded.feldmanshare.id));
+    assert_eq!(
+        decoded.commitments[0],
+        shares[0].commitments[0] + shares[1].commitments[0] + shares[2].commitments[0]
+    );
+}
 
 #[test]
 fn scale_fixed_point_scalar_rejects_unrepresentable_shift() {

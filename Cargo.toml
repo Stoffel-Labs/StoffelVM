@@ -7,9 +7,16 @@ members = [
     "crates/stoffel-vm",
     "crates/stoffel-vm-runner",
     "crates/stoffel-vm-types",
+    "crates/stoffel-wasm-client",
     "crates/stoffel-lang/examples/mpc_aes128_cbc_client_io",
+    "crates/stoffel-lang/examples/mpc_sha256_client_io",
 ]
 resolver = "2"
 exclude = [
     "vendor/mpc-protocols-limit-test",
+    "vendor/stoffel-mpc-coordinator-browser",
 ]
+
+[patch.crates-io]
+stoffel-mpc-coordinator-off-chain = { version = "0.2.0", path = "vendor/stoffel-mpc-coordinator-browser/crates/off-chain" }
+stoffel-mpc-coordinator-shared = { version = "0.2.0", path = "vendor/stoffel-mpc-coordinator-browser/crates/coord-shared" }

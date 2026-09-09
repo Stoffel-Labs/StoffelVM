@@ -25,7 +25,7 @@ where
     }
 
     fn topology(&self) -> MpcSessionTopology {
-        self.topology
+        HoneyBadgerMpcEngine::topology(self)
     }
 
     fn local_identity(&self) -> DurableIdentityDigest {
@@ -110,13 +110,13 @@ where
                 }
             };
 
-            let seq = self.open_registry.insert_single_next(
+            let seq = self.open_registry().insert_single_next(
                 &type_key,
                 self.topology.party_id(),
                 share_bytes.to_vec(),
             )?;
             let wire_message = crate::net::open_registry::encode_single_share_wire_message(
-                self.topology.instance_id(),
+                self.current_instance_id(),
                 seq,
                 &type_key,
                 self.topology.party_id(),
@@ -128,7 +128,7 @@ where
             let n = self.topology.n_parties();
             let t = self.topology.threshold();
 
-            self.open_registry.open_share_at_wait(
+            self.open_registry().open_share_at_wait(
                 self.topology.party_id(),
                 &type_key,
                 seq,
@@ -170,13 +170,13 @@ where
                 }
             };
 
-            let seq = self.open_registry.insert_batch_next(
+            let seq = self.open_registry().insert_batch_next(
                 &type_key,
                 self.topology.party_id(),
                 shares.to_vec(),
             )?;
             let wire_message = crate::net::open_registry::encode_batch_share_wire_message(
-                self.topology.instance_id(),
+                self.current_instance_id(),
                 seq,
                 &type_key,
                 self.topology.party_id(),
@@ -188,7 +188,7 @@ where
             let n = self.topology.n_parties();
             let t = self.topology.threshold();
 
-            self.open_registry.batch_open_at_wait(
+            self.open_registry().batch_open_at_wait(
                 self.topology.party_id(),
                 &type_key,
                 seq,

@@ -19,6 +19,10 @@ impl VmExecutionBudget {
     pub(crate) const fn is_exhausted(self, executed_instructions: usize) -> bool {
         executed_instructions >= self.max_instructions
     }
+
+    pub(crate) const fn remaining(self, executed_instructions: usize) -> usize {
+        self.max_instructions.saturating_sub(executed_instructions)
+    }
 }
 
 #[derive(Debug)]

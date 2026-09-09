@@ -1,0 +1,15 @@
+# Split input/output client workload for standing-node validation.
+#
+# Client slot 0 contributes one secret value and expects no result. A distinct,
+# admitted client in slot 1 contributes no input and receives the product. This
+# exercises an output-only authenticated client independently of input masking.
+
+def main() -> int64:
+  var input: secret int64 = ClientStore.take_share(0, 0)
+  var factor = Share.from_clear_int(5, 64)
+  var product = Share.mul(input, factor)
+
+  if Mpc.has_capability("client-output"):
+    product.send_to_client(1)
+
+  return Share.open(product)

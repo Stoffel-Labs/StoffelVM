@@ -30,14 +30,24 @@ impl<'a> ForeignFunctionContext<'a> {
         self.services.load_client_share(client_id, share_index)
     }
 
-    pub(crate) fn load_client_share_as(
+    pub(crate) fn load_client_share_at_as(
         &self,
-        client_id: ClientId,
+        client_index: ClientInputIndex,
         share_index: ClientShareIndex,
         share_type: ShareType,
     ) -> VmResult<Value> {
         self.services
-            .load_client_share_as(client_id, share_index, share_type)
+            .load_client_share_at_as(client_index, share_index, share_type)
+    }
+
+    pub(crate) fn sum_client_shares_at(
+        &self,
+        share_index: ClientShareIndex,
+        client_count: usize,
+        fallback_type: ShareType,
+    ) -> VmResult<Value> {
+        self.services
+            .sum_client_shares_at(share_index, client_count, fallback_type)
     }
 
     pub(crate) fn send_output_to_client(
@@ -111,6 +121,14 @@ impl<'a> ForeignFunctionContext<'a> {
         self.services.open_share_as_field_data(ty, share_data)
     }
 
+    pub(crate) fn batch_open_shares_as_field_data(
+        &self,
+        ty: ShareType,
+        shares: &[ShareData],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.services.batch_open_shares_as_field_data(ty, shares)
+    }
+
     pub(crate) fn open_share_in_exp_data(
         &self,
         ty: ShareType,
@@ -130,6 +148,28 @@ impl<'a> ForeignFunctionContext<'a> {
     ) -> VmResult<Vec<u8>> {
         self.services
             .open_share_in_exp_group_data(group, ty, share_data, generator_bytes)
+    }
+
+    pub(crate) fn batch_open_shares_in_exp_group_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generator_bytes: &[u8],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.services
+            .batch_open_shares_in_exp_group_data(group, ty, shares, generator_bytes)
+    }
+
+    pub(crate) fn batch_open_shares_in_exp_group_custom_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generators: &[Vec<u8>],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.services
+            .batch_open_shares_in_exp_group_custom_data(group, ty, shares, generators)
     }
 
     pub(crate) fn secret_share_add_data(
@@ -157,6 +197,16 @@ impl<'a> ForeignFunctionContext<'a> {
         rhs_data: &ShareData,
     ) -> VmResult<ShareData> {
         self.services.secret_share_mul_data(ty, lhs_data, rhs_data)
+    }
+
+    pub(crate) fn secret_share_batch_mul_data(
+        &self,
+        ty: ShareType,
+        lhs_data: &[ShareData],
+        rhs_data: &[ShareData],
+    ) -> VmResult<Vec<ShareData>> {
+        self.services
+            .secret_share_batch_mul_data(ty, lhs_data, rhs_data)
     }
 
     pub(crate) fn secret_share_neg_data(

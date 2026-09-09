@@ -7,8 +7,13 @@ PREPROC_COMPOSE="${ROOT_DIR}/docker-compose.coordinator.reserve-index.preproc.ym
 PROJECT_NAME="${PROJECT_NAME:-coordri-preproc}"
 AUTH_TOKEN="${STOFFEL_AUTH_TOKEN:-coord-test-token}"
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-240}"
-COORDINATOR_CONTEXT="${STOFFEL_COORDINATOR_CONTEXT:-${STOFFEL_COORDINATOR_DIR:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#feature/no-feature-gates-and-multi-type-awareness}}"
-NETWORK_CONTEXT="${STOFFEL_NETWORK_CONTEXT:-${STOFFEL_NETWORK_DIR:-https://github.com/Stoffel-Labs/stoffel-networking.git#feature/robust-identity-based-on-cert}}"
+EXECUTION_ID="${STOFFEL_EXECUTION_ID:-$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')}"
+DEFAULT_COORDINATOR_CONTEXT="${ROOT_DIR}/../stoffel-mpc-coordinator"
+if [[ ! -d "${DEFAULT_COORDINATOR_CONTEXT}/crates/off-chain" ]]; then
+    DEFAULT_COORDINATOR_CONTEXT="https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0"
+fi
+COORDINATOR_CONTEXT="${STOFFEL_COORDINATOR_CONTEXT:-${STOFFEL_COORDINATOR_DIR:-${DEFAULT_COORDINATOR_CONTEXT}}}"
+NETWORK_CONTEXT="${STOFFEL_NETWORK_CONTEXT:-${STOFFEL_NETWORK_DIR:-https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1}}"
 WORKLOAD_CONTAINERS=(
     stoffel-coord-party0
     stoffel-coord-party1
@@ -21,6 +26,7 @@ WORKLOAD_CONTAINERS=(
 
 compose() {
     STOFFEL_AUTH_TOKEN="${AUTH_TOKEN}" \
+    STOFFEL_EXECUTION_ID="${EXECUTION_ID}" \
     STOFFEL_COORDINATOR_CONTEXT="${COORDINATOR_CONTEXT}" \
     STOFFEL_NETWORK_CONTEXT="${NETWORK_CONTEXT}" \
         docker compose \
@@ -76,6 +82,7 @@ assert_zero_exit_codes() {
         exit_code="$(docker inspect -f '{{.State.ExitCode}}' "${container}")"
         if [[ "${exit_code}" != "0" ]]; then
             echo "Container ${container} exited with ${exit_code}" >&2
+            capture_logs >&2 || true
             return 1
         fi
     done
@@ -96,17 +103,57 @@ require_log() {
     fi
 }
 
+require_log_count() {
+    local haystack="$1"
+    local needle="$2"
+    local expected="$3"
+    local description="$4"
+    local actual
+    actual="$(grep -Fc "${needle}" <<<"${haystack}" || true)"
+    if (( actual < expected )); then
+        echo "Missing ${description}: expected at least ${expected} occurrences of ${needle}, got ${actual}" >&2
+        return 1
+    fi
+}
+
+assert_all_parties_crossed_mpc_execution() {
+    local run_label="$1"
+    local party party_logs
+    for party in party0 party1 party2 party3 party4; do
+        party_logs="$(compose logs --no-color "${party}")"
+        require_log \
+            "${party_logs}" \
+            "Starting VM execution of 'main'..." \
+            "${run_label} ${party} MPCExecution subscription delivery"
+        require_log \
+            "${party_logs}" \
+            "online VM execution complete!" \
+            "${run_label} ${party} online completion"
+    done
+}
+
 trap cleanup EXIT
+
+if ! [[ "${EXECUTION_ID}" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || [[ "${EXECUTION_ID}" =~ ^0{64}$ ]]; then
+    echo "STOFFEL_EXECUTION_ID must be a nonzero 64-character hexadecimal value" >&2
+    exit 2
+fi
 
 compose down --remove-orphans -v >/dev/null 2>&1 || true
 
 echo "== First run: build and persist preprocessing =="
-compose up --build -d
+first_up_args=(--build)
+if [[ "${STOFFEL_SKIP_BUILD:-0}" == "1" ]]; then
+    first_up_args=(--no-build)
+fi
+compose up "${first_up_args[@]}" -d
 wait_for_workload_exit
 assert_zero_exit_codes
 first_logs="$(capture_logs)"
 require_log "${first_logs}" "outputs: [-10]" "default subtraction output"
-require_log "${first_logs}" "Persisted preprocessing material to store" "preprocessing persistence log"
+require_log_count "${first_logs}" "HB standing preprocessing agreement: action=Rebuild" 5 "fresh-volume rebuild agreement"
+assert_all_parties_crossed_mpc_execution first-run
 
 echo "== Second run: load preprocessing from LMDB =="
 compose down --remove-orphans
@@ -115,6 +162,27 @@ wait_for_workload_exit
 assert_zero_exit_codes
 second_logs="$(capture_logs)"
 require_log "${second_logs}" "outputs: [-10]" "default subtraction output after load"
-require_log "${second_logs}" "Loaded preprocessing material from store" "preprocessing load log"
+require_log_count "${second_logs}" "HB standing preprocessing agreement: action=" 5 "retained-volume preprocessing agreement"
+if grep -Fq "HB standing preprocessing agreement: action=Rebuild" <<<"${second_logs}"; then
+    echo "Matching retained stores unexpectedly selected a rebuild" >&2
+    exit 1
+fi
+assert_all_parties_crossed_mpc_execution retained-run
 
-echo "Coordinator preprocessing store/load test passed."
+echo "== Third run: recover from one party's missing preprocessing volume =="
+compose down --remove-orphans
+docker volume rm "${PROJECT_NAME}_coordri-preproc-party2" >/dev/null
+compose up --no-build -d
+wait_for_workload_exit
+assert_zero_exit_codes
+third_logs="$(capture_logs)"
+require_log "${third_logs}" "outputs: [-10]" "default subtraction output after asymmetric recovery"
+require_log_count "${third_logs}" "HB standing preprocessing agreement: action=Rebuild" 5 "asymmetric-volume rebuild agreement"
+assert_all_parties_crossed_mpc_execution asymmetric-run
+
+if grep -Eq 'RanShaError|BatchReconError|Preprocessing failed' <<<"${third_logs}"; then
+    echo "Protocol failure detected after asymmetric preprocessing recovery" >&2
+    exit 1
+fi
+
+echo "Coordinator preprocessing fresh/load/asymmetric-recovery test passed."

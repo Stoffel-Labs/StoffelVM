@@ -1,5 +1,5 @@
 use super::ForeignFunctionCallbackResult;
-use crate::value_conversions::{value_to_u64, value_to_usize};
+use crate::value_conversions::{value_to_i64, value_to_u64, value_to_usize};
 use stoffel_vm_types::core_types::{ArrayRef, ObjectRef, TableRef, Value};
 
 /// Named argument view for a VM foreign-function call.
@@ -134,6 +134,15 @@ impl<'a> ForeignArguments<'a> {
         argument_name: &'static str,
     ) -> ForeignFunctionCallbackResult<usize> {
         Ok(value_to_usize(self.get(index)?, argument_name)?)
+    }
+
+    /// Convert an integer-like VM value into `i64`.
+    pub fn i64(
+        &self,
+        index: usize,
+        argument_name: &'static str,
+    ) -> ForeignFunctionCallbackResult<i64> {
+        Ok(value_to_i64(self.get(index)?, argument_name)?)
     }
 
     /// Convert an integer-like VM value into `u64`.

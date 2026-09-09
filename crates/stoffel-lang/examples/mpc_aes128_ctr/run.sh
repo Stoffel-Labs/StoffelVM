@@ -46,4 +46,4 @@ STOFFEL="${STOFFEL_BIN:-$REPO_ROOT/target/release/stoffel}"
 
 # shellcheck disable=SC2086
 STOFFEL_RUN_BIN="$RUNNER" "$STOFFEL" run "$(dirname "$0")" \
-  --local --runner "$RUNNER" --timeout-secs 1100 $ARGS
+  --release --local --runner "$RUNNER" --timeout-secs 1100 $ARGS

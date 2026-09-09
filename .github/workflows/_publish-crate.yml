@@ -3,7 +3,7 @@ name: _publish-crate
 # Reusable publish logic for a single workspace crate. Don't trigger this
 # directly — each crate has a thin caller workflow (publish-<crate>.yml) that
 # invokes it with the crate name. Tags are of the form <crate>-v<semver>,
-# e.g. stoffel-vm-types-v0.1.0, so each crate versions independently.
+# e.g. stoffel-vm-types-v0.2.0, so each crate versions independently.
 
 on:
   workflow_call:

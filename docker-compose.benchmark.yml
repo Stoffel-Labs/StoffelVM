@@ -1,11 +1,16 @@
 networks:
   stoffel:
     driver: bridge
+    ipam:
+      config:
+        - {subnet: 172.29.0.0/24, gateway: 172.29.0.1}
 
 x-party: &party
   build:
     context: .
     dockerfile: Dockerfile.benchmark
+    additional_contexts:
+      coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}"
     args:
       PROFILE_BUILD: "${STOFFEL_PROFILE_BUILD:-false}"
   volumes:
@@ -17,13 +22,6 @@ x-party: &party
   entrypoint: ["/bin/bash", "-c"]
   command:
     - |
-      NETEM=""
-      if [ -n "$${NET_LOSS}" ]; then NETEM="$$NETEM loss $${NET_LOSS}%"; fi
-      if [ -n "$${NET_BANDWIDTH}" ]; then NETEM="$$NETEM rate $${NET_BANDWIDTH}mbit"; fi
-      if [ -n "$$NETEM" ]; then
-        tc qdisc add dev eth0 root netem $$NETEM \
-          || echo "WARNING: tc failed" >&2
-      fi
       /app/entrypoint.sh; EXIT=$$?
       MEM=$$(cat /sys/fs/cgroup/memory.peak 2>/dev/null \
           || cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null \
@@ -41,9 +39,13 @@ x-common-env: &common-env
   STOFFEL_PROGRAM: "${STOFFEL_PROGRAM:-/app/programs/mpc_aes128_circuit.stflb}"
   STOFFEL_MPC_BACKEND: ${STOFFEL_MPC_BACKEND:-honeybadger}
   STOFFEL_MPC_CURVE: ${STOFFEL_MPC_CURVE:-bls12-381}
+  # Example-only default; use a fresh nonzero 64-hex ID for each real/overlapping invocation.
+  STOFFEL_EXECUTION_ID: "${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}"
   RUST_MIN_STACK: ${RUST_MIN_STACK:-67108864}
   RUST_LOG: "${RUST_LOG:-info}"
   RUST_BACKTRACE: "1"
+  NET_RTT_MS: "${NET_RTT_MS:-0}"
+  NET_PEER_IPS: "172.29.0.10,172.29.0.11,172.29.0.12,172.29.0.13,172.29.0.14"
   NET_LOSS: "${NET_LOSS:-}"
   NET_BANDWIDTH: "${NET_BANDWIDTH:-}"
   STOFFEL_SKIP_HOST_WAIT: "true"
@@ -52,13 +54,14 @@ x-common-env: &common-env
   STOFFEL_PROFILE_DIR: "${STOFFEL_PROFILE_DIR:-/app/profiles}"
   STOFFEL_PROFILE_LABEL: "${STOFFEL_PROFILE_LABEL:-}"
   STOFFEL_PERF_FREQUENCY: "${STOFFEL_PERF_FREQUENCY:-99}"
-  STOFFEL_UPLOAD_PROGRAM_BYTES: "${STOFFEL_UPLOAD_PROGRAM_BYTES:-false}"
 
 services:
   coordinator:
     build:
       context: .
       dockerfile: docker/coordinator.Dockerfile
+      additional_contexts:
+        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}"
     volumes:
       - ./ids:/app/ids:ro
     entrypoint: ["/bin/sh", "-c"]
@@ -75,6 +78,7 @@ services:
           --bind-addr 0.0.0.0 \
           --port 31415 \
           --hash 0000000000000000000000000000000000000000000000000000000000000000 \
+          --execution-id ${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001} \
           --server-cert /app/ids/server_cert.crt \
           --server-key /app/ids/server_key.der \
           --n 5 \
@@ -101,6 +105,7 @@ services:
       start_period: 10s
     networks:
       stoffel:
+        ipv4_address: 172.29.0.5
         aliases: [coordinator.stoffel-coord.local]
 
   party0:
@@ -113,6 +118,7 @@ services:
       STOFFEL_RPC_ADDR: "0.0.0.0:16180"
       STOFFEL_CERT: /app/ids/nodes/cert0.crt
       STOFFEL_KEY: /app/ids/nodes/key0.der
+      NET_EXTRA_RTT_MS: "${PARTY0_EXTRA_RTT_MS:-0}"
     ports:
       - "9000:9000"
       - "10000:10000"
@@ -128,6 +134,7 @@ services:
       start_period: 10s
     networks:
       stoffel:
+        ipv4_address: 172.29.0.10
         aliases: [party0.stoffel-coord.local]
 
   party1:
@@ -141,6 +148,7 @@ services:
       STOFFEL_CERT: /app/ids/nodes/cert1.crt
       STOFFEL_KEY: /app/ids/nodes/key1.der
       STOFFEL_BOOTSTRAP_ADDR: "party0.stoffel-coord.local:9000"
+      NET_EXTRA_RTT_MS: "${PARTY1_EXTRA_RTT_MS:-0}"
     ports:
       - "9001:9001"
       - "16181:16181"
@@ -151,6 +159,7 @@ services:
         condition: service_healthy
     networks:
       stoffel:
+        ipv4_address: 172.29.0.11
         aliases: [party1.stoffel-coord.local]
 
   party2:
@@ -164,6 +173,7 @@ services:
       STOFFEL_CERT: /app/ids/nodes/cert2.crt
       STOFFEL_KEY: /app/ids/nodes/key2.der
       STOFFEL_BOOTSTRAP_ADDR: "party0.stoffel-coord.local:9000"
+      NET_EXTRA_RTT_MS: "${PARTY2_EXTRA_RTT_MS:-0}"
     ports:
       - "9002:9002"
       - "16182:16182"
@@ -174,6 +184,7 @@ services:
         condition: service_healthy
     networks:
       stoffel:
+        ipv4_address: 172.29.0.12
         aliases: [party2.stoffel-coord.local]
 
   party3:
@@ -187,6 +198,7 @@ services:
       STOFFEL_CERT: /app/ids/nodes/cert3.crt
       STOFFEL_KEY: /app/ids/nodes/key3.der
       STOFFEL_BOOTSTRAP_ADDR: "party0.stoffel-coord.local:9000"
+      NET_EXTRA_RTT_MS: "${PARTY3_EXTRA_RTT_MS:-0}"
     ports:
       - "9003:9003"
       - "16183:16183"
@@ -197,6 +209,7 @@ services:
         condition: service_healthy
     networks:
       stoffel:
+        ipv4_address: 172.29.0.13
         aliases: [party3.stoffel-coord.local]
 
   party4:
@@ -210,6 +223,7 @@ services:
       STOFFEL_CERT: /app/ids/nodes/cert4.crt
       STOFFEL_KEY: /app/ids/nodes/key4.der
       STOFFEL_BOOTSTRAP_ADDR: "party0.stoffel-coord.local:9000"
+      NET_EXTRA_RTT_MS: "${PARTY4_EXTRA_RTT_MS:-0}"
     ports:
       - "9004:9004"
       - "16184:16184"
@@ -220,4 +234,5 @@ services:
         condition: service_healthy
     networks:
       stoffel:
+        ipv4_address: 172.29.0.14
         aliases: [party4.stoffel-coord.local]

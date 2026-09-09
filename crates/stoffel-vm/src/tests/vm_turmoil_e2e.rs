@@ -1220,7 +1220,8 @@ async fn process_hb_node_message(
     message: Vec<u8>,
 ) -> Result<(), String> {
     if router
-        .try_handle_wire_message(sender.id(), &message)
+        .handle_wire_message(sender.id(), &message)
+        .await
         .map_err(|error| format!("HB open-router error: {error}"))?
     {
         return Ok(());
@@ -1239,7 +1240,8 @@ async fn process_avss_node_message(
     message: Vec<u8>,
 ) -> Result<(), String> {
     if router
-        .try_handle_wire_message(sender.id(), &message)
+        .handle_wire_message(sender.id(), &message)
+        .await
         .map_err(|error| format!("AVSS open-router error: {error}"))?
     {
         return Ok(());

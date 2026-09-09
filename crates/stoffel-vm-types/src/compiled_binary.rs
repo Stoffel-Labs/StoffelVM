@@ -27,14 +27,17 @@ use std::io::{self, Read, Write};
 // Magic bytes that identify a StoffelVM bytecode file
 pub const MAGIC_BYTES: &[u8; 4] = b"STFL";
 // Current bytecode format version
-// v9: added LDS/STS spill-slot instructions
-pub const FORMAT_VERSION: u16 = 9;
+// v10: added runtime-client input templates to the client-IO manifest
+pub const FORMAT_VERSION: u16 = 10;
 pub const CLIENT_IO_MANIFEST_FORMAT_VERSION: u16 = 2;
 pub const MPC_BACKEND_MANIFEST_FORMAT_VERSION: u16 = 3;
 pub const MPC_CURVE_MANIFEST_FORMAT_VERSION: u16 = 4;
 pub const FUNCTION_TYPE_METADATA_FORMAT_VERSION: u16 = 5;
 /// Version at which the client IO manifest carries a `PreprocessingDemand`.
 pub const PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION: u16 = 8;
+/// Version at which the client IO manifest can describe homogeneous client
+/// inputs whose slots are selected at runtime by `get_number_clients()`.
+pub const DYNAMIC_CLIENT_INPUT_MANIFEST_FORMAT_VERSION: u16 = 10;
 
 const MAX_BINARY_COLLECTION_LEN: usize = 1_000_000;
 /// Per-function instruction vectors are allowed to grow far larger than the
@@ -319,6 +322,39 @@ pub struct ClientIoManifest {
     /// `#[serde(default)]` keeps older binaries (without this field) loadable.
     #[serde(default)]
     pub preprocessing_demand: PreprocessingDemand,
+    /// Homogeneous input schemas for client slots reached through a runtime
+    /// `ClientStore.get_number_clients()` loop. Each template applies from
+    /// `first_client_slot` onward; a concrete schema in `clients` takes
+    /// precedence.
+    #[serde(default)]
+    pub dynamic_client_inputs: Vec<DynamicClientInputSchema>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicClientInputSchema {
+    pub first_client_slot: u64,
+    pub inputs: Vec<ShareType>,
+}
+
+impl ClientIoManifest {
+    /// Resolve the semantic input layout for a runtime client slot. Concrete
+    /// schemas win; otherwise the most specific dynamic template applies.
+    pub fn input_types_for_client_slot(&self, client_slot: u64) -> Option<&[ShareType]> {
+        let concrete = self
+            .clients
+            .iter()
+            .find(|schema| schema.client_slot == client_slot);
+        if let Some(schema) = concrete.filter(|schema| !schema.inputs.is_empty()) {
+            return Some(&schema.inputs);
+        }
+        let dynamic = self
+            .dynamic_client_inputs
+            .iter()
+            .filter(|schema| schema.first_client_slot <= client_slot)
+            .max_by_key(|schema| schema.first_client_slot)
+            .map(|schema| schema.inputs.as_slice());
+        dynamic.or_else(|| concrete.map(|schema| schema.inputs.as_slice()))
+    }
 }
 
 /// Compiler estimate of preprocessing material a program consumes, used to size
@@ -330,13 +366,15 @@ pub struct ClientIoManifest {
 pub struct PreprocessingDemand {
     /// Beaver triples — one per secret*secret multiplication.
     pub triples: u64,
-    /// Program-visible random shares — masks for inputs/reveals and direct
-    /// random-share requests. Backends may allocate extra internal randoms for
-    /// derived material such as triples.
+    /// Program-visible random field shares — masks for inputs/reveals and
+    /// direct `Share.random_field` requests. Backends may allocate extra
+    /// internal randoms for derived material such as triples.
     pub randoms: u64,
     /// Random bits — `frac_bits` per secret fixed-point division (truncation).
     pub prandbits: u64,
-    /// Random integers — one per secret fixed-point division (truncation).
+    /// Random integers — one per direct `Share.random_int` request (including
+    /// typed `Share.random`, which lowers to it) and one per secret fixed-point
+    /// division (truncation).
     pub prandints: u64,
     /// True when the static estimate may undercount (data-dependent loops,
     /// recursion, or runtime-sized batch operations).
@@ -1168,6 +1206,7 @@ impl CompiledBinary {
                 self.version >= MPC_BACKEND_MANIFEST_FORMAT_VERSION,
                 self.version >= MPC_CURVE_MANIFEST_FORMAT_VERSION,
                 self.version >= PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
+                self.version >= DYNAMIC_CLIENT_INPUT_MANIFEST_FORMAT_VERSION,
                 writer,
             )?;
         }
@@ -1180,6 +1219,7 @@ impl CompiledBinary {
         include_backend: bool,
         include_curve: bool,
         include_demand: bool,
+        include_dynamic_client_inputs: bool,
         writer: &mut W,
     ) -> BinaryResult<()> {
         if include_backend {
@@ -1207,6 +1247,20 @@ impl CompiledBinary {
             writer.write_all(&demand.prandbits.to_le_bytes())?;
             writer.write_all(&demand.prandints.to_le_bytes())?;
             writer.write_all(&[u8::from(demand.dynamic)])?;
+        }
+        if include_dynamic_client_inputs {
+            write_usize_as_u32(
+                writer,
+                manifest.dynamic_client_inputs.len(),
+                "dynamic client input schema count",
+            )?;
+            for schema in &manifest.dynamic_client_inputs {
+                writer.write_all(&schema.first_client_slot.to_le_bytes())?;
+                write_usize_as_u32(writer, schema.inputs.len(), "dynamic client input count")?;
+                for share_type in &schema.inputs {
+                    Self::serialize_share_type(*share_type, writer)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1645,6 +1699,7 @@ impl CompiledBinary {
                 version >= MPC_BACKEND_MANIFEST_FORMAT_VERSION,
                 version >= MPC_CURVE_MANIFEST_FORMAT_VERSION,
                 version >= PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
+                version >= DYNAMIC_CLIENT_INPUT_MANIFEST_FORMAT_VERSION,
             )?
         } else {
             ClientIoManifest::default()
@@ -1723,6 +1778,7 @@ impl CompiledBinary {
                 version >= MPC_BACKEND_MANIFEST_FORMAT_VERSION,
                 version >= MPC_CURVE_MANIFEST_FORMAT_VERSION,
                 version >= PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
+                version >= DYNAMIC_CLIENT_INPUT_MANIFEST_FORMAT_VERSION,
             )?
         } else {
             ClientIoManifest::default()
@@ -1796,6 +1852,7 @@ impl CompiledBinary {
                 version >= MPC_BACKEND_MANIFEST_FORMAT_VERSION,
                 version >= MPC_CURVE_MANIFEST_FORMAT_VERSION,
                 version >= PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
+                version >= DYNAMIC_CLIENT_INPUT_MANIFEST_FORMAT_VERSION,
             )?
         } else {
             ClientIoManifest::default()
@@ -1809,6 +1866,7 @@ impl CompiledBinary {
         has_backend: bool,
         has_curve: bool,
         has_demand: bool,
+        has_dynamic_client_inputs: bool,
     ) -> BinaryResult<ClientIoManifest> {
         let mpc_backend = if has_backend {
             Self::deserialize_mpc_backend(reader)?
@@ -1859,11 +1917,45 @@ impl CompiledBinary {
         } else {
             PreprocessingDemand::default()
         };
+        let dynamic_client_inputs = if has_dynamic_client_inputs {
+            let schema_count = read_u32_len_bounded(
+                reader,
+                "dynamic client input schema count",
+                MAX_BINARY_COLLECTION_LEN,
+            )?;
+            let mut schemas = Vec::new();
+            reserve_vec(
+                &mut schemas,
+                schema_count,
+                "dynamic client input schema count",
+            )?;
+            for _ in 0..schema_count {
+                let first_client_slot = read_u64(reader)?;
+                let input_count = read_u32_len_bounded(
+                    reader,
+                    "dynamic client input count",
+                    MAX_BINARY_COLLECTION_LEN,
+                )?;
+                let mut inputs = Vec::new();
+                reserve_vec(&mut inputs, input_count, "dynamic client input count")?;
+                for _ in 0..input_count {
+                    inputs.push(Self::deserialize_share_type(reader)?);
+                }
+                schemas.push(DynamicClientInputSchema {
+                    first_client_slot,
+                    inputs,
+                });
+            }
+            schemas
+        } else {
+            Vec::new()
+        };
         Ok(ClientIoManifest {
             mpc_backend,
             mpc_curve,
             clients,
             preprocessing_demand,
+            dynamic_client_inputs,
         })
     }
 
@@ -2842,6 +2934,10 @@ mod tests {
                 },
             ],
             preprocessing_demand: PreprocessingDemand::default(),
+            dynamic_client_inputs: vec![DynamicClientInputSchema {
+                first_client_slot: 10,
+                inputs: vec![ShareType::secret_fixed_point_from_bits(64, 16); 4],
+            }],
         };
 
         let mut buffer = Vec::new();

@@ -4,6 +4,7 @@
 
 use crate::net::backend::MpcBackendKind;
 use std::fmt;
+use stoffel_vm_types::compiled_binary::MpcCurve;
 use stoffel_vm_types::core_types::{
     ClearShareValue, FixedPointPrecision, ShareType, Value, BOOLEAN_SECRET_INT_BITS, F64,
 };
@@ -108,7 +109,9 @@ impl From<MpcCurveError> for String {
 /// so `SupportedMpcField` is implemented once and covers both curves.
 /// Engine implementations use the group type to preserve the configured curve
 /// identity where the field alone is ambiguous.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum MpcCurveConfig {
     #[default]
     Bls12_381,
@@ -120,6 +123,19 @@ pub enum MpcCurveConfig {
     Secp256k1,
     /// NIST P-256, also known as secp256r1.
     Secp256r1,
+}
+
+impl From<MpcCurve> for MpcCurveConfig {
+    fn from(curve: MpcCurve) -> Self {
+        match curve {
+            MpcCurve::Bls12_381 => Self::Bls12_381,
+            MpcCurve::Bn254 => Self::Bn254,
+            MpcCurve::Curve25519 => Self::Curve25519,
+            MpcCurve::Ed25519 => Self::Ed25519,
+            MpcCurve::Secp256k1 => Self::Secp256k1,
+            MpcCurve::Secp256r1 => Self::Secp256r1,
+        }
+    }
 }
 
 impl std::str::FromStr for MpcCurveConfig {
@@ -180,7 +196,7 @@ impl MpcCurveConfig {
 }
 
 /// Field-dispatch metadata for VM-local share math.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MpcFieldKind {
     Bls12_381Fr,
     Bn254Fr,
@@ -209,6 +225,41 @@ pub trait SupportedMpcField: ark_ff::FftField + ark_ff::PrimeField + Send + Sync
     fn field_kind() -> MpcFieldKind {
         Self::CURVE_CONFIG.field_kind()
     }
+}
+
+/// Implemented by every field/group pair supported by the generic AVSS engine.
+///
+/// Unlike [`SupportedMpcField`], this marker preserves the configured curve
+/// identity when two curves share a scalar field (notably Curve25519 and
+/// Ed25519). Generic SDK and runner boundaries use it to infer the curve from
+/// `AvssMpcEngine<F, G>` without accepting a separate, potentially mismatched
+/// runtime curve argument.
+pub trait SupportedMpcCurvePair {
+    const CURVE_CONFIG: MpcCurveConfig;
+}
+
+impl SupportedMpcCurvePair for (ark_bls12_381::Fr, ark_bls12_381::G1Projective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Bls12_381;
+}
+
+impl SupportedMpcCurvePair for (ark_bn254::Fr, ark_bn254::G1Projective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Bn254;
+}
+
+impl SupportedMpcCurvePair for (ark_curve25519::Fr, ark_curve25519::EdwardsProjective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Curve25519;
+}
+
+impl SupportedMpcCurvePair for (ark_ed25519::Fr, ark_ed25519::EdwardsProjective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Ed25519;
+}
+
+impl SupportedMpcCurvePair for (ark_secp256k1::Fr, ark_secp256k1::Projective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Secp256k1;
+}
+
+impl SupportedMpcCurvePair for (ark_secp256r1::Fr, ark_secp256r1::Projective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Secp256r1;
 }
 
 impl SupportedMpcField for ark_bls12_381::Fr {

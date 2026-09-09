@@ -2,7 +2,8 @@
 
 def main() -> int64:
   var client_count = ClientStore.get_number_clients()
-  var score: int64 = Mpc.party_id()
+  var local_party_id: int64 = Mpc.party_id()
+  var score: int64 = local_party_id
   score = score + Mpc.n_parties()
   score = score + Mpc.threshold()
   score = score + client_count
@@ -35,7 +36,10 @@ def main() -> int64:
   discard Mpc.capabilities()
 
   if client_count > 0 and Mpc.has_capability("client-output"):
-    var score_share = Share.from_clear(score)
+    # Every party must contribute a share of the same value. Keep the local
+    # party id in the function's diagnostic return, but omit it from the value
+    # reconstructed by the client.
+    var score_share = Share.from_clear(score - local_party_id)
     var output_shares: list[Share] = [score_share]
     MpcOutput.send_to_client(0, output_shares)
 

@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use stoffel_vm_types::core_types::ClearShareValue;
 
+use super::instance::MAX_PENDING_BATCH_ENTRIES_PER_SENDER;
 use super::wire::{
-    AVSS_EXP_WIRE_PREFIX, AVSS_G2_EXP_WIRE_PREFIX, HB_EXP_OPEN_WIRE_PREFIX, MAX_WIRE_MESSAGE_LEN,
-    OPEN_REGISTRY_WIRE_PREFIX,
+    AVSS_EXP_WIRE_PREFIX, AVSS_G2_EXP_WIRE_PREFIX, HB_EXP_OPEN_WIRE_PREFIX, MAX_BATCH_ELEMENTS,
+    MAX_WIRE_MESSAGE_LEN, OPEN_REGISTRY_WIRE_PREFIX,
 };
 use super::*;
 
@@ -236,6 +238,441 @@ fn explicit_rbc_session_rejects_conflicting_duplicate_payload() {
         .try_handle_wire_message(1, &conflict)
         .expect_err("conflicting duplicate RBC payload must be rejected");
     assert!(err.contains("conflicting RBC payload"));
+}
+
+#[test]
+fn rbc_does_not_deliver_sender_equivocation_without_an_agreement_quorum() {
+    let left_router = OpenMessageRouter::new();
+    let right_router = OpenMessageRouter::new();
+    let left = left_router.register_instance(21030);
+    let right = right_router.register_instance(21030);
+
+    let left_value = encode_rbc_wire_message(21030, 7, 1, b"payload-a").unwrap();
+    let right_value = encode_rbc_wire_message(21030, 7, 1, b"payload-b").unwrap();
+    assert!(left_router.try_handle_wire_message(1, &left_value).unwrap());
+    assert!(right_router
+        .try_handle_wire_message(1, &right_value)
+        .unwrap());
+
+    assert!(left.rbc_receive(0, 1, 10).is_err());
+    assert!(right.rbc_receive(2, 1, 10).is_err());
+}
+
+#[test]
+fn rbc_equivocation_converges_on_the_only_value_with_an_honest_quorum() {
+    let instance_id = 21032;
+    let registries = (0..3)
+        .map(|_| {
+            let router = OpenMessageRouter::new();
+            router.register_instance(instance_id)
+        })
+        .collect::<Vec<_>>();
+    registries[0]
+        .insert_rbc_broadcast(7, 0, b"payload-a".to_vec())
+        .unwrap();
+    for registry in &registries[1..] {
+        registry
+            .insert_rbc_broadcast(7, 0, b"payload-b".to_vec())
+            .unwrap();
+    }
+
+    let initial_echoes = registries
+        .iter()
+        .enumerate()
+        .flat_map(|(index, registry)| {
+            registry
+                .rbc_progress(index + 1, Some(0), 4, 1)
+                .unwrap()
+                .relays
+                .into_iter()
+                .map(move |relay| (index + 1, relay))
+        })
+        .collect::<Vec<_>>();
+    for (sender, relay) in initial_echoes {
+        for registry in &registries {
+            registry
+                .insert_rbc_relay(
+                    false,
+                    relay.session_id,
+                    relay.broadcaster_party_id,
+                    sender,
+                    relay.digest,
+                    relay.message.clone(),
+                )
+                .unwrap();
+        }
+    }
+
+    // The Byzantine broadcaster equivocates in both ECHO and READY phases. Its single
+    // authenticated identity cannot make the minority payload meet either threshold.
+    for payload in [b"payload-a".as_slice(), b"payload-b".as_slice()] {
+        let digest = *blake3::hash(payload).as_bytes();
+        for registry in &registries {
+            registry
+                .insert_rbc_relay(false, 7, 0, 0, digest, Some(payload.to_vec()))
+                .unwrap();
+            registry
+                .insert_rbc_relay(true, 7, 0, 0, digest, None)
+                .unwrap();
+        }
+    }
+
+    let honest_readies = registries
+        .iter()
+        .enumerate()
+        .flat_map(|(index, registry)| {
+            registry
+                .rbc_progress(index + 1, Some(0), 4, 1)
+                .unwrap()
+                .relays
+                .into_iter()
+                .filter(|relay| relay.phase == RbcRelayPhase::Ready)
+                .map(move |relay| (index + 1, relay))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(honest_readies.len(), 3);
+    for (sender, relay) in honest_readies {
+        assert_eq!(relay.digest, *blake3::hash(b"payload-b").as_bytes());
+        for registry in &registries {
+            registry
+                .insert_rbc_relay(
+                    true,
+                    relay.session_id,
+                    relay.broadcaster_party_id,
+                    sender,
+                    relay.digest,
+                    None,
+                )
+                .unwrap();
+        }
+    }
+
+    for (index, registry) in registries.iter().enumerate() {
+        let delivery = registry
+            .rbc_progress(index + 1, Some(0), 4, 1)
+            .unwrap()
+            .delivery;
+        assert_eq!(delivery, Some((0, b"payload-b".to_vec())));
+    }
+}
+
+#[test]
+fn rbc_receive_any_skips_an_incomplete_lower_sorted_candidate() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21033);
+    let blocked_digest = *blake3::hash(b"blocked").as_bytes();
+    registry
+        .insert_rbc_relay(false, 0, 0, 1, blocked_digest, Some(b"blocked".to_vec()))
+        .unwrap();
+
+    let deliverable_digest = *blake3::hash(b"deliverable").as_bytes();
+    for sender in 0..3 {
+        registry
+            .insert_rbc_relay(
+                false,
+                1,
+                2,
+                sender,
+                deliverable_digest,
+                Some(b"deliverable".to_vec()),
+            )
+            .unwrap();
+        registry
+            .insert_rbc_relay(true, 1, 2, sender, deliverable_digest, None)
+            .unwrap();
+    }
+
+    let delivery = registry.rbc_progress(3, None, 4, 1).unwrap().delivery;
+    assert_eq!(delivery, Some((2, b"deliverable".to_vec())));
+}
+
+#[test]
+fn rbc_candidate_payload_retention_is_bounded() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21035);
+    let payload = vec![0x7b; 512 * 1024];
+    let digest = *blake3::hash(&payload).as_bytes();
+    let mut rejected = None;
+    for session_id in 0..64 {
+        if let Err(error) =
+            registry.insert_rbc_relay(false, session_id, 0, 1, digest, Some(payload.clone()))
+        {
+            rejected = Some(error);
+            break;
+        }
+    }
+    let error = rejected.expect("the per-instance RBC payload budget must be finite");
+    assert!(error.contains("RBC payload"));
+    assert!(registry.rbc.lock().candidates.len() < 64);
+}
+
+#[test]
+fn rbc_candidate_quota_is_isolated_by_authenticated_sender() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21036);
+    for session_id in 0..1 {
+        let payload = vec![session_id as u8];
+        let digest = *blake3::hash(&payload).as_bytes();
+        registry
+            .insert_rbc_relay(false, session_id, 0, 1, digest, Some(payload))
+            .unwrap();
+    }
+    let rejected_payload = b"ninth-candidate".to_vec();
+    let rejected_digest = *blake3::hash(&rejected_payload).as_bytes();
+    let error = registry
+        .insert_rbc_relay(false, 1, 0, 1, rejected_digest, Some(rejected_payload))
+        .expect_err("one sender must not retain unlimited RBC candidates");
+    assert!(error.contains("sender 1 candidate quota"));
+
+    let honest_payload = b"honest-candidate".to_vec();
+    let honest_digest = *blake3::hash(&honest_payload).as_bytes();
+    registry
+        .insert_rbc_relay(false, 9, 0, 2, honest_digest, Some(honest_payload))
+        .expect("one sender exhausting its quota must not block another sender");
+}
+
+#[test]
+fn rbc_candidate_registry_has_an_aggregate_ceiling() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21039);
+    for sender in 0usize..256 {
+        let payload = sender.to_le_bytes().to_vec();
+        let digest = *blake3::hash(&payload).as_bytes();
+        registry
+            .insert_rbc_relay(false, 0, 0, sender, digest, Some(payload))
+            .unwrap();
+    }
+    let payload = b"aggregate-overflow".to_vec();
+    let digest = *blake3::hash(&payload).as_bytes();
+    let error = registry
+        .insert_rbc_relay(false, 0, 0, 256, digest, Some(payload))
+        .expect_err("many authenticated identities must not multiply retention without bound");
+    assert!(error.contains("aggregate candidate budget"));
+}
+
+#[test]
+fn local_broadcaster_reclaims_its_candidate_before_the_next_session() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21042);
+    assert_eq!(registry.rbc_broadcast(0, b"first").unwrap(), 0);
+    assert_eq!(registry.rbc_broadcast(0, b"second").unwrap(), 1);
+}
+
+#[test]
+fn oversized_batch_element_count_is_rejected_before_registry_allocation() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21031);
+    let shares = vec![Vec::new(); MAX_BATCH_ELEMENTS + 1];
+    let message = encode_batch_share_wire_message(21031, 0, "bounded-batch", 1, &shares)
+        .expect("encode bounded-size reproduction frame");
+
+    let error = router
+        .try_handle_wire_message(1, &message)
+        .expect_err("decoded batch element count must be bounded independently of wire bytes");
+    assert!(error.contains("batch"));
+    assert!(registry.batch.lock().is_empty());
+}
+
+#[test]
+fn repeated_batch_frames_are_bounded_by_retained_byte_budget() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21034);
+    let share = vec![0x5a; 1024 * 1024];
+    let mut rejected = None;
+    for sequence in 0..64 {
+        if let Err(error) =
+            registry.insert_batch(sequence, "retained-byte-budget", 1, vec![share.clone()])
+        {
+            rejected = Some(error);
+            break;
+        }
+    }
+    let error = rejected.expect("the per-instance retained byte budget must be finite");
+    assert!(error.contains("retained byte budget exceeded"));
+    assert!(registry.batch.lock().len() < 64);
+}
+
+#[test]
+fn batch_retention_quota_is_isolated_by_authenticated_sender() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21037);
+    for sequence in 0..MAX_PENDING_BATCH_ENTRIES_PER_SENDER {
+        registry
+            .insert_batch(sequence, "sender-quota", 1, vec![vec![sequence as u8]])
+            .unwrap();
+    }
+    let error = registry
+        .insert_batch(
+            MAX_PENDING_BATCH_ENTRIES_PER_SENDER,
+            "sender-quota",
+            1,
+            vec![vec![0xff]],
+        )
+        .expect_err("one sender must not retain unlimited batch entries");
+    assert!(error.contains("sender 1 entry quota"));
+
+    registry
+        .insert_batch(
+            MAX_PENDING_BATCH_ENTRIES_PER_SENDER + 1,
+            "sender-quota",
+            2,
+            vec![vec![0x22]],
+        )
+        .expect("one sender exhausting its quota must not block another sender");
+}
+
+#[tokio::test]
+async fn authenticated_batch_frame_waits_for_retention_capacity_instead_of_being_dropped() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21044);
+    for sequence in 0..MAX_PENDING_BATCH_ENTRIES_PER_SENDER {
+        registry
+            .insert_batch(
+                sequence,
+                "backpressured-batch",
+                1,
+                vec![vec![sequence as u8]],
+            )
+            .unwrap();
+    }
+
+    let next_sequence = MAX_PENDING_BATCH_ENTRIES_PER_SENDER;
+    let next_message = encode_batch_share_wire_message(
+        21044,
+        next_sequence,
+        "backpressured-batch",
+        1,
+        &[vec![0xff]],
+    )
+    .unwrap();
+
+    let handle_next = router.handle_wire_message(1, &next_message);
+    let release_capacity = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        registry
+            .batch_open_at_async(
+                0,
+                "backpressured-batch".to_string(),
+                Some(0),
+                &[vec![0x00]],
+                2,
+                |shares, _| Ok(ClearShareValue::Integer(shares[0][0] as i64)),
+            )
+            .await
+            .unwrap();
+    };
+
+    let (handled, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(handle_next, release_capacity)
+    })
+    .await
+    .expect("the retained frame should resume after capacity is reclaimed");
+    assert!(handled.unwrap());
+    assert!(registry.batch.lock().contains_key(&(
+        next_sequence,
+        "backpressured-batch".to_string(),
+        1,
+    )));
+}
+
+#[tokio::test]
+async fn batch_frame_too_large_for_an_empty_retention_window_is_not_retried() {
+    let router = OpenMessageRouter::new();
+    let _registry = router.register_instance(21045);
+    let message = encode_batch_share_wire_message(
+        21045,
+        0,
+        "intrinsically-oversized-batch",
+        1,
+        &[vec![0x5a; 300 * 1024]],
+    )
+    .unwrap();
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(100),
+        router.handle_wire_message(1, &message),
+    )
+    .await
+    .expect("an intrinsically oversized frame must fail without waiting")
+    .expect_err("the per-sender retained-byte limit must still be enforced");
+    assert!(error.contains("retained byte budget exceeded"));
+}
+
+#[test]
+fn local_batch_budget_is_enforced_for_a_key_precreated_by_a_peer() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21038);
+    registry
+        .insert_batch(0, "peer-precreated", 1, vec![vec![0x01]])
+        .unwrap();
+
+    let error = registry
+        .insert_batch_next("peer-precreated", 0, vec![vec![0x42; 300 * 1024]])
+        .expect_err("an existing key must not bypass the local sender's byte quota");
+    assert!(error.contains("sender 0 retained byte budget exceeded"));
+}
+
+#[test]
+fn batch_registry_has_an_aggregate_entry_ceiling() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21040);
+    for sender in 0..256 {
+        registry
+            .insert_batch(0, &format!("aggregate-{sender}"), sender, vec![vec![0x01]])
+            .unwrap();
+    }
+    let error = registry
+        .insert_batch(0, "aggregate-overflow", 256, vec![vec![0x02]])
+        .expect_err(
+            "many authenticated identities must not multiply batch retention without bound",
+        );
+    assert!(error.contains("aggregate entry budget"));
+}
+
+#[test]
+fn completed_batch_entries_release_sender_quota_and_payloads() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21041);
+    for sequence in 0..80 {
+        let opened = registry
+            .batch_open_wait(
+                0,
+                "long-lived-batch",
+                &[vec![sequence as u8]],
+                1,
+                |shares, _| Ok(ClearShareValue::Integer(shares[0][0] as i64)),
+            )
+            .unwrap();
+        assert_eq!(opened, vec![ClearShareValue::Integer(sequence as i64)]);
+    }
+
+    let registry = registry.batch.lock();
+    assert_eq!(registry.len(), 64);
+    assert!(registry.values().all(|entry| {
+        entry.results.is_some()
+            && entry.party_ids.is_empty()
+            && entry.shares_per_position.iter().all(Vec::is_empty)
+    }));
+}
+
+#[tokio::test]
+async fn raw_batch_collection_releases_pending_state_for_the_next_operation() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21043);
+    for expected_sequence in 0..2 {
+        let shares = vec![vec![expected_sequence as u8]];
+        let sequence = registry
+            .insert_batch_next("raw-batch", 0, shares.clone())
+            .unwrap();
+        assert_eq!(sequence, expected_sequence);
+        let (party_ids, contributions) = registry
+            .batch_collect_at_async(0, "raw-batch".to_string(), sequence, shares, 1)
+            .await
+            .unwrap();
+        assert_eq!(party_ids, vec![0]);
+        assert_eq!(contributions, vec![vec![vec![expected_sequence as u8]]]);
+        assert!(registry.batch.lock().is_empty());
+    }
 }
 
 #[test]
@@ -617,11 +1054,12 @@ async fn local_batch_insert_wakes_waiters() {
 
     let reg2 = reg.clone();
     let waiter = tokio::spawn(async move {
+        let shares = vec![b"a0".to_vec(), b"b0".to_vec()];
         reg2.batch_open_at_async(
             0,
             "batch-notify".to_string(),
             Some(0),
-            vec![b"a0".to_vec(), b"b0".to_vec()],
+            &shares,
             2,
             |shares, _pos| Ok(ClearShareValue::Integer(shares.len() as i64)),
         )
@@ -646,11 +1084,12 @@ async fn local_batch_insert_wakes_waiters() {
 
     let reg3 = reg.clone();
     let finalizer = tokio::spawn(async move {
+        let shares = vec![b"a1".to_vec(), b"b1".to_vec()];
         reg3.batch_open_at_async(
             1,
             "batch-notify".to_string(),
             Some(0),
-            vec![b"a1".to_vec(), b"b1".to_vec()],
+            &shares,
             2,
             |shares, _pos| Ok(ClearShareValue::Integer(shares.len() as i64)),
         )

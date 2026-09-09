@@ -4,6 +4,9 @@ builtin object ClientStore:
   def take_share(client_id: int64, share_id: int64) -> Share {.builtin.}:
   def take_share_bool(client_id: int64, share_id: int64) -> Share {.builtin.}:
   def take_share_fixed(client_id: int64, share_id: int64) -> Share {.builtin.}:
+  def sum_shares(share_id: int64, client_count: int64) -> Share {.builtin.}:
+  def sum_shares_bool(share_id: int64, client_count: int64) -> Share {.builtin.}:
+  def sum_shares_fixed(share_id: int64, client_count: int64) -> Share {.builtin.}:
   def get_number_clients() -> int64 {.builtin.}:
   def get_number_input_clients() -> int64 {.builtin.}:
   def get_number_output_clients() -> int64 {.builtin.}:
@@ -32,6 +35,9 @@ builtin object Share:
   def get_type(share: Share) -> string {.builtin.}:
   def get_party_id(share: Share) -> int64 {.builtin.}:
   def batch_open(shares: list[Share]) -> list[Object] {.builtin.}:
+  def batch_open_field(shares: list[Share]) -> list[bytes] {.builtin.}:
+  def batch_open_exp(shares: list[Share], curve_name: string) -> list[bytes] {.builtin.}:
+  def batch_open_exp_custom(shares: list[Share], generators: list[bytes], curve_name: string) -> list[bytes] {.builtin.}:
   def batch_open_fixed[T](shares: list[Share]) -> list[T] {.builtin: "Share.batch_open".}:
   def open_exp(share: Share, curve_name: string) -> bytes {.builtin.}:
   def random() -> Share {.builtin.}:

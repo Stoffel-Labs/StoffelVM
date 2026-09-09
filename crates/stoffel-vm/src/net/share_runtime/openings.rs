@@ -77,6 +77,24 @@ impl MpcShareRuntime<'_> {
             .map_mpc_backend_err("open_share_as_field")
     }
 
+    pub(crate) fn batch_open_shares_as_field_data(
+        &self,
+        ty: ShareType,
+        shares: &[ShareData],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.ensure_ready()?;
+        ensure_homogeneous_share_data_format("batch_open_shares_as_fields", shares)?;
+        let share_bytes = shares
+            .iter()
+            .map(|share| share.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        self.engine
+            .field_open_ops()
+            .map_mpc_backend_err("field_open_ops")?
+            .batch_open_shares_as_fields(ty, &share_bytes)
+            .map_mpc_backend_err("batch_open_shares_as_fields")
+    }
+
     pub(crate) fn open_share_in_exp_data(
         &self,
         ty: ShareType,
@@ -104,5 +122,45 @@ impl MpcShareRuntime<'_> {
             .map_mpc_backend_err("open_in_exp_ops")?
             .open_share_in_exp_group(group, ty, share_data.as_bytes(), generator_bytes)
             .map_mpc_backend_err("open_share_in_exp_group")
+    }
+
+    pub(crate) fn batch_open_shares_in_exp_group_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generator_bytes: &[u8],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.ensure_ready()?;
+        ensure_homogeneous_share_data_format("batch_open_shares_in_exp_group", shares)?;
+        let share_bytes = shares
+            .iter()
+            .map(|share| share.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        self.engine
+            .open_in_exp_ops()
+            .map_mpc_backend_err("open_in_exp_ops")?
+            .batch_open_shares_in_exp_group(group, ty, &share_bytes, generator_bytes)
+            .map_mpc_backend_err("batch_open_shares_in_exp_group")
+    }
+
+    pub(crate) fn batch_open_shares_in_exp_group_custom_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generators: &[Vec<u8>],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.ensure_ready()?;
+        ensure_homogeneous_share_data_format("batch_open_shares_in_exp_group_custom", shares)?;
+        let share_bytes = shares
+            .iter()
+            .map(|share| share.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        self.engine
+            .open_in_exp_ops()
+            .map_mpc_backend_err("open_in_exp_ops")?
+            .batch_open_shares_in_exp_group_custom(group, ty, &share_bytes, generators)
+            .map_mpc_backend_err("batch_open_shares_in_exp_group_custom")
     }
 }

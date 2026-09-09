@@ -3,13 +3,15 @@
 # This mirrors StoffelVM's docker-compose.coordinator.reserve-index.yml, but
 # mounts compiled example binaries from examples/dist instead of using the VM's
 # baked-in test fixtures.
+# The default execution ID is example-only; use a fresh shared nonzero 64-hex-character value for
+# each real or overlapping invocation.
 
 x-stoffel-build: &stoffel-build
   context: ${STOFFEL_VM_DIR:-../../..}
   dockerfile: Dockerfile
   additional_contexts:
-    coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#feature/no-feature-gates-and-multi-type-awareness}"
-    network: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#feature/robust-identity-based-on-cert}"
+    coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}"
+    networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1}"
 
 x-party-common: &party-common
   build: *stoffel-build
@@ -23,6 +25,7 @@ x-party-common: &party-common
     STOFFEL_ENTRY: ${STOFFEL_ENTRY:-main}
     STOFFEL_MPC_BACKEND: honeybadger
     STOFFEL_MPC_CURVE: bls12-381
+    STOFFEL_EXECUTION_ID: "${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}"
     STOFFEL_COORD_ADDR: ${STOFFEL_COORD_NET_PREFIX:-172.32.0}.5:31415
     STOFFEL_TIMESTAMP: "0"
     STOFFEL_EXPECTED_CLIENTS: /app/ids/clients/cert0.crt,/app/ids/clients/cert1.crt
@@ -34,13 +37,17 @@ x-party-common: &party-common
 
 x-client-common: &client-common
   build: *stoffel-build
+  volumes:
+    - ${STOFFEL_EXAMPLES_OUT:-./dist}:/app/examples:ro
   environment: &client-env
     STOFFEL_ROLE: client
+    STOFFEL_PROGRAM: /app/examples/${STOFFEL_PROGRAM_NAME:-mpc_share_arithmetic.stflb}
     STOFFEL_SERVERS: ${STOFFEL_COORD_NET_PREFIX:-172.32.0}.10:16180,${STOFFEL_COORD_NET_PREFIX:-172.32.0}.11:16181,${STOFFEL_COORD_NET_PREFIX:-172.32.0}.12:16182,${STOFFEL_COORD_NET_PREFIX:-172.32.0}.13:16183,${STOFFEL_COORD_NET_PREFIX:-172.32.0}.14:16184
     STOFFEL_N_PARTIES: "5"
     STOFFEL_THRESHOLD: "1"
     STOFFEL_MPC_BACKEND: honeybadger
     STOFFEL_MPC_CURVE: bls12-381
+    STOFFEL_EXECUTION_ID: "${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}"
     STOFFEL_COORD_ADDR: ${STOFFEL_COORD_NET_PREFIX:-172.32.0}.5:31415
     STOFFEL_TIMESTAMP: "0"
     STOFFEL_OUTPUTS: ${STOFFEL_OUTPUTS:-1}
@@ -57,8 +64,8 @@ services:
       context: ${STOFFEL_VM_DIR:-../../..}
       dockerfile: docker/coordinator.Dockerfile
       additional_contexts:
-        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#feature/no-feature-gates-and-multi-type-awareness}"
-        network: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#feature/robust-identity-based-on-cert}"
+        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}"
+        networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1}"
     container_name: stoffel-examples-coordinator
     hostname: coordinator
     command:
@@ -68,6 +75,8 @@ services:
       - "31415"
       - --hash
       - "0000000000000000000000000000000000000000000000000000000000000000"
+      - --execution-id
+      - "${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}"
       - --server-cert
       - /app/ids/server_cert.crt
       - --server-key

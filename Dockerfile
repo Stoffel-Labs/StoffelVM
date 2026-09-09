@@ -6,7 +6,16 @@
 #   ENABLE_NAT - Set to "true" to enable NAT traversal features (requires hole-punching branch)
 #
 # Example:
-#   docker build --build-arg ENABLE_NAT=true -t stoffelvm:nat .
+#   docker build \
+#     --build-context coordinator=../stoffel-mpc-coordinator \
+#     --build-context networking=../stoffel-networking \
+#     --build-arg ENABLE_NAT=true \
+#     -t stoffelvm:nat .
+#
+# The coordinator source context is required so the VM and coordinator images
+# are compiled against the same execution-scoped RPC contract.
+# The networking source context supplies the standing transport's physical
+# frame bound and same-certificate multi-connection support.
 
 # ============================================================================
 # Stage 1: Builder
@@ -15,6 +24,7 @@ FROM rustlang/rust:nightly-bookworm AS builder
 
 # Build argument to enable NAT traversal feature
 ARG ENABLE_NAT=false
+ARG STOFFEL_VM_PROFILE=false
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -25,10 +35,20 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 
 COPY . .
+# Keep external workspaces outside /build so Cargo does not attach their
+# workspace-inherited manifests to the Stoffel workspace.
+COPY --from=coordinator . /opt/stoffel-coordinator
+COPY --from=networking . /opt/stoffelnet
 
-RUN printf '%s\n' \
+RUN mkdir -p /build/.cargo && \
+    printf '%s\n' \
       '[net]' \
       'git-fetch-with-cli = true' \
+      '' \
+      '[patch.crates-io]' \
+      'stoffel-mpc-coordinator-off-chain = { path = "/opt/stoffel-coordinator/crates/off-chain" }' \
+      'stoffel-mpc-coordinator-shared = { path = "/opt/stoffel-coordinator/crates/coord-shared" }' \
+      'stoffelnet = { path = "/opt/stoffelnet" }' \
       '' \
       > /build/.cargo/config.toml
 
@@ -42,6 +62,10 @@ RUN mkdir -p ~/.ssh && \
 # Note: If using private repos with SSH, run with: docker build --ssh default .
 # If ENABLE_NAT is true, build with the nat feature
 RUN --mount=type=ssh \
+    export RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8" && \
+    if [ "$STOFFEL_VM_PROFILE" = "true" ]; then \
+        export RUSTFLAGS="$RUSTFLAGS -C debuginfo=2 -C force-frame-pointers=yes"; \
+    fi && \
     if [ "$ENABLE_NAT" = "true" ]; then \
         echo "Building with NAT traversal support..."; \
         cargo build --release --package stoffel-vm-runner --bin stoffel-run --features nat; \
@@ -49,11 +73,14 @@ RUN --mount=type=ssh \
         echo "Building without NAT traversal support..."; \
         cargo build --release --package stoffel-vm-runner --bin stoffel-run; \
     fi && \
-    strip target/release/stoffel-run
+    if [ "$STOFFEL_VM_PROFILE" != "true" ]; then \
+        strip target/release/stoffel-run; \
+    fi
 
 # Compile the AES-128 secret-bit circuit example into VM bytecode for compose runs.
 RUN cargo build --release --package stoffellang && \
     mkdir -p /build/crates/stoffel-lang/examples/mpc_aes128_circuit/target && \
+    mkdir -p /build/docker/standing-concurrency/target && \
     STOFFEL_INLINE_BUDGET=100000000 \
     STOFFEL_UNROLL_BUDGET=100000000 \
     STOFFEL_UNROLL_MAX_EXPANSION=100000000 \
@@ -63,16 +90,68 @@ RUN cargo build --release --package stoffellang && \
       --mpc-backend honeybadger \
       --mpc-curve bls12-381 \
       --output /build/crates/stoffel-lang/examples/mpc_aes128_circuit/target/mpc_aes128_circuit.stflb \
-      /build/crates/stoffel-lang/examples/mpc_aes128_circuit/main.stfl
+      /build/crates/stoffel-lang/examples/mpc_aes128_circuit/main.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend honeybadger \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/single-client-io-honeybadger.stflb \
+      /build/docker/standing-concurrency/programs/single_client_io.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend honeybadger \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/slow-client-io-honeybadger.stflb \
+      /build/docker/standing-concurrency/programs/slow_client_io.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --opt-level 0 \
+      --mpc-backend honeybadger \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.stflb \
+      /build/docker/standing-concurrency/programs/cpu_fairness.stfl && \
+    /build/target/release/stoffellang \
+      --disassemble \
+      /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.stflb \
+      > /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.disassembly && \
+    grep -Fqx '.function cpu_long' \
+      /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.disassembly && \
+    grep -Fqx '.function cpu_short' \
+      /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.disassembly && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend honeybadger \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/multi-client-io-honeybadger.stflb \
+      /build/docker/standing-concurrency/programs/multi_client_io.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend honeybadger \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/output-only-client-io-honeybadger.stflb \
+      /build/docker/standing-concurrency/programs/output_only_client_io.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend avss \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/single-client-io-avss.stflb \
+      /build/docker/standing-concurrency/programs/single_client_io.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend avss \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/multi-client-io-avss.stflb \
+      /build/docker/standing-concurrency/programs/multi_client_io.stfl
 
 # ============================================================================
-# Stage 2: Runtime
+# Stage 2: Credential-free runtime base
 # ============================================================================
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS runtime-base
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    iproute2 \
     libssl3 \
     netcat-openbsd \
     net-tools \
@@ -97,13 +176,18 @@ COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/threshold_bls_bl
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/threshold_ecdsa_secp256k1.stflb /app/programs/threshold_ecdsa_secp256k1.stflb
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/threshold_ecdsa_p256.stflb /app/programs/threshold_ecdsa_p256.stflb
 COPY --from=builder /build/crates/stoffel-lang/examples/mpc_aes128_circuit/target/mpc_aes128_circuit.stflb /app/programs/mpc_aes128_circuit.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/single-client-io-honeybadger.stflb /app/standing-fixtures/single-client-io-honeybadger.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/slow-client-io-honeybadger.stflb /app/standing-fixtures/slow-client-io-honeybadger.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.stflb /app/standing-fixtures/cpu-fairness-honeybadger.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/multi-client-io-honeybadger.stflb /app/standing-fixtures/multi-client-io-honeybadger.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/output-only-client-io-honeybadger.stflb /app/standing-fixtures/output-only-client-io-honeybadger.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/single-client-io-avss.stflb /app/standing-fixtures/single-client-io-avss.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/multi-client-io-avss.stflb /app/standing-fixtures/multi-client-io-avss.stflb
 
-# Copy pre-generated certificates for coordinator identity
-COPY ids /app/ids
-
-# Copy the entrypoint script
+# Copy the entrypoint and peer-network shaping scripts
 COPY docker/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY docker/configure-peer-netem.sh /app/configure-peer-netem.sh
+RUN chmod +x /app/entrypoint.sh /app/configure-peer-netem.sh
 
 # Default environment variables (can be overridden in docker-compose)
 ENV STOFFEL_BIND_ADDR="0.0.0.0:9000"
@@ -132,3 +216,25 @@ ENV STOFFEL_STUN_SERVERS=""
 EXPOSE 9000 10000 16180
 
 ENTRYPOINT ["/app/entrypoint.sh"]
+
+# ============================================================================
+# Stage 3: Standing runtime (public admission rosters only)
+# ============================================================================
+# Private identities are supplied per principal as read-only Compose secrets.
+# Do not COPY the full ids directory into this target: a faulty standing party
+# must not be able to authenticate as another party or client.
+FROM runtime-base AS standing-runtime
+
+RUN mkdir -p /app/ids/nodes /app/ids/clients
+COPY ids/server_cert.crt /app/ids/server_cert.crt
+COPY ids/nodes/*.crt /app/ids/nodes/
+COPY ids/clients/*.crt /app/ids/clients/
+
+# ============================================================================
+# Stage 4: Legacy runtime
+# ============================================================================
+# Preserve the default image contract for existing non-standing Compose stacks.
+# New deployments should mount per-principal private credentials at runtime.
+FROM runtime-base AS runtime
+
+COPY ids /app/ids

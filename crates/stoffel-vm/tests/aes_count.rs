@@ -406,8 +406,10 @@ fn inlining_preserves_secret_multiplication() {
 
 async fn inlining_preserves_secret_multiplication_impl() {
     // `gate_and` is a secret-bool helper (an MPC multiply in GF(2)); `combine`
-    // chains two of them so inlining has something to fold. `x=1, y=1, z=1` so
-    // `gate_and(gate_and(x,y), z) = 1`.
+    // chains two of them so inlining has something to fold. Client shares are
+    // deliberately used instead of public `from_clear_int` values: public
+    // constants are now correctly localized and would make this secrecy test
+    // vacuous for the opposite reason.
     let source = r#"
 def gate_and(a: secret bool, b: secret bool) -> secret bool:
   return a and b
@@ -416,9 +418,9 @@ def combine(a: secret bool, b: secret bool, c: secret bool) -> secret bool:
   return gate_and(gate_and(a, b), c)
 
 def main() -> int64:
-  var x: secret bool = Share.from_clear_int(1, 1)
-  var y: secret bool = Share.from_clear_int(1, 1)
-  var z: secret bool = Share.from_clear_int(1, 1)
+  var x: secret bool = ClientStore.take_share_bool(0, 0)
+  var y: secret bool = ClientStore.take_share_bool(0, 1)
+  var z: secret bool = ClientStore.take_share_bool(0, 2)
   var w: secret bool = combine(x, y, z)
   var r: bool = w.reveal()
   if r:
@@ -441,6 +443,7 @@ def main() -> int64:
         let mut vm = VirtualMachine::builder()
             .with_mpc_engine(engine.clone())
             .build();
+        vm.store_client_shares(0, bits_as_bool_shares(&[0b0000_0111]));
         for function in functions {
             vm.try_register_function(function)
                 .expect("register function");
@@ -644,24 +647,18 @@ async fn optimized_aes_at_o3_matches_nist_vector_impl() {
     // and scalar-free invariants must hold.
     let (scalar, batch_calls, batch_items) = engine.counts();
     assert_eq!(scalar, 0, "every secret multiply must be batched at -O3");
-    // -O3 `fold_public_gates` now localizes provably-public multiply operands to
-    // local `Share.mul_scalar` (secret*public, 0 communication). The AES circuit's
-    // round-0 `add_round_key` XORs the fully-public `nist_plaintext()` (all
-    // `from_clear_int`) into the key, so its 128 byte-bit products become local
-    // scalar muls and drop out of the batched total. On-the-fly key expansion
-    // (round keys derived inside the round loop, adjacent to each round's
-    // sub_bytes) additionally makes the public `Rcon` XORs adjacent to the live
-    // key-schedule words, so more of those public products fold to local scalar
-    // muls — dropping the batched total from 33_952 to 33_736. The NIST
-    // ciphertext above is the correctness oracle and is unchanged.
+    // One proof-driven peel establishes the state shape, then the recurrence-
+    // aware unroller keeps the residual rounds rolled. That exposes additional
+    // provably-local gates without replicating the full round body: 33,280
+    // products remain interactive and are coalesced into 219 calls.
     assert_eq!(
-        batch_items, 33_736,
-        "total products preserved (minus localized public add_round_key + Rcon)"
+        batch_items, 33_280,
+        "interactive product count must match the optimized circuit"
     );
     assert!(
-        batch_calls < 5_000,
-        "scheduler should cut multiply rounds far below the ~25.7k unscheduled \
-         and ~6.3k -O0 baselines; got {batch_calls} rounds"
+        batch_calls <= 225,
+        "scheduler/fixpoint should stay near the 206-round dependency floor; \
+         got {batch_calls} rounds"
     );
 }
 
@@ -766,10 +763,9 @@ fn optimized_aes_full_unroll_minimizes_rounds() {
         );
         let (scalar, batch_calls, batch_items) = engine.counts();
         assert_eq!(scalar, 0);
-        // -O3 localizes round-0 `add_round_key` over the public `nist_plaintext()`
-        // (128 secret*public products → local `Share.mul_scalar`) plus on-the-fly
-        // key expansion's now-adjacent public `Rcon` XORs, so 34_080 - 344 = 33_736.
-        assert_eq!(batch_items, 33_736);
+        // Full flattening changes the communication schedule, not the optimized
+        // circuit's interactive product count.
+        assert_eq!(batch_items, 33_280);
         assert!(
             batch_calls < 1_000,
             "fully-flattened AES should reach a few hundred multiply rounds; got {batch_calls}"
@@ -1318,13 +1314,16 @@ async fn round_gate_impl() {
         ),
     ];
 
-    // Collected so we can assert known-stable invariants after printing every line.
-    let mut aes_all_correct = true;
+    // Collected so the measurement harness is also a correctness gate.
+    let mut all_correct = true;
+    let mut measured_rounds: std::collections::HashMap<(&str, u8), usize> =
+        std::collections::HashMap::new();
 
     for (label, source, inputs, expected) in &programs {
         for level in [0u8, 2, 3] {
             match round_gate_run(source, level, inputs).await {
                 Ok((mul_rounds, output, lever)) => {
+                    measured_rounds.insert((*label, level), mul_rounds);
                     let correct = output == *expected;
                     // The stable, machine-parseable gate line.
                     println!(
@@ -1344,30 +1343,30 @@ async fn round_gate_impl() {
                             "ROUNDGATE {label} O{level} MISMATCH: got {output:?}, expected {expected:?}"
                         );
                     }
-                    if *label == "AES" && !correct {
-                        aes_all_correct = false;
+                    if !correct {
+                        all_correct = false;
                     }
                 }
                 Err(error) => {
                     println!("ROUNDGATE {label} O{level} mul_rounds=ERR correct=false");
                     eprintln!("ROUNDGATE {label} O{level} ERROR: {error}");
-                    if *label == "AES" {
-                        aes_all_correct = false;
-                    }
+                    all_correct = false;
                 }
             }
         }
     }
 
-    // AES correctness at every level is already guaranteed by the dedicated
-    // `optimized_aes_*` tests, so it is safe to assert here and keeps the gate
-    // honest. CTR/CBC correctness is reported per-line (above) but NOT asserted:
-    // a known -O3 full-unroll CTR bug means we must surface reality rather than
-    // fail the measurement harness.
     assert!(
-        aes_all_correct,
-        "AES must reveal the NIST ciphertext at every optimization level"
+        all_correct,
+        "AES, CTR, and CBC must match their NIST outputs at every optimization level"
     );
+    for label in ["CTR", "CBC"] {
+        assert!(
+            measured_rounds[&(label, 3)] < measured_rounds[&(label, 2)]
+                && measured_rounds[&(label, 2)] < measured_rounds[&(label, 0)],
+            "{label} must reduce online rounds monotonically from O0 to O2 to O3"
+        );
+    }
 }
 
 // ===========================================================================
@@ -1551,9 +1550,10 @@ async fn round_histogram_impl() {
             Ok((rounds, output, log)) => {
                 let correct = output == *expected;
                 print_depth_histogram(label, rounds, correct, &log);
+                assert!(correct, "{label} O3 must match its NIST output");
             }
             Err(error) => {
-                println!("HIST {label} O3 rounds=ERR correct=false error={error}");
+                panic!("HIST {label} O3 failed: {error}");
             }
         }
     }

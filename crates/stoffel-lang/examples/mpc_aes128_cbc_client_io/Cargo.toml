@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-stoffel = { package = "stoffel-rust-sdk", version = "=0.1.2", path = "../../../stoffel-rust-sdk" }
+stoffel = { package = "stoffel-rust-sdk", version = "=0.2.0", path = "../../../stoffel-rust-sdk" }
 tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread"] }
 
 [build-dependencies]
-stoffel-bindgen = { version = "=0.1.2", path = "../../../stoffel-bindgen" }
+stoffel-bindgen = { version = "=0.2.0", path = "../../../stoffel-bindgen" }

@@ -1,6 +1,12 @@
 [net]
 git-fetch-with-cli = true
 
+# RustCrypto 0.8/0.6 keeps its aarch64 AES and PMULL implementations behind
+# opt-in cfgs. The implementations still perform runtime feature detection and
+# fall back to software on ARM CPUs without the cryptography extensions.
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
 [alias]
 vm-local-e2e = ["test", "-p", "stoffel-vm", "--test", "local_coordinator_e2e", "--", "--ignored", "--test-threads=1"]
 sdk-test = ["test", "-p", "stoffel-rust-sdk", "--lib", "--test", "sdk_usage"]

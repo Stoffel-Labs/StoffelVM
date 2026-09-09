@@ -4,6 +4,7 @@ use crate::error::{VmError, VmResult};
 use crate::runtime_hooks::HookEvent;
 use crate::runtime_instruction::{FetchedInstruction, RuntimeFunction};
 use std::sync::Arc;
+use stoffel_vm_types::activations::InstructionPointer;
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::instructions::Instruction;
 
@@ -107,13 +108,31 @@ struct RuntimeFunctionCache {
 }
 
 impl RuntimeFunctionCache {
+    #[inline]
     fn current<'cache>(&'cache mut self, state: &mut VMState) -> VmResult<&'cache RuntimeFunction> {
-        let frame_depth = state.current_frame_depth()?.depth();
-        if self.frame_depth != Some(frame_depth) {
-            self.runtime_function = Some(state.current_runtime_function()?);
-            self.frame_depth = Some(frame_depth);
+        let frame_depth = state
+            .call_stack_depth()
+            .checked_sub(1)
+            .ok_or(VmError::NoActiveActivationRecord)?;
+        if self.frame_depth == Some(frame_depth) {
+            return self
+                .runtime_function
+                .as_deref()
+                .ok_or(VmError::NoActiveActivationRecord);
         }
 
+        self.refresh(state, frame_depth)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn refresh<'cache>(
+        &'cache mut self,
+        state: &mut VMState,
+        frame_depth: usize,
+    ) -> VmResult<&'cache RuntimeFunction> {
+        self.runtime_function = Some(state.current_runtime_function()?);
+        self.frame_depth = Some(frame_depth);
         self.runtime_function
             .as_deref()
             .ok_or(VmError::NoActiveActivationRecord)
@@ -159,34 +178,76 @@ impl VMState {
                 }
             }
         } else {
-            loop {
-                let runtime_function = runtime_cache.current(self)?;
-                match self.execute_local_step_without_hooks(context, runtime_function)? {
-                    CompletedStep::Continue => continue,
-                    CompletedStep::Return(value) => return Ok(value),
-                }
-            }
+            self.execute_until_return_without_hooks(context, runtime_cache)
         }
     }
 
-    fn execute_local_step_without_hooks(
+    fn execute_until_return_without_hooks(
         &mut self,
         context: ExecutionContext,
-        runtime_function: &RuntimeFunction,
-    ) -> VmResult<CompletedStep> {
-        let fetched =
-            match self.prepare_next_step_without_hooks(context.checkpoint(), runtime_function)? {
-                PreparedStep::Instruction(prepared) => prepared,
-                PreparedStep::Return(value) => return Ok(CompletedStep::Return(value)),
-                PreparedStep::Continue => return Ok(CompletedStep::Continue),
+        mut runtime_cache: RuntimeFunctionCache,
+    ) -> VmResult<Value> {
+        // Keep fetch and dispatch in one loop. This is the ordinary clear-VM hot
+        // path, so avoid constructing PreparedStep/CompletedStep for every
+        // instruction and give LLVM one loop body in which to retain the frame,
+        // instruction pointer, and runtime function cache.
+        let checkpoint = context.checkpoint();
+        let mut clear_fast_paths_enabled = !self.mpc_runtime.has_any_pending_reveals();
+        loop {
+            if !checkpoint.has_active_frame(self.call_stack.len()) {
+                return Err(VmError::UnexpectedEndOfExecution);
+            }
+            let frame_depth = self.call_stack.len() - 1;
+            let runtime_function = if runtime_cache.frame_depth == Some(frame_depth) {
+                runtime_cache
+                    .runtime_function
+                    .as_deref()
+                    .expect("a populated runtime cache always contains its function")
+            } else {
+                runtime_cache.refresh(self, frame_depth)?
             };
-
-        match self.execute_local_fetched_instruction_without_hooks(
-            fetched.fetched(),
-            context.checkpoint(),
-        )? {
-            InstructionOutcome::Continue => Ok(CompletedStep::Continue),
-            InstructionOutcome::Return(value) => Ok(CompletedStep::Return(value)),
+            let instruction_table = runtime_function.instruction_table();
+            let instruction = {
+                let frame = self
+                    .call_stack
+                    .current_mut()
+                    .expect("an active checkpoint always has a current frame");
+                let mut instruction_pointer = frame.instruction_pointer();
+                let instruction = loop {
+                    // SAFETY: RuntimeFunction appends an implicit-return sentinel,
+                    // and lowering validates every jump target at or before it.
+                    let fetched =
+                        unsafe { instruction_table.get_instruction_unchecked(instruction_pointer) };
+                    instruction_pointer = InstructionPointer::new(
+                        // The fetched cursor indexes a live allocation which
+                        // also contains an implicit-return sentinel, so it
+                        // cannot be usize::MAX.
+                        instruction_pointer.index().wrapping_add(1),
+                    );
+                    let (clear_instructions, clear_instruction_pointer) =
+                        Self::execute_clear_instruction_run_on_frame_without_hooks::<false>(
+                            frame,
+                            fetched,
+                            instruction_table,
+                            instruction_pointer,
+                            clear_fast_paths_enabled,
+                            usize::MAX,
+                        );
+                    instruction_pointer = clear_instruction_pointer;
+                    if clear_instructions != 0 {
+                        continue;
+                    }
+                    break fetched;
+                };
+                frame.set_instruction_pointer(instruction_pointer);
+                instruction
+            };
+            match self.execute_local_fetched_instruction_without_hooks(instruction, checkpoint)? {
+                InstructionOutcome::Continue => {
+                    clear_fast_paths_enabled = !self.mpc_runtime.has_any_pending_reveals();
+                }
+                InstructionOutcome::Return(value) => return Ok(value),
+            }
         }
     }
 
@@ -277,7 +338,9 @@ impl VMState {
             let runtime_function = runtime_cache.current(self)?;
             match self.execute_async_step(context, runtime_function)? {
                 StepResult::Continue => {
-                    executed_instructions = executed_instructions.saturating_add(1);
+                    // The pre-step budget check guarantees this cannot overflow,
+                    // even when the configured maximum is `usize::MAX`.
+                    executed_instructions += 1;
                 }
                 StepResult::Return(value) => return Ok(VmRunSlice::Complete(value)),
                 StepResult::NeedsMpc {
@@ -301,36 +364,75 @@ impl VMState {
         mut executed_instructions: usize,
         mut runtime_cache: RuntimeFunctionCache,
     ) -> VmResult<VmRunSlice> {
-        // Hot path for online MPC execution (no debug hooks). Fetch + execute are
-        // fused into a single loop body so the compiler can keep the frame and
+        // Hot path for online MPC execution (no debug hooks). Keeping fetch and
+        // execute in one interpreter loop lets the compiler retain the frame and
         // instruction pointers in registers across instructions, instead of
         // crossing function-call boundaries and constructing/destructing the
         // `PreparedStep` / `StepResult` intermediate enums on every instruction.
         let checkpoint = context.checkpoint();
+        let mut clear_fast_paths_enabled = !self.mpc_runtime.has_any_pending_reveals();
         loop {
-            if budget.is_exhausted(executed_instructions) {
+            if !checkpoint.has_active_frame(self.call_stack.len()) {
+                return Err(VmError::UnexpectedEndOfExecution);
+            }
+            let frame_depth = self.call_stack.len() - 1;
+            let runtime_function = if runtime_cache.frame_depth == Some(frame_depth) {
+                runtime_cache
+                    .runtime_function
+                    .as_deref()
+                    .expect("a populated runtime cache always contains its function")
+            } else {
+                runtime_cache.refresh(self, frame_depth)?
+            };
+            let instruction_table = runtime_function.instruction_table();
+
+            // ---- fetch + local fast run ----
+            // Keep the current frame borrowed across consecutive clear local
+            // instructions. Generic instructions, function end, and a budget
+            // boundary release the borrow before touching the rest of VMState.
+            let (instruction, budget_exhausted) = {
+                let frame = self
+                    .call_stack
+                    .current_mut()
+                    .expect("an active checkpoint always has a current frame");
+                let mut instruction_pointer = frame.instruction_pointer();
+                let exit = loop {
+                    if budget.is_exhausted(executed_instructions) {
+                        break (None, true);
+                    }
+                    // SAFETY: RuntimeFunction appends an implicit-return sentinel,
+                    // and lowering validates every jump target at or before it.
+                    let fetched =
+                        unsafe { instruction_table.get_instruction_unchecked(instruction_pointer) };
+                    instruction_pointer = InstructionPointer::new(
+                        // The fetched cursor indexes a live allocation which
+                        // also contains an implicit-return sentinel, so it
+                        // cannot be usize::MAX.
+                        instruction_pointer.index().wrapping_add(1),
+                    );
+                    let (clear_instructions, clear_instruction_pointer) =
+                        Self::execute_clear_instruction_run_on_frame_without_hooks::<true>(
+                            frame,
+                            fetched,
+                            instruction_table,
+                            instruction_pointer,
+                            clear_fast_paths_enabled,
+                            budget.remaining(executed_instructions),
+                        );
+                    instruction_pointer = clear_instruction_pointer;
+                    if clear_instructions != 0 {
+                        executed_instructions += clear_instructions;
+                        continue;
+                    }
+                    break (Some(fetched), false);
+                };
+                frame.set_instruction_pointer(instruction_pointer);
+                exit
+            };
+            if budget_exhausted {
                 return Ok(VmRunSlice::BudgetExhausted);
             }
-
-            let runtime_function = runtime_cache.current(self)?;
-
-            // ---- fetch (inlined from prepare_next_step_without_hooks) ----
-            // The frame borrow is confined to this block so `handle_function_end`
-            // below can take `&mut self` once the frame has been dropped.
-            let instruction = match {
-                if !checkpoint.has_active_frame(self.call_stack.len()) {
-                    return Err(VmError::UnexpectedEndOfExecution);
-                }
-                let frame = self.current_frame_mut()?;
-                let instruction_pointer = frame.instruction_pointer();
-                match runtime_function.get_instruction(instruction_pointer) {
-                    Some(fetched) => {
-                        frame.advance_instruction_pointer_after_fetch();
-                        Some(fetched)
-                    }
-                    None => None,
-                }
-            } {
+            let instruction = match instruction {
                 Some(instruction) => instruction,
                 None => {
                     // Ran past the end of this function's instruction vector:
@@ -340,6 +442,7 @@ impl VMState {
                     {
                         return Ok(VmRunSlice::Complete(result));
                     }
+                    clear_fast_paths_enabled = !self.mpc_runtime.has_any_pending_reveals();
                     continue;
                 }
             };
@@ -347,7 +450,10 @@ impl VMState {
             // ---- execute (plan an async MPC effect, otherwise run locally) ----
             match self.execute_effect_fetched_instruction_without_hooks(instruction, checkpoint)? {
                 InstructionEffect::Completed(InstructionOutcome::Continue) => {
-                    executed_instructions = executed_instructions.saturating_add(1);
+                    if !instruction.is_implicit_return() {
+                        executed_instructions += 1;
+                    }
+                    clear_fast_paths_enabled = !self.mpc_runtime.has_any_pending_reveals();
                 }
                 InstructionEffect::Completed(InstructionOutcome::Return(value)) => {
                     return Ok(VmRunSlice::Complete(value));

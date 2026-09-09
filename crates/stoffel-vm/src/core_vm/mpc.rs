@@ -136,6 +136,29 @@ impl VirtualMachine {
         Ok(self.state.try_replace_client_input(inputs)?)
     }
 
+    /// Atomically replace all HoneyBadger client inputs and attach optional
+    /// per-share semantic types for each client.
+    pub fn try_replace_client_inputs_with_types<F, I>(
+        &self,
+        inputs: I,
+    ) -> VirtualMachineResult<usize>
+    where
+        F: ark_ff::FftField,
+        I: IntoIterator<
+            Item = (
+                stoffelnet::network_utils::ClientId,
+                Vec<
+                    stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare<
+                        F,
+                    >,
+                >,
+                Option<Vec<ShareType>>,
+            ),
+        >,
+{
+        Ok(self.state.try_replace_client_input_with_types(inputs)?)
+    }
+
     /// Retrieve a HoneyBadger client share through the VM boundary.
     pub fn client_share<F>(
         &self,

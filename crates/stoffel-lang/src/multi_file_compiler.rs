@@ -223,6 +223,8 @@ impl MultiFileCompiler {
             return Err(error_reporter.get_all().into_iter().cloned().collect());
         }
 
+        let analyzed_ast = optimizations::lower_semantic_client_reductions(analyzed_ast);
+
         // Apply optimizations
         let optimized_ast = if self.options.optimize {
             optimizations::optimize_all_with_budgets(
@@ -243,9 +245,12 @@ impl MultiFileCompiler {
         } else {
             0
         };
-        let mut program =
-            codegen::generate_bytecode_with_opt_level(&optimized_ast, codegen_opt_level)
-                .map_err(|e| vec![e])?;
+        let mut program = codegen::generate_bytecode_with_opt_level_and_backend(
+            &optimized_ast,
+            codegen_opt_level,
+            self.options.mpc_backend,
+        )
+        .map_err(|e| vec![e])?;
         program.client_io_manifest.mpc_backend = self.options.mpc_backend;
         program.client_io_manifest.mpc_curve = self.options.mpc_curve;
 

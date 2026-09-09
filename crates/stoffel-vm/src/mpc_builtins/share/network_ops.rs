@@ -21,6 +21,12 @@ pub(super) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
         share_open,
     )?;
     vm.try_register_mpc_online_foreign_function(MpcOnlineBuiltin::BatchOpen, share_batch_open)?;
+    vm.try_register_typed_foreign_function("Share.batch_open_field", share_batch_open_field)?;
+    vm.try_register_typed_foreign_function("Share.batch_open_exp", share_batch_open_exp)?;
+    vm.try_register_typed_foreign_function(
+        "Share.batch_open_exp_custom",
+        share_batch_open_exp_custom,
+    )?;
     vm.try_register_mpc_online_foreign_method(
         "Share",
         "send_to_client",
@@ -49,6 +55,112 @@ pub(super) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
         share_open_exp_custom,
     )?;
     Ok(())
+}
+
+fn share_batch_open_field(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackResult<Value> {
+    let shares_arg = {
+        let args = ctx.named_args("Share.batch_open_field");
+        args.require_exact(1, "1 argument: shares_array")?;
+        args.cloned(0)?
+    };
+    let Some((share_type, share_data)) =
+        ctx.extract_homogeneous_share_array(&shares_arg, "Share.batch_open_field shares_array")?
+    else {
+        return ctx.create_array(0);
+    };
+    let fields = ctx.batch_open_shares_as_field_data(share_type, &share_data)?;
+    let mut values = Vec::with_capacity(fields.len());
+    for field in fields {
+        values.push(ctx.create_byte_array(&field)?);
+    }
+    let result_ref = ctx.create_array_ref(values.len())?;
+    ctx.push_array_ref_values(result_ref, &values)?;
+    Ok(Value::from(result_ref))
+}
+
+fn share_batch_open_exp(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackResult<Value> {
+    let (shares_arg, curve_name) = {
+        let args = ctx.named_args("Share.batch_open_exp");
+        args.require_exact(2, "2 arguments: shares_array, curve_name")?;
+        let curve_name = match args.cloned(1)? {
+            Value::String(value) => value,
+            _ => return Err("curve_name must be a string".into()),
+        };
+        (args.cloned(0)?, curve_name)
+    };
+    let Some((share_type, share_data)) =
+        ctx.extract_homogeneous_share_array(&shares_arg, "Share.batch_open_exp shares_array")?
+    else {
+        return ctx.create_array(0);
+    };
+    let generator = MpcExponentGenerator::from_curve_name(&curve_name).map_err(String::from)?;
+    let points = ctx.batch_open_shares_in_exp_group_data(
+        generator.group(),
+        share_type,
+        &share_data,
+        generator.bytes(),
+    )?;
+    let mut values = Vec::with_capacity(points.len());
+    for point in points {
+        values.push(ctx.create_byte_array(&point)?);
+    }
+    let result_ref = ctx.create_array_ref(values.len())?;
+    ctx.push_array_ref_values(result_ref, &values)?;
+    Ok(Value::from(result_ref))
+}
+
+fn share_batch_open_exp_custom(
+    mut ctx: ForeignFunctionContext,
+) -> ForeignFunctionCallbackResult<Value> {
+    let (shares_arg, generators_arg, curve_name) = {
+        let args = ctx.named_args("Share.batch_open_exp_custom");
+        args.require_exact(3, "3 arguments: shares_array, generators_array, curve_name")?;
+        let curve_name = match args.cloned(2)? {
+            Value::String(value) => value,
+            _ => return Err("curve_name must be a string".into()),
+        };
+        (args.cloned(0)?, args.cloned(1)?, curve_name)
+    };
+    let Some((share_type, share_data)) = ctx
+        .extract_homogeneous_share_array(&shares_arg, "Share.batch_open_exp_custom shares_array")?
+    else {
+        return ctx.create_array(0);
+    };
+    let Value::Array(generators_ref) = generators_arg else {
+        return Err("generators_array must be a list[bytes]".into());
+    };
+    let generator_count = ctx.read_array_ref_len(generators_ref)?;
+    if generator_count != share_data.len() {
+        return Err(format!(
+            "Share.batch_open_exp_custom requires the same number of shares and generators ({} != {})",
+            share_data.len(),
+            generator_count
+        )
+        .into());
+    }
+    let mut generators = Vec::with_capacity(generator_count);
+    for index in 0..generator_count {
+        let index_i64 = i64::try_from(index)
+            .map_err(|_| "generator index exceeds the VM integer range".to_string())?;
+        let value = ctx
+            .read_table_field(generators_ref.into(), &Value::I64(index_i64))?
+            .ok_or_else(|| format!("missing generator at index {index}"))?;
+        generators.push(ctx.read_byte_array(&value)?);
+    }
+    let generator = MpcExponentGenerator::from_curve_name(&curve_name).map_err(String::from)?;
+    let points = ctx.batch_open_shares_in_exp_group_custom_data(
+        generator.group(),
+        share_type,
+        &share_data,
+        &generators,
+    )?;
+    let mut values = Vec::with_capacity(points.len());
+    for point in points {
+        values.push(ctx.create_byte_array(&point)?);
+    }
+    let result_ref = ctx.create_array_ref(values.len())?;
+    ctx.push_array_ref_values(result_ref, &values)?;
+    Ok(Value::from(result_ref))
 }
 
 fn share_mul(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackResult<Value> {
@@ -99,11 +211,11 @@ fn share_batch_mul(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackRe
         );
     }
 
-    let mut results = Vec::with_capacity(left_data.len());
-    for (left, right) in left_data.iter().zip(right_data.iter()) {
-        let result_data = ctx.secret_share_mul_data(share_type, left, right)?;
-        results.push(Value::Share(share_type, result_data));
-    }
+    let results = ctx
+        .secret_share_batch_mul_data(share_type, &left_data, &right_data)?
+        .into_iter()
+        .map(|data| Value::Share(share_type, data))
+        .collect::<Vec<_>>();
 
     let result_ref = ctx.create_array_ref(results.len())?;
     ctx.push_array_ref_values(result_ref, &results)?;

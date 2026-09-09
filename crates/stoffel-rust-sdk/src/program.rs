@@ -1076,7 +1076,7 @@ mod tests {
             !wrapper.instructions.iter().any(
                 |instruction| matches!(instruction, CompiledInstruction::CALL(name) if name == "Share.open")
             ),
-            "the local wrapper should return the VM value and leave share reveals to the runner"
+            "the local wrapper should return the secret VM value without inserting an open"
         );
 
         Ok(())

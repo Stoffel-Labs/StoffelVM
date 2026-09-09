@@ -34,6 +34,7 @@ example folder has a `main.stfl` source file and a short README.
 - `mpc_sorting_network`: data-oblivious sort via a fixed compare-and-swap network, plus median.
 - `mpc_secure_division`: integer division by a secret divisor via comparison-based long division.
 - `mpc_aes128_circuit`: AES-128 block encryption built from `secret bool` circuit gates.
+- `mpc_sha256_client_io`: fixed-length SHA-256 over a secret 32-byte client input, with client-only digest reconstruction.
 - `mpc_client_federated_average`: client-provided secret inputs via `ClientStore`.
 - `mpc_protocol_coordination`: RBC coordination for distributed protocol phases.
 - `mpc_share_toolkit`: broad Share builtin coverage for MPC service programs.
@@ -241,8 +242,8 @@ Docker examples default to git build contexts for the coordinator and
 networking repos:
 
 ```sh
-STOFFEL_COORDINATOR_CONTEXT='https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#feature/no-feature-gates-and-multi-type-awareness'
-STOFFEL_NETWORK_CONTEXT='https://github.com/Stoffel-Labs/stoffel-networking.git#feature/robust-identity-based-on-cert'
+STOFFEL_COORDINATOR_CONTEXT='https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0'
+STOFFEL_NETWORK_CONTEXT='https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1'
 ```
 
 To test local uncommitted changes, point those contexts at local checkouts:

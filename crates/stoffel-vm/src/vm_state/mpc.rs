@@ -179,6 +179,14 @@ impl VMState {
         self.mpc_runtime.try_replace_client_input(inputs)
     }
 
+    pub(crate) fn try_replace_client_input_with_types<F, I>(&self, inputs: I) -> VmResult<usize>
+    where
+        F: ark_ff::FftField,
+        I: IntoIterator<Item = (ClientId, Vec<RobustShare<F>>, Option<Vec<ShareType>>)>,
+    {
+        self.mpc_runtime.try_replace_client_input_with_types(inputs)
+    }
+
     /// Retrieve a robust share for a client input.
     pub(crate) fn client_share<F>(
         &self,
@@ -202,6 +210,7 @@ impl VMState {
     }
 
     /// Load a client's input share with an explicit VM share type.
+    #[cfg(test)]
     pub(crate) fn load_client_share_as(
         &self,
         client_id: ClientId,
@@ -210,6 +219,32 @@ impl VMState {
     ) -> VmResult<Value> {
         self.mpc_runtime
             .client_share_as(client_id, index, ClientShareRequest::new(share_type))
+    }
+
+    /// Load a client share directly by the VM-visible client slot.
+    pub(crate) fn load_client_share_at_as(
+        &self,
+        client_index: ClientInputIndex,
+        share_index: ClientShareIndex,
+        share_type: ShareType,
+    ) -> VmResult<Value> {
+        self.mpc_runtime.client_share_at_as(
+            client_index,
+            share_index,
+            ClientShareRequest::new(share_type),
+        )
+    }
+
+    /// Sum one client-input column locally across the requested prefix of the
+    /// deterministic client roster.
+    pub(crate) fn sum_client_shares_at(
+        &self,
+        share_index: ClientShareIndex,
+        client_count: usize,
+        fallback_type: ShareType,
+    ) -> VmResult<Value> {
+        self.mpc_runtime
+            .sum_client_shares_at(share_index, client_count, fallback_type)
     }
 
     /// Send output share(s) to a specific client for private reconstruction.
@@ -262,6 +297,15 @@ impl VMState {
             .open_share_as_field_data(ty, share_data)
     }
 
+    pub(crate) fn batch_open_shares_as_field_data(
+        &self,
+        ty: ShareType,
+        shares: &[ShareData],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.share_runtime()?
+            .batch_open_shares_as_field_data(ty, shares)
+    }
+
     pub(crate) fn open_share_in_exp_data(
         &self,
         ty: ShareType,
@@ -281,6 +325,32 @@ impl VMState {
     ) -> VmResult<Vec<u8>> {
         self.share_runtime()?
             .open_share_in_exp_group_data(group, ty, share_data, generator_bytes)
+    }
+
+    pub(crate) fn batch_open_shares_in_exp_group_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generator_bytes: &[u8],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.share_runtime()?.batch_open_shares_in_exp_group_data(
+            group,
+            ty,
+            shares,
+            generator_bytes,
+        )
+    }
+
+    pub(crate) fn batch_open_shares_in_exp_group_custom_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generators: &[Vec<u8>],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.share_runtime()?
+            .batch_open_shares_in_exp_group_custom_data(group, ty, shares, generators)
     }
 
     #[cfg(test)]
@@ -331,6 +401,16 @@ impl VMState {
     ) -> VmResult<ShareData> {
         self.share_runtime()?
             .multiply_share_data(ty, lhs_data, rhs_data)
+    }
+
+    pub(crate) fn secret_share_batch_mul_data(
+        &self,
+        ty: ShareType,
+        lhs_data: &[ShareData],
+        rhs_data: &[ShareData],
+    ) -> VmResult<Vec<ShareData>> {
+        self.share_runtime()?
+            .batch_multiply_share_data(ty, lhs_data, rhs_data)
     }
 
     pub(crate) fn secret_share_neg_data(

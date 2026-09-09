@@ -164,7 +164,15 @@ async fn test_vm_mesh_full_integration() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                let Some(raw_msg) =
+                    crate::tests::test_utils::decode_one_shot_party_message(instance_id, &raw_msg)
+                else {
+                    continue;
+                };
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -525,7 +533,15 @@ async fn test_vm_mesh_average_salary_integration() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                let Some(raw_msg) =
+                    crate::tests::test_utils::decode_one_shot_party_message(instance_id, &raw_msg)
+                else {
+                    continue;
+                };
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -989,7 +1005,15 @@ async fn test_vm_mesh_large_preprocessing() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                let Some(raw_msg) =
+                    crate::tests::test_utils::decode_one_shot_party_message(instance_id, &raw_msg)
+                else {
+                    continue;
+                };
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1278,7 +1302,15 @@ async fn test_vm_mesh_output_client_integration() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                let Some(raw_msg) =
+                    crate::tests::test_utils::decode_one_shot_party_message(instance_id, &raw_msg)
+                else {
+                    continue;
+                };
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1756,7 +1788,15 @@ async fn test_vm_mesh_matrix_average_integration() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                let Some(raw_msg) =
+                    crate::tests::test_utils::decode_one_shot_party_message(instance_id, &raw_msg)
+                else {
+                    continue;
+                };
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -2344,7 +2384,15 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                let Some(raw_msg) =
+                    crate::tests::test_utils::decode_one_shot_party_message(instance_id, &raw_msg)
+                else {
+                    continue;
+                };
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -3482,7 +3530,15 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                let Some(raw_msg) =
+                    crate::tests::test_utils::decode_one_shot_party_message(instance_id, &raw_msg)
+                else {
+                    continue;
+                };
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");

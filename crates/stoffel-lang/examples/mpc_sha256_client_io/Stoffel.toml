@@ -1,0 +1,13 @@
+[package]
+name = "mpc-sha256-client-io"
+version = "0.1.0"
+
+[mpc]
+backend = "honeybadger"
+parties = 5
+threshold = 1
+
+[build]
+source = "main.stfl"
+target_dir = "target"
+optimization_level = 3

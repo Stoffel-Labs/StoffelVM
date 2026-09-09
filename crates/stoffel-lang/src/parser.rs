@@ -763,7 +763,7 @@ impl<'a> Parser<'a> {
                 return Err(CompilerError::syntax_error(
                     "Expected function name",
                     self.get_location(),
-                ))
+                ));
             }
         };
 
@@ -1073,7 +1073,7 @@ impl<'a> Parser<'a> {
                 return Err(CompilerError::syntax_error(
                     "Expected builtin type name",
                     self.get_location(),
-                ))
+                ));
             }
         };
 
@@ -1841,13 +1841,16 @@ impl<'a> Parser<'a> {
                     function: Box::new(left),
                     arguments,
                     location: operator_location, // Location of '('
-                    resolved_return_type: None, // Set to None during parsing
+                    resolved_return_type: None,  // Set to None during parsing
                 })
             }
             TokenKind::Dot => {
                 // This is field access: left.field
                 self.advance(); // Consume '.'
-                let field_name_token = self.consume(&TokenKind::Identifier("".to_string()), "Expected field name after '.'")?;
+                let field_name_token = self.consume(
+                    &TokenKind::Identifier("".to_string()),
+                    "Expected field name after '.'",
+                )?;
                 let field_name = match &field_name_token.kind {
                     TokenKind::Identifier(name) => name.clone(),
                     _ => unreachable!(), // consume ensures it's an identifier
@@ -1864,19 +1867,17 @@ impl<'a> Parser<'a> {
                 // bounds optional). Slices lower to the builtin slice().
                 self.advance(); // Consume '['
 
-                let slice_bound_default = |value: u128, location: &SourceLocation| AstNode::Literal {
-                    value: Value::Int { value, kind: None },
-                    location: location.clone(),
-                };
-                let slice_start_default = |location: &SourceLocation| {
-                    slice_bound_default(i64::MAX as u128, location)
-                };
-                let slice_stop_default = |location: &SourceLocation| {
-                    slice_bound_default(i64::MAX as u128, location)
-                };
-                let slice_step_default = |location: &SourceLocation| {
-                    slice_bound_default(1, location)
-                };
+                let slice_bound_default =
+                    |value: u128, location: &SourceLocation| AstNode::Literal {
+                        value: Value::Int { value, kind: None },
+                        location: location.clone(),
+                    };
+                let slice_start_default =
+                    |location: &SourceLocation| slice_bound_default(i64::MAX as u128, location);
+                let slice_stop_default =
+                    |location: &SourceLocation| slice_bound_default(i64::MAX as u128, location);
+                let slice_step_default =
+                    |location: &SourceLocation| slice_bound_default(1, location);
 
                 let start = if self.check(&TokenKind::Colon) {
                     slice_start_default(&operator_location)
@@ -1886,7 +1887,8 @@ impl<'a> Parser<'a> {
 
                 if self.check(&TokenKind::Colon) {
                     self.advance(); // Consume ':'
-                    let stop = if self.check(&TokenKind::RBracket) || self.check(&TokenKind::Colon) {
+                    let stop = if self.check(&TokenKind::RBracket) || self.check(&TokenKind::Colon)
+                    {
                         slice_stop_default(&operator_location)
                     } else {
                         self.parse_expression()?
@@ -1922,8 +1924,12 @@ impl<'a> Parser<'a> {
                 })
             }
             _ => Err(CompilerError::syntax_error(
-                format!("Expected infix operator, function call '(', field access '.', or index access '[', found {:?}", token_info.kind),
-                token_info.location.clone())),
+                format!(
+                    "Expected infix operator, function call '(', field access '.', or index access '[', found {:?}",
+                    token_info.kind
+                ),
+                token_info.location.clone(),
+            )),
         }
     }
 
@@ -2055,7 +2061,13 @@ impl<'a> Parser<'a> {
                     && !self.check(&TokenKind::Dedent)
                     && !self.check(&TokenKind::RParen)
                 {
-                    return Err(CompilerError::syntax_error(format!("Expected newline, EOF, or dedent after compound assignment, found {:?}", self.current_token_info), self.get_location()));
+                    return Err(CompilerError::syntax_error(
+                        format!(
+                            "Expected newline, EOF, or dedent after compound assignment, found {:?}",
+                            self.current_token_info
+                        ),
+                        self.get_location(),
+                    ));
                 }
 
                 // Desugar: x += y  =>  x = x + y

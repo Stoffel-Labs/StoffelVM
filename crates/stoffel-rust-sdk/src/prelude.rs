@@ -17,8 +17,8 @@ pub use crate::config::{
 };
 pub use crate::consensus::{ConsensusGate, NodePublicKey, VerifiedOrdering};
 pub use crate::coordinator::{
-    Coordinator, OffChainCoordinator, OffChainCoordinatorClient, OffChainCoordinatorServer,
-    ShareBound,
+    Coordinator, ExecutionId, OffChainCoordinator, OffChainCoordinatorClient,
+    OffChainCoordinatorServer, ShareBound,
 };
 pub use crate::error::{
     ConsensusError, CoordinatorError, Error, ErrorCategory, NetworkError, Result,
@@ -43,8 +43,10 @@ pub use crate::types::{
     GeneratedProgramManifest, GroupElement, MaskIndex, PartyId, ProgramArgs, PublicKey, Round,
     Share, TypedClientInputs, TypedClientOutputs, Value, ValueSummary,
 };
-pub use crate::vm::LocalClientOutput;
+pub use crate::vm::{
+    LocalClientOutput, LocalPartyShareOutput, LocalShareExecutionOutput, OpaqueShare,
+};
 pub use crate::FunctionType;
 pub use crate::LoadableProgram;
 pub use crate::Stoffel;
-pub use stoffel_vm_types::core_types::ShareType;
+pub use stoffel_vm_types::core_types::{ShareDataFormat, ShareType};

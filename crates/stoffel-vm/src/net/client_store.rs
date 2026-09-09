@@ -26,8 +26,18 @@ pub use share::{
 /// thread-safe access to client input shares.
 #[derive(Debug, Default)]
 pub struct ClientInputStore {
-    entries: RwLock<BTreeMap<ClientId, ClientInputEntry>>,
-    client_roster: RwLock<Vec<ClientId>>,
+    state: RwLock<ClientInputState>,
+}
+
+/// One coherent view of the client roster and its hydrated inputs.
+///
+/// Keeping these together is important for execution: a VM lookup by client
+/// slot must not observe a roster from one hydration and shares from another.
+/// It also lets the hot slot-based lookup take a single read lock.
+#[derive(Debug, Default)]
+struct ClientInputState {
+    entries: BTreeMap<ClientId, ClientInputEntry>,
+    client_roster: Vec<ClientId>,
 }
 
 #[cfg(test)]

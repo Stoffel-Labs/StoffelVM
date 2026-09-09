@@ -291,11 +291,18 @@ pub(crate) trait ForeignMpcServices {
         share_index: ClientShareIndex,
     ) -> VmResult<Value>;
 
-    fn load_client_share_as(
+    fn load_client_share_at_as(
         &self,
-        client_id: ClientId,
+        client_index: ClientInputIndex,
         share_index: ClientShareIndex,
         share_type: ShareType,
+    ) -> VmResult<Value>;
+
+    fn sum_client_shares_at(
+        &self,
+        share_index: ClientShareIndex,
+        client_count: usize,
+        fallback_type: ShareType,
     ) -> VmResult<Value>;
 
     fn send_output_to_client(
@@ -329,6 +336,12 @@ pub(crate) trait ForeignMpcServices {
 
     fn open_share_as_field_data(&self, ty: ShareType, share_data: &ShareData) -> VmResult<Vec<u8>>;
 
+    fn batch_open_shares_as_field_data(
+        &self,
+        ty: ShareType,
+        shares: &[ShareData],
+    ) -> VmResult<Vec<Vec<u8>>>;
+
     fn open_share_in_exp_data(
         &self,
         ty: ShareType,
@@ -343,6 +356,22 @@ pub(crate) trait ForeignMpcServices {
         share_data: &ShareData,
         generator_bytes: &[u8],
     ) -> VmResult<Vec<u8>>;
+
+    fn batch_open_shares_in_exp_group_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generator_bytes: &[u8],
+    ) -> VmResult<Vec<Vec<u8>>>;
+
+    fn batch_open_shares_in_exp_group_custom_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generators: &[Vec<u8>],
+    ) -> VmResult<Vec<Vec<u8>>>;
 
     fn secret_share_add_data(
         &self,
@@ -364,6 +393,13 @@ pub(crate) trait ForeignMpcServices {
         lhs_data: &ShareData,
         rhs_data: &ShareData,
     ) -> VmResult<ShareData>;
+
+    fn secret_share_batch_mul_data(
+        &self,
+        ty: ShareType,
+        lhs_data: &[ShareData],
+        rhs_data: &[ShareData],
+    ) -> VmResult<Vec<ShareData>>;
 
     fn secret_share_neg_data(&self, ty: ShareType, share_data: &ShareData) -> VmResult<ShareData>;
 
@@ -427,13 +463,22 @@ impl ForeignMpcServices for VMState {
         VMState::load_client_share(self, client_id, share_index)
     }
 
-    fn load_client_share_as(
+    fn load_client_share_at_as(
         &self,
-        client_id: ClientId,
+        client_index: ClientInputIndex,
         share_index: ClientShareIndex,
         share_type: ShareType,
     ) -> VmResult<Value> {
-        VMState::load_client_share_as(self, client_id, share_index, share_type)
+        VMState::load_client_share_at_as(self, client_index, share_index, share_type)
+    }
+
+    fn sum_client_shares_at(
+        &self,
+        share_index: ClientShareIndex,
+        client_count: usize,
+        fallback_type: ShareType,
+    ) -> VmResult<Value> {
+        VMState::sum_client_shares_at(self, share_index, client_count, fallback_type)
     }
 
     fn send_output_to_client(
@@ -489,6 +534,14 @@ impl ForeignMpcServices for VMState {
         VMState::open_share_as_field_data(self, ty, share_data)
     }
 
+    fn batch_open_shares_as_field_data(
+        &self,
+        ty: ShareType,
+        shares: &[ShareData],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        VMState::batch_open_shares_as_field_data(self, ty, shares)
+    }
+
     fn open_share_in_exp_data(
         &self,
         ty: ShareType,
@@ -506,6 +559,26 @@ impl ForeignMpcServices for VMState {
         generator_bytes: &[u8],
     ) -> VmResult<Vec<u8>> {
         VMState::open_share_in_exp_group_data(self, group, ty, share_data, generator_bytes)
+    }
+
+    fn batch_open_shares_in_exp_group_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generator_bytes: &[u8],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        VMState::batch_open_shares_in_exp_group_data(self, group, ty, shares, generator_bytes)
+    }
+
+    fn batch_open_shares_in_exp_group_custom_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generators: &[Vec<u8>],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        VMState::batch_open_shares_in_exp_group_custom_data(self, group, ty, shares, generators)
     }
 
     fn secret_share_add_data(
@@ -533,6 +606,15 @@ impl ForeignMpcServices for VMState {
         rhs_data: &ShareData,
     ) -> VmResult<ShareData> {
         VMState::secret_share_mul_data(self, ty, lhs_data, rhs_data)
+    }
+
+    fn secret_share_batch_mul_data(
+        &self,
+        ty: ShareType,
+        lhs_data: &[ShareData],
+        rhs_data: &[ShareData],
+    ) -> VmResult<Vec<ShareData>> {
+        VMState::secret_share_batch_mul_data(self, ty, lhs_data, rhs_data)
     }
 
     fn secret_share_neg_data(&self, ty: ShareType, share_data: &ShareData) -> VmResult<ShareData> {

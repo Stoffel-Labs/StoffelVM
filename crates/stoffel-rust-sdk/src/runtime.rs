@@ -127,7 +127,8 @@ impl StoffelRuntime {
     ///
     /// The runtime supplies the MPC backend, topology, and output count for
     /// `client_slot`. Callers still provide coordinator/node endpoints,
-    /// timestamp, and client identity explicitly.
+    /// execution ID, timestamp, and client identity explicitly. The execution
+    /// ID must match the coordinator and every MPC node for that invocation.
     pub fn offchain_client_config(&self, client_slot: u64) -> Result<OffChainClientConfigBuilder> {
         let client = self.program.client(client_slot).ok_or_else(|| {
             Error::Configuration(format!(
@@ -277,7 +278,9 @@ impl StoffelRuntime {
         Ok(self)
     }
 
-    /// Add one coordinator client input set for local networked execution.
+    /// Add one semantic coordinator client input set for local networked execution.
+    /// Fixed-point positions declared by the program manifest are scaled
+    /// automatically before secret sharing.
     pub fn with_client_input<V>(mut self, client_slot: u64, values: &[V]) -> Self
     where
         V: Clone + Into<Value>,
@@ -397,6 +400,23 @@ impl StoffelRuntime {
     pub async fn execute_local_function(&self, name: &str) -> Result<Vec<Value>> {
         vm::execute_local(self, name).await
     }
+
+    /// Execute `main` when its VM return must remain secret-shared.
+    pub async fn execute_local_returning_party_shares(
+        &self,
+    ) -> Result<vm::LocalShareExecutionOutput> {
+        self.execute_local_function_returning_party_shares("main")
+            .await
+    }
+
+    /// Execute a named entrypoint that returns exactly one secret share per
+    /// party. Use [`Self::execute_local_function`] for public VM returns.
+    pub async fn execute_local_function_returning_party_shares(
+        &self,
+        name: &str,
+    ) -> Result<vm::LocalShareExecutionOutput> {
+        vm::execute_local_returning_party_shares(self, name).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -455,6 +475,25 @@ impl<'a> LocalNetworkBuilder<'a> {
             ));
         }
         vm::execute_local_with_options(
+            self.runtime,
+            &self.entry,
+            vm::LocalExecutionOptions {
+                runner_path: self.runner_path,
+                timeout: self.timeout,
+            },
+        )
+        .await
+    }
+
+    /// Execute the configured local MPC run when its VM return must remain
+    /// secret-shared. This requires exactly one return share per party.
+    pub async fn run_returning_party_shares(self) -> Result<vm::LocalShareExecutionOutput> {
+        if matches!(self.timeout, Some(timeout) if timeout.is_zero()) {
+            return Err(Error::Configuration(
+                "local network timeout must be greater than zero".to_owned(),
+            ));
+        }
+        vm::execute_local_returning_party_shares_options(
             self.runtime,
             &self.entry,
             vm::LocalExecutionOptions {

@@ -1,0 +1,80 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Phase-aware eBPF profiler for the HoneyBadger client-input path.
+ *
+ * Replace __TARGET_BINARY__ with the executable visible through the target
+ * process's mount namespace (for example,
+ * /proc/1234/root/app/stoffel-run). Argument 1 is the target's host PID.
+ *
+ * Wall time comes from uprobe boundaries; aggregate process CPU is estimated
+ * from 199 Hz on-CPU sampling and can exceed 100% when several runtime threads
+ * execute concurrently. User stacks are retained by phase for attribution
+ * after the run.
+ */
+
+BEGIN
+{
+  printf("INPUT_PATH_EBPF target_pid=%d sample_hz=199\n", $1);
+}
+
+uprobe:__TARGET_BINARY__:stoffel_input_path_probe
+/pid == $1/
+{
+  $next_phase = arg0;
+
+  if (@active[pid]) {
+    $previous_phase = @phase[pid];
+    $wall_ns = nsecs - @boundary_ns[pid];
+    $samples = @oncpu_samples[$previous_phase];
+    printf(
+      "INPUT_PATH_PHASE id=%llu clients=%llu inputs=%llu wall_ns=%llu oncpu_samples=%llu\n",
+      $previous_phase,
+      @clients[pid],
+      @inputs[pid],
+      $wall_ns,
+      $samples
+    );
+    /* Resolve user symbols while the one-off target process is still alive. */
+    print(@oncpu_stacks);
+    clear(@oncpu_stacks);
+  } else {
+    @started_ns[pid] = nsecs;
+    @clients[pid] = arg1;
+    @inputs[pid] = arg2;
+    @active[pid] = 1;
+  }
+
+  if ($next_phase == 16) {
+    printf(
+      "INPUT_PATH_TOTAL clients=%llu inputs=%llu wall_ns=%llu oncpu_samples=%llu\n",
+      @clients[pid],
+      @inputs[pid],
+      nsecs - @started_ns[pid],
+      @total_oncpu_samples[pid]
+    );
+    delete(@active[pid]);
+    delete(@phase[pid]);
+    delete(@boundary_ns[pid]);
+    delete(@started_ns[pid]);
+    delete(@clients[pid]);
+    delete(@inputs[pid]);
+    delete(@total_oncpu_samples[pid]);
+  } else {
+    @phase[pid] = $next_phase;
+    @boundary_ns[pid] = nsecs;
+  }
+}
+
+profile:hz:199
+/pid == $1 && @active[pid]/
+{
+  @oncpu_samples[@phase[pid]] = @oncpu_samples[@phase[pid]] + 1;
+  @total_oncpu_samples[pid] = @total_oncpu_samples[pid] + 1;
+  @oncpu_stacks[@phase[pid], ustack(48)] = count();
+}
+
+END
+{
+  printf("INPUT_PATH_EBPF_END\n");
+}

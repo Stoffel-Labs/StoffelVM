@@ -29,7 +29,7 @@ rounds beyond the underlying AES block calls.
 ## Running it
 
 ```bash
-cargo build --release -p stoffel-vm-runner --bin stoffel-run -p stoffel-cli --bin stoffel
+cargo build --release -p stoffel-vm-runner --bin stoffel-run -p stoffel --bin stoffel
 ./run.sh
 ```
 

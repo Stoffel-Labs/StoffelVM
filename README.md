@@ -190,7 +190,7 @@ participant configuration in Rust applications. The CLI itself is built on it.
 
 ```toml
 # Cargo.toml
-stoffel-rust-sdk = "=0.1.2"
+stoffel-rust-sdk = "=0.2.0"
 ```
 
 ```rust
@@ -215,7 +215,7 @@ use stoffel::prelude::*;
 
 # async fn example() -> stoffel::Result<()> {
 let result = Stoffel::compile(
-    "def main(a: secret int64, b: secret int64) -> secret int64:\n  return a + b",
+    "def main(a: secret int64, b: secret int64) -> int64:\n  var sum: secret int64 = a + b\n  return sum.open()",
 )?
 .parties(5)
 .threshold(1)
@@ -224,6 +224,36 @@ let result = Stoffel::compile(
 # Ok(())
 # }
 ```
+
+When the VM return itself must remain secret, use the opaque-share result API.
+It preserves the exact backend serialization held by each compute party and
+never compares or reconstructs those payload bytes:
+
+```rust
+use stoffel::prelude::*;
+
+# async fn example() -> stoffel::Result<()> {
+let result = Stoffel::compile(
+    "def main() -> secret int64:\n  var share: secret int64 = Share.random()\n  return share",
+)?
+.parties(5)
+.threshold(1)
+.avss(Curve::Bls12_381)
+.execute_local_returning_party_shares()
+.await?;
+
+assert_eq!(result.party_outputs.len(), 5);
+assert_eq!(result.shares().len(), 5);
+# Ok(())
+# }
+```
+
+The two execution APIs are intentionally disjoint: `execute_local()` accepts a
+public VM return, while `execute_local_returning_party_shares()` requires
+exactly one secret return share per compute party. A public return passed to the
+share API—or a secret return passed to the public API—is reported as an error.
+`client_outputs` remains reserved for values explicitly reconstructed with
+`send_to_client`; it never contains the party-local VM return shares.
 
 `crates/stoffel-bindgen` complements the SDK by generating typed Rust bindings
 for a Stoffel program at build time, so host code can call into compiled
@@ -395,12 +425,14 @@ Run a compiled program locally (default entry function is `main`):
 Run a leader node for a 5-party MPC session:
 
 ```bash
+export STOFFEL_EXECUTION_ID="$(openssl rand -hex 32)"
 STOFFEL_AUTH_TOKEN=replace-with-random-secret \
 ./target/release/stoffel-run path/to/program.stflb main \
   --leader \
   --bind 127.0.0.1:9000 \
   --n-parties 5 \
-  --threshold 1
+  --threshold 1 \
+  --execution-id "$STOFFEL_EXECUTION_ID"
 ```
 
 Join as another party:
@@ -412,7 +444,8 @@ STOFFEL_AUTH_TOKEN=replace-with-random-secret \
   --bootstrap 127.0.0.1:9000 \
   --bind 127.0.0.1:9002 \
   --n-parties 5 \
-  --threshold 1
+  --threshold 1 \
+  --execution-id "$STOFFEL_EXECUTION_ID"
 ```
 
 Run in client mode to submit inputs to the party servers:
@@ -421,7 +454,8 @@ Run in client mode to submit inputs to the party servers:
 ./target/release/stoffel-run --client \
   --inputs 10,20 \
   --servers 127.0.0.1:10000,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004,127.0.0.1:9005 \
-  --n-parties 5
+  --n-parties 5 \
+  --execution-id "$STOFFEL_EXECUTION_ID"
 ```
 
 AVSS output-client mode can reconstruct private field outputs:
@@ -433,15 +467,18 @@ AVSS output-client mode can reconstruct private field outputs:
   --inputs 0x<sha256-tbs-digest-hex> \
   --outputs 2 \
   --servers 127.0.0.1:9000,127.0.0.1:9001,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004 \
-  --n-parties 5
+  --n-parties 5 \
+  --execution-id "$STOFFEL_EXECUTION_ID"
 ```
 
 Notes:
 
 - `STOFFEL_AUTH_TOKEN` is required for authenticated discovery in bootnode, leader, and party flows
+- All parties and clients in one run must use the same nonzero `--execution-id`; overlapping runs must use different IDs
 - The CLI accepts any file path; this repository conventionally stores compiled fixtures as `.stflb`
 - `--mpc-backend` supports `honeybadger` and `avss` for client mode; `.stflb` party runs use the backend recorded in the program manifest and reject conflicting CLI overrides
 - `--mpc-curve` supports `bls12-381`, `bn254`, `curve25519`, `ed25519`, `secp256k1`, and `p-256` (`secp256r1`) for AVSS
+- Returning a secret share does not open or reconstruct it. Each party emits its exact local backend bytes as `Program returned: share:v1[<type>;<format>;<byte-length>] 0x<hex>`. Party outputs are expected to differ; `LocalPartyOutput::returned_shares()` decodes the record for hashing or sealing. Treat this stdout as secret material. Programs that intentionally need a clear return must call `open()` or `reveal()` explicitly.
 
 ## Docker Flows
 
@@ -449,6 +486,7 @@ The API/coordinator topology is runnable with the reserve-index compose stack:
 
 ```bash
 STOFFEL_AUTH_TOKEN=replace-with-random-secret \
+STOFFEL_EXECUTION_ID="$(openssl rand -hex 32)" \
 docker compose -f docker-compose.coordinator.reserve-index.yml up --build
 ```
 
@@ -456,10 +494,43 @@ That coordinator path runs through the HoneyBadger/BLS12-381 VM path. The AVSS c
 
 ```bash
 STOFFEL_AUTH_TOKEN=replace-with-random-secret \
+STOFFEL_EXECUTION_ID="$(openssl rand -hex 32)" \
 docker compose -f docker-compose.avss.yml up --build
 ```
 
 `docker-compose.avss.yml` mounts a per-party local data volume and forwards `STOFFEL_LOCAL_STORE` to `stoffel-run`.
+
+### Peer RTT emulation
+
+The normal, benchmark, and standing-concurrency Compose stacks can emulate a
+global peer-network RTT plus extra latency on selected parties. Values are
+non-negative integer milliseconds:
+
+```bash
+NET_RTT_MS=80 \
+PARTY3_EXTRA_RTT_MS=220 \
+docker compose up --build
+```
+
+Every party-to-party pair receives `NET_RTT_MS`. A party's extra RTT is added
+to every pair containing that party, so the resulting pairwise RTT is
+approximately:
+
+```text
+global RTT + source party extra RTT + destination party extra RTT
+```
+
+In the example above, party 0 to party 1 is approximately 80 ms while party 0
+to party 3 is approximately 300 ms. Multiple slow parties compose naturally;
+with `PARTY2_EXTRA_RTT_MS=40` and `PARTY4_EXTRA_RTT_MS=160`, party 2 to party 4
+receives the global RTT plus another 200 ms. `PARTY0_EXTRA_RTT_MS` through
+`PARTY4_EXTRA_RTT_MS` are available in each stack.
+
+The shaper selects only the five fixed party IPs. Coordinator, client, and
+other container traffic remains unshaped, which keeps a slow-party experiment
+focused on the MPC peer mesh. The existing `NET_LOSS` (percent) and
+`NET_BANDWIDTH` (Mbit/s) controls remain whole-network egress controls. The
+defaults are zero RTT and no loss or bandwidth limit.
 
 The AVSS threshold ECDSA examples mirror the threshold signature fixtures:
 
@@ -478,6 +549,47 @@ docker compose -f docker-compose.avss.yml up --build
 The Stoffel source for these programs lives in `crates/stoffel-lang/examples/threshold_signatures/threshold_ecdsa_secp256k1/main.stfl` and `crates/stoffel-lang/examples/threshold_signatures/threshold_ecdsa_p256/main.stfl`. The VM only provides primitive helpers for field inversion, converting an opened curve point to `x mod q`, and formatting the final ECDSA output. The threshold ECDSA protocol itself is expressed in the Stoffel program. The returned layout is fixed-width big-endian `r(32) || s(32) || sec1_compressed_pk(33)`, so callers can DER-encode `(r, s)` directly.
 
 For the AVSS certificate-signing path, run `/app/programs/avss_certificate_keygen.stflb` with `STOFFEL_MPC_CURVE=secp256k1` or `STOFFEL_MPC_CURVE=p-256` to persist each party's CA signing share. Keygen is idempotent: it loads the existing share if the storage key already exists and only generates on first use. Then run `/app/programs/avss_certificate_sign.stflb` with `STOFFEL_WAIT_FOR_CLIENTS=1`; the client submits the real SHA-256 TBS digest and reconstructs fixed-width threshold ECDSA `r || s` material with `--outputs 2`. The corresponding Stoffel source lives in `crates/stoffel-lang/examples/avss_certificate/keygen/main.stfl` and `crates/stoffel-lang/examples/avss_certificate/sign/main.stfl`.
+
+## Standing concurrent nodes
+
+`stoffel-run --standing-node` keeps one authenticated party mesh alive until
+the process receives SIGINT or SIGTERM (SIGKILL stops it immediately). It has
+no finite run count. A trusted controller publishes the same monotonically
+sequenced Prepare/Cancel command into each party's mounted
+`--control-dir`; parties publish acknowledgements and lifecycle events back to
+that mount. This mounted command log is the standing node's admission boundary.
+The shared trusted controller owns deployment concurrency and resource limits;
+nodes intentionally do not make independent local admission decisions, which
+could otherwise make different parties select different executions.
+The MPC coordinator remains execution-scoped protocol infrastructure, not a
+second execution scheduler.
+
+Programs are immutable content-addressed artifacts. Prepare launches the
+execution after setup emits Ready; its online task then waits for the admitted
+clients. Every admission
+contains a new full 256-bit execution ID, the program ID and entry point, and an
+exact `clients` list of `{certificate, manifest_slot}` bindings. The
+program manifest supplies the MPC backend, curve, and client input shape; the
+controller does not repeat those values. Each execution receives an isolated
+transport inbox and storage scope, with preprocessing material destructively
+allocated from its program reservoir. `--pool-id` must be globally unique for a
+live deployment; never attach copies of one preprocessing volume to two live
+pools. Reservoirs are warmed before readiness and refilled as execution bursts
+consume them. The default nine-execution burst is admitted from ten warm
+bundles before a refill owns the program's preprocessing lane.
+
+The production-shaped five-party acceptance campaigns use the current VM,
+coordinator, and networking worktrees:
+
+```bash
+STOFFEL_COORDINATOR_CONTEXT=/absolute/path/to/stoffel-mpc-coordinator \
+STOFFEL_NETWORK_CONTEXT=/absolute/path/to/stoffel-networking \
+docker/test-standing-concurrency.sh
+
+STOFFEL_COORDINATOR_CONTEXT=/absolute/path/to/stoffel-mpc-coordinator \
+STOFFEL_NETWORK_CONTEXT=/absolute/path/to/stoffel-networking \
+docker/test-standing-adversarial.sh
+```
 
 ## C Foreign Function Interface
 
@@ -506,8 +618,15 @@ Run the test suite:
 
 ```bash
 cargo test
-cargo test -- --ignored
+# Generated-Cargo and local-MPC CLI tests share one heavyweight serial group.
+cargo test -p stoffel-cli --test cli -- --ignored --test-threads=1
+# Run the coordinator lifecycle regressions as a separate serial step.
+cargo test -p stoffel-vm-runner --test local_coordinator_e2e -- --ignored --test-threads=1 --skip optimized_aes --skip batch_mul
 ```
+
+The ordinary suite remains parallel. Keep the heavyweight CLI group in its
+separate serial invocation so nested Cargo builds cannot contend with
+timeout-sensitive local MPC subprocesses; CI uses the same split.
 
 Build the runtime and CLI in release mode:
 
@@ -529,9 +648,6 @@ in progress and are **not yet supported**:
 - **Additional SDKs** — Python and TypeScript/WASM SDKs to complement the Rust
   SDK. The C FFI surface exists today; higher-level language bindings are still
   in progress.
-- **Persistent / long-running MPC networks** — keeping nodes and the coordinator
-  warm across runs with ahead-of-time preprocessing, so repeated runs pay only
-  the online cost.
 - **Hosted / managed deployment** — turnkey deployment of MPC party networks
   beyond the local runner and Docker Compose stacks.
 

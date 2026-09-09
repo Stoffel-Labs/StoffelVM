@@ -1,13 +1,16 @@
-//! Bootnode-based discovery for StoffelVM over QUIC.
-//! Supports both direct connections and NAT traversal via ICE hole punching.
+//! Bootnode-assisted formation of one certificate-pinned MPC party mesh.
 mod bootnode;
 
-use super::session::{SessionInfo, SessionMessage};
+use super::session::{ExecutionId, SessionInfo, SessionMessage};
 use bincode;
 use bootnode::{spawn_connection_handler, BootnodeState};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
-use stoffelnet::network_utils::{Network, PartyId};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    time::Duration,
+};
+use stoffelnet::network_utils::{Network, NodePublicKey, PartyId};
 use stoffelnet::transports::quic::{
     NetworkManager, PeerConnection, QuicNetworkConfig, QuicNetworkManager,
 };
@@ -63,55 +66,34 @@ mod nat_stubs {
 
 #[cfg(not(feature = "nat"))]
 use nat_stubs::IceCandidate;
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DiscoveryMessage {
-    Register {
-        party_id: PartyId,
-        listen_addr: SocketAddr,
-        /// Optional shared secret for registration authentication
-        auth_token: Option<String>,
-    },
-    /// Register with session info - used when party wants to join a specific session
+    /// Register one party in the bootnode's immutable physical mesh.
     RegisterWithSession {
+        /// Coordinator-issued identity for this execution. Program IDs are not
+        /// unique execution identities because the same program can overlap.
+        execution_id: ExecutionId,
         party_id: PartyId,
         listen_addr: SocketAddr,
         program_id: [u8; 32],
         entry: String,
         n_parties: usize,
         threshold: usize,
-        /// Optional program bytes - first party to provide these becomes the source
-        program_bytes: Option<Vec<u8>>,
-        /// Optional shared secret for registration authentication
-        auth_token: Option<String>,
+        auth_token: String,
         /// TLS-derived identity (hash of certificate public key) so peers can
         /// pre-register this party in their allowlist before accept().
         tls_derived_id: Option<PartyId>,
+        /// Complete DER-encoded SubjectPublicKeyInfo. This is the
+        /// authorization identity; `tls_derived_id` is diagnostic compact
+        /// bookkeeping only.
+        tls_public_key: Option<Vec<u8>>,
     },
-    /// Request to fetch program bytes from bootnode
-    ProgramFetchRequest {
-        program_id: [u8; 32],
-    },
-    /// Program bytes response from bootnode
-    ProgramFetchResponse {
-        program_id: [u8; 32],
-        bytes: Vec<u8>,
-    },
-    RequestPeers,
-    PeerList {
-        peers: Vec<(PartyId, SocketAddr)>,
-    },
-    PeerJoined {
-        party_id: PartyId,
-        listen_addr: SocketAddr,
-    },
-    PeerLeft {
-        party_id: PartyId,
-    },
-    Heartbeat,
     /// ICE candidates for NAT traversal - sent via bootnode as signaling relay
     IceCandidates {
+        execution_id: ExecutionId,
         from_party_id: PartyId,
         to_party_id: PartyId,
         ufrag: String,
@@ -120,6 +102,7 @@ pub enum DiscoveryMessage {
     },
     /// Request ICE candidate exchange with a peer
     IceExchangeRequest {
+        execution_id: ExecutionId,
         from_party_id: PartyId,
         to_party_id: PartyId,
     },
@@ -137,17 +120,11 @@ fn required_discovery_auth_token(context: &str) -> Result<String, String> {
         .ok_or_else(|| format!("STOFFEL_AUTH_TOKEN must be set for {}", context))
 }
 
-fn registration_token_is_valid(
-    required_auth_token: Option<&str>,
-    message_auth_token: Option<&str>,
-) -> bool {
-    match required_auth_token {
-        Some(expected) => match message_auth_token {
-            Some(provided) => constant_time_eq(expected.as_bytes(), provided.as_bytes()),
-            None => false,
-        },
-        None => true,
-    }
+fn registration_token_is_valid(required_auth_token: &str, message_auth_token: &str) -> bool {
+    constant_time_eq(
+        required_auth_token.as_bytes(),
+        message_auth_token.as_bytes(),
+    )
 }
 
 /// Constant-time byte comparison to prevent timing attacks on auth tokens.
@@ -162,29 +139,33 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Bootnode: accepts party registrations and shares membership updates.
-/// Supports session-aware registration where parties specify the program they want to run.
-/// When enough parties register for the same session, bootnode broadcasts SessionAnnounce.
-pub async fn run_bootnode(bind: SocketAddr) -> Result<(), String> {
-    run_bootnode_with_config(bind, None).await
-}
-
-/// Run bootnode with optional expected party count for session management.
-/// If n_parties is Some, bootnode will wait for exactly that many parties before
-/// announcing the session. If None, uses the n_parties from first RegisterWithSession.
+/// Run a bootnode for one immutable physical party mesh.
 pub async fn run_bootnode_with_config(
     bind: SocketAddr,
-    expected_parties: Option<usize>,
+    expected_parties: usize,
+) -> Result<(), String> {
+    run_bootnode_with_config_ready(bind, expected_parties, None).await
+}
+
+/// Run a bootnode and acknowledge once its UDP listener is bound.
+///
+/// The optional sender lets a supervisor wait for concrete listener readiness
+/// before it starts registering followers.
+pub async fn run_bootnode_with_config_ready(
+    bind: SocketAddr,
+    expected_parties: usize,
+    ready: Option<oneshot::Sender<()>>,
 ) -> Result<(), String> {
     let required_auth_token = required_discovery_auth_token("bootnode discovery registration")?;
     eprintln!("[bootnode] Discovery registration authentication enabled");
-    run_bootnode_with_config_and_auth(bind, expected_parties, Some(required_auth_token)).await
+    run_bootnode_with_config_and_auth(bind, expected_parties, required_auth_token, ready).await
 }
 
 async fn run_bootnode_with_config_and_auth(
     bind: SocketAddr,
-    expected_parties: Option<usize>,
-    required_auth_token: Option<String>,
+    expected_parties: usize,
+    required_auth_token: String,
+    ready: Option<oneshot::Sender<()>>,
 ) -> Result<(), String> {
     let mut net = QuicNetworkManager::with_config(QuicNetworkConfig {
         use_tls: false,
@@ -192,6 +173,9 @@ async fn run_bootnode_with_config_and_auth(
     });
     net.listen(bind).await?;
     let state = BootnodeState::new(expected_parties);
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
 
     eprintln!("[bootnode] Listening on {}", bind);
 
@@ -201,133 +185,69 @@ async fn run_bootnode_with_config_and_auth(
     }
 }
 
-/// Party-side bootstrap: connect to bootnode, register, fetch peers, and connect to them.
-pub async fn bootstrap_with_bootnode(
+/// Connect to a session party using its complete provisioned TLS identity.
+/// No node/key/connection state is inserted until the certificate matches.
+async fn add_node_and_connect_pinned(
     net: &mut QuicNetworkManager,
-    bootnode: SocketAddr,
-    my_party_id: PartyId,
-    my_listen: SocketAddr,
+    party_id: PartyId,
+    addr: SocketAddr,
+    expected_public_key: &NodePublicKey,
 ) -> Result<(), String> {
-    let bn_conn = net.connect(bootnode).await?;
-    let auth_token = required_discovery_auth_token("party discovery registration")?;
-
-    // Register
-    send_ctrl(
-        &*bn_conn,
-        &DiscoveryMessage::Register {
-            party_id: my_party_id,
-            listen_addr: my_listen,
-            auth_token: Some(auth_token),
-        },
-    )
-    .await?;
-
-    // Request peers
-    send_ctrl(&*bn_conn, &DiscoveryMessage::RequestPeers).await?;
-
-    // Receive initial list and connect
-    if let Ok(buf) = bn_conn.receive().await {
-        if let Ok(DiscoveryMessage::PeerList { peers }) =
-            bincode::deserialize::<DiscoveryMessage>(&buf)
-        {
-            for (pid, addr) in peers {
-                if pid == my_party_id {
-                    continue;
-                }
-                // Track node and connect best-effort
-                add_node_and_connect(net, pid, addr).await;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Connect to a peer with timeout and retry logic (direct connection)
-async fn add_node_and_connect(net: &mut QuicNetworkManager, party_id: PartyId, addr: SocketAddr) {
-    net.add_node_with_party_id(party_id, addr);
-
-    // Retry connection with exponential backoff
     let max_retries = 3;
     let base_timeout = Duration::from_secs(10);
+    let transport_id = expected_public_key.derive_id();
+    let mut last_error = "connection was not attempted".to_string();
 
     for attempt in 0..max_retries {
-        let timeout_duration = base_timeout * (1 << attempt); // Exponential backoff: 10s, 20s, 40s
-
+        let timeout_duration = base_timeout * (1 << attempt);
         eprintln!(
-            "[peer-connect] Attempting to connect to party {} at {} (attempt {}/{}, timeout {:?})",
+            "[peer-connect] Pinned connect to logical party {} (transport {}) at {} (attempt {}/{}, timeout {:?})",
             party_id,
+            transport_id,
             addr,
             attempt + 1,
             max_retries,
             timeout_duration
         );
-
-        match tokio::time::timeout(timeout_duration, net.connect(addr)).await {
-            Ok(Ok(_conn)) => {
-                eprintln!(
-                    "[peer-connect] Successfully connected to party {} at {} (attempt {})",
-                    party_id,
-                    addr,
-                    attempt + 1
-                );
-                return;
-            }
-            Ok(Err(e)) => {
-                eprintln!(
-                    "[peer-connect] Connection error to party {} at {}: {} (attempt {}/{})",
-                    party_id,
-                    addr,
-                    e,
-                    attempt + 1,
-                    max_retries
-                );
-            }
-            Err(_) => {
-                eprintln!(
-                    "[peer-connect] Timeout connecting to party {} at {} after {:?} (attempt {}/{})",
-                    party_id,
-                    addr,
-                    timeout_duration,
-                    attempt + 1,
-                    max_retries
-                );
-            }
+        match tokio::time::timeout(
+            timeout_duration,
+            net.connect_as_server_with_expected_public_key(addr, expected_public_key),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(error)) => last_error = error,
+            Err(_) => last_error = format!("timed out after {timeout_duration:?}"),
         }
-
-        // Longer delay before retry to allow other parties to settle
-        if attempt < max_retries - 1 {
-            let delay = Duration::from_millis(500 * (attempt as u64 + 1));
-            eprintln!("[peer-connect] Waiting {:?} before retry...", delay);
-            sleep(delay).await;
+        if attempt + 1 < max_retries {
+            sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
         }
     }
 
-    eprintln!(
-        "[peer-connect] WARNING: Could not connect to party {} at {} after {} attempts",
-        party_id, addr, max_retries
-    );
+    Err(format!(
+        "failed pinned connection to logical party {party_id} (transport {transport_id}) at {addr} after {max_retries} attempts: {last_error}"
+    ))
 }
 
 /// Connect to a peer using NAT traversal (ICE hole punching via bootnode signaling)
 #[cfg(feature = "nat")]
 async fn add_node_and_connect_nat(
     net: &mut QuicNetworkManager,
+    execution_id: ExecutionId,
     my_party_id: PartyId,
     target_party_id: PartyId,
     target_addr: SocketAddr,
+    expected_public_key: &NodePublicKey,
     bn_conn: &dyn PeerConnection,
-) {
-    net.add_node_with_party_id(target_party_id, target_addr);
-
+) -> Result<(), String> {
     if !net.is_nat_traversal_enabled() {
         // Fall back to direct connection if NAT traversal is not enabled
         eprintln!(
             "[NAT] NAT traversal not enabled, using direct connection to party {}",
             target_party_id
         );
-        add_node_and_connect_direct(net, target_party_id, target_addr).await;
-        return;
+        return add_node_and_connect_pinned(net, target_party_id, target_addr, expected_public_key)
+            .await;
     }
 
     eprintln!(
@@ -341,8 +261,13 @@ async fn add_node_and_connect_nat(
         Err(e) => {
             eprintln!("[NAT] Failed to gather ICE candidates: {}", e);
             // Fall back to direct connection
-            add_node_and_connect_direct(net, target_party_id, target_addr).await;
-            return;
+            return add_node_and_connect_pinned(
+                net,
+                target_party_id,
+                target_addr,
+                expected_public_key,
+            )
+            .await;
         }
     };
 
@@ -354,6 +279,7 @@ async fn add_node_and_connect_nat(
 
     // Step 2: Send our ICE candidates to the target party via bootnode
     let ice_msg = DiscoveryMessage::IceCandidates {
+        execution_id,
         from_party_id: my_party_id,
         to_party_id: target_party_id,
         ufrag: local_candidates.ufrag.clone(),
@@ -363,8 +289,8 @@ async fn add_node_and_connect_nat(
 
     if let Err(e) = send_ctrl(bn_conn, &ice_msg).await {
         eprintln!("[NAT] Failed to send ICE candidates: {}", e);
-        add_node_and_connect_direct(net, target_party_id, target_addr).await;
-        return;
+        return add_node_and_connect_pinned(net, target_party_id, target_addr, expected_public_key)
+            .await;
     }
 
     // Step 3: Wait for remote ICE candidates from the target party
@@ -382,13 +308,19 @@ async fn add_node_and_connect_nat(
                 "[NAT] Timeout waiting for ICE candidates from party {}",
                 target_party_id
             );
-            add_node_and_connect_direct(net, target_party_id, target_addr).await;
-            return;
+            return add_node_and_connect_pinned(
+                net,
+                target_party_id,
+                target_addr,
+                expected_public_key,
+            )
+            .await;
         }
 
         match tokio::time::timeout(Duration::from_millis(100), bn_conn.receive()).await {
             Ok(Ok(buf)) => {
                 if let Ok(DiscoveryMessage::IceCandidates {
+                    execution_id: message_execution_id,
                     from_party_id,
                     to_party_id: _,
                     ufrag: _,
@@ -396,7 +328,7 @@ async fn add_node_and_connect_nat(
                     candidates: remote_candidates,
                 }) = bincode::deserialize::<DiscoveryMessage>(&buf)
                 {
-                    if from_party_id == target_party_id {
+                    if message_execution_id == execution_id && from_party_id == target_party_id {
                         eprintln!(
                             "[NAT] Received {} ICE candidates from party {}",
                             remote_candidates.len(),
@@ -424,7 +356,10 @@ async fn add_node_and_connect_nat(
 
                             match tokio::time::timeout(
                                 Duration::from_secs(5),
-                                net.connect(candidate.address),
+                                net.connect_as_server_with_expected_public_key(
+                                    candidate.address,
+                                    expected_public_key,
+                                ),
                             )
                             .await
                             {
@@ -454,15 +389,20 @@ async fn add_node_and_connect_nat(
                         }
 
                         if connected {
-                            return;
+                            return Ok(());
                         }
 
                         eprintln!(
                             "[NAT] All ICE candidates failed for party {}, trying direct",
                             target_party_id
                         );
-                        add_node_and_connect_direct(net, target_party_id, target_addr).await;
-                        return;
+                        return add_node_and_connect_pinned(
+                            net,
+                            target_party_id,
+                            target_addr,
+                            expected_public_key,
+                        )
+                        .await;
                     }
                 }
             }
@@ -478,70 +418,7 @@ async fn add_node_and_connect_nat(
     }
 
     // Fall back to direct connection
-    add_node_and_connect_direct(net, target_party_id, target_addr).await;
-}
-
-/// Direct connection helper (used when NAT traversal fails or is disabled)
-#[allow(dead_code)]
-async fn add_node_and_connect_direct(
-    net: &mut QuicNetworkManager,
-    party_id: PartyId,
-    addr: SocketAddr,
-) {
-    // Retry connection with exponential backoff
-    let max_retries = 3;
-    let base_timeout = Duration::from_secs(10);
-
-    for attempt in 0..max_retries {
-        let timeout_duration = base_timeout * (1 << attempt);
-
-        eprintln!(
-            "[peer-connect] Direct connect to party {} at {} (attempt {}/{}, timeout {:?})",
-            party_id,
-            addr,
-            attempt + 1,
-            max_retries,
-            timeout_duration
-        );
-
-        match tokio::time::timeout(timeout_duration, net.connect(addr)).await {
-            Ok(Ok(_conn)) => {
-                eprintln!(
-                    "[peer-connect] Direct connection established to party {} (attempt {})",
-                    party_id,
-                    attempt + 1
-                );
-                return;
-            }
-            Ok(Err(e)) => {
-                eprintln!(
-                    "[peer-connect] Direct connection error to party {}: {} (attempt {}/{})",
-                    party_id,
-                    e,
-                    attempt + 1,
-                    max_retries
-                );
-            }
-            Err(_) => {
-                eprintln!(
-                    "[peer-connect] Direct connection timeout to party {} (attempt {}/{})",
-                    party_id,
-                    attempt + 1,
-                    max_retries
-                );
-            }
-        }
-
-        if attempt < max_retries - 1 {
-            let delay = Duration::from_millis(500 * (attempt as u64 + 1));
-            sleep(delay).await;
-        }
-    }
-
-    eprintln!(
-        "[peer-connect] WARNING: Could not connect to party {} after {} attempts",
-        party_id, max_retries
-    );
+    add_node_and_connect_pinned(net, target_party_id, target_addr, expected_public_key).await
 }
 
 async fn send_ctrl(conn: &dyn PeerConnection, msg: &DiscoveryMessage) -> Result<(), String> {
@@ -558,49 +435,12 @@ async fn send_session_announce(
     conn.send(&bytes).await.map_err(|e| e.to_string())
 }
 
-/// Wait until at least n parties are in the QuicNetworkManager.parties() view (including self).
-pub async fn wait_until_min_parties(
-    net: &QuicNetworkManager,
-    n: usize,
-    timeout: Duration,
-) -> Result<(), String> {
-    let start = tokio::time::Instant::now();
-    loop {
-        if net.parties().len() >= n {
-            return Ok(());
-        }
-        if start.elapsed() > timeout {
-            return Err(format!(
-                "timeout waiting for {} parties, have {}",
-                n,
-                net.parties().len()
-            ));
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Re-export program sync functions for convenience
-pub async fn agree_and_sync_program(
-    bn_conn: &dyn PeerConnection,
-    my_party: PartyId,
-    entry: &str,
-    maybe_program_bytes: Option<Vec<u8>>,
-) -> Result<([u8; 32], usize, String), String> {
-    super::program_sync::agree_and_sync_program(bn_conn, my_party, entry, maybe_program_bytes)
-        .await
-        .map_err(String::from)
-}
-
-/// Re-export program ID computation
-pub fn program_id_from_bytes(bytes: &[u8]) -> [u8; 32] {
-    super::program_sync::program_id_from_bytes(bytes)
-}
-
 /// Configuration for joining a bootnode-announced MPC session.
 #[derive(Debug, Clone)]
 pub struct SessionRegistrationConfig {
     pub bootnode: SocketAddr,
+    /// Coordinator-issued identity shared by all parties for one execution.
+    pub execution_id: ExecutionId,
     pub my_party_id: PartyId,
     pub my_listen: SocketAddr,
     pub program_id: [u8; 32],
@@ -608,14 +448,43 @@ pub struct SessionRegistrationConfig {
     pub n_parties: usize,
     pub threshold: usize,
     pub timeout: Duration,
-    pub program_bytes: Option<Vec<u8>>,
+    /// Optional locally provisioned logical-party to full-SPKI roster. When
+    /// present, discovery must announce this exact roster and the transport
+    /// freezes it before establishing the party mesh.
+    pub expected_party_public_keys: Option<Vec<(PartyId, NodePublicKey)>>,
 }
 
-impl SessionRegistrationConfig {
-    pub fn with_program_bytes(mut self, program_bytes: Vec<u8>) -> Self {
-        self.program_bytes = Some(program_bytes);
-        self
+fn full_party_public_key_map(
+    entries: &[(PartyId, NodePublicKey)],
+    expected_parties: usize,
+    label: &str,
+) -> Result<HashMap<PartyId, NodePublicKey>, String> {
+    if entries.len() != expected_parties {
+        return Err(format!(
+            "{label} has {} TLS public keys, expected {expected_parties}",
+            entries.len()
+        ));
     }
+    let mut by_party = HashMap::with_capacity(entries.len());
+    let mut identities = HashSet::with_capacity(entries.len());
+    for (party_id, public_key) in entries {
+        if *party_id >= expected_parties {
+            return Err(format!(
+                "{label} contains out-of-range logical party {party_id}"
+            ));
+        }
+        if by_party.insert(*party_id, public_key.clone()).is_some() {
+            return Err(format!(
+                "{label} contains duplicate logical party {party_id}"
+            ));
+        }
+        if !identities.insert(public_key.clone()) {
+            return Err(format!(
+                "{label} assigns one TLS public key to multiple logical parties"
+            ));
+        }
+    }
+    Ok(by_party)
 }
 
 /// Register with bootnode for a specific session and wait for session to be announced.
@@ -625,17 +494,15 @@ impl SessionRegistrationConfig {
 /// 3. Bootnode broadcasts SessionAnnounce to all parties
 /// 4. This function returns with the agreed SessionInfo
 ///
-/// All parties will receive the same instance_id, which is derived deterministically
-/// from the program_id and a session nonce.
+/// All parties receive the same instance ID derived from the full execution ID.
 ///
-/// If `config.program_bytes` is Some, this party will upload the program to the bootnode.
-/// Parties that don't have the program locally can pass None and later fetch it.
 pub async fn register_and_wait_for_session(
     net: &mut QuicNetworkManager,
     config: SessionRegistrationConfig,
 ) -> Result<SessionInfo, String> {
     let SessionRegistrationConfig {
         bootnode,
+        execution_id,
         my_party_id,
         my_listen,
         program_id,
@@ -643,10 +510,37 @@ pub async fn register_and_wait_for_session(
         n_parties,
         threshold,
         timeout,
-        program_bytes,
+        expected_party_public_keys,
     } = config;
-    let uploading_program = program_bytes.is_some();
-
+    if execution_id.is_zero() {
+        return Err("the all-zero execution ID cannot identify a session".to_string());
+    }
+    if n_parties == 0 || my_party_id >= n_parties || threshold >= n_parties {
+        return Err("invalid party count, local party ID, or threshold".to_string());
+    }
+    let local_public_key = net.get_public_key().cloned().ok_or_else(|| {
+        "session registration requires an installed local certificate".to_string()
+    })?;
+    let expected_party_public_key_map = expected_party_public_keys
+        .as_deref()
+        .map(|entries| full_party_public_key_map(entries, n_parties, "configured party roster"))
+        .transpose()?;
+    if let Some(expected) = expected_party_public_key_map.as_ref() {
+        match expected.get(&my_party_id) {
+            Some(expected_local) if expected_local == &local_public_key => {}
+            Some(_) => {
+                return Err(format!(
+                    "configured party roster certificate for logical party {my_party_id} does not match the local certificate"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "configured party roster omits logical party {my_party_id}"
+                ));
+            }
+        }
+        net.install_expected_server_public_keys(expected.values().cloned())?;
+    }
     // Use a separate temporary manager for the bootnode discovery connection
     // so that the bootnode's TLS public key doesn't pollute the party mesh
     // manager's peer_public_keys (which would give N+1 sorted party IDs).
@@ -658,28 +552,28 @@ pub async fn register_and_wait_for_session(
     let auth_token = required_discovery_auth_token("session discovery registration")?;
 
     eprintln!(
-        "[party {}] Registering with bootnode for session (program: {}, n={}, t={}, uploading={})",
+        "[party {}] Registering with bootnode for execution {} (program: {}, n={}, t={})",
         my_party_id,
+        execution_id,
         hex::encode(&program_id[..8]),
         n_parties,
-        threshold,
-        uploading_program
+        threshold
     );
 
-    // Send session-aware registration with optional program bytes.
-    // Include our TLS-derived ID so peers can pre-register us in their
-    // allowlist for accept() with use_tls=true.
-    let local_tls_id = net.local_derived_id();
+    // Send the full TLS identity. The compact ID remains useful in logs and
+    // connection tables, but is deliberately not an authorization credential.
+    let local_tls_id = local_public_key.derive_id();
     let reg_msg = DiscoveryMessage::RegisterWithSession {
+        execution_id,
         party_id: my_party_id,
         listen_addr: my_listen,
         program_id,
         entry,
         n_parties,
         threshold,
-        program_bytes,
-        auth_token: Some(auth_token),
+        auth_token,
         tls_derived_id: Some(local_tls_id),
+        tls_public_key: Some(local_public_key.0.clone()),
     };
     let send_start = tokio::time::Instant::now();
     send_ctrl(&*bn_conn, &reg_msg)
@@ -721,6 +615,21 @@ pub async fn register_and_wait_for_session(
                 if let Ok(SessionMessage::SessionAnnounce(info)) =
                     bincode::deserialize::<SessionMessage>(&buf)
                 {
+                    if info.execution_id != execution_id {
+                        eprintln!(
+                            "[party {}] Ignoring SessionAnnounce for unrelated execution {}",
+                            my_party_id, info.execution_id
+                        );
+                        continue;
+                    }
+                    if info.program_id != program_id {
+                        return Err(format!(
+                            "bootnode announced program {} for execution {}, expected {}",
+                            hex::encode(info.program_id),
+                            execution_id,
+                            hex::encode(program_id)
+                        ));
+                    }
                     eprintln!(
                         "[party {}] Received SessionAnnounce: instance_id={}, {} parties",
                         my_party_id,
@@ -728,18 +637,91 @@ pub async fn register_and_wait_for_session(
                         info.parties.len()
                     );
 
-                    // Build TLS-ID lookup from session info
-                    let tls_id_map: HashMap<PartyId, PartyId> =
-                        info.tls_ids.iter().cloned().collect();
+                    if info.parties.len() != info.n_parties {
+                        return Err(format!(
+                            "bootnode announced {} party addresses for n_parties={}",
+                            info.parties.len(),
+                            info.n_parties
+                        ));
+                    }
+                    let announced_party_ids: HashSet<PartyId> =
+                        info.parties.iter().map(|(party_id, _)| *party_id).collect();
+                    if announced_party_ids.len() != info.parties.len() {
+                        return Err(
+                            "bootnode announced duplicate logical party addresses".to_string()
+                        );
+                    }
 
-                    // Add ALL peers to the node list using their TLS-derived IDs
-                    // so that accept() recognises them with use_tls=true.
-                    for (pid, addr) in &info.parties {
-                        if *pid != my_party_id {
-                            let node_id = tls_id_map.get(pid).copied().unwrap_or(*pid);
-                            net.add_node_with_party_id(node_id, *addr);
+                    let announced_entries = info
+                        .tls_public_keys
+                        .iter()
+                        .map(|(party_id, bytes)| (*party_id, NodePublicKey(bytes.clone())))
+                        .collect::<Vec<_>>();
+                    let announced_public_keys = full_party_public_key_map(
+                        &announced_entries,
+                        info.n_parties,
+                        "bootnode-announced party roster",
+                    )?;
+                    if announced_public_keys
+                        .keys()
+                        .copied()
+                        .collect::<HashSet<_>>()
+                        != announced_party_ids
+                    {
+                        return Err(
+                            "bootnode TLS public-key roster does not match announced parties"
+                                .to_string(),
+                        );
+                    }
+
+                    let mut tls_id_map = HashMap::with_capacity(info.tls_ids.len());
+                    for (party_id, compact_id) in &info.tls_ids {
+                        if tls_id_map.insert(*party_id, *compact_id).is_some() {
+                            return Err(format!(
+                                "bootnode announced duplicate compact TLS ID for logical party {party_id}"
+                            ));
                         }
                     }
+                    if tls_id_map.len() != info.n_parties {
+                        return Err(format!(
+                            "bootnode announced {} compact TLS IDs, expected {}",
+                            tls_id_map.len(),
+                            info.n_parties
+                        ));
+                    }
+                    for (party_id, public_key) in &announced_public_keys {
+                        let announced_compact = tls_id_map.get(party_id).ok_or_else(|| {
+                            format!(
+                                "bootnode omitted compact TLS diagnostic for logical party {party_id}"
+                            )
+                        })?;
+                        if *announced_compact != public_key.derive_id() {
+                            return Err(format!(
+                                "bootnode compact TLS diagnostic for logical party {party_id} does not match its full certificate identity"
+                            ));
+                        }
+                    }
+
+                    if let Some(expected) = expected_party_public_key_map.as_ref() {
+                        if expected != &announced_public_keys {
+                            return Err(
+                                "bootnode-announced TLS public-key roster differs from the configured standing roster"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    if announced_public_keys.get(&my_party_id) != Some(&local_public_key) {
+                        return Err(format!(
+                            "bootnode-announced TLS identity for logical party {my_party_id} does not match the local certificate"
+                        ));
+                    }
+
+                    // Freeze admission before any accept or dial. The
+                    // transport validates compact-ID collisions and compares
+                    // full SPKIs on every physical party connection.
+                    net.install_expected_server_public_keys(
+                        announced_public_keys.values().cloned(),
+                    )?;
 
                     // Peer connection strategy:
                     // - Lower-ID parties CONNECT to higher-ID parties
@@ -749,7 +731,18 @@ pub async fn register_and_wait_for_session(
                         .parties
                         .iter()
                         .filter(|(pid, _)| *pid > my_party_id)
-                        .collect();
+                        .map(|(pid, addr)| {
+                            announced_public_keys
+                                .get(pid)
+                                .cloned()
+                                .map(|public_key| (*pid, *addr, public_key))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "bootnode omitted TLS public key for logical party {pid}"
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     let n_expected_incoming = info
                         .parties
                         .iter()
@@ -840,20 +833,28 @@ pub async fn register_and_wait_for_session(
                             );
                         }
 
-                        for (pid, addr) in &higher_peers {
+                        for (pid, addr, public_key) in &higher_peers {
                             if use_nat {
-                                add_node_and_connect_nat(net, my_party_id, *pid, *addr, &*bn_conn)
-                                    .await;
+                                add_node_and_connect_nat(
+                                    net,
+                                    execution_id,
+                                    my_party_id,
+                                    *pid,
+                                    *addr,
+                                    public_key,
+                                    &*bn_conn,
+                                )
+                                .await?;
                             } else {
-                                add_node_and_connect(net, *pid, *addr).await;
+                                add_node_and_connect_pinned(net, *pid, *addr, public_key).await?;
                             }
                         }
                     }
 
                     #[cfg(not(feature = "nat"))]
                     {
-                        for (pid, addr) in higher_peers {
-                            add_node_and_connect(net, *pid, *addr).await;
+                        for (pid, addr, public_key) in higher_peers {
+                            add_node_and_connect_pinned(net, pid, addr, &public_key).await?;
                         }
                     }
 
@@ -888,6 +889,7 @@ pub async fn register_and_wait_for_session(
 
                     // Send acknowledgment
                     let ack = SessionMessage::SessionAck {
+                        execution_id,
                         party_id: my_party_id,
                         program_id: info.program_id,
                         instance_id: info.instance_id,
@@ -919,7 +921,7 @@ mod tests {
         net::{Ipv4Addr, SocketAddrV4, UdpSocket},
         sync::Once,
     };
-    use tokio::time::{sleep, timeout};
+    use tokio::time::timeout;
 
     static INIT: Once = Once::new();
 
@@ -937,25 +939,6 @@ mod tests {
         socket.local_addr().expect("get local socket address")
     }
 
-    async fn recv_peer_list(conn: &dyn PeerConnection) -> Vec<(PartyId, SocketAddr)> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let now = tokio::time::Instant::now();
-            assert!(now < deadline, "timed out waiting for PeerList");
-            let remaining = deadline.duration_since(now);
-            let buf = timeout(remaining, conn.receive())
-                .await
-                .expect("timed out waiting for discovery response")
-                .expect("receive discovery response");
-            match bincode::deserialize::<DiscoveryMessage>(&buf)
-                .expect("deserialize discovery response")
-            {
-                DiscoveryMessage::PeerList { peers } => return peers,
-                _ => continue,
-            }
-        }
-    }
-
     async fn recv_session_announce(conn: &dyn PeerConnection) -> SessionInfo {
         let buf = timeout(Duration::from_secs(3), conn.receive())
             .await
@@ -968,153 +951,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthenticated_register_can_overwrite_existing_party_entry() {
-        init_crypto_provider();
-        let bootnode_addr = reserve_local_addr();
-        let bootnode = tokio::spawn(run_bootnode_with_config_and_auth(bootnode_addr, None, None));
-        sleep(Duration::from_millis(100)).await;
-
-        let party_id = 7usize;
-        let honest_addr = reserve_local_addr();
-        let attacker_addr = reserve_local_addr();
-
-        let mut honest_net = QuicNetworkManager::new();
-        let honest_conn = honest_net
-            .connect(bootnode_addr)
-            .await
-            .expect("honest party connects to bootnode");
-        send_ctrl(
-            &*honest_conn,
-            &DiscoveryMessage::Register {
-                party_id,
-                listen_addr: honest_addr,
-                auth_token: None,
-            },
-        )
-        .await
-        .expect("honest registration succeeds");
-        let _ = recv_peer_list(&*honest_conn).await;
-
-        let mut attacker_net = QuicNetworkManager::new();
-        let attacker_conn = attacker_net
-            .connect(bootnode_addr)
-            .await
-            .expect("attacker connects to bootnode");
-        send_ctrl(
-            &*attacker_conn,
-            &DiscoveryMessage::Register {
-                party_id,
-                listen_addr: attacker_addr,
-                auth_token: None,
-            },
-        )
-        .await
-        .expect("attacker registration succeeds");
-        let _ = recv_peer_list(&*attacker_conn).await;
-
-        send_ctrl(&*honest_conn, &DiscoveryMessage::RequestPeers)
-            .await
-            .expect("request peers");
-        let peers = recv_peer_list(&*honest_conn).await;
-
-        let mapped_addr = peers
-            .iter()
-            .find(|(pid, _)| *pid == party_id)
-            .map(|(_, addr)| *addr);
-        assert_eq!(
-            mapped_addr,
-            Some(attacker_addr),
-            "without authentication, a second registration can overwrite an existing party entry"
-        );
-
-        bootnode.abort();
-        let _ = bootnode.await;
-    }
-
-    #[tokio::test]
-    async fn invalid_register_auth_token_cannot_overwrite_party_entry() {
-        init_crypto_provider();
-        let bootnode_addr = reserve_local_addr();
-        let auth_token = "shared-secret".to_string();
-        let bootnode = tokio::spawn(run_bootnode_with_config_and_auth(
-            bootnode_addr,
-            None,
-            Some(auth_token.clone()),
-        ));
-        sleep(Duration::from_millis(100)).await;
-
-        let party_id = 11usize;
-        let honest_addr = reserve_local_addr();
-        let attacker_addr = reserve_local_addr();
-
-        let mut honest_net = QuicNetworkManager::new();
-        let honest_conn = honest_net
-            .connect(bootnode_addr)
-            .await
-            .expect("honest party connects to bootnode");
-        send_ctrl(
-            &*honest_conn,
-            &DiscoveryMessage::Register {
-                party_id,
-                listen_addr: honest_addr,
-                auth_token: Some(auth_token.clone()),
-            },
-        )
-        .await
-        .expect("honest registration succeeds");
-        let _ = recv_peer_list(&*honest_conn).await;
-
-        let mut attacker_net = QuicNetworkManager::new();
-        let attacker_conn = attacker_net
-            .connect(bootnode_addr)
-            .await
-            .expect("attacker connects to bootnode");
-        send_ctrl(
-            &*attacker_conn,
-            &DiscoveryMessage::Register {
-                party_id,
-                listen_addr: attacker_addr,
-                auth_token: Some("bad-token".to_string()),
-            },
-        )
-        .await
-        .expect("attacker message is delivered");
-
-        // Allow bootnode task to process and reject attacker registration.
-        sleep(Duration::from_millis(100)).await;
-
-        send_ctrl(&*honest_conn, &DiscoveryMessage::RequestPeers)
-            .await
-            .expect("request peers");
-        let peers = recv_peer_list(&*honest_conn).await;
-
-        let mapped_addr = peers
-            .iter()
-            .find(|(pid, _)| *pid == party_id)
-            .map(|(_, addr)| *addr);
-        assert_eq!(
-            mapped_addr,
-            Some(honest_addr),
-            "invalid auth token must not overwrite existing party mapping"
-        );
-
-        bootnode.abort();
-        let _ = bootnode.await;
-    }
-
-    #[tokio::test]
     async fn invalid_session_register_auth_token_cannot_poison_session_parties() {
         init_crypto_provider();
         let bootnode_addr = reserve_local_addr();
         let auth_token = "session-secret".to_string();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let bootnode = tokio::spawn(run_bootnode_with_config_and_auth(
             bootnode_addr,
-            Some(2),
-            Some(auth_token.clone()),
+            2,
+            auth_token.clone(),
+            Some(ready_tx),
         ));
-        sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("bootnode readiness deadline")
+            .expect("bootnode listener ready");
 
         let program_id = [9u8; 32];
+        let execution_id = ExecutionId::from([7u8; 32]);
         let entry = "main".to_string();
         let honest_party0_addr = reserve_local_addr();
         let honest_party1_addr = reserve_local_addr();
@@ -1125,18 +979,23 @@ mod tests {
             .connect(bootnode_addr)
             .await
             .expect("party0 connects to bootnode");
+        let party0_public_key = party0_net
+            .get_public_key()
+            .cloned()
+            .expect("party0 has TLS identity");
         send_ctrl(
             &*party0_conn,
             &DiscoveryMessage::RegisterWithSession {
+                execution_id,
                 party_id: 0,
                 listen_addr: honest_party0_addr,
                 program_id,
                 entry: entry.clone(),
                 n_parties: 2,
                 threshold: 1,
-                program_bytes: None,
-                auth_token: Some(auth_token.clone()),
-                tls_derived_id: None,
+                auth_token: auth_token.clone(),
+                tls_derived_id: Some(party0_public_key.derive_id()),
+                tls_public_key: Some(party0_public_key.0),
             },
         )
         .await
@@ -1150,15 +1009,16 @@ mod tests {
         send_ctrl(
             &*attacker_conn,
             &DiscoveryMessage::RegisterWithSession {
+                execution_id,
                 party_id: 0,
                 listen_addr: attacker_addr,
                 program_id,
                 entry: entry.clone(),
                 n_parties: 2,
                 threshold: 1,
-                program_bytes: None,
-                auth_token: Some("bad-token".to_string()),
+                auth_token: "bad-token".to_string(),
                 tls_derived_id: None,
+                tls_public_key: None,
             },
         )
         .await
@@ -1169,18 +1029,23 @@ mod tests {
             .connect(bootnode_addr)
             .await
             .expect("party1 connects to bootnode");
+        let party1_public_key = party1_net
+            .get_public_key()
+            .cloned()
+            .expect("party1 has TLS identity");
         send_ctrl(
             &*party1_conn,
             &DiscoveryMessage::RegisterWithSession {
+                execution_id,
                 party_id: 1,
                 listen_addr: honest_party1_addr,
                 program_id,
                 entry,
                 n_parties: 2,
                 threshold: 1,
-                program_bytes: None,
-                auth_token: Some(auth_token),
-                tls_derived_id: None,
+                auth_token,
+                tls_derived_id: Some(party1_public_key.derive_id()),
+                tls_public_key: Some(party1_public_key.0),
             },
         )
         .await

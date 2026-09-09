@@ -1,11 +1,16 @@
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use super::instance::InstanceRegistry;
+use super::instance::{
+    open_registry_wait_timeout, InstanceRegistry, MAX_PENDING_BATCH_BYTES_PER_SENDER,
+    MAX_PENDING_BATCH_POSITIONS_PER_SENDER,
+};
 use super::wire::{
     ExpOpenWireMessage, OpenRegistryWireMessage, AVSS_EXP_WIRE_PREFIX, AVSS_G2_EXP_WIRE_PREFIX,
-    HB_EXP_OPEN_WIRE_PREFIX, MAX_WIRE_MESSAGE_LEN, OPEN_REGISTRY_WIRE_PREFIX, UNKNOWN_SENDER_ID,
+    HB_EXP_OPEN_WIRE_PREFIX, MAX_BATCH_ELEMENTS, MAX_TYPE_KEY_LEN, MAX_WIRE_MESSAGE_LEN,
+    OPEN_REGISTRY_WIRE_PREFIX, UNKNOWN_SENDER_ID,
 };
 
 /// Session-local router for open-share and open-in-exponent wire messages.
@@ -57,6 +62,41 @@ impl OpenMessageRouter {
         self.registries.clear();
     }
 
+    /// Consume an open-registry frame while applying per-peer backpressure.
+    ///
+    /// A quorum may advance through several opens before a slower party polls
+    /// its local registry. In that case the bounded early-message retention
+    /// window can fill temporarily. Dropping the next authenticated frame
+    /// makes that open impossible to finish, so receive loops must wait for the
+    /// local consumer to reclaim capacity and retry the same frame instead.
+    /// Frames that cannot fit even in an empty retention window are rejected
+    /// immediately, preserving the registry's memory bounds.
+    pub async fn handle_wire_message(
+        &self,
+        authenticated_sender_id: usize,
+        payload: &[u8],
+    ) -> Result<bool, String> {
+        let deadline = tokio::time::Instant::now() + open_registry_wait_timeout();
+
+        loop {
+            match self.try_handle_wire_message(authenticated_sender_id, payload) {
+                Err(error)
+                    if is_batch_capacity_error(&error)
+                        && batch_frame_fits_empty_retention_window(payload) =>
+                {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(format!(
+                            "timed out waiting for batch-open router capacity: {error}"
+                        ));
+                    }
+                    tokio::time::sleep_until(deadline.min(now + Duration::from_millis(5))).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// Attempt to consume an incoming transport payload as an open-registry wire message.
     ///
     /// Returns `Ok(true)` when the payload is recognized and handled.
@@ -101,6 +141,16 @@ impl OpenMessageRouter {
                 sender_party_id,
                 ..
             } => (*instance_id, *sender_party_id),
+            OpenRegistryWireMessage::RbcEcho {
+                instance_id,
+                sender_party_id,
+                ..
+            }
+            | OpenRegistryWireMessage::RbcReady {
+                instance_id,
+                sender_party_id,
+                ..
+            } => (*instance_id, *sender_party_id),
         };
 
         if authenticated_sender_id == UNKNOWN_SENDER_ID {
@@ -130,6 +180,13 @@ impl OpenMessageRouter {
                 share,
                 ..
             } => {
+                if type_key.len() > MAX_TYPE_KEY_LEN {
+                    return Err(format!(
+                        "open_share type key too large: {} bytes (max {})",
+                        type_key.len(),
+                        MAX_TYPE_KEY_LEN
+                    ));
+                }
                 let seq = usize::try_from(seq)
                     .map_err(|_| format!("open_share sequence {seq} exceeds local usize"))?;
                 registry.insert_single(seq, &type_key, sender_party_id, share)?
@@ -141,6 +198,20 @@ impl OpenMessageRouter {
                 shares,
                 ..
             } => {
+                if type_key.len() > MAX_TYPE_KEY_LEN {
+                    return Err(format!(
+                        "batch_open_shares type key too large: {} bytes (max {})",
+                        type_key.len(),
+                        MAX_TYPE_KEY_LEN
+                    ));
+                }
+                if shares.len() > MAX_BATCH_ELEMENTS {
+                    return Err(format!(
+                        "batch_open_shares has {} elements (max {})",
+                        shares.len(),
+                        MAX_BATCH_ELEMENTS
+                    ));
+                }
                 let seq = usize::try_from(seq)
                     .map_err(|_| format!("batch_open_shares sequence {seq} exceeds local usize"))?;
                 registry.insert_batch(seq, &type_key, sender_party_id, shares)?
@@ -151,6 +222,35 @@ impl OpenMessageRouter {
                 message,
                 ..
             } => registry.insert_rbc_broadcast(session_id, sender_party_id, message)?,
+            OpenRegistryWireMessage::RbcEcho {
+                session_id,
+                broadcaster_party_id,
+                sender_party_id,
+                digest,
+                message,
+                ..
+            } => registry.insert_rbc_relay(
+                false,
+                session_id,
+                broadcaster_party_id,
+                sender_party_id,
+                digest,
+                Some(message),
+            )?,
+            OpenRegistryWireMessage::RbcReady {
+                session_id,
+                broadcaster_party_id,
+                sender_party_id,
+                digest,
+                ..
+            } => registry.insert_rbc_relay(
+                true,
+                session_id,
+                broadcaster_party_id,
+                sender_party_id,
+                digest,
+                None,
+            )?,
         }
         Ok(true)
     }
@@ -344,4 +444,30 @@ impl OpenMessageRouter {
         }
         Ok(true)
     }
+}
+
+fn is_batch_capacity_error(error: &str) -> bool {
+    error.starts_with("batch_open_shares ")
+        && (error.contains("budget is full")
+            || error.contains("quota is full")
+            || error.contains("budget exceeded"))
+}
+
+fn batch_frame_fits_empty_retention_window(payload: &[u8]) -> bool {
+    let Some(body) = payload.strip_prefix(OPEN_REGISTRY_WIRE_PREFIX) else {
+        return false;
+    };
+    let Ok(message) = bincode::deserialize::<OpenRegistryWireMessage>(body) else {
+        return false;
+    };
+    let OpenRegistryWireMessage::Batch { shares, .. } = message else {
+        return false;
+    };
+    if shares.len() > MAX_PENDING_BATCH_POSITIONS_PER_SENDER {
+        return false;
+    }
+    shares
+        .iter()
+        .try_fold(0usize, |total, share| total.checked_add(share.len()))
+        .is_some_and(|bytes| bytes <= MAX_PENDING_BATCH_BYTES_PER_SENDER)
 }

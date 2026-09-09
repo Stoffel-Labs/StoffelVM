@@ -7,8 +7,10 @@ use crate::net::curve::clear_share_value_to_vm_value;
 use crate::net::mpc_engine::{AsyncMpcEngine, MpcEngine, MpcExponentGroup, MpcPartyId};
 use crate::net::share_runtime::ensure_matching_share_data_format;
 use crate::runtime_hooks::{HookCallTarget, HookEvent};
+#[cfg(test)]
+use crate::runtime_instruction::RuntimeInstruction;
 use crate::runtime_instruction::{
-    FetchedInstruction, RuntimeBinaryOp, RuntimeInstruction, RuntimeRegister,
+    FetchedInstruction, RuntimeBinaryOp, RuntimeOpcode, RuntimeRegister,
 };
 use crate::runtime_value_ops::{bool_or_data, bool_xor_data, matching_share_pair};
 use crate::value_conversions::{u64_to_vm_i64, usize_to_vm_i64};
@@ -550,10 +552,13 @@ impl PendingMpcBuiltinCall {
                 CompletedMpcBuiltinResult::ByteArray(bytes)
             }
             PendingMpcBuiltinOperation::Random { share_type } => {
-                let share_data = engine
-                    .random_share_async(share_type)
-                    .await
-                    .map_mpc_backend_err("async_random_share")?;
+                let share_data = match engine.try_random_share_cached(share_type) {
+                    Some(result) => result.map_mpc_backend_err("cached_random_share")?,
+                    None => engine
+                        .random_share_async(share_type)
+                        .await
+                        .map_mpc_backend_err("async_random_share")?,
+                };
                 CompletedMpcBuiltinResult::ShareObject {
                     share_type,
                     share_data,
@@ -707,8 +712,9 @@ impl VMState {
         fetched: FetchedInstruction<'_>,
         hooks_enabled: bool,
     ) -> VmResult<Option<PendingMpcOperation>> {
-        match fetched.runtime_instruction() {
-            RuntimeInstruction::LoadImmediate { dest, value } => {
+        match fetched.opcode() {
+            RuntimeOpcode::LoadImmediate => {
+                let dest = fetched.register_a();
                 if !self
                     .current_register_layout()?
                     .is_secret(dest.register_index())
@@ -716,14 +722,50 @@ impl VMState {
                     return Ok(None);
                 }
 
-                PendingMpcOperation::input_share(dest, fetched.load_immediate_value(&value)?)
+                PendingMpcOperation::input_share(dest, fetched.direct_load_immediate_value()?)
             }
-            RuntimeInstruction::Call { function } => self
-                .plan_async_mpc_builtin_call(fetched.call_target_name(&function)?, hooks_enabled),
-            instruction => self.plan_async_mpc_operation(&instruction, hooks_enabled),
+            RuntimeOpcode::Move => {
+                let dest = fetched.register_a();
+                let src = fetched.register_b();
+                if self
+                    .current_register_layout()?
+                    .move_kind(dest.register_index(), src.register_index())
+                    != RegisterMoveKind::SecretToClear
+                {
+                    return Ok(None);
+                }
+
+                let src_value = self.resolve_register(src)?.into_value();
+                Ok(PendingMpcOperation::open_share(src, dest, src_value))
+            }
+            RuntimeOpcode::Multiply => {
+                let dest = fetched.register_a();
+                let (left, right) = self
+                    .resolve_register_pair(fetched.register_b(), fetched.register_c())?
+                    .into_values();
+                PendingMpcOperation::multiply_share(dest, left, right)
+            }
+            opcode @ (RuntimeOpcode::BitAnd | RuntimeOpcode::BitOr | RuntimeOpcode::BitXor) => {
+                let op = match opcode {
+                    RuntimeOpcode::BitAnd => RuntimeBinaryOp::BitAnd,
+                    RuntimeOpcode::BitOr => RuntimeBinaryOp::BitOr,
+                    RuntimeOpcode::BitXor => RuntimeBinaryOp::BitXor,
+                    _ => unreachable!("matched boolean runtime opcode"),
+                };
+                let dest = fetched.register_a();
+                let (left, right) = self
+                    .resolve_register_pair(fetched.register_b(), fetched.register_c())?
+                    .into_values();
+                PendingMpcOperation::boolean_bit_share(op, dest, left, right)
+            }
+            RuntimeOpcode::Call => {
+                self.plan_async_mpc_builtin_call(fetched.direct_call_target_name()?, hooks_enabled)
+            }
+            _ => Ok(None),
         }
     }
 
+    #[cfg(test)]
     pub(super) fn plan_async_mpc_operation(
         &mut self,
         instruction: &RuntimeInstruction,
@@ -869,7 +911,7 @@ impl VMState {
                     _ => {
                         return Err(VmError::Message(
                             "completed boolean bit operation used a non-bitwise opcode".to_string(),
-                        ))
+                        ));
                     }
                 };
                 self.write_current_register(

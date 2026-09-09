@@ -20,6 +20,28 @@ impl MpcShareRuntime<'_> {
             .map_mpc_backend_err("multiply_share")
     }
 
+    pub(crate) fn batch_multiply_share_data(
+        &self,
+        share_type: ShareType,
+        left_data: &[ShareData],
+        right_data: &[ShareData],
+    ) -> VmResult<Vec<ShareData>> {
+        self.ensure_ready()?;
+        if left_data.len() != right_data.len() {
+            return Err("batch multiplication requires matching input lengths".into());
+        }
+        let mut pairs = Vec::with_capacity(left_data.len());
+        for (left, right) in left_data.iter().zip(right_data) {
+            ensure_matching_share_data_format("batch_multiply_shares", left, right)?;
+            pairs.push((left.as_bytes().to_vec(), right.as_bytes().to_vec()));
+        }
+        self.engine
+            .multiplication_ops()
+            .map_mpc_backend_err("multiplication_ops")?
+            .batch_multiply_shares(share_type, &pairs)
+            .map_mpc_backend_err("batch_multiply_shares")
+    }
+
     pub(crate) fn add_data(
         &self,
         ty: ShareType,
@@ -32,6 +54,13 @@ impl MpcShareRuntime<'_> {
             .add_share_local(ty, lhs_data.as_bytes(), rhs_data.as_bytes())
             .map_mpc_backend_err("add_share_local")?;
         self.preserve_share_data_format(lhs_data, result)
+    }
+
+    pub(crate) fn sum_data(&self, ty: ShareType, shares: &[ShareData]) -> VmResult<ShareData> {
+        ensure_homogeneous_share_data_format("sum_shares_local", shares)?;
+        self.engine
+            .sum_share_data_local(ty, shares)
+            .map_mpc_backend_err("sum_share_data_local")
     }
 
     pub(crate) fn sub_data(

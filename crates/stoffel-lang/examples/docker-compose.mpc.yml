@@ -3,6 +3,8 @@
 # Usage:
 #   STOFFEL_PROGRAM_NAME=mpc_runtime_info.stflb \
 #     docker compose -f examples/docker-compose.mpc.yml up --build
+# STOFFEL_EXECUTION_ID defaults to an example-only constant below; use a fresh shared nonzero
+# 64-hex-character value for each real or overlapping invocation.
 #
 # For threshold ECDSA:
 #   STOFFEL_PROGRAM_NAME=threshold_signatures_threshold_ecdsa_secp256k1.stflb \
@@ -15,8 +17,8 @@ x-party-common: &party-common
     context: ${STOFFEL_VM_DIR:-../../..}
     dockerfile: Dockerfile
     additional_contexts:
-      coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#feature/no-feature-gates-and-multi-type-awareness}"
-      network: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#feature/robust-identity-based-on-cert}"
+      coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0}"
+      networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1}"
   volumes:
     - ${STOFFEL_EXAMPLES_OUT:-./dist}:/app/examples:ro
     - stoffel-local-store:/app/local-store
@@ -30,6 +32,7 @@ x-party-common: &party-common
     STOFFEL_ENTRY: ${STOFFEL_ENTRY:-main}
     STOFFEL_MPC_BACKEND: ${STOFFEL_MPC_BACKEND:-honeybadger}
     STOFFEL_MPC_CURVE: ${STOFFEL_MPC_CURVE:-bls12-381}
+    STOFFEL_EXECUTION_ID: "${STOFFEL_EXECUTION_ID:-0000000000000000000000000000000000000000000000000000000000000001}"
     STOFFEL_LOCAL_STORE: /app/local-store/party-${STOFFEL_PARTY_ID:-0}.redb
     RUST_LOG: ${RUST_LOG:-info}
     RUST_BACKTRACE: "1"

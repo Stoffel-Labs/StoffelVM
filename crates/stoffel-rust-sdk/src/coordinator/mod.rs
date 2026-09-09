@@ -8,4 +8,6 @@ pub mod offchain;
 pub use offchain::{
     ClientIdentity, OffChainCoordinator, OffChainCoordinatorClient, OffChainCoordinatorServer,
 };
-pub use stoffel_mpc_coordinator_shared::{Coordinator, CoordinatorError, Round, ShareBound};
+pub use stoffel_mpc_coordinator_shared::{
+    Coordinator, CoordinatorError, ExecutionId, Round, ShareBound,
+};

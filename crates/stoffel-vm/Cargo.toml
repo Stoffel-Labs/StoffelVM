@@ -1,7 +1,7 @@
 [package]
 name = "stoffel-vm"
 authors = ["Gabriel Arrouye"]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Register-based virtual machine runtime and MPC execution engine for Stoffel programs"
 license = "Apache-2.0"
@@ -17,14 +17,14 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 libc = "=0.2.186"
-stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.1" }
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.1", features = ["statistics"] }
 stoffelnet = "=0.1.1"
-stoffel-vm-types = { version = "=0.1.2", path = "../stoffel-vm-types" }
+stoffel-vm-types = { version = "=0.2.0", path = "../stoffel-vm-types" }
 alloy = "=1.8.3"
 alloy-primitives = "=1.6.0"
 x509-parser = "=0.18.1"
 
-async-trait = "=0.1.89"
+async-trait = "=0.1.92"
 redb = "=2.6.3"
 tokio = { version = "=1.52.3", features = ["full"] }
 quinn = { version = "=0.11.11", features = ["default", "rustls", "ring"] }
@@ -74,12 +74,13 @@ default = []
 hb_itest = []
 avss_itest = []
 nat = []
+statistics = []
 
 [dev-dependencies]
 criterion = { version = "=0.6.0", features = ["html_reports"] }
 k256 = { version = "=0.13.4", features = ["ecdsa"] }
 p256 = { version = "=0.13.2", features = ["ecdsa"] }
-stoffellang = { version = "=0.1.2", path = "../stoffel-lang" }
+stoffellang = { version = "=0.2.0", path = "../stoffel-lang" }
 tempfile = "=3.27.0"
 turmoil = "=0.7.2"
 

@@ -3,9 +3,17 @@ use crate::net::mpc_engine::{
     MpcSessionTopologyError, MpcThreshold,
 };
 use crate::net::open_registry::OpenMessageRouter;
+use crate::net::session::{derive_execution_id_for_instance, ExecutionId};
 use std::sync::Arc;
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::transports::quic::QuicNetworkManager;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DeploymentMode {
+    #[default]
+    OneShot,
+    Standing,
+}
 
 /// Common MPC engine session wiring shared by backend implementations.
 ///
@@ -18,6 +26,7 @@ pub struct MpcSessionConfig {
     topology: MpcSessionTopology,
     local_identity: DurableIdentityDigest,
     network: Arc<QuicNetworkManager>,
+    execution_id: ExecutionId,
     input_ids: Vec<ClientId>,
     open_message_router: Arc<OpenMessageRouter>,
 }
@@ -39,6 +48,7 @@ impl MpcSessionConfig {
             topology,
             local_identity: DurableIdentityDigest::from_legacy_party_id(topology.party_id()),
             network,
+            execution_id: derive_execution_id_for_instance(topology.instance_id()),
             input_ids: Vec::new(),
             open_message_router: Arc::new(OpenMessageRouter::new()),
         }
@@ -72,6 +82,11 @@ impl MpcSessionConfig {
         Arc::clone(&self.network)
     }
 
+    /// Full identity carried by this session's transport envelope.
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
     pub fn input_ids(&self) -> &[ClientId] {
         &self.input_ids
     }
@@ -103,6 +118,17 @@ impl MpcSessionConfig {
         self
     }
 
+    pub fn try_with_execution_id(
+        mut self,
+        execution_id: ExecutionId,
+    ) -> Result<Self, MpcSessionExecutionError> {
+        if execution_id.is_zero() {
+            return Err(MpcSessionExecutionError::ZeroExecutionId);
+        }
+        self.execution_id = execution_id;
+        Ok(self)
+    }
+
     pub fn with_input_ids(mut self, input_ids: Vec<ClientId>) -> Self {
         self.input_ids = input_ids;
         self
@@ -112,6 +138,12 @@ impl MpcSessionConfig {
         self.open_message_router = router;
         self
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MpcSessionExecutionError {
+    #[error("execution-scoped MPC sessions require a nonzero execution ID")]
+    ZeroExecutionId,
 }
 
 #[cfg(test)]
@@ -143,6 +175,10 @@ mod tests {
         assert_eq!(config.input_ids(), &[10, 11]);
         assert!(Arc::ptr_eq(&config.network(), &network));
         assert!(Arc::ptr_eq(&config.open_message_router(), &router));
+        assert_eq!(
+            config.execution_id(),
+            derive_execution_id_for_instance(config.instance().id())
+        );
     }
 
     #[test]
@@ -167,5 +203,23 @@ mod tests {
                 n_parties: 2
             })
         ));
+    }
+
+    #[test]
+    fn session_config_accepts_only_nonzero_execution_scope() {
+        let network = Arc::new(QuicNetworkManager::new());
+        let execution_id = ExecutionId::from_bytes([7; 32]);
+        let config = MpcSessionConfig::try_new(42, 1, 4, 1, Arc::clone(&network))
+            .unwrap()
+            .try_with_execution_id(execution_id)
+            .unwrap();
+        assert_eq!(config.execution_id(), execution_id);
+
+        let error = MpcSessionConfig::try_new(42, 1, 4, 1, network)
+            .unwrap()
+            .try_with_execution_id(ExecutionId::from([0; 32]))
+            .err()
+            .expect("zero scope must be rejected");
+        assert_eq!(error, MpcSessionExecutionError::ZeroExecutionId);
     }
 }

@@ -128,6 +128,38 @@ impl ClientInputStore {
         Ok(total_shares)
     }
 
+    /// Replace all robust client inputs, optionally attaching per-share type
+    /// metadata for each client.
+    ///
+    /// Every share is serialized and validated before the single atomic store
+    /// replacement. This is the preferred hydration boundary for runners that
+    /// receive a complete execution input snapshot.
+    pub fn try_replace_client_input_with_types<F, I>(
+        &self,
+        inputs: I,
+    ) -> Result<usize, ClientInputStoreError>
+    where
+        F: ark_ff::FftField,
+        I: IntoIterator<Item = (ClientId, Vec<RobustShare<F>>, Option<Vec<ShareType>>)>,
+    {
+        let mut total_shares = 0;
+        let mut prepared = Vec::new();
+
+        for (client_id, shares, share_types) in inputs {
+            let client_shares = match share_types {
+                Some(share_types) => {
+                    Self::robust_client_shares_with_types(client_id, shares, &share_types)?
+                }
+                None => Self::robust_client_shares(client_id, shares, None)?,
+            };
+            total_shares += client_shares.len();
+            prepared.push((client_id, client_shares));
+        }
+
+        self.replace_client_shares(prepared);
+        Ok(total_shares)
+    }
+
     /// Store robust shares with VM-level type metadata.
     pub fn store_client_input_with_type<F>(
         &self,

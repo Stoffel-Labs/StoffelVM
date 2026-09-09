@@ -4,7 +4,24 @@ use crate::vm_state::{CallStackCheckpoint, VMState, VmEffectKind, VmExecutionBud
 use std::time::{Duration, Instant};
 use stoffel_vm_types::core_types::Value;
 
-const DEFAULT_LOCAL_INSTRUCTION_BUDGET: usize = 1024;
+// A 32K slice remains short compared with online MPC effects while reducing
+// executor wakeups for local loop-heavy bytecode. Deployments that need tighter
+// cooperative latency can override it with STOFFEL_VM_LOCAL_INSTRUCTION_BUDGET.
+pub(super) const DEFAULT_LOCAL_INSTRUCTION_BUDGET: usize = 32_768;
+pub(super) const DEFAULT_COMPLETED_EFFECT_BUDGET: usize = 64;
+
+/// Observable evidence that one VM invocation used the cooperative async
+/// scheduler instead of monopolising an executor thread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VmCooperativeExecutionMetrics {
+    /// Number of times local instruction execution exhausted its fair-use
+    /// budget and explicitly yielded to Tokio.
+    pub instruction_budget_yields: u64,
+    /// Number of online MPC effects handed to the async engine. This is a VM
+    /// scheduling boundary, but the engine future may complete immediately and
+    /// therefore does not by itself prove that Tokio scheduled another task.
+    pub online_effect_yields: u64,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AsyncEffectScheduler {
@@ -13,7 +30,12 @@ pub(crate) struct AsyncEffectScheduler {
 
 impl Default for AsyncEffectScheduler {
     fn default() -> Self {
-        Self::new(DEFAULT_LOCAL_INSTRUCTION_BUDGET)
+        let local_instruction_budget = std::env::var("STOFFEL_VM_LOCAL_INSTRUCTION_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_LOCAL_INSTRUCTION_BUDGET);
+        Self::new(local_instruction_budget)
     }
 }
 
@@ -24,23 +46,25 @@ impl AsyncEffectScheduler {
         }
     }
 
-    pub(crate) async fn execute_to_depth<E: AsyncMpcEngine + ?Sized>(
+    pub(crate) async fn execute_to_depth_with_metrics<E: AsyncMpcEngine + ?Sized>(
         self,
         state: &mut VMState,
         checkpoint: CallStackCheckpoint,
         engine: &E,
-    ) -> VmResult<Value> {
+    ) -> VmResult<(Value, VmCooperativeExecutionMetrics)> {
         let mut engine_identity_checked = false;
         let mut progress = AsyncMpcProgress::from_env();
+        let mut completed_effects_since_yield = 0usize;
 
         loop {
             match state.run_until_effect_or_budget_to_depth(checkpoint, self.local_budget)? {
                 VmRunSlice::Complete(value) => {
                     progress.report_final();
-                    return Ok(value);
+                    return Ok((value, progress.cooperative_metrics()));
                 }
                 VmRunSlice::BudgetExhausted => {
-                    progress.record_budget_yield();
+                    completed_effects_since_yield = 0;
+                    progress.record_instruction_budget_yield();
                     tokio::task::yield_now().await;
                 }
                 VmRunSlice::Yield(effect) => {
@@ -68,6 +92,16 @@ impl AsyncEffectScheduler {
                     };
                     progress.record_effect_completion(summary, effect_started_at.elapsed());
                     state.apply_completed_vm_effect(completed)?;
+
+                    // Cached or preprocessed effects may complete on their
+                    // first poll. A fixed completed-effect budget is enough to
+                    // bound executor monopolization without tracking the poll
+                    // history of every protocol future.
+                    completed_effects_since_yield = completed_effects_since_yield.saturating_add(1);
+                    if completed_effects_since_yield >= DEFAULT_COMPLETED_EFFECT_BUDGET {
+                        completed_effects_since_yield = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
         }
@@ -81,7 +115,7 @@ struct AsyncMpcProgress {
     profile_enabled: bool,
     started_at: Instant,
     last_report_at: Instant,
-    budget_yields: u64,
+    instruction_budget_yields: u64,
     effects: u64,
     effect_time: Duration,
     slowest_effect: Option<(VmEffectKind, usize, Duration)>,
@@ -132,7 +166,7 @@ impl AsyncMpcProgress {
             profile_enabled,
             started_at: now,
             last_report_at: now,
-            budget_yields: 0,
+            instruction_budget_yields: 0,
             effects: 0,
             effect_time: Duration::ZERO,
             slowest_effect: None,
@@ -162,9 +196,16 @@ impl AsyncMpcProgress {
         }
     }
 
-    fn record_budget_yield(&mut self) {
-        self.budget_yields = self.budget_yields.saturating_add(1);
+    fn record_instruction_budget_yield(&mut self) {
+        self.instruction_budget_yields = self.instruction_budget_yields.saturating_add(1);
         self.report_if_due();
+    }
+
+    fn cooperative_metrics(&self) -> VmCooperativeExecutionMetrics {
+        VmCooperativeExecutionMetrics {
+            instruction_budget_yields: self.instruction_budget_yields,
+            online_effect_yields: self.effects,
+        }
     }
 
     fn record_effect(&mut self, summary: crate::vm_state::VmEffectSummary) {
@@ -277,11 +318,11 @@ impl AsyncMpcProgress {
             0.0
         };
         eprintln!(
-            "[vm async mpc {label}] elapsed={:.1}s effects={} rate={:.2}/s budget_yields={} input={} mul={} bool={} open={} builtin_input={} builtin_mul={} batch_mul={} batch_mul_items={} builtin_open={} batch_open={} batch_open_items={} builtin_other={}",
+            "[vm async mpc {label}] elapsed={:.1}s effects={} rate={:.2}/s instruction_budget_yields={} input={} mul={} bool={} open={} builtin_input={} builtin_mul={} batch_mul={} batch_mul_items={} builtin_open={} batch_open={} batch_open_items={} builtin_other={}",
             elapsed,
             self.effects,
             effect_rate,
-            self.budget_yields,
+            self.instruction_budget_yields,
             self.inputs,
             self.multiplies,
             self.boolean_bits,

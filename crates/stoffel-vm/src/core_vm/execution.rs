@@ -1,4 +1,4 @@
-use super::effect_scheduler::AsyncEffectScheduler;
+use super::effect_scheduler::{AsyncEffectScheduler, VmCooperativeExecutionMetrics};
 use super::VirtualMachine;
 use crate::foreign_functions::ForeignFunctionContext;
 use crate::net::mpc_engine::AsyncMpcEngine;
@@ -54,13 +54,13 @@ impl VirtualMachine {
         Ok(self.state.execute_until_return_to_depth(base_depth)?)
     }
 
-    async fn execute_vm_entry_async_with_args<E, F>(
+    async fn execute_vm_entry_async_with_args_and_metrics<E, F>(
         &mut self,
         function_name: &str,
         args: &[Value],
         async_engine: &E,
         foreign_error: F,
-    ) -> VirtualMachineResult<Value>
+    ) -> VirtualMachineResult<(Value, VmCooperativeExecutionMetrics)>
     where
         E: AsyncMpcEngine + ?Sized,
         F: FnOnce(&str) -> VmError,
@@ -69,7 +69,7 @@ impl VirtualMachine {
             .state
             .push_entry_frame(function_name, args, foreign_error)?;
         let result = AsyncEffectScheduler::default()
-            .execute_to_depth(&mut self.state, base_depth, async_engine)
+            .execute_to_depth_with_metrics(&mut self.state, base_depth, async_engine)
             .await;
         if result.is_err() {
             self.state.unwind_call_stack_to(base_depth);
@@ -114,6 +114,22 @@ impl VirtualMachine {
             .await
     }
 
+    /// Execute a zero-argument VM function through the cooperative scheduler
+    /// and return scheduler yield counters with the value.
+    pub async fn execute_async_with_metrics<E: AsyncMpcEngine + ?Sized>(
+        &mut self,
+        main_function: &str,
+        async_engine: &E,
+    ) -> VirtualMachineResult<(Value, VmCooperativeExecutionMetrics)> {
+        self.execute_vm_entry_async_with_args_and_metrics(
+            main_function,
+            &[],
+            async_engine,
+            Self::foreign_entry_error,
+        )
+        .await
+    }
+
     /// Execute a VM function with arguments using async MPC operations.
     ///
     /// The entry point must be a VM function. Foreign functions are synchronous
@@ -124,13 +140,14 @@ impl VirtualMachine {
         args: &[Value],
         async_engine: &E,
     ) -> VirtualMachineResult<Value> {
-        self.execute_vm_entry_async_with_args(
+        self.execute_vm_entry_async_with_args_and_metrics(
             main_function,
             args,
             async_engine,
             Self::foreign_entry_error,
         )
         .await
+        .map(|(value, _)| value)
     }
 
     /// Execute multiple zero-argument VM entry points concurrently.
@@ -139,6 +156,15 @@ impl VirtualMachine {
     /// Instruction execution remains synchronous within a task, while async MPC
     /// effects yield back to the async scheduler so other entries can progress.
     /// Results are returned in the same order as the requested entry points.
+    ///
+    /// # Shared engine ordering
+    ///
+    /// Every invocation uses the same `async_engine`. Backends must therefore
+    /// provide an invocation-scoped protocol lane, or callers must guarantee the
+    /// same effect ordering on every party. The HoneyBadger and AVSS engines use
+    /// engine-shared protocol counters and do not currently provide such a lane.
+    /// A standing multi-program host must give each admitted job its own engine
+    /// and execution envelope instead of using this method for unrelated jobs.
     pub async fn execute_many_async<E, I, S>(
         &self,
         function_names: I,
@@ -158,10 +184,11 @@ impl VirtualMachine {
 
     /// Execute multiple VM entry-point invocations concurrently.
     ///
-    /// This is the composable async boundary for running multiple VM programs
-    /// over one MPC engine. The current VM acts as a template: every invocation
-    /// gets an independent runtime clone, and the shared async MPC engine is
-    /// awaited only when a VM task yields an online MPC effect.
+    /// The current VM acts as a template: every invocation gets an independent
+    /// runtime clone, and the shared async MPC engine is awaited only when a VM
+    /// task yields an online MPC effect. See
+    /// [`VirtualMachine::execute_many_async`] for the shared-engine protocol
+    /// ordering constraint.
     pub async fn execute_many_async_with_args<E, I>(
         &self,
         invocations: I,
@@ -236,6 +263,12 @@ impl VirtualMachine {
         Ok(Self {
             state: self.state.try_clone_with_independent_runtime()?,
         })
+    }
+
+    /// Clear configured LocalStorage for a new isolated runtime execution.
+    pub fn clear_local_storage(&mut self) -> VirtualMachineResult<()> {
+        self.state.clear_local_storage()?;
+        Ok(())
     }
 
     fn foreign_entry_error(function: &str) -> VmError {

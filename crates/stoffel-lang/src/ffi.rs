@@ -704,5 +704,5 @@ pub unsafe extern "C" fn stoffel_free_compiler_errors(errors: *const CCompilerEr
 ///
 /// The returned pointer is static and must not be freed.
 pub unsafe extern "C" fn stoffel_get_version() -> *const c_char {
-    c"0.1.0".as_ptr()
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
 }

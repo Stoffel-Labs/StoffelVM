@@ -66,6 +66,9 @@ pub trait LocalStorage: Send + Sync {
 
     /// Checks if a key exists.
     fn exists(&self, key: &[u8]) -> LocalStorageResult<bool>;
+
+    /// Removes all data from this storage namespace.
+    fn clear(&mut self) -> LocalStorageResult<()>;
 }
 
 /// Value-oriented extension methods for [`LocalStorage`] implementations.
@@ -120,12 +123,17 @@ pub trait LocalStorageValues: LocalStorage {
 
 impl<T> LocalStorageValues for T where T: LocalStorage + ?Sized {}
 
-// Define the table for storing key-value pairs
+// All views share one table. The scope prefix keeps one-shot and concurrent
+// execution state disjoint without maintaining two storage implementations.
 const DATA_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("data_kv_store");
+const NAMESPACE_KEY_FORMAT_VERSION: u8 = 1;
+const NAMESPACE_CLEAR_BATCH_KEYS: usize = 256;
 
 /// Implementation of LocalStorage using the redb library.
+#[derive(Clone)]
 pub struct RedbLocalStorage {
     db: Arc<Database>,
+    namespace: Option<[u8; 32]>,
 }
 
 impl RedbLocalStorage {
@@ -158,7 +166,66 @@ impl RedbLocalStorage {
                 reason: error.to_string(),
             })?;
 
-        Ok(RedbLocalStorage { db: Arc::new(db) })
+        Ok(RedbLocalStorage {
+            db: Arc::new(db),
+            namespace: None,
+        })
+    }
+
+    /// Returns a storage view isolated to one execution ID without reopening the database.
+    #[must_use]
+    pub fn with_namespace(&self, namespace: [u8; 32]) -> Self {
+        Self {
+            db: Arc::clone(&self.db),
+            namespace: Some(namespace),
+        }
+    }
+
+    fn scope_prefix(&self) -> Vec<u8> {
+        match self.namespace {
+            Some(namespace) => {
+                let mut prefix = Vec::with_capacity(2 + namespace.len());
+                prefix.extend_from_slice(&[NAMESPACE_KEY_FORMAT_VERSION, 1]);
+                prefix.extend_from_slice(&namespace);
+                prefix
+            }
+            None => vec![NAMESPACE_KEY_FORMAT_VERSION, 0],
+        }
+    }
+
+    fn storage_key(&self, key: &[u8]) -> Vec<u8> {
+        let mut storage_key = self.scope_prefix();
+        storage_key.extend_from_slice(key);
+        storage_key
+    }
+
+    fn clear_batch(&mut self, maximum_keys: usize) -> LocalStorageResult<usize> {
+        let prefix = self.scope_prefix();
+        let mut upper_bound = prefix.clone();
+        let last_non_max = upper_bound
+            .iter()
+            .rposition(|byte| *byte != u8::MAX)
+            .expect("versioned namespace prefix has a finite upper bound");
+        upper_bound[last_non_max] += 1;
+        upper_bound.truncate(last_non_max + 1);
+
+        self.with_write_txn(|table| {
+            let entries = table
+                .extract_from_if(prefix.as_slice()..upper_bound.as_slice(), |_, _| true)
+                .map_err(|error| LocalStorageError::Operation {
+                    operation: "scan storage scope",
+                    reason: error.to_string(),
+                })?;
+            let mut removed = 0;
+            for entry in entries.take(maximum_keys) {
+                entry.map_err(|error| LocalStorageError::Operation {
+                    operation: "remove storage key",
+                    reason: error.to_string(),
+                })?;
+                removed += 1;
+            }
+            Ok(removed)
+        })
     }
 
     fn with_write_txn<F, R>(&mut self, operation: F) -> LocalStorageResult<R>
@@ -197,9 +264,10 @@ impl RedbLocalStorage {
 
 impl LocalStorage for RedbLocalStorage {
     fn store(&mut self, key: &[u8], value: &[u8]) -> LocalStorageResult<()> {
+        let key = self.storage_key(key);
         self.with_write_txn(|table| {
             table
-                .insert(key, value)
+                .insert(key.as_slice(), value)
                 .map_err(|error| LocalStorageError::Operation {
                     operation: "insert",
                     reason: error.to_string(),
@@ -209,6 +277,7 @@ impl LocalStorage for RedbLocalStorage {
     }
 
     fn retrieve(&self, key: &[u8]) -> LocalStorageResult<Option<Vec<u8>>> {
+        let key = self.storage_key(key);
         let read_txn = self
             .db
             .begin_read()
@@ -224,7 +293,7 @@ impl LocalStorage for RedbLocalStorage {
             })?;
 
         match table
-            .get(key)
+            .get(key.as_slice())
             .map_err(|error| LocalStorageError::Operation {
                 operation: "get",
                 reason: error.to_string(),
@@ -235,9 +304,10 @@ impl LocalStorage for RedbLocalStorage {
     }
 
     fn delete(&mut self, key: &[u8]) -> LocalStorageResult<bool> {
+        let key = self.storage_key(key);
         self.with_write_txn(|table| {
             let existed = table
-                .remove(key)
+                .remove(key.as_slice())
                 .map_err(|error| LocalStorageError::Operation {
                     operation: "remove",
                     reason: error.to_string(),
@@ -250,14 +320,24 @@ impl LocalStorage for RedbLocalStorage {
     fn exists(&self, key: &[u8]) -> LocalStorageResult<bool> {
         self.retrieve(key).map(|opt| opt.is_some())
     }
+
+    fn clear(&mut self) -> LocalStorageResult<()> {
+        loop {
+            let removed = self.clear_batch(NAMESPACE_CLEAR_BATCH_KEYS)?;
+            if removed < NAMESPACE_CLEAR_BATCH_KEYS {
+                return Ok(());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalStorage, LocalStorageValues, RedbLocalStorage};
+    use super::{LocalStorage, LocalStorageValues, RedbLocalStorage, DATA_TABLE};
     use crate::net::mpc_engine::DurableIdentityDigest;
     use crate::storage::PersistentShareContext;
     use crate::storage::PersistentValueContext;
+    use std::sync::{Arc, Barrier};
     use stoffel_vm_types::core_types::{
         ObjectStore, ShareData, ShareType, TableMemory, TableRef, Value,
     };
@@ -306,6 +386,184 @@ mod tests {
             storage.retrieve(b"key").expect("retrieve"),
             Some(b"value".to_vec())
         );
+
+        let read_txn = storage.db.begin_read().expect("begin raw read");
+        let table = read_txn.open_table(DATA_TABLE).expect("open data table");
+        let storage_key = storage.storage_key(b"key");
+        assert_eq!(
+            table
+                .get(storage_key.as_slice())
+                .expect("read encoded key")
+                .expect("encoded key exists")
+                .value(),
+            b"value"
+        );
+    }
+
+    #[test]
+    fn redb_storage_clear_removes_all_entries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("local.redb");
+        let mut storage = RedbLocalStorage::new(&path).expect("open storage");
+
+        storage.store(b"a", b"1").expect("store a");
+        storage.store(b"b", b"2").expect("store b");
+        storage.clear().expect("clear storage");
+
+        assert_eq!(storage.retrieve(b"a").expect("retrieve a"), None);
+        assert_eq!(storage.retrieve(b"b").expect("retrieve b"), None);
+
+        drop(storage);
+        let storage = RedbLocalStorage::new(&path).expect("reopen storage");
+        assert_eq!(storage.retrieve(b"a").expect("retrieve a"), None);
+        assert_eq!(storage.retrieve(b"b").expect("retrieve b"), None);
+    }
+
+    #[test]
+    fn redb_namespaces_isolate_the_same_key_from_unscoped_data() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("local.redb");
+        let mut storage = RedbLocalStorage::new(&path).expect("open storage");
+        let mut first = storage.with_namespace([0xA1; 32]);
+        let mut second = storage.with_namespace([0xB2; 32]);
+
+        assert!(Arc::ptr_eq(&storage.db, &first.db));
+        assert!(Arc::ptr_eq(&storage.db, &second.db));
+
+        storage
+            .store(b"state", b"unscoped")
+            .expect("store unscoped");
+        first.store(b"state", b"first").expect("store first");
+        second.store(b"state", b"second").expect("store second");
+
+        assert_eq!(
+            storage.retrieve(b"state").expect("retrieve unscoped"),
+            Some(b"unscoped".to_vec())
+        );
+        assert_eq!(
+            first.retrieve(b"state").expect("retrieve first"),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            second.retrieve(b"state").expect("retrieve second"),
+            Some(b"second".to_vec())
+        );
+    }
+
+    #[test]
+    fn redb_namespace_delete_and_clear_are_scoped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("local.redb");
+        let mut storage = RedbLocalStorage::new(&path).expect("open storage");
+        let mut first = storage.with_namespace([0xA1; 32]);
+        let mut second = storage.with_namespace([0xB2; 32]);
+
+        storage
+            .store(b"state", b"unscoped")
+            .expect("store unscoped");
+        first.store(b"state", b"first").expect("store first state");
+        first.store(b"other", b"first").expect("store first other");
+        second
+            .store(b"state", b"second")
+            .expect("store second state");
+        second
+            .store(b"other", b"second")
+            .expect("store second other");
+
+        assert!(first.delete(b"state").expect("delete first state"));
+        assert_eq!(first.retrieve(b"state").expect("retrieve first"), None);
+        assert_eq!(
+            second.retrieve(b"state").expect("retrieve second"),
+            Some(b"second".to_vec())
+        );
+
+        first.clear().expect("clear first namespace");
+        assert_eq!(first.retrieve(b"other").expect("retrieve first"), None);
+        assert_eq!(
+            second.retrieve(b"other").expect("retrieve second"),
+            Some(b"second".to_vec())
+        );
+        assert_eq!(
+            storage.retrieve(b"state").expect("retrieve unscoped"),
+            Some(b"unscoped".to_vec())
+        );
+
+        storage.clear().expect("clear unscoped storage");
+        assert_eq!(storage.retrieve(b"state").expect("retrieve unscoped"), None);
+        assert_eq!(
+            second.retrieve(b"state").expect("retrieve second"),
+            Some(b"second".to_vec())
+        );
+    }
+
+    #[test]
+    fn redb_namespace_clear_spans_bounded_transactions() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("local.redb");
+        let storage = RedbLocalStorage::new(&path).expect("open storage");
+        let mut target = storage.with_namespace([0xA1; 32]);
+        let mut sibling = storage.with_namespace([0xB2; 32]);
+
+        for index in 0..(super::NAMESPACE_CLEAR_BATCH_KEYS * 2 + 17) {
+            target
+                .store(&index.to_be_bytes(), b"scratch")
+                .expect("store target scratch state");
+        }
+        sibling
+            .store(b"state", b"preserved")
+            .expect("store sibling state");
+
+        target.clear().expect("clear target in bounded batches");
+        for index in 0..(super::NAMESPACE_CLEAR_BATCH_KEYS * 2 + 17) {
+            assert_eq!(
+                target
+                    .retrieve(&index.to_be_bytes())
+                    .expect("retrieve cleared target state"),
+                None
+            );
+        }
+        assert_eq!(
+            sibling.retrieve(b"state").expect("retrieve sibling"),
+            Some(b"preserved".to_vec())
+        );
+    }
+
+    #[test]
+    fn redb_namespace_views_support_concurrent_writers() {
+        const EXECUTIONS: u8 = 4;
+        const KEYS_PER_EXECUTION: u8 = 16;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("local.redb");
+        let storage = RedbLocalStorage::new(&path).expect("open storage");
+        let barrier = Arc::new(Barrier::new(EXECUTIONS.into()));
+        let mut workers = Vec::new();
+
+        for execution in 0..EXECUTIONS {
+            let mut view = storage.with_namespace([execution; 32]);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for key in 0..KEYS_PER_EXECUTION {
+                    view.store(&[key], &[execution, key])
+                        .expect("concurrent store");
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().expect("worker thread");
+        }
+
+        for execution in 0..EXECUTIONS {
+            let view = storage.with_namespace([execution; 32]);
+            for key in 0..KEYS_PER_EXECUTION {
+                assert_eq!(
+                    view.retrieve(&[key]).expect("retrieve concurrent value"),
+                    Some(vec![execution, key])
+                );
+            }
+        }
     }
 
     #[test]

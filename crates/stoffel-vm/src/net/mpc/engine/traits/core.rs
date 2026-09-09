@@ -86,6 +86,18 @@ pub trait MpcEngine: Send + Sync {
         )
     }
 
+    /// Locally sum a homogeneous share batch.
+    ///
+    /// The default implementation decodes each input once and serializes the
+    /// accumulator once, while preserving its backend-neutral share format.
+    fn sum_share_data_local(
+        &self,
+        ty: ShareType,
+        shares: &[ShareData],
+    ) -> ShareAlgebraResult<ShareData> {
+        crate::net::share_algebra::sum_share_data_for_curve(self.curve_config(), ty, shares)
+    }
+
     /// Locally subtract two shares owned by this party.
     fn sub_share_local(
         &self,
