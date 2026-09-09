@@ -1957,6 +1957,9 @@ where
 
     let total_input_count =
         client_input_total.unwrap_or_else(|| input_ids.len().saturating_mul(client_input_count));
+    if total_input_count == 0 {
+        return Ok(());
+    }
     let profile_clients = input_ids.len();
     mark_input_path_phase(
         InputPathPhase::ReservationRegistryInit,
@@ -5863,14 +5866,14 @@ where
     );
 
     let captured_outputs = engine.drain_client_output_records().await;
-    eprintln!("[party {my_id}] proposing OutputDistribution");
-    coord.send_output().await.map_err(|e| e.to_string())?;
-    coord
-        .wait_for_round(Round::OutputDistribution)
-        .await
-        .map_err(|e| e.to_string())?;
-
     if !captured_outputs.is_empty() {
+        eprintln!("[party {my_id}] proposing OutputDistribution");
+        coord.send_output().await.map_err(|e| e.to_string())?;
+        coord
+            .wait_for_round(Round::OutputDistribution)
+            .await
+            .map_err(|e| e.to_string())?;
+
         let outputs_by_client = group_output_shares_by_client(
             captured_outputs
                 .into_iter()
@@ -6891,15 +6894,6 @@ impl StandingRunnerExecutionHandler {
             .await
             .map_err(|error| format!("VM execution failed: {error}"))?;
 
-        eprintln!("[party {}] proposing OutputDistribution", self.party_id);
-        lifecycle_coord
-            .send_output()
-            .await
-            .map_err(|error| error.to_string())?;
-        lifecycle_coord
-            .wait_for_round(Round::OutputDistribution)
-            .await
-            .map_err(|error| error.to_string())?;
         let outputs_by_client = group_output_shares_by_client(
             engine
                 .drain_client_output_records()
@@ -6907,6 +6901,17 @@ impl StandingRunnerExecutionHandler {
                 .into_iter()
                 .map(|record| (record.client_id, record.shares)),
         );
+        if !outputs_by_client.is_empty() {
+            eprintln!("[party {}] proposing OutputDistribution", self.party_id);
+            lifecycle_coord
+                .send_output()
+                .await
+                .map_err(|error| error.to_string())?;
+            lifecycle_coord
+                .wait_for_round(Round::OutputDistribution)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let mut submissions = Vec::with_capacity(outputs_by_client.len());
         for (client_id, shares) in outputs_by_client {
             let client_key = standing_client_key(admission, client_id).ok_or_else(|| {
@@ -7080,15 +7085,6 @@ impl StandingRunnerExecutionHandler {
             .execute_async_with_metrics(&admission.entry, engine.as_ref())
             .await
             .map_err(|error| format!("VM execution failed: {error}"))?;
-        eprintln!("[party {}] proposing OutputDistribution", self.party_id);
-        lifecycle_coord
-            .send_output()
-            .await
-            .map_err(|error| error.to_string())?;
-        lifecycle_coord
-            .wait_for_round(Round::OutputDistribution)
-            .await
-            .map_err(|error| error.to_string())?;
         let outputs_by_client = group_output_shares_by_client(
             engine
                 .drain_client_output_records()
@@ -7096,6 +7092,17 @@ impl StandingRunnerExecutionHandler {
                 .into_iter()
                 .map(|record| (record.client_id, record.shares)),
         );
+        if !outputs_by_client.is_empty() {
+            eprintln!("[party {}] proposing OutputDistribution", self.party_id);
+            lifecycle_coord
+                .send_output()
+                .await
+                .map_err(|error| error.to_string())?;
+            lifecycle_coord
+                .wait_for_round(Round::OutputDistribution)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let mut submissions = Vec::with_capacity(outputs_by_client.len());
         for (client_id, shares) in outputs_by_client {
             let client_key = standing_client_key(admission, client_id).ok_or_else(|| {
@@ -9609,21 +9616,21 @@ async fn main() {
                         Vec::new()
                     };
 
-                    eprintln!("[party] proposing OutputDistribution");
-                    if let Err(error) = coord.send_output().await {
-                        eprintln!(
-                            "Failed to propose coordinator OutputDistribution round: {error}"
-                        );
-                        exit(13);
-                    }
-                    if let Err(error) = coord.wait_for_round(Round::OutputDistribution).await {
-                        eprintln!(
-                            "Failed waiting for coordinator OutputDistribution round: {error}"
-                        );
-                        exit(13);
-                    }
-
                     if output_share.is_some() || !captured_outputs.is_empty() {
+                        eprintln!("[party] proposing OutputDistribution");
+                        if let Err(error) = coord.send_output().await {
+                            eprintln!(
+                                "Failed to propose coordinator OutputDistribution round: {error}"
+                            );
+                            exit(13);
+                        }
+                        if let Err(error) = coord.wait_for_round(Round::OutputDistribution).await {
+                            eprintln!(
+                                "Failed waiting for coordinator OutputDistribution round: {error}"
+                            );
+                            exit(13);
+                        }
+
                         let mut output_shares_by_client: Vec<
                             Vec<HbCoordinatorShare<ark_bls12_381::Fr>>,
                         > = vec![Vec::new(); output_ids.len()];
