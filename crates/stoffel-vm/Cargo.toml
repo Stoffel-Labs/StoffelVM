@@ -24,7 +24,7 @@ alloy = "=1.8.3"
 alloy-primitives = "=1.6.0"
 x509-parser = "=0.18.1"
 
-async-trait = "=0.1.89"
+async-trait = "=0.1.92"
 redb = "=2.6.3"
 tokio = { version = "=1.52.3", features = ["full"] }
 quinn = { version = "=0.11.11", features = ["default", "rustls", "ring"] }
