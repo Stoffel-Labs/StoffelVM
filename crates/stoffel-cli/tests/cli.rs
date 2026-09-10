@@ -22,8 +22,8 @@ const LOCAL_MPC_TEST_TIMEOUT_SECS: &str = "120";
 
 /// Overwrites the scaffolded `src/main.stfl` with a deterministic two-argument
 /// addition program so named-input run flows have a stable, cleartext-safe
-/// `main(a, b)` to exercise. The default `init` template is a no-argument random
-/// boolean circuit, which neither accepts named inputs nor runs without an MPC
+/// `main(a, b)` to exercise. The default `init` template uses ClientStore IO,
+/// which neither accepts named inputs nor runs without an MPC
 /// engine, so tests that assert on `--input a=.. --input b=..` results write this
 /// program after `init` (and before any `build`).
 fn write_addition_program(project_dir: &std::path::Path) {
@@ -85,26 +85,42 @@ fn init_creates_default_project() {
     assert!(temp.path().join("hello/src/main.rs").exists());
     assert!(!temp.path().join("hello/src/stoffel_bindings.rs").exists());
     let program = fs::read_to_string(temp.path().join("hello/src/main.stfl")).unwrap();
-    assert!(program.contains("def gate_and(a: secret bool, b: secret bool) -> secret bool"));
-    assert!(program.contains("var x: secret bool = Share.random()"));
-    assert!(program.contains("return result.reveal()"));
+    assert!(program.contains("ClientStore.take_share(0, 0)"));
+    assert!(program.contains("MpcOutput.send_to_client(0, [doubled])"));
+    assert!(!program.contains(".open()"));
+    assert!(!program.contains(".reveal()"));
     let cargo_toml = fs::read_to_string(temp.path().join("hello/Cargo.toml")).unwrap();
     assert!(cargo_toml.contains("stoffel-rust-sdk"));
     assert!(cargo_toml.contains("stoffel = { package = \"stoffel-rust-sdk\""));
     assert!(cargo_toml.contains("[build-dependencies]"));
     assert!(cargo_toml.contains("stoffel-bindgen"));
     let build_rs = fs::read_to_string(temp.path().join("hello/build.rs")).unwrap();
-    assert!(build_rs.contains("generate_bindings_from_source"));
-    assert!(build_rs.contains("src/main.stfl"));
+    assert!(build_rs.contains("stoffel_bindgen::generate_bindings("));
+    assert!(build_rs.contains("artifacts/program.stflb"));
     let main_rs = fs::read_to_string(temp.path().join("hello/src/main.rs")).unwrap();
     assert!(main_rs.contains("mod stoffel_bindings"));
     assert!(main_rs.contains("include!(concat!(env!(\"OUT_DIR\")"));
     assert!(main_rs.contains("stoffel_bindings::ProgramManifest"));
     assert!(!main_rs.contains("with_inputs"));
+    assert!(main_rs.contains("Stoffel::load_file"));
+    assert!(main_rs.contains("client_for_deployment"));
+    assert!(main_rs.contains("offchain_client_config(0)"));
+    assert!(main_rs.contains(".run_typed("));
+    assert!(!main_rs.contains("execute_local"));
+    assert!(!main_rs.contains("compile_file"));
+    assert!(!main_rs.contains("Command::"));
+    assert!(temp
+        .path()
+        .join("hello/examples/local-coordinator.rs")
+        .exists());
+    assert!(temp.path().join("hello/scripts/local.py").exists());
+    assert!(!temp.path().join("hello/deploy/local").exists());
+    let ignore = fs::read_to_string(temp.path().join("hello/.gitignore")).unwrap();
+    assert!(ignore.contains("/deploy/local/"));
     let readme = fs::read_to_string(temp.path().join("hello/README.md")).unwrap();
     assert!(readme.contains("stoffel check"));
-    assert!(readme.contains("stoffel run"));
-    assert!(readme.contains("stoffel dev --once"));
+    assert!(readme.contains("stoffel-run"));
+    assert!(readme.contains("python3 scripts/local.py"));
     assert!(!readme.contains("--input a=40 --input b=2"));
     assert!(readme.contains("stoffel build"));
     assert!(readme.contains("cargo build"));
@@ -149,8 +165,16 @@ fn init_default_project_builds_with_cargo_and_sdk_bindings() {
         );
     fs::write(&cargo_toml_path, cargo_toml).unwrap();
 
+    Command::cargo_bin("stoffel")
+        .unwrap()
+        .current_dir(&project)
+        .args(["build", "--output", "artifacts/program.stflb"])
+        .assert()
+        .success();
+
     StdCommand::new("cargo")
         .arg("build")
+        .args(["--bins", "--examples"])
         .arg("--offline")
         .current_dir(&project)
         .status()
@@ -158,6 +182,71 @@ fn init_default_project_builds_with_cargo_and_sdk_bindings() {
         .success()
         .then_some(())
         .expect("initialized default project should build with cargo");
+}
+
+#[test]
+fn init_force_preserves_ignore_rules_and_local_identities() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join(".gitignore"), "custom-cache/").unwrap();
+    fs::create_dir_all(temp.path().join("deploy/local")).unwrap();
+    let identity = temp.path().join("deploy/local/client-0.key.der");
+    fs::write(&identity, "identity fixture, not a real private key").unwrap();
+    for _ in 0..2 {
+        Command::cargo_bin("stoffel")
+            .unwrap()
+            .arg("init")
+            .arg(temp.path())
+            .arg("--force")
+            .assert()
+            .success();
+    }
+    assert_eq!(
+        fs::read_to_string(temp.path().join(".gitignore")).unwrap(),
+        "custom-cache/\n/target/\n/artifacts/\n/deploy/local/\n"
+    );
+    assert_eq!(
+        fs::read_to_string(identity).unwrap(),
+        "identity fixture, not a real private key"
+    );
+}
+
+/// Public-dependency consumer test: no path patches or local-MPC SDK calls.
+/// Requires the matching stoffel-run binary and free loopback ports 19200-19404.
+#[test]
+#[ignore = "builds a public-dependency app and starts six real services; set STOFFEL_RUN_BIN"]
+fn init_default_project_runs_with_separate_services() {
+    let _guard = local_mpc_guard();
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("app");
+    Command::cargo_bin("stoffel")
+        .unwrap()
+        .arg("init")
+        .arg(&project)
+        .assert()
+        .success();
+    let cli = assert_cmd::cargo::cargo_bin("stoffel");
+    let mut paths = vec![cli.parent().unwrap().to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    Command::new("python3")
+        .arg(project.join("scripts/local.py"))
+        .current_dir(temp.path())
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .timeout(Duration::from_secs(600))
+        .write_stdin("42\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Doubled result: 84"));
+    assert!(project.join("Cargo.lock").exists());
+    for party in 0..5 {
+        let log = fs::read_to_string(project.join(format!("target/local-logs/node-{party}.log")))
+            .unwrap();
+        assert!(
+            log.contains("Creating MPC engine"),
+            "party {party} did not start"
+        );
+    }
 }
 
 #[test]
@@ -219,7 +308,7 @@ fn init_help_names_supported_templates_and_aliases() {
 }
 
 #[test]
-fn run_executes_default_secret_bool_circuit_project() {
+fn run_executes_default_client_io_project() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
     Command::cargo_bin("stoffel")
@@ -235,15 +324,16 @@ fn run_executes_default_secret_bool_circuit_project() {
         let output = Command::cargo_bin("stoffel")
             .unwrap()
             .current_dir(temp.path())
-            .args(["run", "--timeout-secs", LOCAL_MPC_TEST_TIMEOUT_SECS])
+            .args([
+                "run",
+                "--client-input",
+                "0=42",
+                "--timeout-secs",
+                LOCAL_MPC_TEST_TIMEOUT_SECS,
+            ])
             .output()
             .expect("stoffel run should execute");
         if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("true") || stdout.contains("false"),
-                "expected boolean output, got stdout:\n{stdout}"
-            );
             return;
         }
         last_output = Some(output);
@@ -252,7 +342,7 @@ fn run_executes_default_secret_bool_circuit_project() {
 
     let output = last_output.expect("stoffel run should have been attempted");
     panic!(
-        "default secret bool circuit did not run successfully after retries\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        "default client IO program did not run successfully after retries\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -644,28 +734,6 @@ fn run_rejects_non_project_directories_inside_a_project() {
             .stderr(predicate::str::contains("To run the current project, pass"))
             .stdout(predicate::str::contains("Functions:").not());
     }
-}
-
-#[test]
-fn dev_once_executes_default_secret_bool_circuit_project() {
-    let _guard = local_mpc_guard();
-    let temp = TempDir::new().unwrap();
-    let project = temp.path().join("app");
-    Command::cargo_bin("stoffel")
-        .unwrap()
-        .arg("init")
-        .arg(&project)
-        .assert()
-        .success();
-
-    Command::cargo_bin("stoffel")
-        .unwrap()
-        .arg("dev")
-        .arg(&project)
-        .args(["--once", "--timeout-secs", LOCAL_MPC_TEST_TIMEOUT_SECS])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("true").or(predicate::str::contains("false")));
 }
 
 #[test]
@@ -1468,9 +1536,7 @@ fn run_validates_entry_and_inputs_before_timeout() {
         .stderr(predicate::str::contains(
             "entry function 'missing' is not declared",
         ))
-        .stderr(predicate::str::contains(
-            "Available source functions: circuit, gate_and, gate_not, gate_or, gate_xor, main",
-        ));
+        .stderr(predicate::str::contains("Available source functions: main"));
 
     fs::write(
         temp.path().join("src/main.stfl"),
@@ -3572,7 +3638,7 @@ fn init_supports_declared_templates_and_library_mode() {
         (
             "python",
             "requirements.txt",
-            &["stoffel run", "python3 -m pip install -r requirements.txt"][..],
+            &["stoffel-run", "python3 -m pip install -r requirements.txt"][..],
         ),
         (
             "rust",
@@ -3586,12 +3652,12 @@ fn init_supports_declared_templates_and_library_mode() {
         (
             "solidity-foundry",
             "foundry.toml",
-            &["stoffel run", "forge build"][..],
+            &["stoffel-run", "forge build"][..],
         ),
         (
             "solidity-hardhat",
             "hardhat.config.js",
-            &["stoffel run", "npm install", "npx hardhat compile"][..],
+            &["stoffel-run", "npm install", "npx hardhat compile"][..],
         ),
     ] {
         let path = temp.path().join(name);
@@ -3620,7 +3686,7 @@ fn init_supports_declared_templates_and_library_mode() {
         }
         if name != "rust" {
             let program = fs::read_to_string(path.join("src/main.stfl")).unwrap();
-            assert!(program.contains("secret bool"));
+            assert!(program.contains("ClientStore.take_share(0, 0)"));
         }
     }
 
