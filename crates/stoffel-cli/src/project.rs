@@ -450,16 +450,44 @@ fn init_stoffel_project(path: &Path) -> Result<()> {
     write_new(path.join("Cargo.toml"), &default_cargo_toml_text(&name))?;
     write_new(
         path.join("build.rs"),
-        &default_build_rs_text("src/main.stfl"),
+        include_str!("templates/default/build.rs"),
     )?;
-    write_new(path.join("src/main.rs"), default_main_rs_text())?;
-    write_new(
-        path.join("README.md"),
-        &format!(
-            "{}\nBuild the Rust SDK wrapper with included bindings:\n\n```sh\ncargo build\n```\n\nRun the Rust SDK wrapper:\n\n```sh\ncargo run\n```\n",
-            default_readme_text("Stoffel Project")
+    for (file, contents) in [
+        ("src/main.rs", include_str!("templates/default/main.rs")),
+        (
+            "src/deployment.rs",
+            include_str!("templates/default/deployment.rs"),
         ),
-    )?;
+        (
+            "examples/local-coordinator.rs",
+            include_str!("templates/default/local-coordinator.rs"),
+        ),
+        (
+            "scripts/local.py",
+            include_str!("templates/default/local.py"),
+        ),
+        ("README.md", include_str!("templates/default/README.md")),
+    ] {
+        write_new(path.join(file), contents)?;
+    }
+    // Preserve existing rules while keeping generated identities out of Git,
+    // including when --force refreshes an existing project.
+    let ignore_path = path.join(".gitignore");
+    let mut ignore = if ignore_path.exists() {
+        fs::read_to_string(&ignore_path)?
+    } else {
+        String::new()
+    };
+    for rule in ["/target/", "/artifacts/", "/deploy/local/"] {
+        if !ignore.lines().any(|line| line == rule) {
+            if !ignore.is_empty() && !ignore.ends_with('\n') {
+                ignore.push('\n');
+            }
+            ignore.push_str(rule);
+            ignore.push('\n');
+        }
+    }
+    write_new(ignore_path, &ignore)?;
     Ok(())
 }
 
@@ -916,48 +944,16 @@ fn default_config_text(name: String) -> String {
 }
 
 fn default_readme_text(title: &str) -> String {
-    format!(
-        "# {title}\n\nValidate the Stoffel source:\n\n```sh\nstoffel check\n```\n\nRun the default local MPC example:\n\n```sh\nstoffel run\n```\n\nRun the default example once with the development command:\n\n```sh\nstoffel dev --once\n```\n\nBuild bytecode:\n\n```sh\nstoffel build\n```\n"
-    )
+    include_str!("templates/default/README.md").replacen("# Stoffel app", &format!("# {title}"), 1)
 }
 
 fn default_stoffel_program_text() -> &'static str {
-    concat!(
-        "def gate_and(a: secret bool, b: secret bool) -> secret bool:\n",
-        "  return Share.mul(a, b)\n",
-        "\n",
-        "def gate_not(a: secret bool) -> secret bool:\n",
-        "  var one = Share.from_clear_int(1, 1)\n",
-        "  return Share.sub(one, a)\n",
-        "\n",
-        "def gate_or(a: secret bool, b: secret bool) -> secret bool:\n",
-        "  var ab: secret bool = gate_and(a, b)\n",
-        "  var sum = Share.add(a, b)\n",
-        "  return Share.sub(sum, ab)\n",
-        "\n",
-        "def gate_xor(a: secret bool, b: secret bool) -> secret bool:\n",
-        "  var ab: secret bool = gate_and(a, b)\n",
-        "  var sum = Share.add(a, b)\n",
-        "  var two_ab = Share.mul_scalar(ab, 2)\n",
-        "  return Share.sub(sum, two_ab)\n",
-        "\n",
-        "def circuit(x: secret bool, y: secret bool, z: secret bool) -> secret bool:\n",
-        "  var left: secret bool = gate_or(gate_and(x, y), gate_not(z))\n",
-        "  var right: secret bool = gate_and(x, gate_not(y))\n",
-        "  return gate_xor(left, right)\n",
-        "\n",
-        "def main() -> bool:\n",
-        "  var x: secret bool = Share.random()\n",
-        "  var y: secret bool = Share.random()\n",
-        "  var z: secret bool = Share.random()\n",
-        "  var result: secret bool = circuit(x, y, z)\n",
-        "  return result.reveal()\n",
-    )
+    "def main():\n  var input = ClientStore.take_share(0, 0)\n  var doubled = Share.mul_scalar(input, 2)\n  MpcOutput.send_to_client(0, [doubled])\n"
 }
 
 fn default_cargo_toml_text(name: &str) -> String {
     format!(
-        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstoffel = {{ package = \"stoffel-rust-sdk\", version = \"=0.1.2\" }}\ntokio = {{ version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }}\n\n[build-dependencies]\nstoffel-bindgen = \"=0.1.2\"\n"
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstoffel = {{ package = \"stoffel-rust-sdk\", version = \"=0.1.2\" }}\ntokio = {{ version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\nrustls = {{ version = \"=0.23.41\", default-features = false, features = [\"ring\"] }}\n\n[build-dependencies]\nstoffel-bindgen = \"=0.1.2\"\n\n# Only the local coordinator fixture needs these lower-level dependencies.\n[dev-dependencies]\nstoffel-mpc-coordinator-off-chain = \"=0.1.0\"\nstoffel-mpc-coordinator-shared = \"=0.1.0\"\nblake3 = \"1\"\nx509-parser = \"0.18\"\ntokio = {{ version = \"1\", features = [\"signal\"] }}\n"
     )
 }
 
@@ -965,10 +961,6 @@ fn default_build_rs_text(program_path: &str) -> String {
     format!(
         "use std::path::PathBuf;\n\nfn main() -> std::result::Result<(), Box<dyn std::error::Error>> {{\n    println!(\"cargo:rerun-if-changed={program_path}\");\n\n    let out_file = PathBuf::from(std::env::var(\"OUT_DIR\")?).join(\"stoffel_bindings.rs\");\n    stoffel_bindgen::generate_bindings_from_source(\n        \"{program_path}\",\n        out_file,\n        stoffel_bindgen::BindingsConfig::default(),\n    )?;\n\n    Ok(())\n}}\n"
     )
-}
-
-fn default_main_rs_text() -> &'static str {
-    "use stoffel::prelude::*;\n\n#[allow(dead_code, unused_mut, unused_variables)]\nmod stoffel_bindings {\n    include!(concat!(env!(\"OUT_DIR\"), \"/stoffel_bindings.rs\"));\n}\n\n#[tokio::main]\nasync fn main() -> stoffel::Result<()> {\n    let result = Stoffel::compile_file(\"src/main.stfl\")?\n        .manifest::<stoffel_bindings::ProgramManifest>()\n        .parties(5)\n        .threshold(1)\n        // Load named function inputs from JSON, CSV, or TXT when your program takes parameters.\n        // Examples:\n        //   inputs.json: {\"a\": 40, \"b\": 2}\n        //   inputs.csv:  a,b\\n40,2\n        //   inputs.txt:  a=40\\nb=2\n        // .with_input_file(\"inputs.json\")?\n        // Load ClientStore values for no-argument MPC programs with:\n        // .with_client_input_file(\"client-inputs.json\")?\n        .execute_local()\n        .await?;\n\n    println!(\"{}\", result[0]);\n    Ok(())\n}\n"
 }
 
 fn config_text(name: String, source: &str) -> String {
