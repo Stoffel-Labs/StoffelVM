@@ -1,0 +1,4 @@
+def main() -> int64:
+  var input = 21
+  var doubled = input * 2
+  return doubled

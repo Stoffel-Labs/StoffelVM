@@ -1,0 +1,4 @@
+def main():
+  var input = ClientStore.take_share(0, 0)
+  var doubled = Share.mul_scalar(input, 2)
+  MpcOutput.send_to_client(0, [doubled])

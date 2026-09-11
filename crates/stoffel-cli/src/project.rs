@@ -279,12 +279,7 @@ impl Project {
     }
 
     fn configured_source_is_dir(&self) -> bool {
-        self.config
-            .build
-            .source
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_none_or(|extension| !extension.eq_ignore_ascii_case("stfl"))
+        !is_stoffel_source_path(&self.config.build.source)
     }
 
     pub fn default_bytecode_path_for_source(&self, source: &Path, release: bool) -> PathBuf {
@@ -424,7 +419,9 @@ fn nearest_stoffel_source(path: &Path) -> Option<PathBuf> {
 fn is_stoffel_source_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("stfl"))
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("stfl") || extension.eq_ignore_ascii_case("stoffel")
+        })
 }
 
 fn levenshtein(left: &str, right: &str) -> usize {
@@ -446,7 +443,10 @@ fn levenshtein(left: &str, right: &str) -> usize {
 fn init_stoffel_project(path: &Path) -> Result<()> {
     let name = project_name(path);
     write_new(path.join(CONFIG_FILE), &default_config_text(name.clone()))?;
-    write_new(path.join("src/main.stfl"), default_stoffel_program_text())?;
+    write_new(
+        path.join("src/main.stoffel"),
+        include_str!("templates/default/main.stoffel"),
+    )?;
     write_new(path.join("Cargo.toml"), &default_cargo_toml_text(&name))?;
     write_new(
         path.join("build.rs"),
@@ -454,21 +454,46 @@ fn init_stoffel_project(path: &Path) -> Result<()> {
     )?;
     for (file, contents) in [
         ("src/main.rs", include_str!("templates/default/main.rs")),
+        ("src/client.rs", include_str!("templates/default/client.rs")),
+        ("src/server.rs", include_str!("templates/default/server.rs")),
         (
-            "src/deployment.rs",
-            include_str!("templates/default/deployment.rs"),
+            "src/coordinator.rs",
+            include_str!("templates/default/coordinator.rs"),
         ),
         (
-            "examples/local-coordinator.rs",
-            include_str!("templates/default/local-coordinator.rs"),
+            "tests/test_double.stoffel",
+            include_str!("templates/default/test.stoffel"),
         ),
         (
-            "scripts/local.py",
-            include_str!("templates/default/local.py"),
+            "tests/topology.rs",
+            include_str!("templates/default/topology.rs"),
+        ),
+        (
+            "scripts/run-local.sh",
+            include_str!("templates/default/run-local.sh"),
+        ),
+        (
+            "scripts/run-client.sh",
+            include_str!("templates/default/run-client.sh"),
+        ),
+        (
+            "scripts/docker-compose.yml",
+            include_str!("templates/default/docker-compose.yml"),
+        ),
+        (
+            "scripts/Dockerfile",
+            include_str!("templates/default/Dockerfile"),
         ),
         ("README.md", include_str!("templates/default/README.md")),
     ] {
         write_new(path.join(file), contents)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for script in ["scripts/run-local.sh", "scripts/run-client.sh"] {
+            fs::set_permissions(path.join(script), fs::Permissions::from_mode(0o755))?;
+        }
     }
     // Preserve existing rules while keeping generated identities out of Git,
     // including when --force refreshes an existing project.
@@ -809,11 +834,7 @@ fn validate_source_config(source: &Path) -> Result<()> {
             source.display()
         );
     }
-    if source
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| !extension.eq_ignore_ascii_case("stfl"))
-    {
+    if source.extension().is_some() && !is_stoffel_source_path(source) {
         anyhow::bail!(
             "invalid build.source {}; expected a .stfl source file or source directory",
             source.display()
@@ -913,11 +934,7 @@ fn collect_stfl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         let path = entry?.path();
         if path.is_dir() {
             collect_stfl_files(&path, files)?;
-        } else if path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("stfl"))
-        {
+        } else if is_stoffel_source_path(&path) {
             files.push(path);
         }
     }
@@ -940,20 +957,16 @@ fn write_new(path: PathBuf, contents: &str) -> Result<()> {
 }
 
 fn default_config_text(name: String) -> String {
-    config_text(name, "src/main.stfl")
+    config_text(name, "src/main.stoffel")
 }
 
 fn default_readme_text(title: &str) -> String {
     include_str!("templates/default/README.md").replacen("# Stoffel app", &format!("# {title}"), 1)
 }
 
-fn default_stoffel_program_text() -> &'static str {
-    "def main():\n  var input = ClientStore.take_share(0, 0)\n  var doubled = Share.mul_scalar(input, 2)\n  MpcOutput.send_to_client(0, [doubled])\n"
-}
-
 fn default_cargo_toml_text(name: &str) -> String {
     format!(
-        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstoffel = {{ package = \"stoffel-rust-sdk\", version = \"=0.1.2\" }}\ntokio = {{ version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\nrustls = {{ version = \"=0.23.41\", default-features = false, features = [\"ring\"] }}\n\n[build-dependencies]\nstoffel-bindgen = \"=0.1.2\"\n\n# Only the local coordinator fixture needs these lower-level dependencies.\n[dev-dependencies]\nstoffel-mpc-coordinator-off-chain = \"=0.1.0\"\nstoffel-mpc-coordinator-shared = \"=0.1.0\"\nblake3 = \"1\"\nx509-parser = \"0.18\"\ntokio = {{ version = \"1\", features = [\"signal\"] }}\n"
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"stoffel-services\"\npath = \"src/main.rs\"\n\n[[bin]]\nname = \"stoffel-client\"\npath = \"src/client.rs\"\n\n[[bin]]\nname = \"stoffel-server\"\npath = \"src/server.rs\"\n\n[[bin]]\nname = \"stoffel-coordinator\"\npath = \"src/coordinator.rs\"\n\n[dependencies]\nstoffel = {{ package = \"stoffel-rust-sdk\", version = \"=0.1.2\" }}\ntokio = {{ version = \"1\", features = [\"macros\", \"net\", \"rt-multi-thread\", \"signal\", \"time\"] }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\ntoml = \"0.8\"\nrustls = {{ version = \"=0.23.41\", default-features = false, features = [\"ring\"] }}\nstoffel-mpc-coordinator-off-chain = \"=0.1.0\"\nblake3 = \"1\"\nx509-parser = \"0.18\"\nrcgen = \"0.14\"\n\n[build-dependencies]\nstoffel-bindgen = \"=0.1.2\"\n"
     )
 }
 
