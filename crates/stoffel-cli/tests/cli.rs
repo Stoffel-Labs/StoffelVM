@@ -101,6 +101,7 @@ fn init_creates_default_project() {
     let src = temp.path().join("hello/src");
     for file in [
         "client.rs",
+        "deployment.rs",
         "server.rs",
         "coordinator.rs",
         "main.rs",
@@ -113,17 +114,36 @@ fn init_creates_default_project() {
     assert!(main_rs.contains("server::start_all().await"));
     assert!(!main_rs.contains("client::"));
     let client_rs = fs::read_to_string(src.join("client.rs")).unwrap();
-    assert!(client_rs.contains("mod stoffel_bindings"));
-    assert!(client_rs.contains("include!(concat!(env!(\"OUT_DIR\")"));
-    assert!(client_rs.contains("stoffel_bindings::ProgramManifest"));
-    assert!(client_rs.contains("Stoffel::load_file"));
-    assert!(client_rs.contains("client_for_deployment"));
-    assert!(client_rs.contains("offchain_client_config(0)"));
+    assert!(client_rs.contains("async fn main()"));
+    assert!(client_rs.contains("deployment::client()"));
     assert!(client_rs.contains(".run_typed("));
+    for implementation_detail in [
+        "Deserialize",
+        "NetworkDeployment",
+        "Stoffel::load_file",
+        "offchain_client_config",
+        "identity_files",
+        "serde_json",
+    ] {
+        assert!(
+            !client_rs.contains(implementation_detail),
+            "client.rs exposes configuration detail {implementation_detail}"
+        );
+    }
+    assert!(client_rs.lines().count() < 25);
+    let deployment_rs = fs::read_to_string(src.join("deployment.rs")).unwrap();
+    assert!(deployment_rs.contains("stoffel_bindings.rs"));
+    assert!(
+        deployment_rs.contains("stoffel_bindings::ProgramManifest")
+            || deployment_rs.contains("bindings::ProgramManifest")
+    );
+    assert!(deployment_rs.contains("Stoffel::load_file"));
+    assert!(deployment_rs.contains("client_for_deployment"));
+    assert!(deployment_rs.contains("offchain_client_config(0)"));
     let server_rs = fs::read_to_string(src.join("server.rs")).unwrap();
     assert!(server_rs.contains("config.parties"));
     assert!(server_rs.contains(".server(party_id)"));
-    let generated_rust = format!("{main_rs}\n{client_rs}\n{server_rs}");
+    let generated_rust = format!("{main_rs}\n{client_rs}\n{deployment_rs}\n{server_rs}");
     for prohibited in [
         "execute_local",
         "exec_local",
@@ -144,17 +164,21 @@ fn init_creates_default_project() {
         .path()
         .join("hello/scripts/docker-compose.yml")
         .exists());
+    let compose = fs::read_to_string(temp.path().join("hello/scripts/docker-compose.yml")).unwrap();
+    assert!(compose.contains("[\"stoffel-server\", \"0\"]"));
+    assert!(compose.contains("condition: service_healthy"));
+    assert!(!compose.contains("--client-input-total"));
     assert!(temp.path().join("hello/scripts/Dockerfile").exists());
     assert!(!temp.path().join("hello/deploy/local").exists());
     let ignore = fs::read_to_string(temp.path().join("hello/.gitignore")).unwrap();
     assert!(ignore.contains("/deploy/local/"));
     let readme = fs::read_to_string(temp.path().join("hello/README.md")).unwrap();
     assert!(readme.contains("stoffel check"));
-    assert!(readme.contains("src/client.rs"));
-    assert!(readme.contains("src/server.rs"));
-    assert!(readme.contains("src/coordinator.rs"));
-    assert!(readme.contains("src/main.rs"));
+    for source in ["client.rs", "server.rs", "coordinator.rs", "main.rs"] {
+        assert!(readme.contains(source), "README does not explain {source}");
+    }
     assert!(readme.contains("scripts/docker-compose.yml"));
+    assert!(readme.contains("https://docs.stoffelmpc.com"));
     assert!(!readme.contains("--input a=40 --input b=2"));
     assert!(readme.contains("stoffel build"));
     assert!(readme.contains("cargo build"));
@@ -296,18 +320,19 @@ fn init_default_project_runs_with_separate_services() {
             break;
         }
     }
-    let mut client = StdCommand::new(cargo_target.join("debug/stoffel-client"))
+    let output = StdCommand::new(cargo_target.join("debug/stoffel-client"))
         .current_dir(&project)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
+        .arg("42")
+        .output()
         .unwrap();
-    use std::io::Write;
-    client.stdin.take().unwrap().write_all(b"42\n").unwrap();
-    let output = client.wait_with_output().unwrap();
     let _ = services.kill();
     let _ = services.wait();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "client failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Doubled result: 84"));
     assert!(project.join("Cargo.lock").exists());
 }
