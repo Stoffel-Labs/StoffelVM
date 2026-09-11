@@ -455,6 +455,10 @@ fn init_stoffel_project(path: &Path) -> Result<()> {
     for (file, contents) in [
         ("src/main.rs", include_str!("templates/default/main.rs")),
         ("src/client.rs", include_str!("templates/default/client.rs")),
+        (
+            "src/deployment.rs",
+            include_str!("templates/default/deployment.rs"),
+        ),
         ("src/server.rs", include_str!("templates/default/server.rs")),
         (
             "src/coordinator.rs",

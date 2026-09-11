@@ -1,61 +1,81 @@
 # Stoffel app
 
-This project shows where Stoffel fits in an application:
+This project is a complete Stoffel application: a private program, a Rust application client, and the services that run its MPC network.
 
-```text
-.
-├── Cargo.toml
-├── Stoffel.toml
-├── src/{client.rs,server.rs,coordinator.rs,main.rs,main.stoffel}
-├── tests/
-└── scripts/{run-local.sh,run-client.sh,docker-compose.yml,Dockerfile}
+## Validate the Stoffel program
+
+```sh
+stoffel check
 ```
 
-- `src/client.rs` is participant-owned application code. Integrate this SDK flow into your API, CLI, mobile backend, or other end-user application.
-- `src/server.rs` defines one MPC node. `[mpc].parties` in `Stoffel.toml` controls how many local nodes `src/main.rs` starts.
-- `src/coordinator.rs` prepares participant identities and runs the off-chain coordinator.
-- `src/main.rs` starts only the coordinator and MPC nodes. It never runs a client.
-- `src/main.stoffel` is compiled to the bytecode every node executes.
+## Run the local MPC network
 
-The local services are a single-session development fixture, not reusable production daemons.
-
-## Run locally
-
-Install `stoffel`, `stoffel-run`, and Rust, then start the MPC services:
+Start the coordinator and the number of MPC nodes configured by `[mpc].parties` in `Stoffel.toml`:
 
 ```sh
 ./scripts/run-local.sh
 ```
 
-The script runs `stoffel check`, compiles `src/main.stoffel`, generates the typed Rust bindings, and starts the service binary.
+The script validates and compiles `src/main.stoffel`, builds the Rust binaries, and starts the coordinator and MPC nodes. It does not run a client.
 
-When the services report that they are ready, use a second terminal for the participant client:
+## Integrate the client
 
-```sh
-./scripts/run-client.sh
-```
-
-Enter `42`. The client secret-shares that value, invokes the generated typed interface with `run_typed`, and prints `Doubled result: 84` after MPC execution.
-
-Generated identities and deployment metadata live under ignored `deploy/local/`. The typed Rust bindings are generated from `artifacts/program.stflb` during `cargo build`, keeping application types aligned with deployed bytecode.
-
-## Run roles separately
-
-The same Rust files can be operated as independent processes:
+In a second terminal, send the sample private input:
 
 ```sh
-cargo run --bin stoffel-coordinator -- prepare
-cargo run --bin stoffel-coordinator -- serve
-STOFFEL_AUTH_TOKEN=stoffel-local-example cargo run --bin stoffel-server -- 0
-# Repeat stoffel-server with each party ID through [mpc].parties - 1.
-cargo run --bin stoffel-client -- deploy/local/deployment.json
+./scripts/run-client.sh 42
 ```
 
-Move these roles to separate machines by replacing loopback addresses in deployment metadata, giving each node its own identity files, and setting `STOFFEL_BIND_ADDRESS`, `STOFFEL_RPC_BIND_ADDRESS`, `STOFFEL_COORDINATOR_ADDRESS`, and `STOFFEL_BOOTSTRAP_ADDRESS`. Do not share private key files between machines.
+Expected output:
 
-## Container example
+```text
+Doubled result: 84
+```
 
-After building the bytecode and preparing identities, `scripts/docker-compose.yml` demonstrates a coordinator and five node containers on a private network:
+`src/client.rs` is the code to carry into your application. It gets a configured `StoffelClient`, submits typed private input with `run_typed`, and receives the typed result. `src/deployment.rs` keeps network addresses, identities, and bytecode loading outside the application flow so a real app can replace that module with its own configuration provider.
+
+## Build bytecode
+
+```sh
+stoffel build --output artifacts/program.stflb
+```
+
+`cargo build` then generates typed Rust bindings from that exact bytecode through `build.rs`.
+
+## Project structure
+
+```text
+.
+├── Cargo.toml                 # Rust application and service binaries
+├── Stoffel.toml               # Program, party count, threshold, and build settings
+├── build.rs                   # Typed binding generation
+├── src/
+│   ├── client.rs              # Participant-owned application integration
+│   ├── deployment.rs          # Deployment configuration adapter
+│   ├── server.rs              # One MPC node built with stoffel-rust-sdk
+│   ├── coordinator.rs         # Off-chain coordinator and local identities
+│   ├── main.rs                # Local coordinator and node orchestration
+│   └── main.stoffel           # Private computation
+├── tests/                     # Stoffel and Rust tests
+└── scripts/
+    ├── run-local.sh           # Local coordinator and node launcher
+    ├── run-client.sh          # Sample application client
+    ├── docker-compose.yml     # Coordinator and five deployable MPC nodes
+    └── Dockerfile             # Coordinator and node image
+```
+
+The local network is deployment-shaped: the application client, coordinator, and MPC nodes are separate processes. Private input goes from the participant-owned client directly to the MPC network.
+
+## Run the tests
+
+```sh
+stoffel test
+cargo test
+```
+
+## Run with Docker Compose
+
+Build the program and prepare local development identities once:
 
 ```sh
 stoffel build --output artifacts/program.stflb
@@ -63,10 +83,10 @@ cargo run --bin stoffel-coordinator -- prepare
 docker compose -f scripts/docker-compose.yml up --build
 ```
 
-Run `./scripts/run-client.sh` on the host after the nodes are ready. The Compose file expands the default five-party topology explicitly; update its node services if you change `[mpc].parties`.
+The Compose stack runs one coordinator and five independently addressable MPC nodes. The image includes `stoffel-run`, while the generated `stoffel-server` binary keeps its command short. Keep the client in your application and run `./scripts/run-client.sh 42` after the nodes are healthy.
 
-Run the sample Stoffel test with:
+For a real deployment, provide each service its own identity and persistent runtime environment, replace loopback addresses in the deployment configuration, and manage secrets with your deployment platform.
 
-```sh
-stoffel test
-```
+## Learn more
+
+Read the [Stoffel documentation](https://docs.stoffelmpc.com) for language guides, Rust SDK integration, MPC concepts, and deployment guidance.

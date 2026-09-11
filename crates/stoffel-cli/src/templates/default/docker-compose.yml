@@ -2,11 +2,18 @@ x-node: &node
   build:
     context: ..
     dockerfile: scripts/Dockerfile
-  depends_on: [coordinator]
+  command: ["stoffel-server"]
   volumes:
     - ../deploy/local:/app/deploy/local:ro
-  environment:
+  environment: &node-env
     STOFFEL_AUTH_TOKEN: ${STOFFEL_AUTH_TOKEN:-stoffel-local-example}
+    STOFFEL_COORDINATOR_ADDRESS: coordinator:19300
+    STOFFEL_RUN_BIN: /usr/local/bin/stoffel-run
+  healthcheck:
+    test: ["CMD-SHELL", "nc -z 127.0.0.1 $${STOFFEL_RPC_BIND_ADDRESS##*:}"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
   restart: "no"
 
 services:
@@ -19,29 +26,86 @@ services:
       STOFFEL_COORDINATOR_BIND: 0.0.0.0
     volumes:
       - ../deploy/local:/app/deploy/local:ro
-    ports: ["19300:19300"]
+    ports:
+      - "19300:19300"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "19300"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
   node-0:
     <<: *node
-    command: ["stoffel-run", "/app/artifacts/program.stflb", "main", "--n-parties", "5", "--threshold", "1", "--leader", "--bind", "0.0.0.0:19200", "--advertise", "node-0:20200", "--mpc-backend", "honeybadger", "--off-chain-coord", "coordinator:19300", "--rpc-bind", "0.0.0.0:19400", "--key", "/app/deploy/local/node-0.key.der", "--cert", "/app/deploy/local/node-0.cert.der", "--expected-clients", "/app/deploy/local/client-0.cert.der", "--client-roster", "0", "--client-input-slots", "0", "--client-input-count", "1", "--client-input-total", "1"]
-    ports: ["20200:20200", "19400:19400"]
-
+    command: ["stoffel-server", "0"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    environment:
+      <<: *node-env
+      STOFFEL_BIND_ADDRESS: node-0:19200
+      STOFFEL_RPC_BIND_ADDRESS: 0.0.0.0:19400
+    ports:
+      - "19400:19400"
   node-1:
     <<: *node
-    command: ["stoffel-run", "/app/artifacts/program.stflb", "main", "--n-parties", "5", "--threshold", "1", "--party-id", "1", "--bootstrap", "node-0:19200", "--bind", "0.0.0.0:19202", "--advertise", "node-1:19202", "--mpc-backend", "honeybadger", "--off-chain-coord", "coordinator:19300", "--rpc-bind", "0.0.0.0:19401", "--key", "/app/deploy/local/node-1.key.der", "--cert", "/app/deploy/local/node-1.cert.der", "--expected-clients", "/app/deploy/local/client-0.cert.der", "--client-roster", "0", "--client-input-slots", "0", "--client-input-count", "1", "--client-input-total", "1"]
-    ports: ["19202:19202", "19401:19401"]
+    command: ["stoffel-server", "1"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      node-0:
+        condition: service_healthy
+    environment:
+      <<: *node-env
+      STOFFEL_BIND_ADDRESS: node-1:19202
+      STOFFEL_RPC_BIND_ADDRESS: 0.0.0.0:19401
+      STOFFEL_BOOTSTRAP_ADDRESS: node-0:19200
+    ports:
+      - "19401:19401"
 
   node-2:
     <<: *node
-    command: ["stoffel-run", "/app/artifacts/program.stflb", "main", "--n-parties", "5", "--threshold", "1", "--party-id", "2", "--bootstrap", "node-0:19200", "--bind", "0.0.0.0:19204", "--advertise", "node-2:19204", "--mpc-backend", "honeybadger", "--off-chain-coord", "coordinator:19300", "--rpc-bind", "0.0.0.0:19402", "--key", "/app/deploy/local/node-2.key.der", "--cert", "/app/deploy/local/node-2.cert.der", "--expected-clients", "/app/deploy/local/client-0.cert.der", "--client-roster", "0", "--client-input-slots", "0", "--client-input-count", "1", "--client-input-total", "1"]
-    ports: ["19204:19204", "19402:19402"]
+    command: ["stoffel-server", "2"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      node-0:
+        condition: service_healthy
+    environment:
+      <<: *node-env
+      STOFFEL_BIND_ADDRESS: node-2:19204
+      STOFFEL_RPC_BIND_ADDRESS: 0.0.0.0:19402
+      STOFFEL_BOOTSTRAP_ADDRESS: node-0:19200
+    ports:
+      - "19402:19402"
 
   node-3:
     <<: *node
-    command: ["stoffel-run", "/app/artifacts/program.stflb", "main", "--n-parties", "5", "--threshold", "1", "--party-id", "3", "--bootstrap", "node-0:19200", "--bind", "0.0.0.0:19206", "--advertise", "node-3:19206", "--mpc-backend", "honeybadger", "--off-chain-coord", "coordinator:19300", "--rpc-bind", "0.0.0.0:19403", "--key", "/app/deploy/local/node-3.key.der", "--cert", "/app/deploy/local/node-3.cert.der", "--expected-clients", "/app/deploy/local/client-0.cert.der", "--client-roster", "0", "--client-input-slots", "0", "--client-input-count", "1", "--client-input-total", "1"]
-    ports: ["19206:19206", "19403:19403"]
+    command: ["stoffel-server", "3"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      node-0:
+        condition: service_healthy
+    environment:
+      <<: *node-env
+      STOFFEL_BIND_ADDRESS: node-3:19206
+      STOFFEL_RPC_BIND_ADDRESS: 0.0.0.0:19403
+      STOFFEL_BOOTSTRAP_ADDRESS: node-0:19200
+    ports:
+      - "19403:19403"
 
   node-4:
     <<: *node
-    command: ["stoffel-run", "/app/artifacts/program.stflb", "main", "--n-parties", "5", "--threshold", "1", "--party-id", "4", "--bootstrap", "node-0:19200", "--bind", "0.0.0.0:19208", "--advertise", "node-4:19208", "--mpc-backend", "honeybadger", "--off-chain-coord", "coordinator:19300", "--rpc-bind", "0.0.0.0:19404", "--key", "/app/deploy/local/node-4.key.der", "--cert", "/app/deploy/local/node-4.cert.der", "--expected-clients", "/app/deploy/local/client-0.cert.der", "--client-roster", "0", "--client-input-slots", "0", "--client-input-count", "1", "--client-input-total", "1"]
-    ports: ["19208:19208", "19404:19404"]
+    command: ["stoffel-server", "4"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      node-0:
+        condition: service_healthy
+    environment:
+      <<: *node-env
+      STOFFEL_BIND_ADDRESS: node-4:19208
+      STOFFEL_RPC_BIND_ADDRESS: 0.0.0.0:19404
+      STOFFEL_BOOTSTRAP_ADDRESS: node-0:19200
+    ports:
+      - "19404:19404"
